@@ -2,6 +2,54 @@ import Foundation
 import Darwin
 import RFBProtocol
 
+/// Amortized-O(1) FIFO used between the socket read source and the transport
+/// actor. `Array.removeFirst()` shifts every remaining element and made the old
+/// queue progressively more expensive precisely when an RTP burst built a
+/// backlog. This queue advances a head index and compacts only occasionally.
+struct BoundedDatagramFIFO {
+    private var storage: [Data] = []
+    private var head = 0
+    let capacity: Int
+
+    init(capacity: Int) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+    }
+
+    var count: Int { storage.count - head }
+    var isEmpty: Bool { count == 0 }
+
+    /// Appends datagrams in order and, if the hard memory bound is exceeded,
+    /// drops the oldest entries. Returns the number dropped.
+    mutating func append(contentsOf datagrams: [Data]) -> Int {
+        guard !datagrams.isEmpty else { return 0 }
+        storage.append(contentsOf: datagrams)
+        let overflow = max(0, count - capacity)
+        head += overflow
+        compactIfNeeded()
+        return overflow
+    }
+
+    mutating func popFirst() -> Data? {
+        guard head < storage.count else { return nil }
+        let value = storage[head]
+        head += 1
+        compactIfNeeded()
+        return value
+    }
+
+    private mutating func compactIfNeeded() {
+        guard head > 0 else { return }
+        if head == storage.count {
+            storage.removeAll(keepingCapacity: true)
+            head = 0
+        } else if head >= 4096 && head >= storage.count / 2 {
+            storage.removeFirst(head)
+            head = 0
+        }
+    }
+}
+
 /// A UDP channel backed directly by a POSIX socket.
 ///
 /// This mirrors Apple Screen Sharing's native
@@ -33,7 +81,7 @@ public actor PosixUDPChannel {
     private var boundPort: UInt16?
     private var readSource: DispatchSourceRead?
     private let readQueue = DispatchQueue(label: "com.rootshell.vnc.udp.read", qos: .userInitiated)
-    private let log = VNCLogger(category: "PosixUDPChannel")
+    private nonisolated let log = VNCLogger(category: "PosixUDPChannel")
 
     // Datagram handoff state, guarded by `stateLock` (NOT actor-isolated: the
     // read source appends from `readQueue`, `receive()` consumes from the
@@ -44,13 +92,12 @@ public actor PosixUDPChannel {
     // the client. Reordered video packets shred HEVC fragmentation units and
     // read as sequence gaps, i.e. macroblocks that worsen with system load.
     private let stateLock = NSLock()
-    private nonisolated(unsafe) var pendingDatagrams: [Data] = []
+    private nonisolated(unsafe) var pendingDatagrams = BoundedDatagramFIFO(
+        capacity: 8192)
     private nonisolated(unsafe) var receiveWaiters: [CheckedContinuation<Data, Error>] = []
     private nonisolated(unsafe) var lockedClosed = false
     /// Soft cap so a stalled consumer degrades like a kernel buffer overflow
     /// (bounded memory, oldest dropped) instead of growing without bound.
-    private let maxPendingDatagrams = 8192
-
     private var closed = false
 
     // MARK: - Init
@@ -170,8 +217,7 @@ public actor PosixUDPChannel {
     public func receive() async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             stateLock.lock()
-            if !pendingDatagrams.isEmpty {
-                let datagram = pendingDatagrams.removeFirst()
+            if let datagram = pendingDatagrams.popFirst() {
                 stateLock.unlock()
                 continuation.resume(returning: datagram)
             } else if lockedClosed {
@@ -262,15 +308,15 @@ public actor PosixUDPChannel {
     /// `nonisolated` — runs on the serial read queue, not the actor.
     private nonisolated func publishBatchInOrder(_ batch: [Data]) {
         stateLock.lock()
-        pendingDatagrams.append(contentsOf: batch)
-        if pendingDatagrams.count > maxPendingDatagrams {
-            pendingDatagrams.removeFirst(pendingDatagrams.count - maxPendingDatagrams)
-        }
+        let dropped = pendingDatagrams.append(contentsOf: batch)
         var resumes: [(CheckedContinuation<Data, Error>, Data)] = []
-        while !receiveWaiters.isEmpty && !pendingDatagrams.isEmpty {
-            resumes.append((receiveWaiters.removeFirst(), pendingDatagrams.removeFirst()))
+        while !receiveWaiters.isEmpty, let datagram = pendingDatagrams.popFirst() {
+            resumes.append((receiveWaiters.removeFirst(), datagram))
         }
         stateLock.unlock()
+        if dropped > 0 {
+            log.error("UDP userspace receive queue overflow; dropped \(dropped) oldest datagrams")
+        }
         for (cont, datagram) in resumes {
             cont.resume(returning: datagram)
         }

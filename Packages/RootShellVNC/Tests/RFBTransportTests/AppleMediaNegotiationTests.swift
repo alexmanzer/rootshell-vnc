@@ -30,7 +30,9 @@ final class AppleMediaNegotiationTests: XCTestCase {
         let screen = try XCTUnwrap(root.message(5))
         XCTAssertEqual(screen.varint(1), 0xa1b2_c3d4)
         XCTAssertEqual(screen.varint(2), 0)
-        XCTAssertEqual(screen.varint(6), 4)
+        // A public VideoToolbox client requests the supported single-image
+        // path; AVConference's private decoder is what permits four tiles.
+        XCTAssertEqual(screen.varint(6), 1)
         XCTAssertEqual(screen.varint(7), 1)
         XCTAssertEqual(screen.varint(8), 63)
         XCTAssertEqual(screen.varint(9), 1)

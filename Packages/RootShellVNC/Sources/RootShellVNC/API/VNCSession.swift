@@ -486,8 +486,13 @@ public final class VNCSession {
             streamID: offer.streamID,
             width: width,
             height: height,
+            // Our Viceroy profile negotiates one tile so the stream is
+            // compatible with public VideoToolbox. That RTP mode omits DONL.
+            usesDecodingOrderNumbers: false,
             frameCallback: callback
         )
+
+        let streamGeneration = manager.decodeProgress.streamGeneration
 
         // Dead-band watchdog. If any packet of the initial burst is lost, the
         // affected band misses its ONLY IRAP and never decodes a frame — and
@@ -517,16 +522,50 @@ public final class VNCSession {
             }
         }
 
-        // Loss recovery: ONE refresh request per fresh loss event. The stream
-        // heals continuously via gradual intra refresh, so a lost packet mends
-        // itself within a sweep even with no request at all; the request just
-        // accelerates it. Firing repeatedly (an earlier design retried every
-        // 250 ms) made the server run intra sweep after intra sweep — visible
-        // as constant quality "pulsing". The transport's own 1 Hz gap trigger
-        // remains as the backstop if this request datagram is lost.
+        // Long-running decode-output watchdog. A static desktop naturally
+        // produces no decode submissions, so silence by itself is not a fault.
+        // We recover only when complete pictures KEEP being submitted while no
+        // frame reaches the renderer. This catches a VideoToolbox/reference
+        // stall without examining image contents and stops requesting refreshes
+        // as soon as output advances.
+        if let transport = transportSession {
+            let watchdogManager = manager
+            let log = logger
+            Task { [weak transport, weak watchdogManager] in
+                var detector = DecodeOutputStallDetector()
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    guard let transport,
+                          let m = watchdogManager,
+                          m.isStreamActive else { return }
+                    let progress = m.decodeProgress
+                    guard progress.streamGeneration == streamGeneration else { return }
+                    if detector.observe(
+                        submittedFrameCount: progress.submittedFrameCount,
+                        deliveredFrameCount: decodedBands.frameCount,
+                        nowNanos: DispatchTime.now().uptimeNanoseconds
+                    ) {
+                        log.warning("Decode-output stall while compressed frames continue; forcing one full refresh")
+                        try? await transport.requestFramebufferUpdate(incremental: false)
+                        await transport.requestVideoKeyframe()
+                    }
+                }
+            }
+        }
+
+        // Loss recovery: ONE full-refresh/keyframe request per fresh loss event.
+        // The keyframe feedback alone is not always honored by the screen
+        // encoder; marking the framebuffer dirty makes the server produce the
+        // intra-refresh content needed to rebuild the broken reference chain.
+        // This is event-driven rather than periodic, avoiding the continuous
+        // refresh sweeps that previously caused visible quality pulsing.
         if let transport = transportSession {
             manager.onLossDetected = { [weak transport] ssrc in
-                Task { await transport?.requestVideoKeyframe(ssrc: ssrc) }
+                Task {
+                    guard let transport else { return }
+                    try? await transport.requestFramebufferUpdate(incremental: false)
+                    await transport.requestVideoKeyframe(ssrc: ssrc)
+                }
             }
         }
 
@@ -669,10 +708,12 @@ final class DiagnosticFrameDumper: @unchecked Sendable {
 final class DecodedBandTracker: @unchecked Sendable {
     private let lock = NSLock()
     private var ssrcs: Set<UInt32> = []
+    private var frames: UInt64 = 0
 
     func record(_ ssrc: UInt32) {
         lock.lock()
         ssrcs.insert(ssrc)
+        frames &+= 1
         lock.unlock()
     }
 
@@ -680,6 +721,59 @@ final class DecodedBandTracker: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return ssrcs.count
+    }
+
+    var frameCount: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return frames
+    }
+}
+
+/// Detects a decoder/display wedge from progress counters. The detector is
+/// deliberately ignorant of pixels: it fires only when new compressed access
+/// units are submitted but delivered-frame progress remains unchanged.
+struct DecodeOutputStallDetector {
+    private var previousSubmittedFrameCount: UInt64 = 0
+    private var previousDeliveredFrameCount: UInt64 = 0
+    private var stalledSinceNanos: UInt64?
+    private var lastRecoveryNanos: UInt64 = 0
+
+    let stallThresholdNanos: UInt64
+    let recoveryCooldownNanos: UInt64
+
+    init(
+        stallThresholdNanos: UInt64 = 1_000_000_000,
+        recoveryCooldownNanos: UInt64 = 2_000_000_000
+    ) {
+        self.stallThresholdNanos = stallThresholdNanos
+        self.recoveryCooldownNanos = recoveryCooldownNanos
+    }
+
+    mutating func observe(
+        submittedFrameCount: UInt64,
+        deliveredFrameCount: UInt64,
+        nowNanos: UInt64
+    ) -> Bool {
+        let submissionsAdvanced = submittedFrameCount > previousSubmittedFrameCount
+        let outputAdvanced = deliveredFrameCount > previousDeliveredFrameCount
+        previousSubmittedFrameCount = submittedFrameCount
+        previousDeliveredFrameCount = deliveredFrameCount
+
+        if outputAdvanced {
+            stalledSinceNanos = nil
+            return false
+        }
+        guard submissionsAdvanced else { return false }
+        guard let stalledSinceNanos else {
+            self.stalledSinceNanos = nowNanos
+            return false
+        }
+        guard nowNanos &- stalledSinceNanos >= stallThresholdNanos else { return false }
+        guard lastRecoveryNanos == 0
+                || nowNanos &- lastRecoveryNanos >= recoveryCooldownNanos else { return false }
+        lastRecoveryNanos = nowNanos
+        return true
     }
 }
 

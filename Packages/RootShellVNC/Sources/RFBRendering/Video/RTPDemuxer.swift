@@ -98,6 +98,7 @@ public final class RTPDemuxer: @unchecked Sendable {
     // MARK: - Private state
 
     private let lock = NSLock()
+    private let usesDONL: Bool
     // Reassembly state is tracked per SSRC: Apple multiplexes several media
     // streams (e.g. video PT 100 and PT 101) with independent sequence spaces,
     // and all RTP timestamps are 0, so a single shared FU/sequence state would
@@ -107,7 +108,12 @@ public final class RTPDemuxer: @unchecked Sendable {
 
     // MARK: - Init
 
-    public init() {}
+    /// - Parameter usesDecodingOrderNumbers: Whether the negotiated HEVC RTP
+    ///   mode inserts a DONL field. Apple's interleaved multi-tile mode does;
+    ///   its conventional one-tile mode does not.
+    public init(usesDecodingOrderNumbers: Bool = true) {
+        self.usesDONL = usesDecodingOrderNumbers
+    }
 
     /// Return whether the datagram is an RTCP packet rather than RTP media.
     ///
@@ -264,16 +270,15 @@ public final class RTPDemuxer: @unchecked Sendable {
             return handleFragmentationUnit(packet)
 
         default:
-            // Single NAL unit packet. With DON in use, Apple inserts a 2-byte
-            // DONL between the NAL header and the NAL payload
-            // (`[NAL hdr:2][DONL:2][RBSP]`, RFC 7798 §4.4.1). Strip it; leaving
-            // it in corrupts the slice header (ffmpeg: "PPS id out of range").
             fuStates[ssrc] = nil
-            let don = Self.donl(in: packet.payload)
+            // With DON enabled, Apple inserts a 2-byte DONL between the NAL
+            // header and RBSP. The one-tile mode is ordinary HEVC RTP and its
+            // RBSP starts immediately after the NAL header.
+            let don = usesDONL ? Self.donl(in: packet.payload) : 0
             return [DemuxedNAL(
                 don: don,
                 ssrc: ssrc,
-                nal: stripSingleNALUnitDONL(packet.payload),
+                nal: usesDONL ? stripSingleNALUnitDONL(packet.payload) : packet.payload,
                 endOfAccessUnit: packet.marker)]
         }
     }
@@ -318,8 +323,10 @@ public final class RTPDemuxer: @unchecked Sendable {
     ///  Bits 2-7: FuType (the actual NAL unit type being fragmented)
     /// ```
     private func handleFragmentationUnit(_ packet: RTPPacket) -> [DemuxedNAL] {
-        // 2-byte PayloadHdr + 1-byte FU header + 2-byte DONL.
-        guard packet.payload.count >= 3 + Self.donlLength else { return [] }
+        // 2-byte PayloadHdr + 1-byte FU header, followed by DONL only in the
+        // negotiated interleaved mode.
+        let metadataLength = usesDONL ? Self.donlLength : 0
+        guard packet.payload.count >= 3 + metadataLength else { return [] }
 
         let payloadBase = packet.payload.startIndex
         let byte0 = packet.payload[payloadBase]
@@ -338,9 +345,11 @@ public final class RTPDemuxer: @unchecked Sendable {
         // so a 2-byte DONL follows the FU header in *every* fragment (not just
         // the start fragment as RFC 7798 specifies). Skip it; it is not part of
         // the reassembled NAL unit. Leaving it in corrupts every slice.
-        let don = UInt16(packet.payload[payloadBase + 3]) << 8
-            | UInt16(packet.payload[payloadBase + 4])
-        let fragmentData = packet.payload.suffix(from: payloadBase + 3 + Self.donlLength)
+        let don = usesDONL
+            ? UInt16(packet.payload[payloadBase + 3]) << 8
+                | UInt16(packet.payload[payloadBase + 4])
+            : 0
+        let fragmentData = packet.payload.suffix(from: payloadBase + 3 + metadataLength)
 
         if isStart {
             // Start of a new FU: construct the real NAL header
@@ -415,8 +424,8 @@ public final class RTPDemuxer: @unchecked Sendable {
         marker: Bool
     ) -> [DemuxedNAL] {
         let base = payload.startIndex
-        let don = Self.donl(in: payload) // single DONL for the whole AP
-        var offset = base + 2 + Self.donlLength // AP header + DONL
+        let don = usesDONL ? Self.donl(in: payload) : 0
+        var offset = base + 2 + (usesDONL ? Self.donlLength : 0)
         var nalUnits: [DemuxedNAL] = []
 
         while offset + 2 <= payload.endIndex {

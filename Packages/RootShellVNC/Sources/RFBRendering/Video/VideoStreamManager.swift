@@ -44,11 +44,10 @@ public struct VideoStreamFeedResult: Sendable, Equatable {
 
 /// Manages the accelerated HEVC video stream for high-performance VNC mode.
 ///
-/// Apple round-robins one HEVC reference timeline across several band SSRCs.
-/// RTP fragmentation is independent per SSRC, but completed VCL access units
-/// must be restored to global DON order and submitted to one VideoToolbox
-/// decoder. A live four-session experiment froze after the initial pictures,
-/// confirming that subsequent pictures reference sibling-SSRC pictures.
+/// Supports both Apple HEVC RTP modes. The native multi-tile mode round-robins
+/// a DON timeline across several SSRCs; the portable one-tile mode is a normal
+/// sequential RTP stream without DONL metadata. Both use one VideoToolbox
+/// session, but only the former needs cross-SSRC DON reordering.
 public final class VideoStreamManager: @unchecked Sendable {
 
     /// Delivers a decoded frame and the source SSRC (which screen band it is).
@@ -59,9 +58,15 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var demuxer: RTPDemuxer
     private var frameCallback: FrameCallback?
     private var _isActive: Bool = false
+    private var usesDecodingOrderNumbers = true
     private var streamID: UInt32 = 0
+    private var streamGeneration: UInt64 = 0
     private var fullFrameHeight = 0
     private var frameCounter: Int64 = 0
+    private var submittedFrameCount: UInt64 = 0
+    private var decoderOutputCount: UInt64 = 0
+    private var lastSubmissionNanos: UInt64 = 0
+    private var lastDecoderOutputNanos: UInt64 = 0
     private var droppedPacketLogCount = 0
     private var multiNALAccessUnitLogCount = 0
     private var pendingVPS: Data?
@@ -113,6 +118,29 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// Parameter sets bypass this scheduler and configure the decoder
     /// immediately; only completed VCL pictures participate in global DON order.
     private var donReorderBuffer = CompoundHEVCDONReorderBuffer()
+    private var sequentialAccessUnitAssembler = SequentialHEVCAccessUnitAssembler()
+
+    /// Monotonic decode-pipeline progress for liveness monitoring. A screen can
+    /// legitimately be static, so callers distinguish an idle stream from a
+    /// wedged decoder by checking whether submissions continue without output.
+    public struct DecodeProgress: Sendable, Equatable {
+        public let streamGeneration: UInt64
+        public let submittedFrameCount: UInt64
+        public let decoderOutputCount: UInt64
+        public let lastSubmissionNanos: UInt64
+        public let lastDecoderOutputNanos: UInt64
+    }
+
+    public var decodeProgress: DecodeProgress {
+        lock.lock()
+        defer { lock.unlock() }
+        return DecodeProgress(
+            streamGeneration: streamGeneration,
+            submittedFrameCount: submittedFrameCount,
+            decoderOutputCount: decoderOutputCount,
+            lastSubmissionNanos: lastSubmissionNanos,
+            lastDecoderOutputNanos: lastDecoderOutputNanos)
+    }
 
     /// Snapshot of the loss/gating counters.
     public var lossStatsSnapshot: LossStats {
@@ -145,6 +173,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         streamID: UInt32,
         width: Int,
         height: Int,
+        usesDecodingOrderNumbers: Bool = true,
         frameCallback: @escaping FrameCallback
     ) {
         lock.lock()
@@ -153,17 +182,24 @@ public final class VideoStreamManager: @unchecked Sendable {
         _stopStream()
         self.streamID = streamID
         self.fullFrameHeight = height
+        self.usesDecodingOrderNumbers = usesDecodingOrderNumbers
         self.frameCallback = frameCallback
         self.frameCounter = 0
+        self.submittedFrameCount = 0
+        self.decoderOutputCount = 0
+        self.lastSubmissionNanos = 0
+        self.lastDecoderOutputNanos = 0
         self.droppedPacketLogCount = 0
         self.multiNALAccessUnitLogCount = 0
         self._isActive = true
-        demuxer = RTPDemuxer()
+        demuxer = RTPDemuxer(
+            usesDecodingOrderNumbers: usesDecodingOrderNumbers)
 
         // Hardware decode callbacks can arrive out of submission order. PTS is
         // global because all SSRCs participate in one reference timeline.
         let orderer = DecodedFrameOrderer(callback: frameCallback)
-        decoder = HEVCDecoder { pixelBuffer, pts, ssrc in
+        decoder = HEVCDecoder { [weak self] pixelBuffer, pts, ssrc in
+            self?.recordDecoderOutput()
             orderer.submit(pixelBuffer: pixelBuffer, pts: pts, ssrc: ssrc)
         }
 
@@ -204,8 +240,13 @@ public final class VideoStreamManager: @unchecked Sendable {
             // died (whole frame, FU fragment, or parameter-set AP). Latch all
             // bands broken before feeding the demuxer, so nothing decoded from
             // this packet onward can render against a stale reference.
-            let freshLoss = noteVideoPacketAndDetectGap(ssrc: packet.ssrc, sequence: packet.sequenceNumber)
-            if freshLoss {
+            let gap = noteVideoPacketAndDetectGap(
+                ssrc: packet.ssrc,
+                sequence: packet.sequenceNumber)
+            if gap.detected, !usesDecodingOrderNumbers {
+                discardPartialSequentialAccessUnit()
+            }
+            if gap.shouldRequestRecovery {
                 onLossDetected?(packet.ssrc)
             }
 
@@ -227,10 +268,18 @@ public final class VideoStreamManager: @unchecked Sendable {
                 case 32: handleParameterSet(nalUnit: unit.nal, type: .vps)
                 case 33: handleParameterSet(nalUnit: unit.nal, type: .sps)
                 case 34: handleParameterSet(nalUnit: unit.nal, type: .pps)
-                case 35, 36, 37, 38, 39, 40: continue
-                default:
-                    orderedVCL.append(contentsOf:
-                        enqueueAndDrainReorder([unit]).orderedAccessUnits)
+                case 0...31:
+                    if usesDecodingOrderNumbers {
+                        orderedVCL.append(contentsOf:
+                            enqueueAndDrainReorder([unit]).orderedAccessUnits)
+                    } else {
+                        appendSequentialVCL(unit)
+                    }
+                default: break
+                }
+                if !usesDecodingOrderNumbers, unit.endOfAccessUnit,
+                   let complete = finishSequentialAccessUnit(ssrc: unit.ssrc) {
+                    orderedVCL.append(complete)
                 }
             }
 
@@ -269,6 +318,7 @@ public final class VideoStreamManager: @unchecked Sendable {
                         nalUnits: nalUnits,
                         presentationTime: pts,
                         frameTag: accessUnit.ssrc)
+                    recordDecodeSubmission()
                     decodedCount += 1
                 }
             }
@@ -293,20 +343,23 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// Track per-SSRC video sequence numbers; on a gap, mark the stream
     /// recovering. Returns true when this is a FRESH loss (no recovery already
     /// in flight), so callers kick off recovery once per loss burst.
-    private func noteVideoPacketAndDetectGap(ssrc: UInt32, sequence: UInt16) -> Bool {
+    private func noteVideoPacketAndDetectGap(
+        ssrc: UInt32,
+        sequence: UInt16
+    ) -> (detected: Bool, shouldRequestRecovery: Bool) {
         lock.lock()
         defer { lock.unlock() }
         seenVideoSSRCs.insert(ssrc)
         let last = lastVideoSeq[ssrc]
         lastVideoSeq[ssrc] = sequence
-        guard let last, sequence != last &+ 1 else { return false }
+        guard let last, sequence != last &+ 1 else { return (false, false) }
         // A duplicate/late packet (seq <= last) is not a new hole in the chain;
         // only a forward jump means data was lost.
         let forward = sequence &- last
-        guard forward != 0 && forward < 0x8000 else { return false }
+        guard forward != 0 && forward < 0x8000 else { return (false, false) }
         lossStats.gapsDetected += 1
-        guard lossRecoveryEnabled else { return false }
-        return markLossLocked(affectedSSRC: ssrc)
+        guard lossRecoveryEnabled else { return (true, false) }
+        return (true, markLossLocked(affectedSSRC: ssrc))
     }
 
     /// Mark a loss (used directly for losses whose SSRC is unknown: parse
@@ -379,6 +432,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     }
 
     private func _stopStream() {
+        streamGeneration &+= 1
         decoder?.flush()
         decoder?.reset()
         decoder = nil
@@ -386,6 +440,10 @@ public final class VideoStreamManager: @unchecked Sendable {
         frameCallback = nil
         _isActive = false
         frameCounter = 0
+        submittedFrameCount = 0
+        decoderOutputCount = 0
+        lastSubmissionNanos = 0
+        lastDecoderOutputNanos = 0
         droppedPacketLogCount = 0
         multiNALAccessUnitLogCount = 0
         pendingVPS = nil
@@ -399,6 +457,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         earlyVCLBuffer.removeAll()
         lossStats = LossStats()
         donReorderBuffer.reset()
+        sequentialAccessUnitAssembler.reset()
     }
 
     private func logDroppedPacket(error: Error, byteCount: Int) {
@@ -424,6 +483,20 @@ public final class VideoStreamManager: @unchecked Sendable {
         if earlyVCLBuffer.count < 256 {
             earlyVCLBuffer.append((nals, ssrc))
         }
+    }
+
+    private func recordDecodeSubmission() {
+        lock.lock()
+        submittedFrameCount &+= 1
+        lastSubmissionNanos = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
+    }
+
+    private func recordDecoderOutput() {
+        lock.lock()
+        decoderOutputCount &+= 1
+        lastDecoderOutputNanos = DispatchTime.now().uptimeNanoseconds
+        lock.unlock()
     }
 
     private func handleParameterSet(nalUnit: Data, type: ParameterSetType) {
@@ -472,10 +545,15 @@ public final class VideoStreamManager: @unchecked Sendable {
 
         for item in buffered {
             let pts = CMTime(value: nextPresentationTimeValue(), timescale: 90000)
-            try? decoderRef.decode(
-                nalUnits: item.nals,
-                presentationTime: pts,
-                frameTag: item.ssrc)
+            do {
+                try decoderRef.decode(
+                    nalUnits: item.nals,
+                    presentationTime: pts,
+                    frameTag: item.ssrc)
+                recordDecodeSubmission()
+            } catch {
+                log.warning("Failed to decode buffered startup frame: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -488,6 +566,26 @@ public final class VideoStreamManager: @unchecked Sendable {
         if shouldLog {
             log.info("Submitting complete multi-NAL HEVC access unit DON=\(don) nals=\(count)")
         }
+    }
+
+    private func appendSequentialVCL(_ unit: RTPDemuxer.DemuxedNAL) {
+        lock.lock()
+        sequentialAccessUnitAssembler.appendVCL(unit)
+        lock.unlock()
+    }
+
+    private func finishSequentialAccessUnit(
+        ssrc: UInt32
+    ) -> CompoundHEVCDONReorderBuffer.AccessUnit? {
+        lock.lock()
+        defer { lock.unlock() }
+        return sequentialAccessUnitAssembler.finish(ssrc: ssrc)
+    }
+
+    private func discardPartialSequentialAccessUnit() {
+        lock.lock()
+        sequentialAccessUnitAssembler.discardPartialAccessUnit()
+        lock.unlock()
     }
 
     /// Restore completed VCL units to the single cross-SSRC HEVC timeline.
@@ -525,6 +623,9 @@ public final class VideoStreamManager: @unchecked Sendable {
         private var nextIndex: Int64 = 0
         private let callback: FrameCallback
         private let maxHeld = 6
+        private let maxHoldNanos: UInt64 = 100_000_000
+        private var gapTimerGeneration: UInt64 = 0
+        private var gapTimerScheduled = false
 
         init(callback: @escaping FrameCallback) {
             self.callback = callback
@@ -541,22 +642,67 @@ public final class VideoStreamManager: @unchecked Sendable {
                 return
             }
             pending[index] = (pixelBuffer, ssrc)
-            while true {
-                if let frame = pending.removeValue(forKey: nextIndex) {
-                    ready.append(frame)
-                    nextIndex += 1
-                } else if pending.count > maxHeld, let smallest = pending.keys.min() {
-                    // The frame at nextIndex never came out of the decoder;
-                    // skip forward rather than stalling the stream.
-                    nextIndex = smallest
-                } else {
-                    break
-                }
-            }
+            drainLocked(allowGapSkip: pending.count > maxHeld, into: &ready)
+            scheduleGapTimerLockedIfNeeded()
             lock.unlock()
 
             for (buffer, source) in ready {
                 callback(buffer, source)
+            }
+        }
+
+        /// A screen stream can be change-gated: if VideoToolbox swallows one
+        /// damaged picture and only one newer picture arrives, a count-only
+        /// reorder window would hold that newer picture forever. Bound the hold
+        /// by time as well as depth so sparse desktop updates cannot freeze.
+        private func scheduleGapTimerLockedIfNeeded() {
+            guard !pending.isEmpty, pending[nextIndex] == nil else {
+                if gapTimerScheduled {
+                    gapTimerGeneration &+= 1
+                    gapTimerScheduled = false
+                }
+                return
+            }
+            guard !gapTimerScheduled else { return }
+            gapTimerScheduled = true
+            gapTimerGeneration &+= 1
+            let generation = gapTimerGeneration
+            DispatchQueue.global(qos: .userInteractive).asyncAfter(
+                deadline: .now() + .nanoseconds(Int(maxHoldNanos))) { [weak self] in
+                    self?.expireGap(generation: generation)
+                }
+        }
+
+        private func expireGap(generation: UInt64) {
+            var ready: [(CVPixelBuffer, UInt32)] = []
+            lock.lock()
+            guard gapTimerScheduled, gapTimerGeneration == generation else {
+                lock.unlock()
+                return
+            }
+            gapTimerScheduled = false
+            drainLocked(allowGapSkip: true, into: &ready)
+            scheduleGapTimerLockedIfNeeded()
+            lock.unlock()
+
+            for (buffer, source) in ready {
+                callback(buffer, source)
+            }
+        }
+
+        private func drainLocked(
+            allowGapSkip: Bool,
+            into ready: inout [(CVPixelBuffer, UInt32)]
+        ) {
+            while true {
+                if let frame = pending.removeValue(forKey: nextIndex) {
+                    ready.append(frame)
+                    nextIndex += 1
+                } else if allowGapSkip, let smallest = pending.keys.min() {
+                    nextIndex = smallest
+                } else {
+                    break
+                }
             }
         }
     }

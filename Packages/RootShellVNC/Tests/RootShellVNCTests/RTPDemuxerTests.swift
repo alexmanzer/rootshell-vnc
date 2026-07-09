@@ -83,6 +83,53 @@ final class RTPDemuxerTests: XCTestCase {
         XCTAssertEqual(result.first?.endOfAccessUnit, true)
     }
 
+    func testAggregationPacketWithoutDONL() throws {
+        let demuxer = RTPDemuxer(usesDecodingOrderNumbers: false)
+        let vps = Data([0x40, 0x01, 0xAA])
+        let sps = Data([0x42, 0x01, 0xBB])
+        var payload = Data([0x60, 0x01])
+        payload.append(contentsOf: [0x00, UInt8(vps.count)])
+        payload.append(vps)
+        payload.append(contentsOf: [0x00, UInt8(sps.count)])
+        payload.append(sps)
+
+        let result = demuxer.feedPacket(packet(
+            sequence: 30,
+            payload: payload,
+            marker: true))
+
+        XCTAssertEqual(result.map(\.nal), [vps, sps])
+        XCTAssertEqual(result.map(\.don), [0, 0])
+    }
+
+    func testFragmentationUnitWithoutDONL() throws {
+        let demuxer = RTPDemuxer(usesDecodingOrderNumbers: false)
+        let start = Data([0x62, 0x01, 0x80 | 19, 0xAA, 0xBB])
+        let end = Data([0x62, 0x01, 0x40 | 19, 0xCC, 0xDD])
+
+        XCTAssertTrue(demuxer.feedPacket(packet(sequence: 40, payload: start)).isEmpty)
+        let result = demuxer.feedPacket(packet(
+            sequence: 41,
+            payload: end,
+            marker: true))
+
+        XCTAssertEqual(result.map(\.nal), [Data([0x26, 0x01, 0xAA, 0xBB, 0xCC, 0xDD])])
+        XCTAssertEqual(result.first?.don, 0)
+    }
+
+    func testSingleNALUnitWithoutDONLPreservesRBSP() throws {
+        let demuxer = RTPDemuxer(usesDecodingOrderNumbers: false)
+        let payload = Data([0x02, 0x01, 0xD4, 0x14, 0xAA])
+
+        let result = demuxer.feedPacket(packet(
+            sequence: 50,
+            payload: payload,
+            marker: true))
+
+        XCTAssertEqual(result.map(\.nal), [payload])
+        XCTAssertEqual(result.first?.don, 0)
+    }
+
     func testRTCPPacketDetection() {
         let senderReport = Data([0x81, 0xc8, 0x00, 0x0c])
         let receiverReport = Data([0x81, 0xc9, 0x00, 0x07])

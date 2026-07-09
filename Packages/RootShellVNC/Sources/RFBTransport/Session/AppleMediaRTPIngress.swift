@@ -162,9 +162,17 @@ struct AppleMediaRTPReorderBuffer {
 
     init(
         startupHoldNanos: UInt64 = 8_000_000,
-        maximumGapWaitNanos: UInt64 = 100_000_000,
-        nackRetryNanos: UInt64 = 20_000_000,
-        maximumBufferedPacketsPerStream: Int = 512
+        // This wait is entered only after a sequence hole, so it does not add
+        // latency to normal playback. One hundred milliseconds was too short:
+        // a lone delayed/retransmitted fragment was declared lost and poisoned
+        // the long HEVC reference chain. Keep requesting it for a bounded 300
+        // ms before releasing newer packets.
+        maximumGapWaitNanos: UInt64 = 300_000_000,
+        nackRetryNanos: UInt64 = 25_000_000,
+        // At the negotiated 65 Mbps ceiling, 300 ms can contain roughly 1,700
+        // full-size RTP packets. The former 512-packet cap forced a loss before
+        // the time deadline during high-bitrate motion.
+        maximumBufferedPacketsPerStream: Int = 4096
     ) {
         self.startupHoldNanos = startupHoldNanos
         self.maximumGapWaitNanos = maximumGapWaitNanos
