@@ -12,13 +12,12 @@ import RFBProtocol
 /// from advertising the wrong client, reusing an SSRC and creation time can be
 /// interpreted as a colliding or stale media session.
 struct AppleMediaNegotiationProfile: Sendable {
-    /// The public VideoToolbox decoder accepts a conventional single-image
-    /// reference timeline. AVConference can additionally decode multi-tile
-    /// screen streams by passing private subframe metadata to VideoProcessing,
-    /// but that path is unavailable to App Store clients. Viceroy negotiates
-    /// the minimum of the two peers' values, so advertising one selects its
-    /// supported single-image stream without relying on private frameworks.
-    private static let publicDecoderTilesPerFrame: UInt64 = 1
+    /// Apple multiplexes four independently referenced horizontal HEVC tiles
+    /// through one private VideoProcessing decoder by attaching TileID and
+    /// TileOrder to each sample. The portable equivalent is four ordinary,
+    /// public VideoToolbox sessions (one per RTP tile) followed by GPU band
+    /// composition. Viceroy negotiates the minimum of the peers' values.
+    static let publicDecoderTilesPerFrame: UInt64 = 4
 
     enum MediaKind: Sendable {
         case audio

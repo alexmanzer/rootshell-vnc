@@ -486,9 +486,10 @@ public final class VNCSession {
             streamID: offer.streamID,
             width: width,
             height: height,
-            // Our Viceroy profile negotiates one tile so the stream is
-            // compatible with public VideoToolbox. That RTP mode omits DONL.
-            usesDecodingOrderNumbers: false,
+            // Our Viceroy profile negotiates Apple's tiled screen mode. DONL
+            // restores access-unit order; each SSRC is decoded by its own
+            // public VideoToolbox session rather than Apple's private VCP path.
+            usesDecodingOrderNumbers: true,
             frameCallback: callback
         )
 

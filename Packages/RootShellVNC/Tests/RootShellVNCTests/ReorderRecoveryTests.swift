@@ -3,7 +3,7 @@ import Foundation
 @testable import RFBRendering
 
 /// Replays a real decrypted-RTP capture and verifies that the interleaved band
-/// SSRCs produce output through the single compound decoder timeline.
+/// SSRCs produce output through independent public tile decoders.
 ///
 ///   ROOTSHELL_VNC_DECODED_RTP=/tmp/vnccap/local_rtp.bin \
 ///   swift test --filter ReorderRecoveryTests

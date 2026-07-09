@@ -42,12 +42,37 @@ public struct VideoStreamFeedResult: Sendable, Equatable {
     }
 }
 
+/// Generates synthetic monotonic PTS values. Conventional video has one
+/// timeline; Apple's screen tiles have independent reference timelines, so a
+/// quiet tile must not consume or block another tile's presentation sequence.
+struct HEVCPresentationTimeline {
+    private var sequentialCounter: Int64 = 0
+    private var tileCounters: [UInt32: Int64] = [:]
+
+    mutating func next(source: UInt32, independentTiles: Bool) -> CMTimeValue {
+        if independentTiles {
+            let counter = tileCounters[source, default: 0]
+            tileCounters[source] = counter + 1
+            return CMTimeValue(counter * 3000)
+        }
+        defer { sequentialCounter += 1 }
+        return CMTimeValue(sequentialCounter * 3000)
+    }
+
+    mutating func reset() {
+        sequentialCounter = 0
+        tileCounters.removeAll(keepingCapacity: false)
+    }
+}
+
 /// Manages the accelerated HEVC video stream for high-performance VNC mode.
 ///
 /// Supports both Apple HEVC RTP modes. The native multi-tile mode round-robins
-/// a DON timeline across several SSRCs; the portable one-tile mode is a normal
-/// sequential RTP stream without DONL metadata. Both use one VideoToolbox
-/// session, but only the former needs cross-SSRC DON reordering.
+/// a DON timeline across several SSRCs; each SSRC is an independently
+/// referenced horizontal tile and therefore owns a public VideoToolbox
+/// session. The one-tile mode is a normal sequential RTP stream without DONL
+/// metadata and uses one session. This mirrors the state isolation performed
+/// by Apple's private `NumberOfTiles`/`TileID` decoder path without calling it.
 public final class VideoStreamManager: @unchecked Sendable {
 
     /// Delivers a decoded frame and the source SSRC (which screen band it is).
@@ -55,6 +80,7 @@ public final class VideoStreamManager: @unchecked Sendable {
 
     private let lock = NSLock()
     private var decoder: HEVCDecoder?
+    private var tileDecoders: [UInt32: HEVCDecoder] = [:]
     private var demuxer: RTPDemuxer
     private var frameCallback: FrameCallback?
     private var _isActive: Bool = false
@@ -62,7 +88,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var streamID: UInt32 = 0
     private var streamGeneration: UInt64 = 0
     private var fullFrameHeight = 0
-    private var frameCounter: Int64 = 0
+    private var presentationTimeline = HEVCPresentationTimeline()
     private var submittedFrameCount: UInt64 = 0
     private var decoderOutputCount: UInt64 = 0
     private var lastSubmissionNanos: UInt64 = 0
@@ -177,14 +203,12 @@ public final class VideoStreamManager: @unchecked Sendable {
         frameCallback: @escaping FrameCallback
     ) {
         lock.lock()
-        defer { lock.unlock() }
-
-        _stopStream()
+        let retiredDecoders = _stopStreamLocked()
         self.streamID = streamID
         self.fullFrameHeight = height
         self.usesDecodingOrderNumbers = usesDecodingOrderNumbers
         self.frameCallback = frameCallback
-        self.frameCounter = 0
+        self.presentationTimeline.reset()
         self.submittedFrameCount = 0
         self.decoderOutputCount = 0
         self.lastSubmissionNanos = 0
@@ -195,14 +219,18 @@ public final class VideoStreamManager: @unchecked Sendable {
         demuxer = RTPDemuxer(
             usesDecodingOrderNumbers: usesDecodingOrderNumbers)
 
-        // Hardware decode callbacks can arrive out of submission order. PTS is
-        // global because all SSRCs participate in one reference timeline.
-        let orderer = DecodedFrameOrderer(callback: frameCallback)
-        decoder = HEVCDecoder { [weak self] pixelBuffer, pts, ssrc in
-            self?.recordDecoderOutput()
-            orderer.submit(pixelBuffer: pixelBuffer, pts: pts, ssrc: ssrc)
+        // Hardware callbacks can arrive out of submission order. The one-tile
+        // stream has one orderer. Multi-tile streams create one orderer and one
+        // decoder per SSRC lazily, because their reference/PTS timelines are
+        // independent (Apple's private decoder performs the same isolation).
+        if !usesDecodingOrderNumbers {
+            decoder = makeDecoder(
+                source: nil,
+                generation: streamGeneration,
+                frameCallback: frameCallback)
         }
-
+        lock.unlock()
+        retireDecoders(retiredDecoders)
     }
 
     @discardableResult
@@ -214,7 +242,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     @discardableResult
     public func feedRTPData(_ data: Data) -> VideoStreamFeedResult {
         lock.lock()
-        guard _isActive, let decoder else {
+        guard _isActive else {
             lock.unlock()
             return VideoStreamFeedResult(byteCount: data.count, isActive: false)
         }
@@ -309,12 +337,17 @@ public final class VideoStreamManager: @unchecked Sendable {
                     // the startup burst (each band's ONLY IRAP is in there —
                     // dropping one leaves the band dead all session). Buffer
                     // until the format description exists, then drain in order.
-                    guard decoder.isReady else {
+                    guard let decoderRef = decoderForSource(accessUnit.ssrc) else {
+                        continue
+                    }
+                    guard decoderRef.isReady else {
                         bufferEarlyVCL(nals: nalUnits, ssrc: accessUnit.ssrc)
                         continue
                     }
-                    let pts = CMTime(value: nextPresentationTimeValue(), timescale: 90000)
-                    try decoder.decode(
+                    let pts = CMTime(
+                        value: nextPresentationTimeValue(for: accessUnit.ssrc),
+                        timescale: 90000)
+                    try decoderRef.decode(
                         nalUnits: nalUnits,
                         presentationTime: pts,
                         frameTag: accessUnit.ssrc)
@@ -411,8 +444,9 @@ public final class VideoStreamManager: @unchecked Sendable {
 
     public func stopStream() {
         lock.lock()
-        defer { lock.unlock() }
-        _stopStream()
+        let retiredDecoders = _stopStreamLocked()
+        lock.unlock()
+        retireDecoders(retiredDecoders)
     }
 
     public var isStreamActive: Bool {
@@ -423,23 +457,27 @@ public final class VideoStreamManager: @unchecked Sendable {
 
     // MARK: - Private
 
-    private func nextPresentationTimeValue() -> CMTimeValue {
+    private func nextPresentationTimeValue(for ssrc: UInt32) -> CMTimeValue {
         lock.lock()
         defer { lock.unlock() }
-        let value = frameCounter * 3000
-        frameCounter += 1
-        return CMTimeValue(value)
+        return presentationTimeline.next(
+            source: ssrc,
+            independentTiles: usesDecodingOrderNumbers)
     }
 
-    private func _stopStream() {
+    /// Detach decoder callbacks while holding `lock`, but never wait for
+    /// VideoToolbox under that lock: an in-flight output callback records its
+    /// progress through the same lock and would otherwise deadlock shutdown.
+    private func _stopStreamLocked() -> [HEVCDecoder] {
         streamGeneration &+= 1
-        decoder?.flush()
-        decoder?.reset()
+        var retiredDecoders = [decoder].compactMap { $0 }
         decoder = nil
+        retiredDecoders.append(contentsOf: tileDecoders.values)
+        tileDecoders.removeAll()
         demuxer.reset()
         frameCallback = nil
         _isActive = false
-        frameCounter = 0
+        presentationTimeline.reset()
         submittedFrameCount = 0
         decoderOutputCount = 0
         lastSubmissionNanos = 0
@@ -458,6 +496,13 @@ public final class VideoStreamManager: @unchecked Sendable {
         lossStats = LossStats()
         donReorderBuffer.reset()
         sequentialAccessUnitAssembler.reset()
+        return retiredDecoders
+    }
+
+    private func retireDecoders(_ decoders: [HEVCDecoder]) {
+        for decoder in decoders {
+            decoder.reset()
+        }
     }
 
     private func logDroppedPacket(error: Error, byteCount: Int) {
@@ -492,11 +537,17 @@ public final class VideoStreamManager: @unchecked Sendable {
         lock.unlock()
     }
 
-    private func recordDecoderOutput() {
+    @discardableResult
+    private func recordDecoderOutput(generation: UInt64) -> Bool {
         lock.lock()
+        guard generation == streamGeneration, _isActive else {
+            lock.unlock()
+            return false
+        }
         decoderOutputCount &+= 1
         lastDecoderOutputNanos = DispatchTime.now().uptimeNanoseconds
         lock.unlock()
+        return true
     }
 
     private func handleParameterSet(nalUnit: Data, type: ParameterSetType) {
@@ -510,23 +561,36 @@ public final class VideoStreamManager: @unchecked Sendable {
             lock.unlock()
             return
         }
-        let decoderRef = decoder
+        let decoderRefs = [decoder].compactMap { $0 } + Array(tileDecoders.values)
         let vps = pendingVPS
         lock.unlock()
 
-        do {
-            try decoderRef?.updateFormatDescription(sps: sps, pps: pps, vps: vps)
-            if let codedHeight = decoderRef?.formatDimensions?.height,
-               codedHeight > 0 {
-                lock.lock()
-                let expectedBands = max(
-                    1,
-                    (fullFrameHeight + Int(codedHeight) - 1) / Int(codedHeight))
-                donReorderBuffer.setExpectedSourceCount(expectedBands)
-                lock.unlock()
+        var codedHeight: Int32?
+        for decoderRef in decoderRefs {
+            do {
+                try decoderRef.updateFormatDescription(sps: sps, pps: pps, vps: vps)
+                codedHeight = codedHeight ?? decoderRef.formatDimensions?.height
+            } catch {
+                log.warning("Failed to configure HEVC format: \(error.localizedDescription)")
             }
-        } catch {
-            log.warning("Failed to configure HEVC format: \(error.localizedDescription)")
+        }
+        if codedHeight == nil {
+            do {
+                codedHeight = try HEVCDecoder.codedDimensions(
+                    sps: sps,
+                    pps: pps,
+                    vps: vps).height
+            } catch {
+                log.warning("Failed to inspect HEVC format: \(error.localizedDescription)")
+            }
+        }
+        if let codedHeight, codedHeight > 0 {
+            lock.lock()
+            let expectedBands = max(
+                1,
+                (fullFrameHeight + Int(codedHeight) - 1) / Int(codedHeight))
+            donReorderBuffer.setExpectedSourceCount(expectedBands)
+            lock.unlock()
         }
         drainEarlyVCLIfReady()
     }
@@ -535,7 +599,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// sets to the pipeline (they include the bands' only IRAPs).
     private func drainEarlyVCLIfReady() {
         lock.lock()
-        guard let decoderRef = decoder, decoderRef.isReady, !earlyVCLBuffer.isEmpty else {
+        guard !earlyVCLBuffer.isEmpty else {
             lock.unlock()
             return
         }
@@ -544,7 +608,13 @@ public final class VideoStreamManager: @unchecked Sendable {
         lock.unlock()
 
         for item in buffered {
-            let pts = CMTime(value: nextPresentationTimeValue(), timescale: 90000)
+            guard let decoderRef = decoderForSource(item.ssrc), decoderRef.isReady else {
+                bufferEarlyVCL(nals: item.nals, ssrc: item.ssrc)
+                continue
+            }
+            let pts = CMTime(
+                value: nextPresentationTimeValue(for: item.ssrc),
+                timescale: 90000)
             do {
                 try decoderRef.decode(
                     nalUnits: item.nals,
@@ -554,6 +624,66 @@ public final class VideoStreamManager: @unchecked Sendable {
             } catch {
                 log.warning("Failed to decode buffered startup frame: \(error.localizedDescription)")
             }
+        }
+    }
+
+    /// Return the conventional one-tile decoder or lazily create the public
+    /// decoder that owns one multi-tile SSRC's reference-picture state.
+    private func decoderForSource(_ ssrc: UInt32) -> HEVCDecoder? {
+        lock.lock()
+        if !usesDecodingOrderNumbers {
+            let decoderRef = decoder
+            lock.unlock()
+            return decoderRef
+        }
+        if let decoderRef = tileDecoders[ssrc] {
+            lock.unlock()
+            return decoderRef
+        }
+        guard let callback = frameCallback else {
+            lock.unlock()
+            return nil
+        }
+
+        let decoderRef = makeDecoder(
+            source: ssrc,
+            generation: streamGeneration,
+            frameCallback: callback)
+        tileDecoders[ssrc] = decoderRef
+        let tileDecoderCount = tileDecoders.count
+        let sps = pendingSPS
+        let pps = pendingPPS
+        let vps = pendingVPS
+        lock.unlock()
+
+        log.info(
+            "Creating independent HEVC tile decoder "
+                + "SSRC=\(ssrc) tileCount=\(tileDecoderCount)")
+
+        if let sps, let pps {
+            do {
+                try decoderRef.updateFormatDescription(sps: sps, pps: pps, vps: vps)
+            } catch {
+                log.warning("Failed to configure HEVC tile \(ssrc): \(error.localizedDescription)")
+            }
+        }
+        return decoderRef
+    }
+
+    private func makeDecoder(
+        source: UInt32?,
+        generation: UInt64,
+        frameCallback: @escaping FrameCallback
+    ) -> HEVCDecoder {
+        let orderer = DecodedFrameOrderer(callback: frameCallback)
+        return HEVCDecoder { [weak self] pixelBuffer, pts, frameTag in
+            guard self?.recordDecoderOutput(generation: generation) == true else {
+                return
+            }
+            orderer.submit(
+                pixelBuffer: pixelBuffer,
+                pts: pts,
+                ssrc: source ?? frameTag)
         }
     }
 

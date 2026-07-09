@@ -86,6 +86,36 @@ public final class HEVCDecoder: @unchecked Sendable {
     }
 
     private func _updateFormatDescription(sps: Data, pps: Data, vps: Data?) throws {
+        let desc = try Self.makeFormatDescription(sps: sps, pps: pps, vps: vps)
+
+        // Check if format changed; if so, recreate the decompression session
+        let formatChanged = formatDescription == nil
+            || !CMFormatDescriptionEqual(desc, otherFormatDescription: formatDescription!)
+
+        formatDescription = desc
+
+        if formatChanged {
+            try _createDecompressionSession()
+        }
+    }
+
+    /// Parse coded dimensions from public CoreMedia format-description APIs
+    /// without creating a VideoToolbox session. The multi-tile receiver uses
+    /// this during startup to derive how many horizontal bands are expected.
+    public static func codedDimensions(
+        sps: Data,
+        pps: Data,
+        vps: Data?
+    ) throws -> CMVideoDimensions {
+        let description = try makeFormatDescription(sps: sps, pps: pps, vps: vps)
+        return CMVideoFormatDescriptionGetDimensions(description)
+    }
+
+    private static func makeFormatDescription(
+        sps: Data,
+        pps: Data,
+        vps: Data?
+    ) throws -> CMFormatDescription {
         // Build parameter set arrays for CMVideoFormatDescriptionCreateFromHEVCParameterSets
         var parameterSets: [Data] = []
         if let vps = vps {
@@ -115,16 +145,7 @@ public final class HEVCDecoder: @unchecked Sendable {
         guard status == noErr, let desc = newFormatDescription else {
             throw HEVCDecoderError.formatDescriptionCreationFailed(status)
         }
-
-        // Check if format changed; if so, recreate the decompression session
-        let formatChanged = formatDescription == nil
-            || !CMFormatDescriptionEqual(desc, otherFormatDescription: formatDescription!)
-
-        formatDescription = desc
-
-        if formatChanged {
-            try _createDecompressionSession()
-        }
+        return desc
     }
 
     // MARK: - Session Management

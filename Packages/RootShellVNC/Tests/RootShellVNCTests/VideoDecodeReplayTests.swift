@@ -52,7 +52,7 @@ final class VideoDecodeReplayTests: XCTestCase {
 
         // Decrypt everything, keeping arrival order. Apple round-robins one HEVC
         // video across several SSRCs, so all decrypted RTP is fed, in order, to a
-        // single manager/decoder.
+        // one manager, which routes each SSRC to its independent tile decoder.
         var rtpStream: [Data] = []
         var decrypted = 0
         for datagram in datagrams {
