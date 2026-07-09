@@ -1,0 +1,245 @@
+import Foundation
+
+/// A pure, synchronous state machine for the RFB connection lifecycle.
+///
+/// Given the current state and an event, `handle(event:)` returns a list
+/// of actions the transport layer should perform and transitions the
+/// internal state accordingly.
+///
+/// This type has no I/O dependencies and is safe to use from any context.
+public struct ConnectionStateMachine: Sendable {
+
+    // MARK: - State
+
+    /// The current connection state.
+    public private(set) var state: ConnectionState = .idle
+
+    /// The negotiated protocol version (set after version exchange).
+    public private(set) var negotiatedVersion: ProtocolVersion?
+
+    /// The security type selected during handshake.
+    public private(set) var selectedSecurityType: SecurityType?
+
+    /// The server's initialization info (set after ServerInit).
+    public private(set) var serverInit: ServerInit?
+
+    /// The preferred pixel format to request from the server.
+    public var preferredPixelFormat: PixelFormat
+
+    /// The preferred encoding list to request from the server.
+    public var preferredEncodings: [Encoding]
+
+    public static let defaultPreferredEncodings: [Encoding] = [
+        // Prefer copyRect (cheap) then raw (simple, reliable).
+        // ZRLE/Zlib are available through the renderer but left to higher-level
+        // configuration so tests and callers can choose their own risk profile.
+        .copyRect, .raw,
+        // Pseudo-encodings (informational, server-initiated).
+        .cursor, .desktopSize, .extendedDesktopSize,
+        .encryptionInfo, .serverDisplayInfo,
+        .mediaStreamOffer, .mediaStreamAnswer,
+    ]
+
+    // MARK: - Init
+
+    public init(
+        preferredPixelFormat: PixelFormat = .bgra8888,
+        preferredEncodings: [Encoding] = ConnectionStateMachine.defaultPreferredEncodings
+    ) {
+        self.preferredPixelFormat = preferredPixelFormat
+        self.preferredEncodings = preferredEncodings
+    }
+
+    // MARK: - Event handling
+
+    /// Process an event and return the actions the transport layer should perform.
+    public mutating func handle(event: ConnectionEvent) -> [ConnectionAction] {
+        switch (state, event) {
+
+        // MARK: idle / connecting → waitingForProtocolVersion
+
+        case (.idle, .connected):
+            state = .waitingForProtocolVersion
+            return []
+
+        case (.connecting, .connected):
+            state = .waitingForProtocolVersion
+            return []
+
+        // MARK: waitingForProtocolVersion → waitingForSecurityTypes
+
+        case (.waitingForProtocolVersion, .receivedProtocolVersion(let serverVersion)):
+            let ourVersion: ProtocolVersion
+            if serverVersion.isApple {
+                // Apple ARD: echo back their version to activate Apple extensions.
+                ourVersion = serverVersion
+            } else if serverVersion.isAtLeast(.v3_8) {
+                ourVersion = .v3_8
+            } else if serverVersion.isAtLeast(.v3_7) {
+                ourVersion = .v3_7
+            } else if serverVersion.isAtLeast(.v3_3) {
+                ourVersion = .v3_3
+            } else {
+                state = .failed(.unsupportedVersion)
+                return [.reportError(.unsupportedVersion)]
+            }
+
+            negotiatedVersion = ourVersion
+            state = .waitingForSecurityTypes
+            return [.sendProtocolVersion(ourVersion)]
+
+        // MARK: waitingForSecurityTypes → authenticating / waitingForAuthResult
+
+        case (.waitingForSecurityTypes, .receivedSecurityTypes(let types)):
+            guard !types.isEmpty else {
+                let error = VNCProtocolError.authenticationFailed("Server offered no security types")
+                state = .failed(error)
+                return [.reportError(error)]
+            }
+
+            let selected = selectBestSecurityType(from: types)
+            selectedSecurityType = selected
+
+            switch selected {
+            case .none:
+                // No authentication needed.
+                // For 3.8+ the server still sends a SecurityResult.
+                // For 3.3/3.7 it may go straight to ServerInit.
+                if let v = negotiatedVersion, v.isAtLeast(.v3_8) {
+                    state = .waitingForAuthResult
+                    return [.sendSecurityType(selected)]
+                } else {
+                    state = .waitingForServerInit
+                    return [.sendSecurityType(selected), .requestServerInit]
+                }
+
+            default:
+                state = .authenticating(selected)
+                return [.sendSecurityType(selected)]
+            }
+
+        // MARK: authenticating
+
+        case (.authenticating(let secType), .receivedAuthChallenge(let challenge)):
+            return [.performAuthentication(secType, challenge)]
+
+        case (.authenticating, .authenticationSucceeded):
+            state = .waitingForServerInit
+            return [.requestServerInit]
+
+        case (.authenticating, .authenticationFailed(let reason)):
+            let error = VNCProtocolError.authenticationFailed(reason)
+            state = .failed(error)
+            return [.reportError(error)]
+
+        // MARK: waitingForAuthResult
+
+        case (.waitingForAuthResult, .authenticationSucceeded):
+            state = .waitingForServerInit
+            return [.requestServerInit]
+
+        case (.waitingForAuthResult, .authenticationFailed(let reason)):
+            let error = VNCProtocolError.authenticationFailed(reason)
+            state = .failed(error)
+            return [.reportError(error)]
+
+        // MARK: waitingForServerInit → operational
+
+        case (.waitingForServerInit, .receivedServerInit(let si)):
+            serverInit = si
+            state = .operational
+
+            return [
+                .sendSetPixelFormat(preferredPixelFormat),
+                .sendSetEncodings(preferredEncodings),
+                .sendFramebufferUpdateRequest(
+                    incremental: false,
+                    width: si.framebufferWidth,
+                    height: si.framebufferHeight
+                ),
+            ]
+
+        // MARK: operational
+
+        case (.operational, .receivedFramebufferUpdate(let rects)):
+            var actions: [ConnectionAction] = [.updateFramebuffer(rects)]
+            if let si = serverInit {
+                actions.append(.sendFramebufferUpdateRequest(
+                    incremental: true,
+                    width: si.framebufferWidth,
+                    height: si.framebufferHeight
+                ))
+            }
+            return actions
+
+        case (.operational, .receivedBell):
+            return [.notifyBell]
+
+        case (.operational, .receivedServerCutText(let text)):
+            return [.notifyClipboard(text)]
+
+        case (.operational, .receivedEncryptionInfo):
+            return [.sendEncryptionResponse]
+
+        case (.operational, .receivedAppleDisplayInfo):
+            // Display info is informational; no response action needed.
+            return []
+
+        case (.operational, .receivedMediaStreamOffer(let offer)):
+            let answer = AppleMediaStreamAnswer(streamID: offer.streamID, accepted: true)
+            return [.sendMediaStreamAnswer(answer)]
+
+        // MARK: disconnect (from any state)
+
+        case (_, .userRequestedDisconnect):
+            state = .disconnecting
+            return [.disconnect]
+
+        case (_, .connectionLost(let error)):
+            state = .failed(error)
+            return [.reportError(error)]
+
+        // MARK: unexpected events
+
+        default:
+            return [.reportError(.unexpectedMessage)]
+        }
+    }
+
+    // MARK: - Helpers
+
+    /// Transition from idle to connecting (for callers that track
+    /// the TCP establishment separately).
+    public mutating func beginConnecting() {
+        state = .connecting
+    }
+
+    // MARK: - Security type selection
+
+    private func selectBestSecurityType(from types: [SecurityType]) -> SecurityType {
+        if let forced = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_SECURITY_TYPE"] {
+            let selected: SecurityType? = {
+                switch forced.lowercased() {
+                case "none": return SecurityType.none
+                case "vnc", "vncAuthentication".lowercased(): return .vncAuthentication
+                case "apple30", "dh": return .apple30
+                case "mac", "macAuthentication".lowercased(), "type33": return .macAuthentication
+                default:
+                    if let raw = UInt8(forced) {
+                        return SecurityType(rawValue: raw)
+                    }
+                    return nil
+                }
+            }()
+            if let selected, types.contains(selected) {
+                return selected
+            }
+        }
+
+        let ranked = types
+            .filter { $0.negotiationPriority != nil }
+            .sorted { ($0.negotiationPriority ?? -1) > ($1.negotiationPriority ?? -1) }
+
+        return ranked.first ?? types.first ?? .none
+    }
+}

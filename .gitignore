@@ -1,0 +1,17 @@
+.DS_Store
+**/.DS_Store
+
+# Swift Package Manager
+.build/
+**/.build/
+**/.swiftpm/xcode/xcuserdata/
+
+# Xcode
+DerivedData/
+**/DerivedData/
+**/xcuserdata/
+*.xcuserstate
+
+# Profiling and diagnostics
+*.profraw
+*.profdata
