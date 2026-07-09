@@ -55,6 +55,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertNil(config.preferredPixelFormat)
         XCTAssertEqual(config.preferredEncodings, [.copyRect, .raw])
         XCTAssertTrue(config.enableHighPerformanceMode)
+        XCTAssertEqual(config.videoQualityMode, .adaptive)
         XCTAssertEqual(config.targetFrameRate, 30)
         XCTAssertFalse(config.enableProtocolTrace)
     }
@@ -129,6 +130,16 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(effective.contains(.desktopSize))
         XCTAssertTrue(effective.contains(.cursor))
         XCTAssertTrue(effective.contains(.raw))
+    }
+
+    func testFullQualityUsesNativeLosslessEncodingProfile() {
+        let config = VNCConfiguration(videoQualityMode: .fullQuality)
+        let effective = config.effectiveEncodings
+        XCTAssertFalse(effective.contains(.appleH264))
+        XCTAssertFalse(effective.contains(.appleMultiVariantScreenshare))
+        XCTAssertFalse(effective.contains(.mediaStreamOffer))
+        XCTAssertTrue(effective.contains(.zlib))
+        XCTAssertTrue(effective.contains(.zrle))
     }
 
     func testEffectiveEncodingsAlwaysIncludesRaw() {

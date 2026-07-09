@@ -46,7 +46,7 @@ final class LiveLoginProbeTests: XCTestCase {
         let probe = ProbeState()
 
         // Closed-loop keyframe recovery, mirroring VNCSession's wiring.
-        manager.onLossDetected = { [weak session, weak manager] in
+        manager.onLossDetected = { [weak session, weak manager] _ in
             probe.note("LOSS DETECTED -> starting keyframe retry loop")
             Task {
                 var attempts = 0
@@ -193,7 +193,7 @@ final class LiveLoginProbeTests: XCTestCase {
         let manager = VideoStreamManager()
         let probe = ProbeState()
 
-        manager.onLossDetected = { [weak session, weak manager] in
+        manager.onLossDetected = { [weak session, weak manager] _ in
             Task {
                 var attempts = 0
                 while let m = manager, let s = session, m.hasGatedBands, attempts < 40 {

@@ -44,15 +44,12 @@ public struct VideoStreamFeedResult: Sendable, Equatable {
 
 /// Manages the accelerated HEVC video stream for high-performance VNC mode.
 ///
-/// Apple splits one HEVC video across several RTP SSRCs (round-robin by frame:
-/// consecutive frames land on different SSRCs, and each P-frame references the
-/// immediately preceding frame in a sibling SSRC). All SSRCs share identical
-/// parameter sets. So reassembly is tracked **per SSRC** (fragmentation units
-/// only regroup within their own SSRC), but the recovered NAL units are fed to
-/// a **single** decoder — feeding them to per-SSRC decoders breaks every
-/// P-frame's cross-SSRC reference. The single global decode order is carried in
-/// each NAL's DON (DONL); NAL units are reordered by DON before decode so that
-/// jittered (Wi-Fi) arrivals don't corrupt the reference chain.
+/// Apple round-robins one HEVC reference timeline across several band SSRCs.
+/// RTP fragmentation is independent per SSRC, but completed VCL NAL units must
+/// be restored to their global decoding order (DON) and submitted to one
+/// VideoToolbox decoder. Decoding each SSRC separately renders the initial
+/// intra pictures, then freezes because subsequent bands reference pictures
+/// carried by sibling SSRCs.
 public final class VideoStreamManager: @unchecked Sendable {
 
     /// Delivers a decoded frame and the source SSRC (which screen band it is).
@@ -64,6 +61,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var frameCallback: FrameCallback?
     private var _isActive: Bool = false
     private var streamID: UInt32 = 0
+    private var fullFrameHeight = 0
     private var frameCounter: Int64 = 0
     private var droppedPacketLogCount = 0
     private var pendingVPS: Data?
@@ -98,7 +96,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     var irapGateEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_ENABLE_IRAP_GATE"] == "1"
     /// Fired (off-lock) when a fresh loss is detected while no recovery is in
     /// flight. VNCSession wires this to the transport's keyframe request.
-    public var onLossDetected: (@Sendable () -> Void)?
+    public var onLossDetected: (@Sendable (UInt32?) -> Void)?
 
     /// Counters for tests/diagnostics.
     public struct LossStats: Sendable, Equatable {
@@ -109,6 +107,12 @@ public final class VideoStreamManager: @unchecked Sendable {
         public init() {}
     }
     private var lossStats = LossStats()
+
+    // MARK: - Compound-frame decode ordering
+
+    /// Parameter sets bypass this scheduler and configure the decoder
+    /// immediately; only completed VCL pictures participate in global DON order.
+    private var donReorderBuffer = CompoundHEVCDONReorderBuffer()
 
     /// Snapshot of the loss/gating counters.
     public var lossStatsSnapshot: LossStats {
@@ -131,29 +135,6 @@ public final class VideoStreamManager: @unchecked Sendable {
             && DispatchTime.now().uptimeNanoseconds &- lastLossNanos < healWindowNanos
     }
 
-    // MARK: - DON reorder (dejitter) buffer
-    //
-    // Apple round-robins ONE HEVC reference chain across the SSRCs and stamps
-    // the global decode order in each NAL's DONL. On a fast link packets arrive
-    // in decode order, but over Wi-Fi they reorder, and feeding the decoder
-    // out of order corrupts every referencing frame (the "constant pulsing").
-    // Buffer decoded NAL units keyed by DON and release them in strict DON
-    // order, holding back a few frames to absorb reordering and skipping a DON
-    // only once it is `window` frames stale (presumed lost).
-    private var reorderPending: [UInt16: [RTPDemuxer.DemuxedNAL]] = [:]
-    private var reorderNextDON: UInt16?
-    private var reorderHighestDON: UInt16?
-    private var reorderLossDetected = false
-    // Settable (internal) so tests can exercise reorder on/off; default from env.
-    // Default OFF: real Wi-Fi captures show ZERO cross-frame reordering, so the
-    // buffer only adds holdback latency, and under an unrecovered loss (this is
-    // a single-IDR long-GOP stream) it stalls for `window` frames and scans a
-    // growing buffer. Enable only for links that genuinely reorder.
-    var reorderEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_ENABLE_REORDER"] == "1"
-    var reorderHoldback = UInt16(ProcessInfo.processInfo.environment["ROOTSHELL_VNC_REORDER_HOLDBACK"].flatMap(Int.init) ?? 2)
-    var reorderWindow = UInt16(ProcessInfo.processInfo.environment["ROOTSHELL_VNC_REORDER_WINDOW"].flatMap(Int.init) ?? 48)
-    private let reorderMaxBuffered = 600
-
     public init() {
         self.demuxer = RTPDemuxer()
     }
@@ -171,22 +152,20 @@ public final class VideoStreamManager: @unchecked Sendable {
 
         _stopStream()
         self.streamID = streamID
+        self.fullFrameHeight = height
         self.frameCallback = frameCallback
         self.frameCounter = 0
         self.droppedPacketLogCount = 0
         self._isActive = true
         demuxer = RTPDemuxer()
 
-        // VideoToolbox's HARDWARE decoder, in asynchronous mode, may deliver
-        // output callbacks out of submission order (the software decoder is
-        // serial, which is why the simulator looked fine while Catalyst
-        // flickered: adjacent frames swapped on screen, worst under motion).
-        // Every frame is stamped with a strictly increasing PTS at submission,
-        // so release decoded frames to the renderer in exact PTS order.
+        // Hardware decode callbacks can arrive out of submission order. PTS is
+        // global because all SSRCs participate in the same reference timeline.
         let orderer = DecodedFrameOrderer(callback: frameCallback)
         decoder = HEVCDecoder { pixelBuffer, pts, ssrc in
             orderer.submit(pixelBuffer: pixelBuffer, pts: pts, ssrc: ssrc)
         }
+
     }
 
     @discardableResult
@@ -198,7 +177,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     @discardableResult
     public func feedRTPData(_ data: Data) -> VideoStreamFeedResult {
         lock.lock()
-        guard _isActive, let decoder = decoder else {
+        guard _isActive, let decoder else {
             lock.unlock()
             return VideoStreamFeedResult(byteCount: data.count, isActive: false)
         }
@@ -226,37 +205,46 @@ public final class VideoStreamManager: @unchecked Sendable {
             // this packet onward can render against a stale reference.
             let freshLoss = noteVideoPacketAndDetectGap(ssrc: packet.ssrc, sequence: packet.sequenceNumber)
             if freshLoss {
-                onLossDetected?()
+                onLossDetected?(packet.ssrc)
             }
 
             let demuxed = demuxerRef.feedPacket(packet)
-            // Reorder into decode (DON) order before touching the decoder. On a
-            // clean link this releases immediately; only reordered/lost DONs are
-            // held or skipped.
-            let ordered = reorderEnabled ? enqueueAndDrainReorder(demuxed) : demuxed
-            guard !ordered.isEmpty else {
+            guard !demuxed.isEmpty else {
                 return VideoStreamFeedResult(
                     byteCount: data.count, isActive: true,
                     sequenceNumber: packet.sequenceNumber, payloadType: packet.payloadType,
                     timestamp: packet.timestamp)
             }
 
-            var nalUnitTypes: [UInt8] = []
+            // Parameter sets are not pictures and may share a DON with a later
+            // IRAP, so apply them immediately. Buffer only VCL units by DON.
+            var orderedVCL: [RTPDemuxer.DemuxedNAL] = []
+            for unit in demuxed {
+                guard unit.nal.count >= 2 else { continue }
+                let type = (unit.nal[unit.nal.startIndex] >> 1) & 0x3f
+                switch type {
+                case 32: handleParameterSet(nalUnit: unit.nal, type: .vps)
+                case 33: handleParameterSet(nalUnit: unit.nal, type: .sps)
+                case 34: handleParameterSet(nalUnit: unit.nal, type: .pps)
+                case 35, 36, 37, 38, 39, 40: continue
+                default: orderedVCL.append(contentsOf: enqueueAndDrainReorder([unit]))
+                }
+            }
+
+            let nalUnitTypes: [UInt8] = demuxed.compactMap { unit in
+                guard unit.nal.count >= 2 else { return nil }
+                return (unit.nal[unit.nal.startIndex] >> 1) & 0x3f
+            }
             var decodedCount = 0
-            for unit in ordered {
+            for unit in orderedVCL {
                 let nalUnit = unit.nal
                 guard nalUnit.count >= 2 else { continue }
                 let nalType = (nalUnit[nalUnit.startIndex] >> 1) & 0x3F
-                nalUnitTypes.append(nalType)
                 switch nalType {
-                case 32: handleParameterSet(nalUnit: nalUnit, type: .vps)
-                case 33: handleParameterSet(nalUnit: nalUnit, type: .sps)
-                case 34: handleParameterSet(nalUnit: nalUnit, type: .pps)
-                case 35, 36, 37, 38, 39, 40: continue // AUD/EOS/EOB/filler/SEI
+                case 32...40: continue
                 default:
-                    // One VCL NAL == one access unit (Apple uses single-slice
-                    // frames). Decode it in DON order, tagged with its source
-                    // SSRC so the renderer routes it to the right screen band.
+                    // One VCL NAL is one band access unit. Its source SSRC is
+                    // carried through the global decoder to route the output.
                     // IRAP NAL units (16-21) heal their band; non-IRAP VCL from
                     // a gated band is dropped (its reference chain is broken —
                     // decoding it would render macroblocks, not fail).
@@ -269,8 +257,6 @@ public final class VideoStreamManager: @unchecked Sendable {
                         bufferEarlyVCL(nal: nalUnit, ssrc: unit.ssrc)
                         continue
                     }
-                    // RTP timestamps are all 0; synthesize a strictly increasing
-                    // PTS so VideoToolbox treats each as a distinct frame.
                     let pts = CMTime(value: nextPresentationTimeValue(), timescale: 90000)
                     try decoder.decode(nalUnits: [nalUnit], presentationTime: pts, frameTag: unit.ssrc)
                     decodedCount += 1
@@ -286,7 +272,7 @@ public final class VideoStreamManager: @unchecked Sendable {
             // A packet we couldn't parse/decode is as gone as one that never
             // arrived — latch the gate so the broken chain isn't rendered.
             let freshLoss = gateAllBands()
-            if freshLoss { onLossDetected?() }
+            if freshLoss { onLossDetected?(nil) }
             logDroppedPacket(error: error, byteCount: data.count)
             return VideoStreamFeedResult(
                 byteCount: data.count, isActive: true,
@@ -310,7 +296,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         guard forward != 0 && forward < 0x8000 else { return false }
         lossStats.gapsDetected += 1
         guard lossRecoveryEnabled else { return false }
-        return markLossLocked()
+        return markLossLocked(affectedSSRC: ssrc)
     }
 
     /// Mark a loss (used directly for losses whose SSRC is unknown: parse
@@ -321,16 +307,20 @@ public final class VideoStreamManager: @unchecked Sendable {
         defer { lock.unlock() }
         lossStats.gapsDetected += 1
         guard lossRecoveryEnabled else { return false }
-        return markLossLocked()
+        return markLossLocked(affectedSSRC: nil)
     }
 
     /// Record a loss under `lock`; returns true when no recovery was in flight.
-    private func markLossLocked() -> Bool {
+    private func markLossLocked(affectedSSRC: UInt32?) -> Bool {
         let now = DispatchTime.now().uptimeNanoseconds
         let fresh: Bool
         if irapGateEnabled {
             fresh = awaitingIRAP.isEmpty
-            awaitingIRAP.formUnion(seenVideoSSRCs)
+            if let affectedSSRC {
+                awaitingIRAP.insert(affectedSSRC)
+            } else {
+                awaitingIRAP.formUnion(seenVideoSSRCs)
+            }
         } else {
             fresh = lastLossNanos == 0 || now &- lastLossNanos > healWindowNanos
         }
@@ -390,13 +380,14 @@ public final class VideoStreamManager: @unchecked Sendable {
         pendingVPS = nil
         pendingSPS = nil
         pendingPPS = nil
+        fullFrameHeight = 0
         seenVideoSSRCs.removeAll()
         awaitingIRAP.removeAll()
         lastVideoSeq.removeAll()
         lastLossNanos = 0
         earlyVCLBuffer.removeAll()
         lossStats = LossStats()
-        resetReorderBuffer()
+        donReorderBuffer.reset()
     }
 
     private func logDroppedPacket(error: Error, byteCount: Int) {
@@ -439,7 +430,18 @@ public final class VideoStreamManager: @unchecked Sendable {
         let vps = pendingVPS
         lock.unlock()
 
-        try? decoderRef?.updateFormatDescription(sps: sps, pps: pps, vps: vps)
+        do {
+            try decoderRef?.updateFormatDescription(sps: sps, pps: pps, vps: vps)
+            if let codedHeight = decoderRef?.formatDimensions?.height,
+               codedHeight > 0 {
+                lock.lock()
+                let expectedBands = max(1, (fullFrameHeight + Int(codedHeight) - 1) / Int(codedHeight))
+                donReorderBuffer.setExpectedSourceCount(expectedBands)
+                lock.unlock()
+            }
+        } catch {
+            log.warning("Failed to configure HEVC format: \(error.localizedDescription)")
+        }
         drainEarlyVCLIfReady()
     }
 
@@ -461,65 +463,26 @@ public final class VideoStreamManager: @unchecked Sendable {
         }
     }
 
-    // MARK: - DON reorder buffer
-
-    /// Insert freshly demuxed NAL units into the DON reorder buffer and return
-    /// every unit that is now ready to decode, in strict decoding order.
-    private func enqueueAndDrainReorder(_ nals: [RTPDemuxer.DemuxedNAL]) -> [RTPDemuxer.DemuxedNAL] {
+    /// Restore completed VCL units to the single cross-SSRC HEVC timeline.
+    /// Startup waits for the first compound pass so a late first band cannot be
+    /// discarded. Once started, one future picture is enough to release the
+    /// current DON; a bounded gap is skipped rather than freezing forever.
+    private func enqueueAndDrainReorder(
+        _ nals: [RTPDemuxer.DemuxedNAL]
+    ) -> [RTPDemuxer.DemuxedNAL] {
         lock.lock()
         defer { lock.unlock() }
-
-        for n in nals {
-            // Drop units whose DON is behind what we've already released.
-            if let next = reorderNextDON {
-                let behind = Int(next &- n.don)
-                if behind != 0 && behind < 0x8000 { continue }
-            }
-            reorderPending[n.don, default: []].append(n)
-            if let hi = reorderHighestDON {
-                let ahead = Int(n.don &- hi)
-                if ahead != 0 && ahead < 0x8000 { reorderHighestDON = n.don }
-            } else {
-                reorderHighestDON = n.don
-            }
+        let result = donReorderBuffer.enqueue(nals)
+        if let startupOrder = result.startupOrder {
+            let values = startupOrder.map(String.init).joined(separator: ",")
+            log.info("Starting compound HEVC decode at DONs [\(values)] across \(seenVideoSSRCs.count) SSRCs")
         }
-
-        guard let hi = reorderHighestDON else { return [] }
-        if reorderNextDON == nil {
-            reorderNextDON = smallestPendingDON(reference: hi &- reorderWindow)
+        for gap in result.skippedGaps {
+            log.warning("Skipping missing compound HEVC DON \(gap.missingDON); "
+                + "next=\(gap.nextDON) buffered=\(gap.bufferedFrameCount)")
+            if lossRecoveryEnabled { _ = markLossLocked(affectedSSRC: nil) }
         }
-
-        var out: [RTPDemuxer.DemuxedNAL] = []
-        while let next = reorderNextDON {
-            let ahead = Int(hi &- next)
-            if ahead >= 0x8000 { break } // nothing newer than `next` yet
-            if let group = reorderPending[next] {
-                // Hold back a couple of frames so a DON that shares fragments
-                // across packets (e.g. an AP of parameter sets plus the IDR FU
-                // that carry the same DON) is fully collected before release.
-                guard ahead >= Int(reorderHoldback) else { break }
-                out.append(contentsOf: group)
-                reorderPending.removeValue(forKey: next)
-                reorderNextDON = next &+ 1
-            } else {
-                // Gap at `next`. Skip it once it is `window` frames stale (or the
-                // buffer is overfull) — the frame is presumed lost.
-                if ahead >= Int(reorderWindow) || reorderPending.count > reorderMaxBuffered {
-                    reorderLossDetected = true
-                    // A skipped DON is a lost frame: mark the stream recovering
-                    // (inline — this method already holds `lock`).
-                    if lossRecoveryEnabled { _ = markLossLocked() }
-                    if let skip = smallestPendingDON(reference: next &+ 1), skip != next {
-                        reorderNextDON = skip
-                    } else {
-                        reorderNextDON = next &+ 1
-                    }
-                } else {
-                    break
-                }
-            }
-        }
-        return out
+        return result.ordered
     }
 
     /// Releases decoded frames in strict presentation (submission) order.
@@ -572,25 +535,4 @@ public final class VideoStreamManager: @unchecked Sendable {
         }
     }
 
-    /// The buffered DON with the smallest forward distance from `reference`
-    /// (i.e. the next one to release), honoring 16-bit wraparound.
-    private func smallestPendingDON(reference: UInt16) -> UInt16? {
-        var best: UInt16?
-        var bestDistance = Int.max
-        for key in reorderPending.keys {
-            let distance = Int(key &- reference)
-            if distance < bestDistance {
-                bestDistance = distance
-                best = key
-            }
-        }
-        return best
-    }
-
-    private func resetReorderBuffer() {
-        reorderPending.removeAll()
-        reorderNextDON = nil
-        reorderHighestDON = nil
-        reorderLossDetected = false
-    }
 }

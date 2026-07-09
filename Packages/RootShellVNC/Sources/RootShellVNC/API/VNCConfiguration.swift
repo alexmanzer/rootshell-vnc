@@ -9,12 +9,12 @@ public struct VNCConfiguration: Sendable {
 
     /// High-performance video quality profile, mirroring the native client's
     /// Quality setting.
-    public enum VideoQualityMode: Sendable {
+    public enum VideoQualityMode: Sendable, Equatable {
         /// "Adapt quality to network conditions" — the server may lower bitrate
         /// and drop resolution/quality on static regions under pressure.
         case adaptive
-        /// "Show the screen at full quality" — no dynamic bitrate drop or
-        /// resolution scaling; static regions stay sharp.
+        /// "Show the screen at full quality" — mirrors Screen Sharing mode 4
+        /// by using lossless Zlib/ZRLE instead of lossy AVConference video.
         case fullQuality
     }
 
@@ -63,7 +63,7 @@ public struct VNCConfiguration: Sendable {
         preferredPixelFormat: PixelFormat? = nil,
         preferredEncodings: [Encoding] = [.copyRect, .raw],
         enableHighPerformanceMode: Bool = true,
-        videoQualityMode: VideoQualityMode = .fullQuality,
+        videoQualityMode: VideoQualityMode = .adaptive,
         targetFrameRate: Int = 30,
         enableProtocolTrace: Bool = false
     ) {
@@ -85,8 +85,11 @@ public struct VNCConfiguration: Sendable {
     var effectiveEncodings: [Encoding] {
         var encodings = preferredEncodings
 
-        // Add high-performance encodings if requested
-        if enableHighPerformanceMode {
+        // Apple's default/high quality mode offers AVC first. Its Full Quality
+        // mode does not negotiate AVC at all: the native binary's exact video
+        // list is [Zlib (6), ZRLE (16)]. Keep those semantics instead of trying
+        // to manufacture a "lossless HEVC" profile that the protocol lacks.
+        if enableHighPerformanceMode, videoQualityMode == .adaptive {
             let proModeEncodings: [Encoding] = [
                 .appleH264, .appleMultiVariantScreenshare, .appleSubZlibThousands, .zlib, .zrle,
             ]
@@ -97,6 +100,10 @@ public struct VNCConfiguration: Sendable {
                 if !encodings.contains(encoding) {
                     encodings.append(encoding)
                 }
+            }
+        } else if videoQualityMode == .fullQuality {
+            for encoding in [Encoding.zrle, .zlib] where !encodings.contains(encoding) {
+                encodings.insert(encoding, at: 0)
             }
         }
 

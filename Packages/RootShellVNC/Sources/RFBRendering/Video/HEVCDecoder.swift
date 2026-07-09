@@ -236,6 +236,14 @@ public final class HEVCDecoder: @unchecked Sendable {
         return decompressionSession != nil && formatDescription != nil
     }
 
+    /// Coded dimensions negotiated from the current parameter sets.
+    public var formatDimensions: CMVideoDimensions? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let formatDescription else { return nil }
+        return CMVideoFormatDescriptionGetDimensions(formatDescription)
+    }
+
     // MARK: - Decode
 
     /// Feed a complete HEVC NAL unit for decoding.

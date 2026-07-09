@@ -525,8 +525,8 @@ public final class VNCSession {
         // as constant quality "pulsing". The transport's own 1 Hz gap trigger
         // remains as the backstop if this request datagram is lost.
         if let transport = transportSession {
-            manager.onLossDetected = { [weak transport] in
-                Task { await transport?.requestVideoKeyframe() }
+            manager.onLossDetected = { [weak transport] ssrc in
+                Task { await transport?.requestVideoKeyframe(ssrc: ssrc) }
             }
         }
 
