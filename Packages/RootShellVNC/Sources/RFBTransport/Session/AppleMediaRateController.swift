@@ -5,9 +5,13 @@ import Foundation
 /// The previous implementation advertised its requested target as measured
 /// bandwidth and then sent the same value as a hard TMMBR ceiling. That feedback
 /// loop could never discover spare capacity quickly. This controller keeps a
-/// capacity estimate separate from the encoder target, increases
-/// only while the sender is actually using the current allowance, and decreases
-/// only for confirmed loss—not for idle screen content.
+/// capacity estimate separate from observed screen activity and decreases only
+/// for confirmed loss—not for idle screen content. It starts at the negotiated
+/// wire ceiling: passive observation cannot discover unused capacity while the
+/// sender is application-limited, and starting at an arbitrary low ceiling
+/// creates a self-fulfilling low-quality stream. Confirmed loss multiplicatively
+/// reduces the estimate; clean intervals recover it toward the ceiling. RCTL is
+/// advisory feedback; this class does not impose a second TMMBR ceiling.
 final class AppleMediaRateController {
     private struct Config {
         let minimumCapacity: Double
@@ -16,7 +20,6 @@ final class AppleMediaRateController {
         let targetUtilization: Double
         let rampFactor: Double
         let decreaseFactor: Double
-        let utilizationThreshold: Double
         let headroomFactor: Double
         let rampInterval: Double
         let cooldown: Double
@@ -32,7 +35,9 @@ final class AppleMediaRateController {
             let maximum = value(
                 "ROOTSHELL_VNC_RC_MAX_KBPS",
                 default: maximumCapacity / 1_000) * 1_000
-            let initial = value("ROOTSHELL_VNC_RC_INIT_KBPS", default: 20_000) * 1_000
+            let initial = value(
+                "ROOTSHELL_VNC_RC_INIT_KBPS",
+                default: maximum / 1_000) * 1_000
             return Config(
                 minimumCapacity: minimum,
                 maximumCapacity: max(minimum, maximum),
@@ -43,7 +48,6 @@ final class AppleMediaRateController {
                 targetUtilization: value("ROOTSHELL_VNC_RC_TARGET_UTILIZATION", default: 1.0),
                 rampFactor: value("ROOTSHELL_VNC_RC_RAMP_FACTOR", default: 1.50),
                 decreaseFactor: value("ROOTSHELL_VNC_RC_DECREASE_FACTOR", default: 0.80),
-                utilizationThreshold: value("ROOTSHELL_VNC_RC_UTILIZATION_THRESHOLD", default: 0.80),
                 headroomFactor: value("ROOTSHELL_VNC_RC_HEADROOM", default: 1.25),
                 rampInterval: value("ROOTSHELL_VNC_RC_RAMP_INTERVAL", default: 0.50),
                 cooldown: value("ROOTSHELL_VNC_RC_COOLDOWN", default: 2.0),
@@ -149,8 +153,10 @@ final class AppleMediaRateController {
             confirmedLossPending = false
             lastRamp = now
         } else if now >= cooldownUntil,
-                  now - (lastRamp ?? now) >= config.rampInterval,
-                  observed >= target * config.utilizationThreshold {
+                  now - (lastRamp ?? now) >= config.rampInterval {
+            // An idle or low-complexity desktop is application-limited, not
+            // evidence of a low-capacity link. Recover toward the advertised
+            // ceiling even when observed bitrate is below the current estimate.
             let probed = max(
                 capacityEstimate * config.rampFactor,
                 observed * config.headroomFactor)
@@ -183,16 +189,4 @@ final class AppleMediaRateController {
             byteSampleHead = 0
         }
     }
-}
-
-/// RFC 5104 TMMBR MxTBR encoding: exp[6] : mantissa[17] : overhead[9].
-/// `exp` is the smallest shift making `bps >> exp` fit in 17 bits.
-func appleMediaTMMBRMxTBR(bps: UInt32, overhead: UInt32 = 40) -> UInt32 {
-    var exp: UInt32 = 0
-    if bps >= (1 << 17) {
-        var n = bps >> 17
-        while n > 0 { exp += 1; n >>= 1 }
-    }
-    let mantissa = (bps >> exp) & 0x1_FFFF
-    return (exp << 26) | (mantissa << 9) | (overhead & 0x1FF)
 }

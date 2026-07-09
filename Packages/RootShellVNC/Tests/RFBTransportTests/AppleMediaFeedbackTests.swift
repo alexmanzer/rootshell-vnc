@@ -55,10 +55,54 @@ final class AppleMediaFeedbackTests: XCTestCase {
         XCTAssertEqual(data[17], 0xff)
     }
 
-    func testRateControllerRampsUnderSustainedUseAndHoldsOnIdle() {
+    func testRCTLPacketIsStandaloneAVConferenceAPPReport() {
+        let feedback = AppleMediaRCTLFeedback(
+            lossPercent: 0,
+            echoTimestamp: 0,
+            measurementAgeMilliseconds: 50,
+            localTimestampQ10: 1,
+            owrdQ13: 0,
+            burstyLoss: 0,
+            jitterQueueSize: 0,
+            bandwidthEstimateKbps: 60_000)
+        let packet = appleMediaRCTLPacket(
+            senderSSRC: 0x1234_5678,
+            feedback: feedback)
+
+        XCTAssertEqual(packet.count, 32)
+        XCTAssertEqual(packet.prefix(12), Data([
+            0x80, 0xcc, 0x00, 0x07,
+            0x12, 0x34, 0x56, 0x78,
+            0x52, 0x43, 0x54, 0x4c,
+        ]))
+        XCTAssertEqual(packet.suffix(20), feedback.serialized())
+    }
+
+    func testAppleMediaRTPTransmitTimestampIsConvertedFromQ18ToQ10() {
+        // Prefix of a decrypted Screen Sharing HEVC packet captured from the
+        // native server: RTP X bit, 0x9311 profile, one extension word.
+        let packet = Data([
+            0x90, 0x64, 0x30, 0x9f, 0, 0, 0, 0,
+            0x07, 0x0d, 0xfa, 0x0e,
+            0x93, 0x11, 0x00, 0x01, 0x00, 0x3c, 0x77, 0xc0,
+        ])
+
+        XCTAssertEqual(appleMediaRTPTransmitTimestampQ10(packet), 0x3c77)
+    }
+
+    func testAppleMediaRTPTransmitTimestampRejectsOtherExtensions() {
+        var packet = Data(repeating: 0, count: 20)
+        packet[0] = 0x90
+        packet[12] = 0xbe
+        packet[13] = 0xde
+        packet[15] = 1
+        XCTAssertNil(appleMediaRTPTransmitTimestampQ10(packet))
+    }
+
+    func testRateControllerStartsAtAvailableCeilingAndHoldsWithoutLoss() {
         let controller = AppleMediaRateController(maxTargetBps: 60_000_000)
-        XCTAssertEqual(controller.bandwidthEstimateBps, 20_000_000)
-        XCTAssertEqual(controller.targetBitrateBps, 20_000_000)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 60_000_000)
+        XCTAssertEqual(controller.targetBitrateBps, 60_000_000)
         _ = controller.update(now: 0)
 
         for step in 0...10 {
@@ -70,12 +114,12 @@ final class AppleMediaFeedbackTests: XCTestCase {
                 now: Double(step) * 0.05)
         }
         _ = controller.update(now: 0.5)
-        XCTAssertEqual(controller.bandwidthEstimateBps, 30_000_000)
-        XCTAssertEqual(controller.targetBitrateBps, 30_000_000)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 60_000_000)
+        XCTAssertEqual(controller.targetBitrateBps, 60_000_000)
 
         _ = controller.update(now: 1.1)
-        XCTAssertEqual(controller.bandwidthEstimateBps, 30_000_000)
-        XCTAssertEqual(controller.targetBitrateBps, 30_000_000)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 60_000_000)
+        XCTAssertEqual(controller.targetBitrateBps, 60_000_000)
     }
 
     func testRateControllerCutsOnlyAfterConfirmedLoss() {
@@ -84,8 +128,8 @@ final class AppleMediaFeedbackTests: XCTestCase {
         controller.onConfirmedLoss(count: 1, now: 0.1)
         _ = controller.update(now: 0.1)
 
-        XCTAssertEqual(controller.bandwidthEstimateBps, 16_000_000)
-        XCTAssertEqual(controller.targetBitrateBps, 16_000_000)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 48_000_000)
+        XCTAssertEqual(controller.targetBitrateBps, 48_000_000)
         XCTAssertEqual(controller.owrdSeconds, 0)
     }
 
@@ -100,16 +144,7 @@ final class AppleMediaFeedbackTests: XCTestCase {
         controller.onConfirmedLoss(count: 1, now: 0.1)
         _ = controller.update(now: 0.1)
 
-        XCTAssertEqual(controller.bandwidthEstimateBps, 16_000_000)
-        XCTAssertEqual(controller.targetBitrateBps, 16_000_000)
-    }
-
-    func testTMMBRPackingUsesSmallestValidExponent() {
-        let packed = appleMediaTMMBRMxTBR(bps: 18_000_000, overhead: 40)
-        let exponent = packed >> 26
-        let mantissa = (packed >> 9) & 0x1ffff
-        XCTAssertLessThanOrEqual(mantissa, 0x1ffff)
-        XCTAssertEqual(mantissa << exponent, (18_000_000 >> exponent) << exponent)
-        XCTAssertEqual(packed & 0x1ff, 40)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 80_000_000)
+        XCTAssertEqual(controller.targetBitrateBps, 80_000_000)
     }
 }

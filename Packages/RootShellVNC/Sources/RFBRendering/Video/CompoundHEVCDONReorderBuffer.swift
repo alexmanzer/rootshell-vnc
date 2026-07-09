@@ -4,6 +4,12 @@ import Foundation
 /// decoding timeline. RTP sequence numbers and FU assembly are per SSRC, but
 /// DON values are interleaved across every screen band.
 struct CompoundHEVCDONReorderBuffer {
+    struct AccessUnit: Equatable {
+        let don: UInt16
+        let ssrc: UInt32
+        let nals: [RTPDemuxer.DemuxedNAL]
+    }
+
     struct SkippedGap: Equatable {
         let missingDON: UInt16
         let nextDON: UInt16
@@ -11,15 +17,20 @@ struct CompoundHEVCDONReorderBuffer {
     }
 
     struct Result {
-        var ordered: [RTPDemuxer.DemuxedNAL] = []
+        var orderedAccessUnits: [AccessUnit] = []
         var startupOrder: [UInt16]?
         var skippedGaps: [SkippedGap] = []
+    }
+
+    private struct PendingAccessUnit {
+        var nals: [RTPDemuxer.DemuxedNAL] = []
+        var isComplete = false
     }
 
     private let startupFrameCount: Int
     private let maximumGapFrames: Int
     private var expectedSourceCount: Int
-    private var pending: [UInt16: [RTPDemuxer.DemuxedNAL]] = [:]
+    private var pending: [UInt16: PendingAccessUnit] = [:]
     private var nextDON: UInt16?
     private var startupReferenceDON: UInt16?
     private var started = false
@@ -48,15 +59,18 @@ struct CompoundHEVCDONReorderBuffer {
                 if started, behind != 0, behind < 0x8000 { continue }
             }
             if startupReferenceDON == nil { startupReferenceDON = nal.don }
-            pending[nal.don, default: []].append(nal)
+            var accessUnit = pending[nal.don] ?? PendingAccessUnit()
+            accessUnit.nals.append(nal)
+            accessUnit.isComplete = accessUnit.isComplete || nal.endOfAccessUnit
+            pending[nal.don] = accessUnit
         }
 
         if !started {
             // Four screen bands carry N, N+1, N+2 and N+3, but their sockets
             // can become readable in any order. Collect the first complete pass
             // before choosing the earliest wraparound-relative DON.
-            let sourceCount = Set(pending.values.flatMap { group in
-                group.map(\.ssrc)
+            let sourceCount = Set(pending.values.filter(\.isComplete).flatMap { accessUnit in
+                accessUnit.nals.map(\.ssrc)
             }).count
             guard sourceCount >= expectedSourceCount,
                   pending.count >= max(startupFrameCount, expectedSourceCount),
@@ -71,8 +85,14 @@ struct CompoundHEVCDONReorderBuffer {
         }
 
         while let expected = nextDON {
-            if let group = pending.removeValue(forKey: expected) {
-                result.ordered.append(contentsOf: group)
+            if let accessUnit = pending[expected],
+               accessUnit.isComplete,
+               let first = accessUnit.nals.first {
+                pending.removeValue(forKey: expected)
+                result.orderedAccessUnits.append(.init(
+                    don: expected,
+                    ssrc: first.ssrc,
+                    nals: accessUnit.nals))
                 nextDON = expected &+ 1
                 continue
             }
@@ -85,6 +105,7 @@ struct CompoundHEVCDONReorderBuffer {
                 missingDON: expected,
                 nextDON: nearest,
                 bufferedFrameCount: pending.count))
+            pending.removeValue(forKey: expected)
             nextDON = nearest
         }
         return result

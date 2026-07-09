@@ -31,6 +31,7 @@ final class RTPDemuxerTests: XCTestCase {
         XCTAssertEqual(result.map(\.nal), [nal1, nal2])
         // All aggregated units share the AP's DON (0xD410).
         XCTAssertEqual(result.map(\.don), [0xD410, 0xD410])
+        XCTAssertEqual(result.map(\.endOfAccessUnit), [false, true])
     }
 
     func testFragmentationUnitReassemblesNALUnit() throws {
@@ -51,13 +52,14 @@ final class RTPDemuxerTests: XCTestCase {
         ])
 
         let start = packet(sequence: 10, payload: startPayload)
-        let end = packet(sequence: 11, payload: endPayload)
+        let end = packet(sequence: 11, payload: endPayload, marker: true)
 
         XCTAssertTrue(demuxer.feedPacket(start).isEmpty)
         let result = demuxer.feedPacket(end)
         XCTAssertEqual(result.map(\.nal), [Data([0x26, 0x01, 0xAA, 0xBB, 0xCC, 0xDD])])
         // DON is taken from the start fragment's DONL (0xD410).
         XCTAssertEqual(result.first?.don, 0xD410)
+        XCTAssertEqual(result.first?.endOfAccessUnit, true)
     }
 
     func testSequenceGapDropsInProgressFragment() throws {
@@ -74,10 +76,11 @@ final class RTPDemuxerTests: XCTestCase {
         let demuxer = RTPDemuxer()
         // Single-NAL packet: [NAL hdr 0x02 0x01][DONL 0xD4 0x14][RBSP ...].
         let payload = Data([0x02, 0x01, 0xD4, 0x14, 0xAA, 0xBB, 0xCC])
-        let result = demuxer.feedPacket(packet(sequence: 5, payload: payload))
+        let result = demuxer.feedPacket(packet(sequence: 5, payload: payload, marker: true))
         // DONL removed; NAL header + RBSP retained.
         XCTAssertEqual(result.map(\.nal), [Data([0x02, 0x01, 0xAA, 0xBB, 0xCC])])
         XCTAssertEqual(result.first?.don, 0xD414)
+        XCTAssertEqual(result.first?.endOfAccessUnit, true)
     }
 
     func testRTCPPacketDetection() {
@@ -90,7 +93,11 @@ final class RTPDemuxerTests: XCTestCase {
         XCTAssertFalse(RTPDemuxer.isRTCPPacket(rtpMedia))
     }
 
-    private func packet(sequence: UInt16, payload: Data) -> RTPDemuxer.RTPPacket {
+    private func packet(
+        sequence: UInt16,
+        payload: Data,
+        marker: Bool = false
+    ) -> RTPDemuxer.RTPPacket {
         RTPDemuxer.RTPPacket(
             version: 2,
             payloadType: 96,
@@ -98,7 +105,7 @@ final class RTPDemuxerTests: XCTestCase {
             timestamp: 1234,
             ssrc: 42,
             payload: payload,
-            marker: false
+            marker: marker
         )
     }
 }

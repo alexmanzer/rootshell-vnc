@@ -66,10 +66,19 @@ public final class RTPDemuxer: @unchecked Sendable {
         public let don: UInt16
         public let ssrc: UInt32
         public let nal: Data
-        public init(don: UInt16, ssrc: UInt32, nal: Data) {
+        /// True when this NAL ends the RTP access unit. HEVC pictures may
+        /// contain several VCL NALs; VideoToolbox must receive them together.
+        public let endOfAccessUnit: Bool
+        public init(
+            don: UInt16,
+            ssrc: UInt32,
+            nal: Data,
+            endOfAccessUnit: Bool = true
+        ) {
             self.don = don
             self.ssrc = ssrc
             self.nal = nal
+            self.endOfAccessUnit = endOfAccessUnit
         }
     }
 
@@ -245,7 +254,10 @@ public final class RTPDemuxer: @unchecked Sendable {
         switch nalType {
         case 48:
             // Aggregation Packet (AP)
-            return handleAggregationPacket(packet.payload, ssrc: ssrc)
+            return handleAggregationPacket(
+                packet.payload,
+                ssrc: ssrc,
+                marker: packet.marker)
 
         case 49:
             // Fragmentation Unit (FU)
@@ -258,7 +270,11 @@ public final class RTPDemuxer: @unchecked Sendable {
             // it in corrupts the slice header (ffmpeg: "PPS id out of range").
             fuStates[ssrc] = nil
             let don = Self.donl(in: packet.payload)
-            return [DemuxedNAL(don: don, ssrc: ssrc, nal: stripSingleNALUnitDONL(packet.payload))]
+            return [DemuxedNAL(
+                don: don,
+                ssrc: ssrc,
+                nal: stripSingleNALUnitDONL(packet.payload),
+                endOfAccessUnit: packet.marker)]
         }
     }
 
@@ -340,7 +356,11 @@ public final class RTPDemuxer: @unchecked Sendable {
             if isEnd {
                 // Single-fragment FU (unusual but valid)
                 fuStates[packet.ssrc] = nil
-                return [DemuxedNAL(don: don, ssrc: packet.ssrc, nal: nalData)]
+                return [DemuxedNAL(
+                    don: don,
+                    ssrc: packet.ssrc,
+                    nal: nalData,
+                    endOfAccessUnit: packet.marker)]
             }
 
             fuStates[packet.ssrc] = FUState(
@@ -365,7 +385,11 @@ public final class RTPDemuxer: @unchecked Sendable {
             if isEnd {
                 // FU complete. Use the DON captured from the start fragment.
                 fuStates[packet.ssrc] = nil
-                return [DemuxedNAL(don: state.don, ssrc: packet.ssrc, nal: state.nalData)]
+                return [DemuxedNAL(
+                    don: state.don,
+                    ssrc: packet.ssrc,
+                    nal: state.nalData,
+                    endOfAccessUnit: packet.marker)]
             } else {
                 fuStates[packet.ssrc] = state
                 return []
@@ -385,7 +409,11 @@ public final class RTPDemuxer: @unchecked Sendable {
     /// aggregation unit as `2-byte NAL size + NAL unit`. Despite RFC 7798
     /// specifying a per-unit DOND when DON is in use, Apple omits it (verified
     /// on the wire: `... 00 17 [VPS] 00 52 [SPS] 00 07 [PPS]`).
-    private func handleAggregationPacket(_ payload: Data, ssrc: UInt32) -> [DemuxedNAL] {
+    private func handleAggregationPacket(
+        _ payload: Data,
+        ssrc: UInt32,
+        marker: Bool
+    ) -> [DemuxedNAL] {
         let base = payload.startIndex
         let don = Self.donl(in: payload) // single DONL for the whole AP
         var offset = base + 2 + Self.donlLength // AP header + DONL
@@ -402,10 +430,22 @@ public final class RTPDemuxer: @unchecked Sendable {
             // Apple omits per-unit DOND, so all units in the AP share the AP's
             // DON. APs carry only VPS/SPS/PPS (sent together just before an IDR),
             // so grouping them under one DON keeps them ahead of that IDR.
-            nalUnits.append(DemuxedNAL(don: don, ssrc: ssrc, nal: Data(payload[offset ..< offset + nalSize])))
+            nalUnits.append(DemuxedNAL(
+                don: don,
+                ssrc: ssrc,
+                nal: Data(payload[offset ..< offset + nalSize]),
+                endOfAccessUnit: false))
             offset += nalSize
         }
 
+        if marker, let last = nalUnits.indices.last {
+            let unit = nalUnits[last]
+            nalUnits[last] = DemuxedNAL(
+                don: unit.don,
+                ssrc: unit.ssrc,
+                nal: unit.nal,
+                endOfAccessUnit: true)
+        }
         return nalUnits
     }
 

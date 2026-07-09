@@ -18,8 +18,6 @@ public final class VideoBandLayerRenderer {
     private var bandLayers: [UInt32: CALayer] = [:]
     private var bandBuffers: [UInt32: CVPixelBuffer] = [:] // retained so VideoToolbox can't recycle a displayed buffer
     private var previousBandBuffers: [UInt32: CVPixelBuffer] = [:] // retained one commit longer: WindowServer may still scan out the just-replaced surface
-    private var stagedBuffers: [UInt32: CVPixelBuffer] = [:] // decoded, awaiting the atomic per-pass commit
-    private var commitScheduled = false
     private var bandHeight: CGFloat = 0
     private var screenWidth: CGFloat = 0
     private var screenHeight: CGFloat = 0
@@ -54,42 +52,19 @@ public final class VideoBandLayerRenderer {
         bandLayers.removeAll()
         bandBuffers.removeAll()
         previousBandBuffers.removeAll()
-        stagedBuffers.removeAll()
-        commitScheduled = false
     }
 
-    /// Display a decoded band. Zero-copy: the layer references the pixel
-    /// buffer's IOSurface directly.
-    ///
-    /// Bands from one capture pass are NOT committed one-by-one: each band is
-    /// staged, and all staged bands are pushed to the screen in a single
-    /// CATransaction once every known band has a fresh buffer (or after a
-    /// short deadline for bands that skip a cycle). Committing per band put
-    /// sibling bands from different capture instants on screen together —
-    /// visible horizontal tearing at band seams whenever motion spans bands.
-    public func setBand(ssrc: UInt32, pixelBuffer: CVPixelBuffer) {
-        stagedBuffers[ssrc] = pixelBuffer
-        let expected = max(bandLayers.count, stagedBuffers.count)
-        if stagedBuffers.count >= expected {
-            commitStagedBands()
-        } else if !commitScheduled {
-            commitScheduled = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(12)) { [weak self] in
-                guard let self, self.commitScheduled else { return }
-                self.commitStagedBands()
-            }
-        }
-    }
-
-    /// Push every staged band to its layer in one atomic transaction.
-    private func commitStagedBands() {
-        commitScheduled = false
-        guard !stagedBuffers.isEmpty else { return }
+    /// Push the latest independently updated screen bands in a single Core
+    /// Animation transaction. `BandFrameCoalescer` coalesces only values already
+    /// pending in the same main-thread hop; it never invents a cross-band frame
+    /// boundary from timing or pixels.
+    public func setBands(_ buffers: [UInt32: CVPixelBuffer]) {
+        guard !buffers.isEmpty else { return }
         var needsLayout = false
 
         CATransaction.begin()
         CATransaction.setDisableActions(true) // no implicit animation — this is video
-        for (ssrc, pixelBuffer) in stagedBuffers {
+        for (ssrc, pixelBuffer) in buffers {
             // Keep the just-replaced buffer alive one extra commit: WindowServer
             // can still be scanning out its IOSurface this frame, and releasing
             // it returns it to VideoToolbox's pool for immediate overwrite.
@@ -127,7 +102,6 @@ public final class VideoBandLayerRenderer {
             }
         }
         CATransaction.commit()
-        stagedBuffers.removeAll(keepingCapacity: true)
 
         if needsLayout { layout() }
     }
@@ -138,11 +112,10 @@ public final class VideoBandLayerRenderer {
         layout()
     }
 
-    /// Position the bands. The band height rarely divides the screen evenly, so
-    /// the encoder pads the last band; that padding decodes as solid green.
-    /// Each band is explicitly clipped to the real screen height via
-    /// `contentsRect` (not `masksToBounds`, which wasn't reliably trimming it),
-    /// so no padding is ever shown.
+    /// Position the bands. The coded band height need not divide the negotiated
+    /// framebuffer height, so the final coded band can extend below the desktop.
+    /// Clip it by geometry to the negotiated height; no pixel inspection is
+    /// involved.
     public func layout() {
         guard screenWidth > 0, screenHeight > 0, viewBounds.width > 0, viewBounds.height > 0 else { return }
         let nativeBandHeight = bandHeight > 0 ? bandHeight : screenHeight

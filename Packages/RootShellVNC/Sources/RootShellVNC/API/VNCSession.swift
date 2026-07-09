@@ -585,7 +585,10 @@ struct SendablePixelBuffer: @unchecked Sendable {
 }
 
 /// Diagnostic: saves periodic PNGs of decoded band buffers exactly as they are
-/// handed to the renderer (enable with ROOTSHELL_VNC_FRAME_OUT_DIR=<dir>).
+/// handed to the renderer. `ROOTSHELL_VNC_FRAME_OUT_DIR=<dir>` selects an
+/// explicit directory; Debug builds otherwise use this app's sandboxed Caches
+/// directory so a normal Xcode launch can capture without changing its network
+/// execution context.
 /// Lets a live GUI session's decode output be compared against what the screen
 /// shows, isolating decode-path vs display-path corruption. PNG encoding runs
 /// on a background queue so the tap doesn't perturb delivery timing.
@@ -598,10 +601,38 @@ final class DiagnosticFrameDumper: @unchecked Sendable {
     private let ciContext = CIContext()
 
     static func fromEnvironment() -> DiagnosticFrameDumper? {
-        guard let dir = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_FRAME_OUT_DIR"],
-              !dir.isEmpty else { return nil }
-        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        return DiagnosticFrameDumper(dir: dir)
+        let fileManager = FileManager.default
+        let environment = ProcessInfo.processInfo.environment
+
+        let root: URL
+        if let explicit = environment["ROOTSHELL_VNC_FRAME_OUT_DIR"], !explicit.isEmpty {
+            root = URL(fileURLWithPath: explicit, isDirectory: true)
+        } else {
+            #if DEBUG
+            guard let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+                return nil
+            }
+            root = caches.appendingPathComponent("RootShellVNC/DecodedFrames", isDirectory: true)
+            #else
+            return nil
+            #endif
+        }
+
+        let sessionDirectory = root.appendingPathComponent(
+            UUID().uuidString,
+            isDirectory: true)
+        do {
+            try fileManager.createDirectory(
+                at: sessionDirectory,
+                withIntermediateDirectories: true)
+        } catch {
+            VNCLogger(category: "FrameCapture").warning(
+                "Could not create decoded-frame capture directory: \(error.localizedDescription)")
+            return nil
+        }
+        VNCLogger(category: "FrameCapture").info(
+            "Capturing decoded frames in \(sessionDirectory.path)")
+        return DiagnosticFrameDumper(dir: sessionDirectory.path)
     }
 
     private init(dir: String) {
@@ -652,14 +683,31 @@ final class DecodedBandTracker: @unchecked Sendable {
     }
 }
 
-/// Delivers decoded band frames to the main-thread renderer, in order and
-/// coalesced: the newest buffer per band is staged under a lock, and one
-/// main-queue hop (FIFO, unlike spawned Tasks) drains every staged band.
-/// If the main thread is busy, intermediate frames are superseded rather than
-/// queued — display can never fall behind the decoder.
+/// Accumulates the newest decoded value for every source since the last display
+/// drain. Screen bands are independent dirty-region streams: a static band can
+/// legitimately emit fewer frames than a busy band, so no all-band barrier is
+/// valid here.
+struct LatestBandFrameAccumulator<Value> {
+    private var staged: [UInt32: Value] = [:]
+
+    mutating func submit(source: UInt32, value: Value) {
+        staged[source] = value
+    }
+
+    mutating func takeAll() -> [UInt32: Value] {
+        let latest = staged
+        staged.removeAll(keepingCapacity: true)
+        return latest
+    }
+}
+
+/// Delivers the latest independently decoded screen bands to the main-thread
+/// renderer. One FIFO main-queue hop coalesces bursts across sources; a newer
+/// frame supersedes an older pending frame for the same band, so the UI cannot
+/// fall behind the decoder.
 final class BandFrameCoalescer: @unchecked Sendable {
     private let lock = NSLock()
-    private var staged: [UInt32: CVPixelBuffer] = [:]
+    private var accumulator = LatestBandFrameAccumulator<CVPixelBuffer>()
     private var hopScheduled = false
     private let renderer: VideoBandLayerRenderer
 
@@ -669,22 +717,23 @@ final class BandFrameCoalescer: @unchecked Sendable {
 
     func submit(ssrc: UInt32, pixelBuffer: CVPixelBuffer) {
         lock.lock()
-        staged[ssrc] = pixelBuffer
-        let shouldSchedule = !hopScheduled
-        hopScheduled = true
+        accumulator.submit(source: ssrc, value: pixelBuffer)
+        let shouldScheduleHop = !hopScheduled
+        if shouldScheduleHop { hopScheduled = true }
         lock.unlock()
-        guard shouldSchedule else { return }
 
+        if shouldScheduleHop { scheduleRendererHop() }
+    }
+
+    private func scheduleRendererHop() {
         DispatchQueue.main.async { [self] in
             lock.lock()
-            let frames = staged
-            staged.removeAll(keepingCapacity: true)
+            let frames = accumulator.takeAll()
             hopScheduled = false
             lock.unlock()
+            guard !frames.isEmpty else { return }
             MainActor.assumeIsolated {
-                for (ssrc, buffer) in frames {
-                    renderer.setBand(ssrc: ssrc, pixelBuffer: buffer)
-                }
+                renderer.setBands(frames)
             }
         }
     }

@@ -45,11 +45,10 @@ public struct VideoStreamFeedResult: Sendable, Equatable {
 /// Manages the accelerated HEVC video stream for high-performance VNC mode.
 ///
 /// Apple round-robins one HEVC reference timeline across several band SSRCs.
-/// RTP fragmentation is independent per SSRC, but completed VCL NAL units must
-/// be restored to their global decoding order (DON) and submitted to one
-/// VideoToolbox decoder. Decoding each SSRC separately renders the initial
-/// intra pictures, then freezes because subsequent bands reference pictures
-/// carried by sibling SSRCs.
+/// RTP fragmentation is independent per SSRC, but completed VCL access units
+/// must be restored to global DON order and submitted to one VideoToolbox
+/// decoder. A live four-session experiment froze after the initial pictures,
+/// confirming that subsequent pictures reference sibling-SSRC pictures.
 public final class VideoStreamManager: @unchecked Sendable {
 
     /// Delivers a decoded frame and the source SSRC (which screen band it is).
@@ -64,6 +63,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var fullFrameHeight = 0
     private var frameCounter: Int64 = 0
     private var droppedPacketLogCount = 0
+    private var multiNALAccessUnitLogCount = 0
     private var pendingVPS: Data?
     private var pendingSPS: Data?
     private var pendingPPS: Data?
@@ -156,11 +156,12 @@ public final class VideoStreamManager: @unchecked Sendable {
         self.frameCallback = frameCallback
         self.frameCounter = 0
         self.droppedPacketLogCount = 0
+        self.multiNALAccessUnitLogCount = 0
         self._isActive = true
         demuxer = RTPDemuxer()
 
         // Hardware decode callbacks can arrive out of submission order. PTS is
-        // global because all SSRCs participate in the same reference timeline.
+        // global because all SSRCs participate in one reference timeline.
         let orderer = DecodedFrameOrderer(callback: frameCallback)
         decoder = HEVCDecoder { pixelBuffer, pts, ssrc in
             orderer.submit(pixelBuffer: pixelBuffer, pts: pts, ssrc: ssrc)
@@ -218,7 +219,7 @@ public final class VideoStreamManager: @unchecked Sendable {
 
             // Parameter sets are not pictures and may share a DON with a later
             // IRAP, so apply them immediately. Buffer only VCL units by DON.
-            var orderedVCL: [RTPDemuxer.DemuxedNAL] = []
+            var orderedVCL: [CompoundHEVCDONReorderBuffer.AccessUnit] = []
             for unit in demuxed {
                 guard unit.nal.count >= 2 else { continue }
                 let type = (unit.nal[unit.nal.startIndex] >> 1) & 0x3f
@@ -227,7 +228,9 @@ public final class VideoStreamManager: @unchecked Sendable {
                 case 33: handleParameterSet(nalUnit: unit.nal, type: .sps)
                 case 34: handleParameterSet(nalUnit: unit.nal, type: .pps)
                 case 35, 36, 37, 38, 39, 40: continue
-                default: orderedVCL.append(contentsOf: enqueueAndDrainReorder([unit]))
+                default:
+                    orderedVCL.append(contentsOf:
+                        enqueueAndDrainReorder([unit]).orderedAccessUnits)
                 }
             }
 
@@ -236,29 +239,36 @@ public final class VideoStreamManager: @unchecked Sendable {
                 return (unit.nal[unit.nal.startIndex] >> 1) & 0x3f
             }
             var decodedCount = 0
-            for unit in orderedVCL {
-                let nalUnit = unit.nal
-                guard nalUnit.count >= 2 else { continue }
-                let nalType = (nalUnit[nalUnit.startIndex] >> 1) & 0x3F
+            for accessUnit in orderedVCL {
+                let nalUnits = accessUnit.nals.map(\.nal)
+                guard let firstNAL = nalUnits.first, firstNAL.count >= 2 else { continue }
+                let nalType = (firstNAL[firstNAL.startIndex] >> 1) & 0x3F
                 switch nalType {
                 case 32...40: continue
                 default:
-                    // One VCL NAL is one band access unit. Its source SSRC is
-                    // carried through the global decoder to route the output.
+                    // One DON is one band access unit. Preserve all of its VCL
+                    // NALs/slices in a single VideoToolbox sample; submitting
+                    // slices separately renders partial pictures.
                     // IRAP NAL units (16-21) heal their band; non-IRAP VCL from
                     // a gated band is dropped (its reference chain is broken —
                     // decoding it would render macroblocks, not fail).
-                    guard shouldDecodeVCL(nalType: nalType, ssrc: unit.ssrc) else { continue }
+                    guard shouldDecodeVCL(nalType: nalType, ssrc: accessUnit.ssrc) else { continue }
+                    logMultiNALAccessUnitIfNeeded(
+                        don: accessUnit.don,
+                        count: nalUnits.count)
                     // A VCL NAL can beat its parameter sets to the decoder in
                     // the startup burst (each band's ONLY IRAP is in there —
                     // dropping one leaves the band dead all session). Buffer
                     // until the format description exists, then drain in order.
                     guard decoder.isReady else {
-                        bufferEarlyVCL(nal: nalUnit, ssrc: unit.ssrc)
+                        bufferEarlyVCL(nals: nalUnits, ssrc: accessUnit.ssrc)
                         continue
                     }
                     let pts = CMTime(value: nextPresentationTimeValue(), timescale: 90000)
-                    try decoder.decode(nalUnits: [nalUnit], presentationTime: pts, frameTag: unit.ssrc)
+                    try decoder.decode(
+                        nalUnits: nalUnits,
+                        presentationTime: pts,
+                        frameTag: accessUnit.ssrc)
                     decodedCount += 1
                 }
             }
@@ -377,6 +387,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         _isActive = false
         frameCounter = 0
         droppedPacketLogCount = 0
+        multiNALAccessUnitLogCount = 0
         pendingVPS = nil
         pendingSPS = nil
         pendingPPS = nil
@@ -405,13 +416,13 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// VCL NAL units that arrived before the decoder had its parameter sets
     /// (startup burst ordering). Drained the moment the format description is
     /// configured; bounded so a broken stream can't grow it unboundedly.
-    private var earlyVCLBuffer: [(nal: Data, ssrc: UInt32)] = []
+    private var earlyVCLBuffer: [(nals: [Data], ssrc: UInt32)] = []
 
-    private func bufferEarlyVCL(nal: Data, ssrc: UInt32) {
+    private func bufferEarlyVCL(nals: [Data], ssrc: UInt32) {
         lock.lock()
         defer { lock.unlock() }
         if earlyVCLBuffer.count < 256 {
-            earlyVCLBuffer.append((nal, ssrc))
+            earlyVCLBuffer.append((nals, ssrc))
         }
     }
 
@@ -435,7 +446,9 @@ public final class VideoStreamManager: @unchecked Sendable {
             if let codedHeight = decoderRef?.formatDimensions?.height,
                codedHeight > 0 {
                 lock.lock()
-                let expectedBands = max(1, (fullFrameHeight + Int(codedHeight) - 1) / Int(codedHeight))
+                let expectedBands = max(
+                    1,
+                    (fullFrameHeight + Int(codedHeight) - 1) / Int(codedHeight))
                 donReorderBuffer.setExpectedSourceCount(expectedBands)
                 lock.unlock()
             }
@@ -459,7 +472,21 @@ public final class VideoStreamManager: @unchecked Sendable {
 
         for item in buffered {
             let pts = CMTime(value: nextPresentationTimeValue(), timescale: 90000)
-            try? decoderRef.decode(nalUnits: [item.nal], presentationTime: pts, frameTag: item.ssrc)
+            try? decoderRef.decode(
+                nalUnits: item.nals,
+                presentationTime: pts,
+                frameTag: item.ssrc)
+        }
+    }
+
+    private func logMultiNALAccessUnitIfNeeded(don: UInt16, count: Int) {
+        guard count > 1 else { return }
+        lock.lock()
+        let shouldLog = multiNALAccessUnitLogCount < 8
+        multiNALAccessUnitLogCount += 1
+        lock.unlock()
+        if shouldLog {
+            log.info("Submitting complete multi-NAL HEVC access unit DON=\(don) nals=\(count)")
         }
     }
 
@@ -469,7 +496,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// current DON; a bounded gap is skipped rather than freezing forever.
     private func enqueueAndDrainReorder(
         _ nals: [RTPDemuxer.DemuxedNAL]
-    ) -> [RTPDemuxer.DemuxedNAL] {
+    ) -> CompoundHEVCDONReorderBuffer.Result {
         lock.lock()
         defer { lock.unlock() }
         let result = donReorderBuffer.enqueue(nals)
@@ -482,7 +509,7 @@ public final class VideoStreamManager: @unchecked Sendable {
                 + "next=\(gap.nextDON) buffered=\(gap.bufferedFrameCount)")
             if lossRecoveryEnabled { _ = markLossLocked(affectedSSRC: nil) }
         }
-        return result.ordered
+        return result
     }
 
     /// Releases decoded frames in strict presentation (submission) order.
@@ -490,9 +517,8 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// PTS values are synthesized at decode submission as consecutive multiples
     /// of 3000 (90 kHz ticks), so the expected sequence is exactly 0, 1, 2, …
     /// in frame indices. Out-of-order hardware-decoder callbacks are held until
-    /// their turn; a frame the decoder swallowed (decode error, corrupt slice)
-    /// is skipped once a few newer frames have queued behind it, so one loss
-    /// can never stall the display.
+    /// their turn; a frame the decoder swallowed is skipped once a few newer
+    /// frames have queued behind it, so one loss cannot stall the display.
     final class DecodedFrameOrderer: @unchecked Sendable {
         private let lock = NSLock()
         private var pending: [Int64: (CVPixelBuffer, UInt32)] = [:]

@@ -131,6 +131,9 @@ public actor TransportSession {
     private var appleMediaReceptionStats: [UInt32: AppleMediaReceptionStats] = [:]
     private var appleMediaLastSRLSR: UInt32 = 0
     private var appleMediaLastSRArrivalNanos: UInt64 = 0
+    /// Q10 sender clock from the latest Apple 0x9311 RTP media-control
+    /// extension. Native echoes this in RCTL; it is unrelated to RTCP LSR.
+    private var appleMediaLastTransmitTimestampQ10: UInt16 = 0
     /// RTCP APP "RCTL" rate-control feedback (drives the server's adaptive
     /// encoder bitrate). Native sends this ~20 Hz; without it the server encodes
     /// at a constant maximum bitrate. Interval accumulators for received bitrate
@@ -140,12 +143,11 @@ public actor TransportSession {
     private var appleRCTLLostInterval: Int = 0
     private var appleRCTLBurstLostInterval: Int = 0
     private var appleRCTLLastSendNanos: UInt64 = 0
-    /// Receiver-side rate controller: estimates a target bitrate from the delay
-    /// trend + loss of the received video and requests it via TMMBR, and supplies
-    /// the measured one-way delay / bandwidth estimate for RCTL.
+    private var appleRCTLLastDiagnosticNanos: UInt64 = 0
+    /// Receiver-side capacity estimator used to populate RCTL. Apple's
+    /// feedback-only screen receiver sends RCTL by itself; it does not append a
+    /// second TMMBR controller to every feedback packet.
     private var appleMediaRateController: AppleMediaRateController?
-    private var appleMediaLastTMMBRBps: UInt32 = 0
-    private var appleMediaLastTMMBRNanos: UInt64 = 0
     private var appleRTCPReportTask: Task<Void, Never>?
 
     private struct AppleMediaReceptionStats {
@@ -159,6 +161,9 @@ public actor TransportSession {
         var initialized = false
     }
     private var appleMediaDisplayCount: Int = 1
+    /// Message-1 bit advertised by the server. The native viewer only adds the
+    /// HDR capability option to its video negotiator when this bit is present.
+    private var appleMediaSupportsHDR = false
     private var appleMediaUDPBindings: [AppleMediaUDPBinding] = []
     private let appleMediaControlBufferLimit = 64 * 1024
 
@@ -684,6 +689,11 @@ public actor TransportSession {
                     let maxDisplays = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_MAX_DISPLAYS"]
                         .flatMap(Int.init) ?? 1
                     appleMediaDisplayCount = min(offer.videoStreamDisplayCount ?? 1, max(1, maxDisplays))
+                    // ScreenSharing reads bit 1 of byte 0x14 in the native
+                    // message-1 structure before adding HDR mode 3.
+                    if offer.rawPayload.count > 0x14 {
+                        appleMediaSupportsHDR = offer.rawPayload[offer.rawPayload.startIndex + 0x14] & 0x02 != 0
+                    }
                 }
                 try configureAppleMediaComCryptionIfPresent(offer.rawPayload)
                 try await configureAppleMediaUDP(for: offer)
@@ -2041,38 +2051,33 @@ public actor TransportSession {
     }
 
     private func appleAVCMediaStreamOffer(mode: Int) throws -> Data {
-        let cappedVideo = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_CAPPED_BLOB"] == "1"
-        // Use the native adaptive Viceroy blob byte-for-byte. Apple's actual
-        // Full Quality setting does not offer AVC; it selects Zlib/ZRLE in the
-        // RFB encoding list. A locally modified "full HEVC" protobuf is not a
-        // protocol profile and caused quality behavior unlike Screen Sharing.
-        var videoBlob = cappedVideo
-            ? Self.appleAVCVideoMediaBlobCapped
-            : Self.appleAVCVideoMediaBlob
-        // Override the video media blob from a file (for testing alternate blobs).
-        if let blobPath = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_AVC_BLOB"],
-           let override = try? Data(contentsOf: URL(fileURLWithPath: blobPath)) {
-            videoBlob = override
-        }
-        let mediaBlob = mode == 8 ? Self.appleAVCAudioMediaBlob : videoBlob
-        // The negotiator mode selects the quality profile: 7 = adapt to network
-        // conditions (the server may raise QP / starve static regions to hit a
-        // bitrate target); 1 = full quality. Overridable for video to test.
+        // Mode 8 is Apple's system-audio profile and mode 7 is its screen-video
+        // profile. Full Quality is not another media mode: the native client
+        // leaves AVC entirely and requests lossless RFB encodings.
         var negotiatorMode = mode
         if mode != 8, let override = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_AVC_MODE"]
             .flatMap(Int.init) {
             negotiatorMode = override
         }
-        let plist: [String: Any] = [
-            "avcMediaStreamNegotiatorMediaBlob": mediaBlob,
-            "avcMediaStreamNegotiatorMode": negotiatorMode,
-            "avcMediaStreamOptionCallID": UUID().uuidString,
-            "avcMediaStreamOptionRemoteEndpointInfo": Self.appleAVCEndpointInfo,
-        ]
-        return try PropertyListSerialization.data(
-            fromPropertyList: plist,
-            format: .binary,
-            options: 0
+
+        let random = try randomBytes(count: 4)
+        var ssrc = random.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+        if ssrc == 0 { ssrc = 1 }
+        let profile = AppleMediaNegotiationProfile(
+            framebufferWidth: fbWidth,
+            framebufferHeight: fbHeight,
+            supportsHDR: appleMediaSupportsHDR
+        )
+        log.debug(
+            "Generated Apple media \(mode == 8 ? "audio" : "screen") offer "
+                + "ssrc=\(ssrc) aspect=\(profile.aspectRatio.landscapeWidth)/"
+                + "\(profile.aspectRatio.landscapeHeight) hdr=\(appleMediaSupportsHDR)"
+        )
+        return try profile.makeOffer(
+            kind: mode == 8 ? .audio : .screen,
+            mode: negotiatorMode,
+            ssrc: ssrc,
+            ntpTimestamp: AppleMediaNegotiationProfile.ntpTimestamp()
         )
     }
 
@@ -2098,54 +2103,6 @@ public actor TransportSession {
         data[offset + 2] = UInt8((value >> 8) & 0xff)
         data[offset + 3] = UInt8(value & 0xff)
     }
-
-    private static let appleAVCEndpointInfo = Data([
-        0x08, 0x00, 0x10, 0x01, 0x1a, 0x0e, 0x4d, 0x61,
-        0x63, 0x42, 0x6f, 0x6f, 0x6b, 0x50, 0x72, 0x6f,
-        0x31, 0x38, 0x2c, 0x34, 0x22, 0x08, 0x32, 0x32,
-        0x30, 0x35, 0x2e, 0x33, 0x2e, 0x31, 0x2a, 0x05,
-        0x32, 0x35, 0x46, 0x38, 0x30,
-    ])
-
-    /// Experimental: the video media blob with the bandwidth-tier ladder capped
-    /// (100/75/60/40/20 Mbps tiers lowered to 8 Mbps), to test whether the server
-    /// respects a lower offered maximum. Enabled with ROOTSHELL_VNC_CAPPED_BLOB=1.
-    private static let appleAVCVideoMediaBlobCapped = Data([
-        0x78,0xda,0xe3,0x60,0x14,0x60,0xd4,0xfa,0xcc,0xc8,0x71,0x7a,0xe2,0xd7,0x03,0x6c,0x02,0x0c,0x52,0xf5,0x1c,0xd5,0x42,0x5c,0x1c,0x40,0x41,0x89,0xc3,0xed,0xcc,0x0a,0x0c,0x60,0x36,0x13,0x12,0x1b,0x8b,0xb8,0x94,0xa7,0x9b,0x4f,0xb0,0xb5,0x6f,0xb0,0x95,0xae,0xa1,0xb5,0x8f,0x1b,0x98,0x0c,0x09,0xb2,0x76,0x76,0x74,0x72,0x74,0xb6,0x0e,0xf0,0x0f,0xb6,0x32,0xb0,0x76,0xf5,0x77,0xb1,0x32,0xb4,0xf6,0x08,0x09,0xb6,0x32,0xb2,0x0e,0x0a,0xb2,0x32,0xb6,0x76,0x0c,0xb2,0x32,0x34,0xd3,0xb7,0xd4,0x31,0xd5,0xb7,0xb0,0x8e,0x40,0x62,0x2b,0x30,0x4a,0xc5,0x71,0xa4,0xe0,0xb4,0xc8,0x01,0x64,0x11,0xc4,0x0a,0x90,0xc1,0xa6,0x98,0x06,0x03,0x85,0x5d,0xad,0x4c,0x70,0x9b,0xcf,0x67,0xc0,0x62,0xc1,0xe8,0x60,0xef,0xc1,0x98,0xc0,0x68,0xc4,0x1b,0x96,0x99,0x9c,0x5a,0x94,0x5f,0xa9,0x60,0xa8,0x67,0xae,0x67,0xe0,0xc0,0xe0,0xc5,0xc9,0xf1,0x4a,0x5e,0x80,0x41,0xa2,0xa1,0x81,0xd1,0x8b,0x9b,0x83,0x41,0xa0,0x61,0xf6,0x3b,0x26,0x20,0x87,0xc3,0x8b,0x0b,0xc4,0x59,0xf2,0x82,0x59,0xa2,0x21,0xc1,0x8b,0x15,0xe8,0x9c,0xd5,0x4c,0x10,0x79,0xb0,0x50,0x83,0x02,0x32,0x87,0x0d,0x99,0x23,0x00,0x54,0x2d,0x20,0xd0,0x82,0xa2,0xc0,0x01,0x28,0xc6,0x22,0xf0,0xc4,0x28,0xa3,0xe1,0xc3,0xa4,0xb7,0xbf,0xd6,0x5c,0xfa,0xf1,0x96,0xb1,0x80,0xa9,0x81,0x91,0x01,0x00,0xbd,0xc0,0x5e,0x46,
-    ])
-
-    private static let appleAVCVideoMediaBlob = Data([
-        0x78, 0xda, 0xe3, 0x60, 0x14, 0x60, 0xd4, 0xfa, 0xcc, 0xc8, 0x71, 0x7a, 0xe2, 0xd7, 0x03, 0x6c,
-        0x02, 0x0c, 0x52, 0xf5, 0x1c, 0xd5, 0x42, 0x5c, 0x1c, 0x40, 0x41, 0x89, 0xc3, 0xed, 0xcc, 0x0a,
-        0x0c, 0x60, 0x36, 0x13, 0x12, 0x1b, 0x8b, 0xb8, 0x94, 0xa7, 0x9b, 0x4f, 0xb0, 0xb5, 0x6f, 0xb0,
-        0x95, 0xae, 0xa1, 0xb5, 0x8f, 0x1b, 0x98, 0x0c, 0x09, 0xb2, 0x76, 0x76, 0x74, 0x72, 0x74, 0xb6,
-        0x0e, 0xf0, 0x0f, 0xb6, 0x32, 0xb0, 0x76, 0xf5, 0x77, 0xb1, 0x32, 0xb4, 0xf6, 0x08, 0x09, 0xb6,
-        0x32, 0xb2, 0x0e, 0x0a, 0xb2, 0x32, 0xb6, 0x76, 0x0c, 0xb2, 0x32, 0x34, 0xd3, 0xb7, 0xd4, 0x31,
-        0xd5, 0xb7, 0xb0, 0x8e, 0x40, 0x62, 0x2b, 0x30, 0x4a, 0xc5, 0x71, 0xa4, 0xe0, 0xb4, 0xc8, 0x01,
-        0x64, 0x11, 0xc4, 0x0a, 0x90, 0xc1, 0xa6, 0x98, 0x06, 0x03, 0x85, 0x5d, 0xad, 0x4c, 0x70, 0x9b,
-        0xcf, 0x67, 0xc0, 0x62, 0xc1, 0xe8, 0x60, 0xef, 0xc1, 0x98, 0xc0, 0x68, 0xc4, 0x1b, 0x96, 0x99,
-        0x9c, 0x5a, 0x94, 0x5f, 0xa9, 0x60, 0xa8, 0x67, 0xae, 0x67, 0xe0, 0xc0, 0xe0, 0xc5, 0xc9, 0xf1,
-        0x4a, 0x5e, 0x80, 0x41, 0xa2, 0xa1, 0x81, 0xd1, 0x8b, 0x9b, 0x83, 0x41, 0xa0, 0x61, 0xf6, 0x3b,
-        0x26, 0x20, 0x87, 0xc3, 0x8b, 0x0b, 0xc4, 0xd9, 0xd2, 0x29, 0x2c, 0xd1, 0x90, 0xe0, 0xc5, 0x0a,
-        0x74, 0xce, 0x6a, 0x26, 0xb0, 0xfc, 0x81, 0x8b, 0x0f, 0x95, 0x81, 0xf2, 0x0a, 0x10, 0xc5, 0xb7,
-        0x8e, 0x70, 0x02, 0x39, 0x6c, 0x10, 0x4e, 0xdf, 0x39, 0x19, 0x20, 0x47, 0x00, 0xa8, 0x5a, 0x40,
-        0xa0, 0x05, 0xaa, 0xe0, 0xd0, 0x75, 0x7d, 0xa0, 0x98, 0x03, 0x50, 0x8c, 0x45, 0xe0, 0x89, 0x51,
-        0x46, 0xc3, 0x87, 0x49, 0x6f, 0x7f, 0xad, 0xb9, 0xf4, 0xe3, 0x2d, 0x63, 0x01, 0x53, 0x03, 0x23,
-        0x03, 0x00, 0xd6, 0x3e, 0x5e, 0xc7,
-    ])
-
-    private static let appleAVCAudioMediaBlob = Data([
-        0x78, 0xda, 0xe3, 0x60, 0x14, 0x60, 0x94, 0x12, 0xe2, 0xb8, 0xdc, 0xd7, 0x7e, 0x8b, 0x53, 0x80,
-        0x41, 0x82, 0x41, 0xe1, 0xff, 0x1e, 0x46, 0x0d, 0x06, 0x03, 0x06, 0x23, 0xde, 0xb0, 0xcc, 0xe4,
-        0xd4, 0xa2, 0xfc, 0x4a, 0x05, 0x43, 0x3d, 0x73, 0x3d, 0x03, 0x07, 0x06, 0x2f, 0x4e, 0x8e, 0x57,
-        0xf2, 0x40, 0x15, 0x0d, 0x0d, 0x8c, 0x5e, 0x5c, 0x1c, 0x0c, 0x02, 0x0d, 0x5b, 0x3a, 0x85, 0x25,
-        0x1a, 0x12, 0xbc, 0x58, 0x39, 0x18, 0x05, 0x56, 0x33, 0x79, 0x71, 0x03, 0x85, 0x0e, 0x5c, 0x7c,
-        0xa8, 0x0c, 0x94, 0x57, 0x00, 0x73, 0x1a, 0x6e, 0x1d, 0xe1, 0x04, 0x72, 0xd8, 0x80, 0x0a, 0x04,
-        0x04, 0x5a, 0x14, 0x80, 0x14, 0x8b, 0xc0, 0x13, 0x23, 0x88, 0x54, 0xdf, 0x39, 0x19, 0xa0, 0x94,
-        0x00, 0x84, 0x73, 0xe8, 0xba, 0x3e, 0x90, 0xe3, 0x00, 0xe1, 0xcc, 0x7e, 0xc7, 0x04, 0xe4, 0x70,
-        0x64, 0x34, 0x3c, 0xb8, 0x38, 0xeb, 0xf7, 0x9a, 0x4b, 0x3f, 0xde, 0x32, 0x16, 0x30, 0x35, 0x30,
-        0x32, 0x00, 0x00, 0x9e, 0x20, 0x2e, 0xff,
-    ])
 
     /// A minimal RTCP receiver-report used to prime the server's symmetric-RTP
     /// destination latch. PT=201 (RTCP RR) so it is never confused with video.
@@ -2333,8 +2290,9 @@ public actor TransportSession {
         appleRCTLPacketsInterval = 0
         appleRCTLLostInterval = 0; appleRCTLBurstLostInterval = 0
         appleRCTLLastSendNanos = 0
+        appleRCTLLastDiagnosticNanos = 0
         appleMediaRateController = nil
-        appleMediaLastTMMBRBps = 0; appleMediaLastTMMBRNanos = 0
+        appleMediaLastTransmitTimestampQ10 = 0
         appleMediaVideoSSRCChannels.removeAll()
         appleMediaReceptionStats.removeAll()
         appleMediaPreKeyDatagrams.removeAll()
@@ -2613,6 +2571,9 @@ public actor TransportSession {
             ssrc: header.ssrc,
             sequence: header.sequenceNumber)
         if unique {
+            if let transmitTimestamp = appleMediaRTPTransmitTimestampQ10(packet) {
+                appleMediaLastTransmitTimestampQ10 = transmitTimestamp
+            }
             appleRCTLPacketsInterval += 1
             startAppleRTCPReportLoop()
             startAppleRCTLFeedbackLoop()
@@ -2892,12 +2853,12 @@ public actor TransportSession {
             controller.update(now: nowSeconds)
         }
 
-        // RCTL carries estimated link capacity, not the requested encoder cap.
-        // The legacy fixed-rate diagnostic advertises the largest representable
-        // estimate and omits TMMBR; adaptive mode reports the separate capacity
-        // estimator and requests its current target via TMMBR.
+        // RCTL carries estimated receive capacity. It is the feedback input to
+        // the peer's encoder controller, not a request to install a separate
+        // TMMBR ceiling.
         let estimatedKbps = rateControlEnabled
-            ? Double(appleMediaRateController?.bandwidthEstimateBps ?? 20_000_000) / 1_000
+            ? Double(appleMediaRateController?.bandwidthEstimateBps
+                ?? UInt32(appleMediaRateControllerMaxBps)) / 1_000
             : 65_535
         let bweKbps = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_RCTL_BWE_KBPS"]
             .flatMap(Double.init) ?? estimatedKbps
@@ -2913,9 +2874,9 @@ public actor TransportSession {
         let owrdSeconds = fakeCongestion ? 0.5 : (appleMediaRateController?.owrdSeconds ?? 0)
         let owrd = UInt16(min(65535, (owrdSeconds * 8192).rounded()))
         let ts = UInt16(truncatingIfNeeded: Int(nowSeconds * 1024))          // Q10 s
-        let echo = UInt16(truncatingIfNeeded: appleMediaLastSRLSR >> 16)     // reflect server SR
+        let echo = appleMediaLastTransmitTimestampQ10                        // reflect RTP Tx clock
         let age = UInt16(min(65535, (intervalSeconds * 1000).rounded()))
-        let payload = AppleMediaRCTLFeedback(
+        let feedback = AppleMediaRCTLFeedback(
             lossPercent: UInt8(min(100, max(0, (lossFrac * 100).rounded()))),
             echoTimestamp: echo,
             measurementAgeMilliseconds: age,
@@ -2923,25 +2884,27 @@ public actor TransportSession {
             owrdQ13: owrd,
             burstyLoss: burstyLoss,
             jitterQueueSize: jitterQueueSize,
-            bandwidthEstimateKbps: bwe).serialized()
+            bandwidthEstimateKbps: bwe)
 
         let sender = appleMediaLocalSSRC
-        var app = Data(capacity: 32)
-        app.append(0x80); app.append(0xcc)           // V=2, P=0; PT=204 (APP)
-        app.append(0x00); app.append(0x07)           // length = 7 words (32 bytes)
-        app.append(UInt8((sender >> 24) & 0xff)); app.append(UInt8((sender >> 16) & 0xff))
-        app.append(UInt8((sender >> 8) & 0xff)); app.append(UInt8(sender & 0xff))
-        app.append(contentsOf: [0x52, 0x43, 0x54, 0x4c]) // "RCTL"
-        app.append(payload)
+        let app = appleMediaRCTLPacket(senderSSRC: sender, feedback: feedback)
 
-        // Apple expects a compound report. The adaptive mode also appends its
-        // current TMMBR request.
-        var compound = Data()
-        if let rr = buildAppleMediaReceiverReport() { compound.append(rr) }
-        compound.append(app)
-        if let tmmbr = buildAppleMediaTMMBRPacketIfChanged() { compound.append(tmmbr) }
-        guard let protected = try? srtcp.protect(compound, senderSSRC: sender) else { return }
-        dumpAppleMediaOutgoingRTCPIfRequested(plaintext: compound, protected: protected)
+        if appleRCTLLastDiagnosticNanos == 0
+            || now &- appleRCTLLastDiagnosticNanos >= 1_000_000_000 {
+            appleRCTLLastDiagnosticNanos = now
+            let receivedKbps = Int(
+                (appleMediaRateController?.throughputBps(now: nowSeconds) ?? 0) / 1_000)
+            log.debug(
+                "RCTL bwe=\(bwe)kbps received=\(receivedKbps)kbps "
+                    + "echoQ10=\(echo) loss=\(feedback.lossPercent)% queue=\(jitterQueueSize)")
+        }
+
+        // AVConference's `VCVideoStreamRateAdaptationFeedbackOnly` passes a
+        // parameter block containing only the RCTL flag to
+        // `RTPSendRateControlPacket`. Keep the wire shape identical: ordinary
+        // Receiver Reports have their own 1 Hz loop below.
+        guard let protected = try? srtcp.protect(app, senderSSRC: sender) else { return }
+        dumpAppleMediaOutgoingRTCPIfRequested(plaintext: app, protected: protected)
         try? await channel.send(protected)
     }
 
@@ -2954,49 +2917,14 @@ public actor TransportSession {
             && ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_RATE_CONTROL"] != "1"
     }
 
-    /// Ceiling for the rate controller (bps). Env-overridable via the controller.
-    // The native Viceroy blob advertises 20/40/60/75/100 Mbps operating tiers.
-    // Capping our controller at 60 Mbps made the top two native tiers
-    // unreachable even on a clean local network.
-    private var appleMediaRateControllerMaxBps: Double { 100_000_000 }
-
-    /// Build a TMMBR (RFC 5104) carrying the rate controller's current target
-    /// bitrate, coalesced: returned only when the target moved materially or 1 s
-    /// has passed. Targets the busiest video source SSRC. Returns the unprotected
-    /// RTCP packet to be concatenated into the compound feedback datagram.
-    private func buildAppleMediaTMMBRPacketIfChanged() -> Data? {
-        guard rateControlEnabled, let controller = appleMediaRateController else { return nil }
-        guard let targetSSRC = appleMediaReceptionStats
-            .filter({ $0.value.initialized })
-            .max(by: { $0.value.received < $1.value.received })?.key else { return nil }
-
-        let bps = controller.targetBitrateBps
-        let now = DispatchTime.now().uptimeNanoseconds
-        let last = appleMediaLastTMMBRBps
-        let changedEnough = last == 0
-            || abs(Int64(bps) - Int64(last)) * 10 >= Int64(last)   // >= 10% change
-        let elapsedEnough = appleMediaLastTMMBRNanos == 0
-            || (now &- appleMediaLastTMMBRNanos) > 1_000_000_000
-        guard changedEnough || elapsedEnough else { return nil }
-        appleMediaLastTMMBRBps = bps
-        appleMediaLastTMMBRNanos = now
-
-        let sender = appleMediaLocalSSRC
-        var pkt = Data(capacity: 20)
-        pkt.append(0x83); pkt.append(0xcd)   // V=2, P=0, FMT=3 | PT=205 (RTPFB)
-        pkt.append(0x00); pkt.append(0x04)   // length = 4 (one FCI)
-        appendUInt32BE(sender, to: &pkt)     // packet sender SSRC
-        appendUInt32BE(0, to: &pkt)          // media source SSRC = 0
-        appendUInt32BE(targetSSRC, to: &pkt) // FCI: target SSRC
-        appendUInt32BE(appleMediaTMMBRMxTBR(bps: bps), to: &pkt)  // FCI: MxTBR
-        log.debug("TMMBR target=\(bps) bps ssrc=0x\(String(targetSSRC, radix: 16))")
-        return pkt
+    /// Ceiling for the receive-capacity estimator (bps). RCTL serializes kbps
+    /// as UInt16; estimates above that only delay a later loss response because
+    /// several reductions would still encode as the same saturated value.
+    private var appleMediaRateControllerMaxBps: Double {
+        Double(UInt16.max) * 1_000
     }
 
     private func sendAppleMediaReceiverReport() async {
-        // With RCTL on, the RR is folded into the compound feedback
-        // datagram sent by the RCTL loop; don't also send it standalone.
-        guard !rctlEnabled else { return }
         guard let context = appleMediaSRTCPContext,
               let channel = appleMediaVideoSSRCChannels.values.first,
               let rr = buildAppleMediaReceiverReport(),
