@@ -902,8 +902,8 @@ final class TouchInputHandlerTests: XCTestCase {
         XCTAssertEqual(event.deltaY, -1)
         XCTAssertEqual(event.pointDeltaX, 1)
         XCTAssertEqual(event.pointDeltaY, -4)
-        XCTAssertEqual(event.fixedDeltaX, 0)
-        XCTAssertEqual(event.fixedDeltaY, 0)
+        XCTAssertEqual(event.fixedDeltaX, 6_553)
+        XCTAssertEqual(event.fixedDeltaY, -26_214)
         XCTAssertEqual(event.scrollPhase, .changed)
         XCTAssertEqual(event.flags, [.continuous])
         XCTAssertEqual(event.x, 20)
@@ -925,6 +925,26 @@ final class TouchInputHandlerTests: XCTestCase {
             AppleGestureEvent(kind: .began, x: 20, y: 30),
             AppleGestureEvent(kind: .ended, x: 21, y: 31),
         ])
+    }
+
+    @MainActor
+    func testPreciseScrollDeltaRepresentationsSaturateSafely() {
+        var scrollEvents: [AppleScrollEvent] = []
+        let handler = TouchInputHandler(
+            sendPointerEvent: { _, _, _ in },
+            sendScrollEvent: { scrollEvents.append($0) })
+
+        handler.handleScroll(
+            x: 1,
+            y: 2,
+            pointDeltaX: .max,
+            pointDeltaY: .min,
+            scrollPhase: .changed)
+
+        XCTAssertEqual(scrollEvents[0].deltaX, .max)
+        XCTAssertEqual(scrollEvents[0].deltaY, .min)
+        XCTAssertEqual(scrollEvents[0].fixedDeltaX, .max)
+        XCTAssertEqual(scrollEvents[0].fixedDeltaY, .min)
     }
 
     func testScrollPointAccumulatorPreservesSubpointMovement() {

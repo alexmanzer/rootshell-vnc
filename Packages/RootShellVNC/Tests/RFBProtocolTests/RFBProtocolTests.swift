@@ -821,12 +821,23 @@ final class MessageWriterTests: XCTestCase {
             0x11, 0x22, 0x33, 0x44,
             0xff, 0xff, 0xff, 0xfd,
             0x7f, 0xff, 0xff, 0xff,
-            0x00, 0x00, 0x00, 0x04,
-            0x00, 0x00, 0x00, 0x08,
+            0x00, 0x00, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x03,
             0x01, 0x02, 0x03, 0x04,
             0x00, 0x00, 0x00, 0x03,
             0xab, 0xcd, 0x12, 0x34,
         ]))
+    }
+
+    func testAppleScrollPhaseValuesMatchMeasuredCGEventFields() {
+        XCTAssertEqual(AppleScrollEvent.Phase.began.rawValue, 1)
+        XCTAssertEqual(AppleScrollEvent.Phase.changed.rawValue, 2)
+        XCTAssertEqual(AppleScrollEvent.Phase.ended.rawValue, 4)
+        XCTAssertEqual(AppleScrollEvent.Phase.cancelled.rawValue, 8)
+        XCTAssertEqual(AppleScrollEvent.Phase.mayBegin.rawValue, 128)
+        XCTAssertEqual(AppleScrollEvent.MomentumPhase.began.rawValue, 1)
+        XCTAssertEqual(AppleScrollEvent.MomentumPhase.changed.rawValue, 2)
+        XCTAssertEqual(AppleScrollEvent.MomentumPhase.ended.rawValue, 3)
     }
 
     func testWriteAppleGestureEnvelopeMatchesScreenSharing() {

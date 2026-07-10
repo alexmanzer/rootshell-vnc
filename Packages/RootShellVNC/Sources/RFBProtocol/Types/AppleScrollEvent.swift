@@ -19,11 +19,19 @@ public struct AppleScrollEvent: Sendable, Equatable {
 
         public static let none: Phase = []
         public static let began = Phase(rawValue: 1)
-        public static let stationary = Phase(rawValue: 2)
-        public static let changed = Phase(rawValue: 4)
-        public static let ended = Phase(rawValue: 8)
-        public static let cancelled = Phase(rawValue: 16)
+        public static let changed = Phase(rawValue: 2)
+        public static let ended = Phase(rawValue: 4)
+        public static let cancelled = Phase(rawValue: 8)
         public static let mayBegin = Phase(rawValue: 128)
+    }
+
+    /// Raw momentum values carried by CGEvent field 123. Unlike the direct
+    /// scroll phase field, the terminal value is `3`, not a bit flag.
+    public enum MomentumPhase: UInt32, Sendable {
+        case none = 0
+        case began = 1
+        case changed = 2
+        case ended = 3
     }
 
     public struct Flags: OptionSet, Sendable {
@@ -47,7 +55,7 @@ public struct AppleScrollEvent: Sendable, Equatable {
     public let pointDeltaY: Int32
     public let pointDeltaZ: Int32
     public let scrollPhase: Phase
-    public let momentumPhase: Phase
+    public let momentumPhase: MomentumPhase
     public let scrollCount: UInt32
     public let flags: Flags
     public let x: UInt16
@@ -64,7 +72,7 @@ public struct AppleScrollEvent: Sendable, Equatable {
         pointDeltaY: Int32 = 0,
         pointDeltaZ: Int32 = 0,
         scrollPhase: Phase = .none,
-        momentumPhase: Phase = .none,
+        momentumPhase: MomentumPhase = .none,
         scrollCount: UInt32 = 1,
         flags: Flags = [],
         x: UInt16,

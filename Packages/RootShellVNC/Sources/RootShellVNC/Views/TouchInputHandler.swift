@@ -170,21 +170,22 @@ public struct TouchInputHandler {
         }
     }
 
-    /// Forward a point-accurate scroll sample. UIKit exposes point movement and
-    /// gesture phase but not AppKit's separate 16.16 fixed-point line delta, so
-    /// those fields remain zero instead of inventing a scale. Coarse deltas are
-    /// retained as signs for the standards-compatible RFB fallback.
+    /// Forward a point-accurate continuous scroll sample. CoreGraphics carries
+    /// point pixels alongside accelerated whole-wheel and signed 16.16 wheel
+    /// units; the conversion below matches values measured from trackpad events.
     public func handleScroll(
         x: UInt16,
         y: UInt16,
         pointDeltaX: Int32,
         pointDeltaY: Int32,
         scrollPhase: AppleScrollEvent.Phase,
-        momentumPhase: AppleScrollEvent.Phase = .none
+        momentumPhase: AppleScrollEvent.MomentumPhase = .none
     ) {
         let event = AppleScrollEvent(
             deltaX: Self.coarseDelta(for: pointDeltaX),
             deltaY: Self.coarseDelta(for: pointDeltaY),
+            fixedDeltaX: Self.fixed16_16(for: pointDeltaX),
+            fixedDeltaY: Self.fixed16_16(for: pointDeltaY),
             pointDeltaX: pointDeltaX,
             pointDeltaY: pointDeltaY,
             scrollPhase: scrollPhase,
@@ -200,10 +201,19 @@ public struct TouchInputHandler {
         }
     }
 
+    private nonisolated static func fixed16_16(for pointDelta: Int32) -> Int32 {
+        // Measured public CGEvents use approximately ten pixels per one fixed
+        // wheel unit. Integer division preserves the sign and total direction.
+        Int32(clamping: Int64(pointDelta) * 65_536 / 10)
+    }
+
     private nonisolated static func coarseDelta(for pointDelta: Int32) -> Int16 {
-        if pointDelta > 0 { return 1 }
-        if pointDelta < 0 { return -1 }
-        return 0
+        guard pointDelta != 0 else { return 0 }
+        let wholeWheelUnits = pointDelta / 10
+        if wholeWheelUnits != 0 {
+            return Int16(clamping: wholeWheelUnits)
+        }
+        return pointDelta > 0 ? 1 : -1
     }
 
     /// Forward the gesture envelope that native Screen Sharing places around
