@@ -22,6 +22,10 @@ public final class VideoBandLayerRenderer {
     private var screenWidth: CGFloat = 0
     private var screenHeight: CGFloat = 0
     private var viewBounds: CGRect = .zero
+    /// A media renegotiation can replace every SSRC. Retain the previous
+    /// generation on screen while the server negotiates, then remove its
+    /// layers in the same transaction that installs the first new frame.
+    private var replaceLayersOnNextFrame = false
     /// Display pixel density. Hand-made CALayers default to 1.0, which renders
     /// at half resolution on a Retina display (blurry, "compressed"); this must
     /// track the screen's scale.
@@ -52,6 +56,11 @@ public final class VideoBandLayerRenderer {
         bandLayers.removeAll()
         bandBuffers.removeAll()
         previousBandBuffers.removeAll()
+        replaceLayersOnNextFrame = false
+    }
+
+    public func beginStreamGeneration() {
+        replaceLayersOnNextFrame = true
     }
 
     /// Push the latest independently updated screen bands in a single Core
@@ -64,6 +73,15 @@ public final class VideoBandLayerRenderer {
 
         CATransaction.begin()
         CATransaction.setDisableActions(true) // no implicit animation — this is video
+        if replaceLayersOnNextFrame {
+            for layer in bandLayers.values { layer.removeFromSuperlayer() }
+            bandLayers.removeAll()
+            bandBuffers.removeAll()
+            previousBandBuffers.removeAll()
+            bandHeight = 0
+            replaceLayersOnNextFrame = false
+            needsLayout = true
+        }
         for (ssrc, pixelBuffer) in buffers {
             // Keep the just-replaced buffer alive one extra commit: WindowServer
             // can still be scanning out its IOSurface this frame, and releasing

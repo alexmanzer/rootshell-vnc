@@ -55,6 +55,23 @@ public struct VideoDecoderFailure: Sendable, Equatable {
     }
 }
 
+/// Authoritative full-frame geometry learned from the public HEVC format.
+/// Apple renegotiates the media stream when a display changes size, but does
+/// not necessarily send an RFB DesktopSize rectangle on that path. In the
+/// portable one-tile profile, the decoded frame dimensions are therefore the
+/// source of truth for the new desktop bounds.
+public struct VideoFrameGeometry: Sendable, Equatable {
+    public let width: Int
+    public let height: Int
+    public let mediaGeneration: UInt64
+
+    public init(width: Int, height: Int, mediaGeneration: UInt64) {
+        self.width = width
+        self.height = height
+        self.mediaGeneration = mediaGeneration
+    }
+}
+
 /// Latches one terminal decoder failure per stream generation. Once the
 /// hardware decoder enters its wait-for-IDR state, feeding more dependent
 /// pictures only floods its callback with the same error.
@@ -110,6 +127,9 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var usesDecodingOrderNumbers = true
     private var streamID: UInt32 = 0
     private var streamGeneration: UInt64 = 0
+    /// AVC negotiation generation inside the still-live RFB stream. Unlike
+    /// `streamGeneration`, this advances for display-size renegotiations.
+    private var mediaGeneration: UInt64 = 0
     private var fullFrameWidth = 0
     private var fullFrameHeight = 0
     private var codedBandHeight = 0
@@ -153,6 +173,10 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// the session owner schedules an in-session public-VideoToolbox rebuild.
     public var onDecoderFailure: (@Sendable (VideoDecoderFailure) -> Void)?
 
+    /// Fired when a one-tile HEVC format reports new full-frame dimensions.
+    /// The callback runs off-lock on the serial media path.
+    public var onFrameGeometryChange: (@Sendable (VideoFrameGeometry) -> Void)?
+
     /// Counters for tests/diagnostics.
     public struct LossStats: Sendable, Equatable {
         public var gapsDetected = 0
@@ -190,6 +214,13 @@ public final class VideoStreamManager: @unchecked Sendable {
             decoderOutputCount: decoderOutputCount,
             lastSubmissionNanos: lastSubmissionNanos,
             lastDecoderOutputNanos: lastDecoderOutputNanos)
+    }
+
+    /// Current AVC negotiation generation within the active RFB stream.
+    public var currentMediaGeneration: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return mediaGeneration
     }
 
     /// Snapshot of the loss/gating counters.
@@ -241,6 +272,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         lock.lock()
         let retiredDecoders = _stopStreamLocked()
         self.streamID = streamID
+        self.mediaGeneration = 1
         self.fullFrameWidth = width
         self.fullFrameHeight = height
         self.usesDecodingOrderNumbers = usesDecodingOrderNumbers
@@ -261,7 +293,8 @@ public final class VideoStreamManager: @unchecked Sendable {
         // public VideoToolbox session sees them. Splitting the SSRCs across
         // decoder sessions loses sibling reference pictures after frame one.
         decoder = makeDecoder(
-            generation: streamGeneration,
+            streamGeneration: streamGeneration,
+            mediaGeneration: mediaGeneration,
             frameCallback: frameCallback)
         lock.unlock()
         retireDecoders(retiredDecoders)
@@ -278,6 +311,49 @@ public final class VideoStreamManager: @unchecked Sendable {
         fullFrameWidth = width
         fullFrameHeight = height
         updateExpectedBandCountLocked()
+    }
+
+    /// Reset only compressed-media state for a fresh negotiated AVC
+    /// generation. The RFB connection, frame callback, geometry, feedback
+    /// wiring, and liveness counters remain in place. Calling this on the
+    /// session's serial media queue orders it before the new generation's RTP.
+    public func prepareForStreamReconfiguration(mediaGeneration: UInt64) {
+        let retiredDecoder: HEVCDecoder?
+
+        lock.lock()
+        guard _isActive,
+              mediaGeneration > self.mediaGeneration,
+              let callback = frameCallback else {
+            lock.unlock()
+            return
+        }
+
+        self.mediaGeneration = mediaGeneration
+        retiredDecoder = decoder
+        decoder = makeDecoder(
+            streamGeneration: streamGeneration,
+            mediaGeneration: mediaGeneration,
+            frameCallback: callback)
+        demuxer.reset()
+        presentationTimeline.reset()
+        pendingVPS = nil
+        pendingSPS = nil
+        pendingPPS = nil
+        decoderFailureLatch.reset()
+        codedBandHeight = 0
+        expectedBandCount = 0
+        seenVideoSSRCs.removeAll()
+        awaitingIRAP.removeAll()
+        lastVideoSeq.removeAll()
+        lastLossNanos = 0
+        earlyVCLBuffer.removeAll()
+        lossStats = LossStats()
+        donReorderBuffer = CompoundHEVCDONReorderBuffer()
+        sequentialAccessUnitAssembler.reset()
+        lock.unlock()
+
+        retireDecoders([retiredDecoder].compactMap { $0 })
+        log.info("Prepared public video decoder for negotiated media generation")
     }
 
     @discardableResult
@@ -553,6 +629,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         decoderFailureLatch.reset()
         fullFrameWidth = 0
         fullFrameHeight = 0
+        mediaGeneration = 0
         codedBandHeight = 0
         expectedBandCount = 0
         seenVideoSSRCs.removeAll()
@@ -605,9 +682,14 @@ public final class VideoStreamManager: @unchecked Sendable {
     }
 
     @discardableResult
-    private func recordDecoderOutput(generation: UInt64) -> Bool {
+    private func recordDecoderOutput(
+        streamGeneration: UInt64,
+        mediaGeneration: UInt64
+    ) -> Bool {
         lock.lock()
-        guard generation == streamGeneration, _isActive else {
+        guard streamGeneration == self.streamGeneration,
+              mediaGeneration == self.mediaGeneration,
+              _isActive else {
             lock.unlock()
             return false
         }
@@ -618,7 +700,8 @@ public final class VideoStreamManager: @unchecked Sendable {
     }
 
     private func recordDecoderFailure(
-        generation: UInt64,
+        streamGeneration: UInt64,
+        mediaGeneration: UInt64,
         status: OSStatus,
         ssrc: UInt32
     ) {
@@ -626,7 +709,8 @@ public final class VideoStreamManager: @unchecked Sendable {
         let callback: (@Sendable (VideoDecoderFailure) -> Void)?
 
         lock.lock()
-        guard generation == streamGeneration,
+        guard streamGeneration == self.streamGeneration,
+              mediaGeneration == self.mediaGeneration,
               _isActive,
               decoderFailureLatch.record(failure) else {
             lock.unlock()
@@ -652,6 +736,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         let oldDecoder: HEVCDecoder
         let replacement: HEVCDecoder
         let generation: UInt64
+        let currentMediaGeneration: UInt64
         let vps: Data?
         let sps: Data
         let pps: Data
@@ -667,9 +752,11 @@ public final class VideoStreamManager: @unchecked Sendable {
             return false
         }
         generation = streamGeneration
+        currentMediaGeneration = mediaGeneration
         oldDecoder = currentDecoder
         replacement = makeDecoder(
-            generation: generation,
+            streamGeneration: generation,
+            mediaGeneration: currentMediaGeneration,
             frameCallback: callback)
         vps = pendingVPS
         sps = configuredSPS
@@ -694,6 +781,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         lock.lock()
         guard _isActive,
               streamGeneration == generation,
+              mediaGeneration == currentMediaGeneration,
               decoder == nil else {
             lock.unlock()
             replacement.reset()
@@ -723,32 +811,68 @@ public final class VideoStreamManager: @unchecked Sendable {
         let vps = pendingVPS
         lock.unlock()
 
-        var codedHeight: Int32?
+        var codedDimensions: CMVideoDimensions?
         for decoderRef in decoderRefs {
             do {
                 try decoderRef.updateFormatDescription(sps: sps, pps: pps, vps: vps)
-                codedHeight = codedHeight ?? decoderRef.formatDimensions?.height
+                codedDimensions = codedDimensions ?? decoderRef.formatDimensions
             } catch {
                 log.warning("Failed to configure HEVC format: \(error.localizedDescription)")
             }
         }
-        if codedHeight == nil {
+        if codedDimensions == nil {
             do {
-                codedHeight = try HEVCDecoder.codedDimensions(
-                    sps: sps,
-                    pps: pps,
-                    vps: vps).height
+                codedDimensions = try HEVCDecoder.codedDimensions(
+                    sps: sps, pps: pps, vps: vps)
             } catch {
                 log.warning("Failed to inspect HEVC format: \(error.localizedDescription)")
             }
         }
-        if let codedHeight, codedHeight > 0 {
-            lock.lock()
-            codedBandHeight = Int(codedHeight)
-            updateExpectedBandCountLocked()
-            lock.unlock()
+        if let codedDimensions,
+           codedDimensions.width > 0,
+           codedDimensions.height > 0 {
+            acceptCodedDimensions(
+                width: Int(codedDimensions.width),
+                height: Int(codedDimensions.height))
         }
         drainEarlyVCLIfReady()
+    }
+
+    /// Apply dimensions carried by the negotiated HEVC parameter sets. In the
+    /// default portable one-tile profile this is the complete desktop. The
+    /// opt-in tiled profile encodes only a band per output buffer, so it keeps
+    /// using explicit RFB geometry for the full height.
+    @discardableResult
+    func acceptCodedDimensions(width: Int, height: Int) -> VideoFrameGeometry? {
+        guard width > 0, height > 0 else { return nil }
+
+        let update: VideoFrameGeometry?
+        let callback: (@Sendable (VideoFrameGeometry) -> Void)?
+        lock.lock()
+        codedBandHeight = height
+        if !usesDecodingOrderNumbers
+            && (width != fullFrameWidth || height != fullFrameHeight) {
+            fullFrameWidth = width
+            fullFrameHeight = height
+            update = VideoFrameGeometry(
+                width: width,
+                height: height,
+                mediaGeneration: mediaGeneration)
+            callback = onFrameGeometryChange
+        } else {
+            update = nil
+            callback = nil
+        }
+        updateExpectedBandCountLocked()
+        lock.unlock()
+
+        if let update {
+            log.info(
+                "HEVC media geometry \(update.width)x\(update.height) "
+                    + "generation=\(update.mediaGeneration)")
+            callback?(update)
+        }
+        return update
     }
 
     private func updateExpectedBandCountLocked() {
@@ -809,13 +933,16 @@ public final class VideoStreamManager: @unchecked Sendable {
     }
 
     private func makeDecoder(
-        generation: UInt64,
+        streamGeneration: UInt64,
+        mediaGeneration: UInt64,
         frameCallback: @escaping FrameCallback
     ) -> HEVCDecoder {
         let orderer = DecodedFrameOrderer(callback: frameCallback)
         return HEVCDecoder(
             frameCallback: { [weak self] pixelBuffer, pts, frameTag in
-                guard self?.recordDecoderOutput(generation: generation) == true else {
+                guard self?.recordDecoderOutput(
+                    streamGeneration: streamGeneration,
+                    mediaGeneration: mediaGeneration) == true else {
                     return
                 }
                 orderer.submit(
@@ -825,7 +952,8 @@ public final class VideoStreamManager: @unchecked Sendable {
             },
             failureCallback: { [weak self] status, _, frameTag in
                 self?.recordDecoderFailure(
-                    generation: generation,
+                    streamGeneration: streamGeneration,
+                    mediaGeneration: mediaGeneration,
                     status: status,
                     ssrc: frameTag)
             })

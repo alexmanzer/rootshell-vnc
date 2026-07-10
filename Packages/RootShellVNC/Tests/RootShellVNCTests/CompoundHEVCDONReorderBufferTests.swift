@@ -106,6 +106,49 @@ final class CompoundHEVCDONReorderBufferTests: XCTestCase {
         manager.stopStream()
     }
 
+    func testMediaReconfigurationKeepsStreamAndConnectionGenerationAlive() {
+        let manager = VideoStreamManager()
+        manager.startStream(streamID: 7, width: 2560, height: 1600) { _, _ in }
+        let connectionGeneration = manager.decodeProgress.streamGeneration
+
+        manager.prepareForStreamReconfiguration(mediaGeneration: 2)
+        manager.prepareForStreamReconfiguration(mediaGeneration: 1)
+
+        XCTAssertTrue(manager.isStreamActive)
+        XCTAssertEqual(manager.currentMediaGeneration, 2)
+        XCTAssertEqual(manager.decodeProgress.streamGeneration, connectionGeneration)
+        XCTAssertEqual(manager.frameGeometrySnapshot.width, 2560)
+        XCTAssertEqual(manager.frameGeometrySnapshot.height, 1600)
+        XCTAssertEqual(manager.frameGeometrySnapshot.codedBandHeight, 0)
+        manager.stopStream()
+    }
+
+    func testOneTileCodecGeometryUpdatesDesktopAfterMediaRenegotiation() {
+        let manager = VideoStreamManager()
+        manager.startStream(
+            streamID: 7,
+            width: 2976,
+            height: 1860,
+            usesDecodingOrderNumbers: false
+        ) { _, _ in }
+        let connectionGeneration = manager.decodeProgress.streamGeneration
+        manager.prepareForStreamReconfiguration(mediaGeneration: 2)
+
+        let update = manager.acceptCodedDimensions(width: 3808, height: 2380)
+
+        XCTAssertEqual(
+            update,
+            VideoFrameGeometry(
+                width: 3808,
+                height: 2380,
+                mediaGeneration: 2))
+        XCTAssertEqual(manager.frameGeometrySnapshot.width, 3808)
+        XCTAssertEqual(manager.frameGeometrySnapshot.height, 2380)
+        XCTAssertEqual(manager.frameGeometrySnapshot.codedBandHeight, 2380)
+        XCTAssertEqual(manager.decodeProgress.streamGeneration, connectionGeneration)
+        manager.stopStream()
+    }
+
     func testExpectedBandCountRoundsUpPartialFinalBand() {
         XCTAssertEqual(
             VideoStreamManager.expectedBandCount(

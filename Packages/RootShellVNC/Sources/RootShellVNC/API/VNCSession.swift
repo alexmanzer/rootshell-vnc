@@ -75,6 +75,10 @@ public final class VNCSession {
     /// serial queue preserves packet order.
     @ObservationIgnored
     private let mediaQueue = DispatchQueue(label: "com.rootshell.vnc.media", qos: .userInitiated)
+    /// Rejects late geometry callbacks from a decoder retired by a newer AVC
+    /// negotiation generation.
+    @ObservationIgnored
+    private var appliedMediaGeometryGeneration: UInt64 = 0
 
     // MARK: - Init
 
@@ -446,6 +450,39 @@ public final class VNCSession {
         }
     }
 
+    /// Apply the full-frame dimensions carried by the one-tile HEVC format.
+    /// Apple's resize path can renegotiate AVC without emitting DesktopSize,
+    /// so the public codec format is authoritative for both display layout and
+    /// input-coordinate bounds in high-performance mode.
+    private func applyMediaStreamGeometry(
+        _ geometry: VideoFrameGeometry,
+        from manager: VideoStreamManager
+    ) {
+        guard videoStreamManager === manager else { return }
+        guard manager.currentMediaGeneration == geometry.mediaGeneration else { return }
+        guard geometry.mediaGeneration >= appliedMediaGeometryGeneration else { return }
+        guard geometry.width > 0, geometry.height > 0,
+              geometry.width <= Int(UInt16.max),
+              geometry.height <= Int(UInt16.max) else { return }
+
+        appliedMediaGeometryGeneration = geometry.mediaGeneration
+        guard geometry.width != framebufferWidth
+                || geometry.height != framebufferHeight else { return }
+
+        logger.info(
+            "Applying HEVC media resize \(framebufferWidth)x\(framebufferHeight) "
+                + "-> \(geometry.width)x\(geometry.height) "
+                + "generation=\(geometry.mediaGeneration)")
+        renderer?.handleDesktopResize(
+            width: UInt16(geometry.width),
+            height: UInt16(geometry.height))
+        framebufferWidth = geometry.width
+        framebufferHeight = geometry.height
+        videoBandRenderer.setScreenSize(
+            width: geometry.width,
+            height: geometry.height)
+    }
+
     private func handleError(_ error: VNCProtocolError) {
         logger.error("Protocol error: \(error.localizedDescription)")
         lastError = error
@@ -512,6 +549,15 @@ public final class VNCSession {
             frameDumper?.maybeDump(pixelBuffer, ssrc: ssrc)
             decodedBands.record(ssrc)
             coalescer.submit(ssrc: ssrc, pixelBuffer: pixelBuffer)
+        }
+
+        appliedMediaGeometryGeneration = 1
+        manager.onFrameGeometryChange = { [weak self, weak manager] geometry in
+            guard let manager else { return }
+            Task { @MainActor [weak self, weak manager] in
+                guard let self, let manager else { return }
+                self.applyMediaStreamGeometry(geometry, from: manager)
+            }
         }
 
         manager.startStream(
@@ -642,6 +688,14 @@ public final class VNCSession {
         if let transport = transportSession {
             let queue = mediaQueue
             let sinkManager = manager // VideoStreamManager is Sendable
+            let generationCoalescer = coalescer
+            await transport.setAppleMediaGenerationSink { generation in
+                queue.async {
+                    sinkManager.prepareForStreamReconfiguration(
+                        mediaGeneration: generation)
+                    generationCoalescer.beginStreamGeneration(generation)
+                }
+            }
             await transport.setAppleMediaRTPSink { packet in
                 queue.async { sinkManager.feedRTPData(packet) }
             }
@@ -857,25 +911,52 @@ final class BandFrameCoalescer: @unchecked Sendable {
     private let lock = NSLock()
     private var accumulator = LatestBandFrameAccumulator<CVPixelBuffer>()
     private var hopScheduled = false
+    private var streamGeneration: UInt64 = 0
     private let renderer: VideoBandLayerRenderer
 
     init(renderer: VideoBandLayerRenderer) {
         self.renderer = renderer
     }
 
+    /// Drop decoded values staged from the retired media generation and queue
+    /// the visual handoff before any subsequently submitted frame can queue its
+    /// own main-thread hop. The renderer keeps showing its last committed
+    /// surfaces until that first replacement frame exists.
+    func beginStreamGeneration(_ generation: UInt64) {
+        lock.lock()
+        streamGeneration = generation
+        accumulator = LatestBandFrameAccumulator()
+        hopScheduled = false
+        lock.unlock()
+
+        DispatchQueue.main.async { [renderer] in
+            MainActor.assumeIsolated {
+                renderer.beginStreamGeneration()
+            }
+        }
+    }
+
     func submit(ssrc: UInt32, pixelBuffer: CVPixelBuffer) {
         lock.lock()
         accumulator.submit(source: ssrc, value: pixelBuffer)
         let shouldScheduleHop = !hopScheduled
+        let generation = streamGeneration
         if shouldScheduleHop { hopScheduled = true }
         lock.unlock()
 
-        if shouldScheduleHop { scheduleRendererHop() }
+        if shouldScheduleHop { scheduleRendererHop(generation: generation) }
     }
 
-    private func scheduleRendererHop() {
+    private func scheduleRendererHop(generation: UInt64) {
         DispatchQueue.main.async { [self] in
             lock.lock()
+            guard generation == streamGeneration else {
+                // This hop was queued by the retired media generation. Its
+                // accumulator was deliberately discarded; leave the new
+                // generation's scheduled-hop state untouched.
+                lock.unlock()
+                return
+            }
             let frames = accumulator.takeAll()
             hopScheduled = false
             lock.unlock()

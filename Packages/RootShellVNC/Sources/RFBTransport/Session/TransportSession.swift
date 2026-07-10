@@ -69,6 +69,10 @@ public actor TransportSession {
     /// packets until the decoder sink is ready and drains them atomically, so
     /// the former AsyncStream/direct-path boundary cannot reorder the IRAP burst.
     private var appleMediaPacketHandoff = AppleMediaPacketHandoff()
+    /// Ordered notification for a fresh AVC media generation. The app installs
+    /// this beside the RTP sink so its decoder reset is queued before any RTP
+    /// from the new keys/SSRC can overtake it.
+    private var appleMediaGenerationSink: (@Sendable (UInt64) -> Void)?
     /// Per-SSRC packet jitter buffer. UDP reordering is repaired here before an
     /// HEVC fragmentation unit reaches the decoder.
     private var appleMediaRTPReorderBuffer = AppleMediaRTPReorderBuffer()
@@ -89,6 +93,7 @@ public actor TransportSession {
     private var sentAppleMediaPostAnswerViewerInfo = false
     private var sentAppleMediaInitialSetDisplay = false
     private var sentAppleMediaAutoFrameUpdate = false
+    private var appleMediaGenerationTracker = AppleMediaNegotiationGenerationTracker()
     private var acceptedAppleMediaStream = false
     private var drainedAppleMediaControlBytes = 0
     private var appleMediaControlBuffer = Data()
@@ -308,6 +313,15 @@ public actor TransportSession {
         appleMediaVideoSSRCChannels.count
     }
 
+    /// Install the in-session media-generation boundary callback. This is
+    /// separate from connection state: a display resize renegotiates AVC while
+    /// the RFB session and its input/control channel remain alive.
+    public func setAppleMediaGenerationSink(
+        _ sink: (@Sendable (UInt64) -> Void)?
+    ) {
+        appleMediaGenerationSink = sink
+    }
+
     /// Request a framebuffer update from the server.
     public func requestFramebufferUpdate(incremental: Bool) async throws {
         let msg = ClientMessage.framebufferUpdateRequest(
@@ -324,6 +338,7 @@ public actor TransportSession {
         log.info("Disconnecting")
         readTask?.cancel()
         readTask = nil
+        appleMediaGenerationSink = nil
         await stopAppleMediaUDP()
         tcp.close()
         let actions = stateMachine.handle(event: .userRequestedDisconnect)
@@ -920,8 +935,9 @@ public actor TransportSession {
 
     private func sendAppleMediaPostAnswerViewerInfoIfNeeded(for payload: Data) async throws {
         guard requestAppleMediaStream,
-              !sentAppleMediaPostAnswerViewerInfo,
               isAppleAVCMediaAnswerPayload(payload) else { return }
+        _ = appleMediaGenerationTracker.finishMessageTwo()
+        guard !sentAppleMediaPostAnswerViewerInfo else { return }
         let viewerInfo = appleMediaStreamConfiguration(localPort: appleMediaConfigurationUDPPort())
         try await sendAppleEncryptedClientPayload(viewerInfo)
         sentAppleMediaPostAnswerViewerInfo = true
@@ -2188,6 +2204,12 @@ public actor TransportSession {
         guard let message = findAppleAVCMediaMessage(in: payload) else { return false }
         guard message.messageType == 1 else { return false }
 
+        guard let transition = appleMediaGenerationTracker.beginMessageOne() else {
+            log.warning("Ignoring duplicate AVC media message 1 while its answer is pending")
+            return true
+        }
+        beginAppleMediaGeneration(transition)
+
         let ports = configuredAppleMediaPortOverride() ?? appleMediaServerPorts(from: message.body)
         guard !ports.isEmpty else {
             log.debug("Server AVC media type-1 had no usable UDP ports (body=\(message.body.count) bytes)")
@@ -2197,7 +2219,70 @@ public actor TransportSession {
         let bindings = ports.map { AppleMediaUDPBinding(localPort: $0, remotePort: $0) }
         log.debug("Server AVC media type-1 offered UDP ports \(ports); opening symmetric sockets")
         try await startAppleMediaStreamUDPIfNeeded(bindings: bindings)
+
+        // A type-1 AVC media message is the request for a fresh client media
+        // configuration. Native ScreenSharing creates its negotiators, offers,
+        // and keys in `handleAVCMediaEncoding:` and immediately enqueues that
+        // configuration for transmission before message 2 arrives. Waiting
+        // for the separate 0x456 control record happened to work at startup,
+        // where it follows type 1 almost immediately, but a display resize
+        // does not send 0x456 first: the server retransmits type 1 while it is
+        // waiting for this response. Keep the 0x456 call site as an idempotent
+        // compatibility path; this call owns the actual negotiation response.
+        try await sendAppleMediaServerConfigurationIfNeeded()
         return true
+    }
+
+    /// Begin one native message-1/answer media cycle. All fields reset here are
+    /// scoped to the encoded media generation; the TCP/RFB connection, input
+    /// path, UDP sockets, and installed RTP sink remain intact.
+    private func beginAppleMediaGeneration(
+        _ transition: AppleMediaNegotiationGenerationTracker.Transition
+    ) {
+        sentAppleMediaServerConfiguration = false
+        sentAppleMediaPostAnswerViewerInfo = false
+        sentAppleMediaInitialSetDisplay = false
+        sentAppleMediaAutoFrameUpdate = false
+
+        appleMediaRTPReorderFlushTask?.cancel()
+        appleMediaRTPReorderFlushTask = nil
+        appleMediaRTPReorderScheduledDeadlineNanos = nil
+        appleMediaRTPReorderBuffer.reset()
+        pendingAppleMediaRTPStream = nil
+        confirmedAppleMediaRTPStream = nil
+
+        // Message 2 installs fresh keys. Clear the old contexts now so an
+        // early new-generation IRAP is buffered instead of being rejected by
+        // authentication against the previous generation's keys.
+        appleMediaSRTPKeys = nil
+        appleMediaSRTPContexts.removeAll(keepingCapacity: true)
+        appleMediaSRTPContextBySSRC.removeAll(keepingCapacity: true)
+        appleMediaSRTCPContext = nil
+        appleMediaSRTCPRxContext = nil
+        appleMediaExpectsSRTP = true
+        appleMediaPreKeyDatagrams.removeAll(keepingCapacity: true)
+        appleMediaUnprotectFailures = 0
+
+        appleMediaVideoSSRCChannels.removeAll(keepingCapacity: true)
+        appleMediaReceptionStats.removeAll(keepingCapacity: true)
+        appleMediaLastFrameLossFeedback.removeAll(keepingCapacity: true)
+        appleMediaMostRecentFrameLossSSRC = nil
+        appleMediaLastSRLSR = 0
+        appleMediaLastSRArrivalNanos = 0
+        appleMediaLastRTPEchoTimestampQ10 = 0
+        appleRCTLPreviousRTPTimestamp = nil
+        appleRCTLEchoTimestampArrivalNanos = 0
+        appleRCTLTotalPacketsReceived = 0
+        appleRCTLBurstLostInterval = 0
+        appleRCTLLastDiagnosticNanos = 0
+        appleMediaRateController = nil
+        appleLastKeyframeRequestNanos = 0
+
+        if transition.isReconfiguration {
+            log.info(
+                "Beginning in-session Apple media generation \(transition.generation)")
+            appleMediaGenerationSink?(transition.generation)
+        }
     }
 
     /// Locate a `0x3f2` AVC media pseudo-rectangle body inside a payload.

@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import CoreVideo
 @testable import RootShellVNC
 import RFBProtocol
 
@@ -645,6 +646,41 @@ final class VideoBandGeometryTests: XCTestCase {
         XCTAssertEqual(renderer.containerLayer.frame.minY, 0, accuracy: 0.001)
         XCTAssertEqual(renderer.containerLayer.frame.width, 1000, accuracy: 0.001)
         XCTAssertEqual(renderer.containerLayer.frame.height, 1000, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testNewMediaGenerationRetainsOldFrameUntilAtomicReplacement() throws {
+        let renderer = VideoBandLayerRenderer()
+        renderer.setViewBounds(CGRect(x: 0, y: 0, width: 100, height: 100))
+        renderer.setScreenSize(width: 100, height: 100)
+
+        renderer.setBands([1: try makePixelBuffer(width: 100, height: 100)])
+        XCTAssertEqual(renderer.containerLayer.sublayers?.count, 1)
+
+        renderer.beginStreamGeneration()
+        XCTAssertEqual(
+            renderer.containerLayer.sublayers?.count,
+            1,
+            "The last complete frame should remain visible during negotiation")
+
+        renderer.setBands([2: try makePixelBuffer(width: 100, height: 100)])
+        XCTAssertEqual(
+            renderer.containerLayer.sublayers?.count,
+            1,
+            "The first new frame must replace, not accumulate with, old SSRC layers")
+    }
+
+    private func makePixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {
+        var buffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            nil,
+            &buffer)
+        XCTAssertEqual(status, kCVReturnSuccess)
+        return try XCTUnwrap(buffer)
     }
 }
 

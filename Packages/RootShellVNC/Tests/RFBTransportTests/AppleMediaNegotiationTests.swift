@@ -4,6 +4,22 @@ import XCTest
 @testable import RFBTransport
 
 final class AppleMediaNegotiationTests: XCTestCase {
+    func testMediaMessageOneAnswerCyclesCreateDistinctGenerations() {
+        var tracker = AppleMediaNegotiationGenerationTracker()
+
+        XCTAssertEqual(
+            tracker.beginMessageOne(),
+            .init(generation: 1, isReconfiguration: false))
+        XCTAssertNil(tracker.beginMessageOne())
+        XCTAssertTrue(tracker.finishMessageTwo())
+        XCTAssertFalse(tracker.finishMessageTwo())
+
+        XCTAssertEqual(
+            tracker.beginMessageOne(),
+            .init(generation: 2, isReconfiguration: true))
+        XCTAssertTrue(tracker.isAwaitingAnswer)
+    }
+
     func testScreenBlobCarriesFreshSessionIdentityAndNamedCapabilities() throws {
         let profile = AppleMediaNegotiationProfile(
             framebufferWidth: 2940,

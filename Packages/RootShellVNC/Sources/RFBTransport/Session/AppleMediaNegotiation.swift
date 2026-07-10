@@ -3,6 +3,36 @@ import Darwin
 import Foundation
 import RFBProtocol
 
+/// Tracks the native AVC message-1/answer lifecycle across in-session media
+/// reconfigurations. ScreenSharing sets its `mediaStreamMessage1Received` bit
+/// on message 1, rejects another while an answer is pending, and clears the bit
+/// when message 2 arrives. A display resize starts another complete cycle.
+struct AppleMediaNegotiationGenerationTracker {
+    struct Transition: Sendable, Equatable {
+        let generation: UInt64
+        let isReconfiguration: Bool
+    }
+
+    private(set) var generation: UInt64 = 0
+    private(set) var isAwaitingAnswer = false
+
+    mutating func beginMessageOne() -> Transition? {
+        guard !isAwaitingAnswer else { return nil }
+        generation &+= 1
+        isAwaitingAnswer = true
+        return Transition(
+            generation: generation,
+            isReconfiguration: generation > 1)
+    }
+
+    @discardableResult
+    mutating func finishMessageTwo() -> Bool {
+        guard isAwaitingAnswer else { return false }
+        isAwaitingAnswer = false
+        return true
+    }
+}
+
 /// Selects the portable Apple screen-video profile.
 ///
 /// A one-tile stream is a conventional HEVC reference timeline accepted by
