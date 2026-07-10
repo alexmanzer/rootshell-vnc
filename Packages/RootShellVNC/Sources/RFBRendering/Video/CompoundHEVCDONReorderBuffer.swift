@@ -45,9 +45,15 @@ struct CompoundHEVCDONReorderBuffer {
         self.maximumGapFrames = maximumGapFrames
     }
 
-    mutating func setExpectedSourceCount(_ count: Int) {
-        guard !started else { return }
-        expectedSourceCount = max(1, count)
+    /// Change the number of interleaved sources at a display-geometry
+    /// boundary. An already-started timeline must collect a fresh complete
+    /// source pass before choosing its next DON; retaining the prior startup
+    /// assumption can otherwise leave it waiting forever for a removed band.
+    mutating func reconfigureExpectedSourceCount(_ count: Int) {
+        let normalized = max(1, count)
+        guard normalized != expectedSourceCount else { return }
+        expectedSourceCount = normalized
+        reset()
     }
 
     mutating func enqueue(_ nals: [RTPDemuxer.DemuxedNAL]) -> Result {

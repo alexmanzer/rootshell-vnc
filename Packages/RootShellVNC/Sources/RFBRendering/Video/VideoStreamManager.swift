@@ -110,7 +110,10 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var usesDecodingOrderNumbers = true
     private var streamID: UInt32 = 0
     private var streamGeneration: UInt64 = 0
+    private var fullFrameWidth = 0
     private var fullFrameHeight = 0
+    private var codedBandHeight = 0
+    private var expectedBandCount = 0
     private var presentationTimeline = HEVCPresentationTimeline()
     private var submittedFrameCount: UInt64 = 0
     private var decoderOutputCount: UInt64 = 0
@@ -209,6 +212,23 @@ public final class VideoStreamManager: @unchecked Sendable {
         self.demuxer = RTPDemuxer()
     }
 
+    struct FrameGeometry: Sendable, Equatable {
+        let width: Int
+        let height: Int
+        let codedBandHeight: Int
+        let expectedBandCount: Int
+    }
+
+    var frameGeometrySnapshot: FrameGeometry {
+        lock.lock()
+        defer { lock.unlock() }
+        return FrameGeometry(
+            width: fullFrameWidth,
+            height: fullFrameHeight,
+            codedBandHeight: codedBandHeight,
+            expectedBandCount: expectedBandCount)
+    }
+
     // MARK: - Stream Lifecycle
 
     public func startStream(
@@ -221,6 +241,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         lock.lock()
         let retiredDecoders = _stopStreamLocked()
         self.streamID = streamID
+        self.fullFrameWidth = width
         self.fullFrameHeight = height
         self.usesDecodingOrderNumbers = usesDecodingOrderNumbers
         self.frameCallback = frameCallback
@@ -244,6 +265,19 @@ public final class VideoStreamManager: @unchecked Sendable {
             frameCallback: frameCallback)
         lock.unlock()
         retireDecoders(retiredDecoders)
+    }
+
+    /// Update geometry in place when RFB announces DesktopSize. Decoder
+    /// reconfiguration remains driven by the stream's next public HEVC
+    /// parameter sets; this method only updates assembly/compositing context.
+    public func updateFrameGeometry(width: Int, height: Int) {
+        guard width > 0, height > 0 else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard width != fullFrameWidth || height != fullFrameHeight else { return }
+        fullFrameWidth = width
+        fullFrameHeight = height
+        updateExpectedBandCountLocked()
     }
 
     @discardableResult
@@ -517,7 +551,10 @@ public final class VideoStreamManager: @unchecked Sendable {
         pendingSPS = nil
         pendingPPS = nil
         decoderFailureLatch.reset()
+        fullFrameWidth = 0
         fullFrameHeight = 0
+        codedBandHeight = 0
+        expectedBandCount = 0
         seenVideoSSRCs.removeAll()
         awaitingIRAP.removeAll()
         lastVideoSeq.removeAll()
@@ -707,13 +744,26 @@ public final class VideoStreamManager: @unchecked Sendable {
         }
         if let codedHeight, codedHeight > 0 {
             lock.lock()
-            let expectedBands = max(
-                1,
-                (fullFrameHeight + Int(codedHeight) - 1) / Int(codedHeight))
-            donReorderBuffer.setExpectedSourceCount(expectedBands)
+            codedBandHeight = Int(codedHeight)
+            updateExpectedBandCountLocked()
             lock.unlock()
         }
         drainEarlyVCLIfReady()
+    }
+
+    private func updateExpectedBandCountLocked() {
+        guard fullFrameHeight > 0, codedBandHeight > 0 else { return }
+        let count = Self.expectedBandCount(
+            fullFrameHeight: fullFrameHeight,
+            codedBandHeight: codedBandHeight)
+        guard count != expectedBandCount else { return }
+        expectedBandCount = count
+        donReorderBuffer.reconfigureExpectedSourceCount(count)
+    }
+
+    static func expectedBandCount(fullFrameHeight: Int, codedBandHeight: Int) -> Int {
+        guard fullFrameHeight > 0, codedBandHeight > 0 else { return 0 }
+        return max(1, (fullFrameHeight + codedBandHeight - 1) / codedBandHeight)
     }
 
     /// Decode, in arrival order, any VCL NAL units that beat their parameter

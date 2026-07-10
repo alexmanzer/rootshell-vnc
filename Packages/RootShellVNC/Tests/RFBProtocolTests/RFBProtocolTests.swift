@@ -1243,6 +1243,58 @@ final class ConnectionStateMachineTests: XCTestCase {
         XCTAssertEqual(actions.count, 2)
     }
 
+    func testDesktopResizeChangesAllSubsequentUpdateRequestBounds() {
+        var sm = ConnectionStateMachine()
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.v3_8))
+        _ = sm.handle(event: .receivedSecurityTypes([.none]))
+        _ = sm.handle(event: .authenticationSucceeded)
+        _ = sm.handle(event: .receivedServerInit(makeTestServerInit()))
+
+        let resize = FramebufferRect(
+            x: 0, y: 0, width: 2560, height: 1440, encoding: .desktopSize)
+        let resizeActions = sm.handle(event: .receivedFramebufferUpdate([resize]))
+        XCTAssertEqual(sm.framebufferWidth, 2560)
+        XCTAssertEqual(sm.framebufferHeight, 1440)
+        guard case .sendFramebufferUpdateRequest(let incremental, let width, let height)
+                = resizeActions.last else {
+            return XCTFail("Expected update request after resize")
+        }
+        XCTAssertTrue(incremental)
+        XCTAssertEqual(width, 2560)
+        XCTAssertEqual(height, 1440)
+
+        let raw = FramebufferRect(x: 0, y: 0, width: 10, height: 10, encoding: .raw)
+        let nextActions = sm.handle(event: .receivedFramebufferUpdate([raw]))
+        guard case .sendFramebufferUpdateRequest(_, let nextWidth, let nextHeight)
+                = nextActions.last else {
+            return XCTFail("Expected subsequent update request")
+        }
+        XCTAssertEqual(nextWidth, 2560)
+        XCTAssertEqual(nextHeight, 1440)
+    }
+
+    func testRejectedExtendedDesktopResizeDoesNotChangeRequestBounds() {
+        var sm = ConnectionStateMachine()
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.v3_8))
+        _ = sm.handle(event: .receivedSecurityTypes([.none]))
+        _ = sm.handle(event: .authenticationSucceeded)
+        _ = sm.handle(event: .receivedServerInit(makeTestServerInit()))
+
+        // ExtendedDesktopSize uses y as the response status; 1 is failure.
+        let rejected = FramebufferRect(
+            x: 1, y: 1, width: 2560, height: 1440, encoding: .extendedDesktopSize)
+        let actions = sm.handle(event: .receivedFramebufferUpdate([rejected]))
+        XCTAssertEqual(sm.framebufferWidth, 1920)
+        XCTAssertEqual(sm.framebufferHeight, 1080)
+        guard case .sendFramebufferUpdateRequest(_, let width, let height) = actions.last else {
+            return XCTFail("Expected update request")
+        }
+        XCTAssertEqual(width, 1920)
+        XCTAssertEqual(height, 1080)
+    }
+
     func testOperationalBell() {
         var sm = ConnectionStateMachine()
         _ = sm.handle(event: .connected)
@@ -1476,6 +1528,41 @@ final class ServerMessageTests: XCTestCase {
 // MARK: - AppleMessages Tests
 
 final class AppleMessagesTests: XCTestCase {
+
+    func testExtendedDesktopSizePayloadConsumesEveryScreenRecord() throws {
+        let payload = Data([
+            0x02, 0x00, 0x00, 0x00,
+            // Screen 7: 1920x1080 at (0, 0), primary flag.
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x00, 0x00, 0x00,
+            0x07, 0x80, 0x04, 0x38,
+            0x00, 0x00, 0x00, 0x01,
+            // Screen 9: 1280x1024 at (1920, 0).
+            0x00, 0x00, 0x00, 0x09,
+            0x07, 0x80, 0x00, 0x00,
+            0x05, 0x00, 0x04, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ])
+
+        XCTAssertEqual(
+            payload.count,
+            ExtendedDesktopSizePayload.wireSize(screenCount: 2))
+        let layout = try ExtendedDesktopSizePayload(data: payload)
+        XCTAssertEqual(layout.screens.count, 2)
+        XCTAssertEqual(
+            layout.screens[0],
+            RFBScreenLayout(
+                id: 7, x: 0, y: 0, width: 1920, height: 1080, flags: 1))
+        XCTAssertEqual(
+            layout.screens[1],
+            RFBScreenLayout(
+                id: 9, x: 1920, y: 0, width: 1280, height: 1024, flags: 0))
+    }
+
+    func testExtendedDesktopSizePayloadRejectsTruncation() {
+        let truncated = Data([0x01, 0, 0, 0, 0, 0, 0])
+        XCTAssertThrowsError(try ExtendedDesktopSizePayload(data: truncated))
+    }
 
     func testAppleEncryptionInfoRoundTrip() throws {
         let info = AppleEncryptionInfo(cipherMode: 0x00000001, keyLength: 128)

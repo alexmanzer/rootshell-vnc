@@ -389,9 +389,13 @@ public final class VNCSession {
                 renderer.applyCopyRect(rect: rect, srcX: srcX, srcY: srcY)
 
             case .desktopSize, .extendedDesktopSize:
-                renderer.handleDesktopResize(width: rect.width, height: rect.height)
-                framebufferWidth = Int(rect.width)
-                framebufferHeight = Int(rect.height)
+                guard rect.isSuccessfulDesktopResize else {
+                    logger.warning(
+                        "Ignoring rejected/invalid desktop resize status=\(rect.y) "
+                            + "size=\(rect.width)x\(rect.height)")
+                    continue
+                }
+                applyDesktopResize(width: rect.width, height: rect.height, renderer: renderer)
 
             case .cursor:
                 // Cursor pseudo-encoding: handled at the rendering layer if needed
@@ -412,6 +416,34 @@ public final class VNCSession {
 
         // Update the displayed image
         currentImage = renderer.snapshot()
+    }
+
+    /// Apply one live geometry transition to every consumer of framebuffer
+    /// dimensions. The media stream remains connected; new SPS/PPS parameter
+    /// sets reconfigure the public VideoToolbox session when they arrive.
+    private func applyDesktopResize(
+        width: UInt16,
+        height: UInt16,
+        renderer: FramebufferRenderer
+    ) {
+        let newWidth = Int(width)
+        let newHeight = Int(height)
+        guard newWidth > 0, newHeight > 0 else { return }
+        guard newWidth != framebufferWidth || newHeight != framebufferHeight else { return }
+
+        logger.info(
+            "Applying desktop resize \(framebufferWidth)x\(framebufferHeight) "
+                + "-> \(newWidth)x\(newHeight)")
+        renderer.handleDesktopResize(width: width, height: height)
+        framebufferWidth = newWidth
+        framebufferHeight = newHeight
+        videoBandRenderer.setScreenSize(width: newWidth, height: newHeight)
+
+        if let manager = videoStreamManager {
+            mediaQueue.async {
+                manager.updateFrameGeometry(width: newWidth, height: newHeight)
+            }
+        }
     }
 
     private func handleError(_ error: VNCProtocolError) {
@@ -458,10 +490,10 @@ public final class VNCSession {
         let manager = videoStreamManager ?? VideoStreamManager()
         videoStreamManager = manager
         videoBandRenderer.reset()
-        videoBandRenderer.setScreenSize(width: framebufferWidth, height: framebufferHeight)
 
         let width = framebufferWidth > 0 ? framebufferWidth : Int(offer.width)
         let height = framebufferHeight > 0 ? framebufferHeight : Int(offer.height)
+        videoBandRenderer.setScreenSize(width: width, height: height)
 
         let renderer = videoBandRenderer
         // Coalesced main-thread delivery. A Task per decoded frame has no FIFO

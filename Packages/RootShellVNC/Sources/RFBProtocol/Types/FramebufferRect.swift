@@ -45,4 +45,21 @@ public struct FramebufferRect: Sendable, Equatable {
     public var pixelCount: Int {
         Int(width) * Int(height)
     }
+
+    /// Whether this rectangle announces a usable framebuffer geometry.
+    ///
+    /// `ExtendedDesktopSize` overloads the rectangle's `y` field with a
+    /// status code when replying to a client-initiated layout request. A
+    /// nonzero status is a rejection, not a resize.
+    public var isSuccessfulDesktopResize: Bool {
+        guard width > 0, height > 0 else { return false }
+        switch encoding {
+        case .desktopSize:
+            return true
+        case .extendedDesktopSize:
+            return y == 0
+        default:
+            return false
+        }
+    }
 }

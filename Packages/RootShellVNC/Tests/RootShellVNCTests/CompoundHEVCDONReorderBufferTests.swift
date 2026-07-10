@@ -79,6 +79,41 @@ final class CompoundHEVCDONReorderBufferTests: XCTestCase {
         XCTAssertEqual(result.orderedAccessUnits.first?.nals, [firstSlice, finalSlice])
     }
 
+    func testSourceCountChangeRestartsStartupCollection() {
+        var reorder = startedBuffer(at: 100)
+        reorder.reconfigureExpectedSourceCount(2)
+
+        XCTAssertTrue(reorder.enqueue([nal(104, ssrc: 0)]).orderedAccessUnits.isEmpty)
+        XCTAssertTrue(reorder.enqueue([nal(105, ssrc: 1)]).orderedAccessUnits.isEmpty)
+        XCTAssertTrue(reorder.enqueue([nal(106, ssrc: 0)]).orderedAccessUnits.isEmpty)
+        let result = reorder.enqueue([nal(107, ssrc: 1)])
+
+        XCTAssertEqual(result.startupOrder, [104, 105, 106, 107])
+        XCTAssertEqual(result.orderedAccessUnits.map(\.don), [104, 105, 106, 107])
+    }
+
+    func testVideoGeometryUpdatesWithoutRestartingStream() {
+        let manager = VideoStreamManager()
+        manager.startStream(streamID: 1, width: 1920, height: 1080) { _, _ in }
+        let generation = manager.decodeProgress.streamGeneration
+
+        manager.updateFrameGeometry(width: 2560, height: 1440)
+
+        XCTAssertEqual(manager.frameGeometrySnapshot.width, 2560)
+        XCTAssertEqual(manager.frameGeometrySnapshot.height, 1440)
+        XCTAssertEqual(manager.decodeProgress.streamGeneration, generation)
+        XCTAssertTrue(manager.isStreamActive)
+        manager.stopStream()
+    }
+
+    func testExpectedBandCountRoundsUpPartialFinalBand() {
+        XCTAssertEqual(
+            VideoStreamManager.expectedBandCount(
+                fullFrameHeight: 1200,
+                codedBandHeight: 512),
+            3)
+    }
+
     private func startedBuffer(at firstDON: UInt16) -> CompoundHEVCDONReorderBuffer {
         var reorder = CompoundHEVCDONReorderBuffer()
         _ = reorder.enqueue([nal(firstDON &+ 2)])

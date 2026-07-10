@@ -613,6 +613,7 @@ public actor TransportSession {
 
         var rectsWithData: [(FramebufferRect, Data)] = []
         rectsWithData.reserveCapacity(Int(rectCount))
+        var pendingResize: FramebufferRect?
 
         for _ in 0..<rectCount {
             let rectData = try await tcp.read(exactly: FramebufferRect.wireSize)
@@ -652,11 +653,21 @@ public actor TransportSession {
                 // 4 bytes: srcX(2) + srcY(2)
                 pixelData = try await tcp.read(exactly: 4)
 
-            case .desktopSize, .extendedDesktopSize:
-                // Desktop resize pseudo-encoding: update our stored dimensions
-                fbWidth = rect.width
-                fbHeight = rect.height
+            case .desktopSize:
                 pixelData = Data()
+
+            case .extendedDesktopSize:
+                // ExtendedDesktopSize is not payload-free: one count byte and
+                // three padding bytes are followed by 16 bytes per screen.
+                // Consume it in full or the next RFB message begins mid-layout.
+                var payload = try await tcp.read(exactly: ExtendedDesktopSizePayload.headerWireSize)
+                let payloadSize = ExtendedDesktopSizePayload.wireSize(screenCount: payload[payload.startIndex])
+                let remaining = payloadSize - ExtendedDesktopSizePayload.headerWireSize
+                if remaining > 0 {
+                    payload.append(try await tcp.read(exactly: remaining))
+                }
+                _ = try ExtendedDesktopSizePayload(data: payload)
+                pixelData = payload
 
             case .encryptionInfo:
                 // Apple encryption pseudo-encoding: read 8 bytes
@@ -727,6 +738,13 @@ public actor TransportSession {
             }
 
             rectsWithData.append((rect, pixelData))
+            if rect.isSuccessfulDesktopResize {
+                pendingResize = rect
+            }
+        }
+
+        if let resize = pendingResize {
+            try await acceptFramebufferResize(width: resize.width, height: resize.height)
         }
 
         continuation?.yield(.framebufferUpdate(rectsWithData))
@@ -973,6 +991,28 @@ public actor TransportSession {
         try await sendAppleEncryptedClientPayload(appleAutoFrameUpdateMessage(intervalMilliseconds: interval))
     }
 
+    /// Commit server-announced geometry before any subsequent update request.
+    /// An active Apple media subscription carries explicit capture bounds, so
+    /// resend that same understood control message with the new dimensions;
+    /// this keeps the existing media session and decoder timeline intact.
+    private func acceptFramebufferResize(width: UInt16, height: UInt16) async throws {
+        guard width > 0, height > 0 else { return }
+        guard width != fbWidth || height != fbHeight else { return }
+
+        let oldWidth = fbWidth
+        let oldHeight = fbHeight
+        fbWidth = width
+        fbHeight = height
+        log.info("Framebuffer resized \(oldWidth)x\(oldHeight) -> \(width)x\(height)")
+
+        guard acceptedAppleMediaStream, sentAppleMediaAutoFrameUpdate else { return }
+        let interval = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_AUTOFRAME_INTERVAL_MS"]
+            .flatMap { Int32($0) } ?? 16
+        try await sendAppleEncryptedClientPayload(
+            appleAutoFrameUpdateMessage(intervalMilliseconds: interval))
+        log.debug("Updated Apple media frame subscription to \(width)x\(height)")
+    }
+
     private func appleAutoFrameUpdateMessage(intervalMilliseconds: Int32) -> Data {
         var data = Data(count: 16)
         data[0] = 0x09
@@ -1206,6 +1246,7 @@ public actor TransportSession {
         var offset = base + 4
         var rectsWithData: [(FramebufferRect, Data)] = []
         rectsWithData.reserveCapacity(rectCount)
+        var pendingResize: FramebufferRect?
 
         for _ in 0..<rectCount {
             guard offset + FramebufferRect.wireSize <= appleDecryptedRFBBuffer.endIndex else { return false }
@@ -1227,7 +1268,14 @@ public actor TransportSession {
                 pixelDataLength = 4 + compressedLength
             case .copyRect:
                 pixelDataLength = 4
-            case .desktopSize, .extendedDesktopSize, .encryptionInfo, .serverDisplayInfo, .mediaStreamOffer, .mediaStreamAnswer:
+            case .desktopSize:
+                pixelDataLength = 0
+            case .extendedDesktopSize:
+                guard offset + ExtendedDesktopSizePayload.headerWireSize
+                        <= appleDecryptedRFBBuffer.endIndex else { return false }
+                pixelDataLength = ExtendedDesktopSizePayload.wireSize(
+                    screenCount: appleDecryptedRFBBuffer[offset])
+            case .encryptionInfo, .serverDisplayInfo, .mediaStreamOffer, .mediaStreamAnswer:
                 pixelDataLength = 0
             case .cursor:
                 let pixelBytes = Int(rect.width) * Int(rect.height) * pixelFormat.bytesPerPixel
@@ -1240,10 +1288,19 @@ public actor TransportSession {
             guard offset + pixelDataLength <= appleDecryptedRFBBuffer.endIndex else { return false }
             let pixelData = Data(appleDecryptedRFBBuffer[offset..<offset + pixelDataLength])
             offset += pixelDataLength
+            if rect.encoding == .extendedDesktopSize {
+                _ = try ExtendedDesktopSizePayload(data: pixelData)
+            }
             rectsWithData.append((rect, pixelData))
+            if rect.isSuccessfulDesktopResize {
+                pendingResize = rect
+            }
         }
 
         appleDecryptedRFBBuffer.removeSubrange(base..<offset)
+        if let resize = pendingResize {
+            try await acceptFramebufferResize(width: resize.width, height: resize.height)
+        }
         continuation?.yield(.framebufferUpdate(rectsWithData))
         return true
     }

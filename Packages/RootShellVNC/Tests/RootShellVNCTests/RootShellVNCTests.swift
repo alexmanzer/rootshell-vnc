@@ -625,6 +625,29 @@ final class VNCConnectionStateTests: XCTestCase {
     }
 }
 
+// MARK: - Video Band Geometry Tests
+
+final class VideoBandGeometryTests: XCTestCase {
+
+    @MainActor
+    func testLiveScreenResizeRecomputesAspectFitContainer() {
+        let renderer = VideoBandLayerRenderer()
+        renderer.setViewBounds(CGRect(x: 0, y: 0, width: 1000, height: 1000))
+        renderer.setScreenSize(width: 1920, height: 1080)
+
+        XCTAssertEqual(renderer.containerLayer.frame.width, 1000, accuracy: 0.001)
+        XCTAssertEqual(renderer.containerLayer.frame.height, 562.5, accuracy: 0.001)
+        XCTAssertEqual(renderer.containerLayer.frame.minY, 218.75, accuracy: 0.001)
+
+        renderer.setScreenSize(width: 1000, height: 1000)
+
+        XCTAssertEqual(renderer.containerLayer.frame.minX, 0, accuracy: 0.001)
+        XCTAssertEqual(renderer.containerLayer.frame.minY, 0, accuracy: 0.001)
+        XCTAssertEqual(renderer.containerLayer.frame.width, 1000, accuracy: 0.001)
+        XCTAssertEqual(renderer.containerLayer.frame.height, 1000, accuracy: 0.001)
+    }
+}
+
 // MARK: - TouchInputHandler Tests
 
 final class TouchInputHandlerTests: XCTestCase {

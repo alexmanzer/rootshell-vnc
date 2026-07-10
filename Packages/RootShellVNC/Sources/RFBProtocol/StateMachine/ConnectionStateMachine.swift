@@ -23,6 +23,11 @@ public struct ConnectionStateMachine: Sendable {
     /// The server's initialization info (set after ServerInit).
     public private(set) var serverInit: ServerInit?
 
+    /// Current framebuffer geometry. Unlike `serverInit`, these values track
+    /// successful DesktopSize changes for all later update requests.
+    public private(set) var framebufferWidth: UInt16 = 0
+    public private(set) var framebufferHeight: UInt16 = 0
+
     /// The preferred pixel format to request from the server.
     public var preferredPixelFormat: PixelFormat
 
@@ -147,6 +152,8 @@ public struct ConnectionStateMachine: Sendable {
 
         case (.waitingForServerInit, .receivedServerInit(let si)):
             serverInit = si
+            framebufferWidth = si.framebufferWidth
+            framebufferHeight = si.framebufferHeight
             state = .operational
 
             return [
@@ -162,12 +169,16 @@ public struct ConnectionStateMachine: Sendable {
         // MARK: operational
 
         case (.operational, .receivedFramebufferUpdate(let rects)):
+            if let resize = rects.last(where: \.isSuccessfulDesktopResize) {
+                framebufferWidth = resize.width
+                framebufferHeight = resize.height
+            }
             var actions: [ConnectionAction] = [.updateFramebuffer(rects)]
-            if let si = serverInit {
+            if framebufferWidth > 0, framebufferHeight > 0 {
                 actions.append(.sendFramebufferUpdateRequest(
                     incremental: true,
-                    width: si.framebufferWidth,
-                    height: si.framebufferHeight
+                    width: framebufferWidth,
+                    height: framebufferHeight
                 ))
             }
             return actions
