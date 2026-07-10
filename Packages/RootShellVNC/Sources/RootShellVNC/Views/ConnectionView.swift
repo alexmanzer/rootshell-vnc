@@ -40,6 +40,7 @@ public struct ConnectionView: View {
             Form {
                 serverSection
                 authenticationSection
+                qualitySection
                 statusSection
                 connectSection
             }
@@ -126,6 +127,21 @@ public struct ConnectionView: View {
                 SecureField("required", text: $password)
                     .textContentType(.password)
             }
+        }
+    }
+
+    private var qualitySection: some View {
+        Section("Display Quality") {
+            Picker("Quality", selection: $session.configuration.videoQualityMode) {
+                ForEach(VNCConfiguration.VideoQualityMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Text(session.configuration.videoQualityMode.explanation)
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

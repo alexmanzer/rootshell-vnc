@@ -9,13 +9,31 @@ public struct VNCConfiguration: Sendable {
 
     /// High-performance video quality profile, mirroring the native client's
     /// Quality setting.
-    public enum VideoQualityMode: Sendable, Equatable {
+    public enum VideoQualityMode: String, Sendable, Equatable, CaseIterable, Identifiable {
         /// "Adapt quality to network conditions" — the server may lower bitrate
         /// and drop resolution/quality on static regions under pressure.
         case adaptive
         /// "Show the screen at full quality" — mirrors Screen Sharing mode 4
         /// by using lossless Zlib/ZRLE instead of lossy AVConference video.
         case fullQuality
+
+        public var id: Self { self }
+
+        public var title: String {
+            switch self {
+            case .adaptive: "Adaptive"
+            case .fullQuality: "Full Quality"
+            }
+        }
+
+        public var explanation: String {
+            switch self {
+            case .adaptive:
+                "Hardware-accelerated video that adapts to network conditions."
+            case .fullQuality:
+                "Lossless framebuffer updates with higher bandwidth and CPU use."
+            }
+        }
     }
 
     /// Which high-performance video quality profile to offer the server.

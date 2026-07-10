@@ -127,7 +127,8 @@ public struct TouchInputHandler {
     public func handleScroll(x: UInt16, y: UInt16, deltaY: CGFloat) {
         // VNC uses button 4 (bit 3) for scroll up and button 5 (bit 4) for scroll down.
         // Each click of the wheel is a separate press+release pair.
-        let steps = max(1, Int(abs(deltaY) / 10))
+        guard deltaY != 0 else { return }
+        let steps = min(20, max(1, Int(abs(deltaY) / 10)))
         let button: UInt8 = deltaY < 0 ? Self.scrollUp : Self.scrollDown
 
         for _ in 0..<steps {

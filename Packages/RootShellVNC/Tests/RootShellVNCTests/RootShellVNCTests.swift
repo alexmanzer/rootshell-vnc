@@ -143,6 +143,14 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(effective.contains(.zrle))
     }
 
+    func testQualityModesExposeGUILabels() {
+        XCTAssertEqual(
+            VNCConfiguration.VideoQualityMode.allCases,
+            [.adaptive, .fullQuality])
+        XCTAssertEqual(VNCConfiguration.VideoQualityMode.adaptive.title, "Adaptive")
+        XCTAssertEqual(VNCConfiguration.VideoQualityMode.fullQuality.title, "Full Quality")
+    }
+
     func testEffectiveEncodingsAlwaysIncludesRaw() {
         let config = VNCConfiguration(preferredEncodings: [.zrle, .tight])
         let effective = config.effectiveEncodings
@@ -185,6 +193,24 @@ final class KeyboardInputHandlerTests: XCTestCase {
         XCTAssertEqual(KeyboardInputHandler.keysymPageUp, 0xFF55)
         XCTAssertEqual(KeyboardInputHandler.keysymPageDown, 0xFF56)
         XCTAssertEqual(KeyboardInputHandler.keysymInsert, 0xFF63)
+    }
+
+    func testHardwareKeyboardHIDMapping() {
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x28, characters: "\r"),
+            KeyboardInputHandler.keysymReturn)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x50, characters: ""),
+            KeyboardInputHandler.keysymLeft)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x3A, characters: ""),
+            KeyboardInputHandler.keysymF1)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0xE3, characters: ""),
+            KeyboardInputHandler.keysymSuperL)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x04, characters: "A"),
+            0x41)
     }
 
     func testFunctionKeyConstants() {

@@ -1,293 +1,280 @@
 import SwiftUI
 import RFBProtocol
 
-/// SwiftUI view that displays the remote VNC desktop and handles user input.
-///
-/// This view renders the VNC framebuffer image and translates touch/mouse
-/// gestures into RFB pointer events sent to the remote server.
-///
-/// Usage:
-/// ```swift
-/// RemoteDesktopView(session: vncSession)
-/// ```
+/// Displays the remote desktop and provides one input/viewport layer for both
+/// Adaptive video and Full Quality framebuffer rendering.
 public struct RemoteDesktopView: View {
-
-    // MARK: - Properties
-
     @Bindable var session: VNCSession
 
-    @State private var scale: CGFloat = 1.0
-    @State private var offset: CGSize = .zero
-    @State private var lastDragPosition: CGSize = .zero
-    @State private var isPanning: Bool = false
+    @State private var viewport = RemoteViewportState()
+    @State private var keyboardActive = false
+
+    #if !canImport(UIKit)
+    @State private var lastFallbackMagnification: CGFloat = 1
+    @State private var fallbackDragRemotePoint: CGPoint?
+    #endif
 
     private let touchHandler: TouchInputHandler
     private let keyboardHandler: KeyboardInputHandler
 
-    // MARK: - Init
-
-    /// Create a remote desktop view bound to the given VNC session.
-    ///
-    /// - Parameter session: The active VNC session providing framebuffer images
-    ///   and accepting input events.
     public init(session: VNCSession) {
         self.session = session
         self.touchHandler = TouchInputHandler(
             sendPointerEvent: { [session] buttonMask, x, y in
                 session.sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
-            }
-        )
+            })
         self.keyboardHandler = KeyboardInputHandler(
             sendKeyEvent: { [session] downFlag, key in
                 session.sendKeyEvent(downFlag: downFlag, key: key)
-            }
-        )
+            })
     }
-
-    // MARK: - Body
 
     public var body: some View {
         GeometryReader { geometry in
+            let framebufferSize = CGSize(
+                width: CGFloat(session.framebufferWidth),
+                height: CGFloat(session.framebufferHeight))
+
             ZStack {
                 Color.black
                     .ignoresSafeArea()
 
-                if session.isHighPerformanceMode {
-                    #if canImport(UIKit)
-                    // Zero-copy GPU rendering of the decoded HEVC screen bands.
-                    VideoBandView(renderer: session.videoBandRenderer)
-                        .frame(width: geometry.size.width, height: geometry.size.height)
-                    #else
-                    placeholderView
-                    #endif
-                } else if let image = session.currentImage {
-                    framebufferImageView(image: image, in: geometry)
-                } else {
-                    placeholderView
+                desktopContent(in: geometry.size)
+                    .scaleEffect(viewport.scale)
+                    .offset(viewport.offset)
+
+                if session.connectionState.isConnected,
+                   framebufferSize.width > 0,
+                   framebufferSize.height > 0 {
+                    interactionLayer(
+                        viewSize: geometry.size,
+                        framebufferSize: framebufferSize)
                 }
+
+                viewportControls
             }
             .clipped()
+            .onChange(of: geometry.size) { _, newSize in
+                viewport.clampOffset(
+                    viewSize: newSize,
+                    framebufferSize: framebufferSize)
+            }
+            .onChange(of: framebufferSize) { _, newSize in
+                viewport.clampOffset(
+                    viewSize: geometry.size,
+                    framebufferSize: newSize)
+            }
         }
         #if os(iOS)
         .statusBarHidden()
         #endif
     }
 
-    // MARK: - Subviews
+    @ViewBuilder
+    private func desktopContent(in viewSize: CGSize) -> some View {
+        if session.isHighPerformanceMode {
+            #if canImport(UIKit)
+            VideoBandView(renderer: session.videoBandRenderer)
+                .frame(width: viewSize.width, height: viewSize.height)
+            #else
+            placeholderView
+                .frame(width: viewSize.width, height: viewSize.height)
+            #endif
+        } else if let image = session.currentImage {
+            Image(decorative: image, scale: 1)
+                .interpolation(.high)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: viewSize.width, height: viewSize.height)
+        } else {
+            placeholderView
+                .frame(width: viewSize.width, height: viewSize.height)
+        }
+    }
 
     @ViewBuilder
-    private func framebufferImageView(image: CGImage, in geometry: GeometryProxy) -> some View {
-        let fbSize = CGSize(
-            width: CGFloat(session.framebufferWidth),
-            height: CGFloat(session.framebufferHeight)
-        )
-        let viewSize = geometry.size
-        let fitScale = fitScale(framebufferSize: fbSize, viewSize: viewSize)
-
-        // Use SwiftUI's resizable + fit to fill the available space,
-        // then apply user zoom on top
-        Image(decorative: image, scale: 1.0)
-            .interpolation(.medium)
-            .resizable()
-            .aspectRatio(contentMode: .fit)
-            .scaleEffect(scale)
-            .offset(offset)
+    private func interactionLayer(
+        viewSize: CGSize,
+        framebufferSize: CGSize
+    ) -> some View {
+        #if canImport(UIKit)
+        RemoteInteractionView(
+            viewport: $viewport,
+            keyboardActive: $keyboardActive,
+            framebufferSize: framebufferSize,
+            touchHandler: touchHandler,
+            keyboardHandler: keyboardHandler)
             .frame(width: viewSize.width, height: viewSize.height)
-            .gesture(
-                tapGesture(viewSize: viewSize, fbSize: fbSize, fitScale: fitScale)
-            )
-            .gesture(
-                dragGesture(viewSize: viewSize, fbSize: fbSize, fitScale: fitScale)
-            )
-            .gesture(
-                magnificationGesture()
-            )
-            #if os(macOS)
-            .simultaneousGesture(
-                scrollGesture(viewSize: viewSize, fbSize: fbSize, fitScale: fitScale)
-            )
-            #endif
+            .contentShape(Rectangle())
+        #else
+        Color.clear
+            .contentShape(Rectangle())
+            .gesture(fallbackTapGesture(
+                viewSize: viewSize,
+                framebufferSize: framebufferSize))
+            .simultaneousGesture(fallbackDragGesture(
+                viewSize: viewSize,
+                framebufferSize: framebufferSize))
+            .simultaneousGesture(fallbackMagnificationGesture(
+                viewSize: viewSize,
+                framebufferSize: framebufferSize))
+        #endif
+    }
+
+    @ViewBuilder
+    private var viewportControls: some View {
+        VStack {
+            Spacer()
+            HStack(spacing: 10) {
+                Spacer()
+                if !viewport.isIdentity {
+                    controlButton(
+                        title: "Fit Screen",
+                        systemImage: "arrow.down.right.and.arrow.up.left") {
+                            viewport.reset()
+                        }
+                }
+                #if canImport(UIKit)
+                controlButton(
+                    title: keyboardActive ? "Hide Keyboard" : "Show Keyboard",
+                    systemImage: keyboardActive ? "keyboard.chevron.compact.down" : "keyboard") {
+                        keyboardActive.toggle()
+                    }
+                #endif
+            }
+            .padding(12)
+        }
+        .allowsHitTesting(true)
+    }
+
+    private func controlButton(
+        title: String,
+        systemImage: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.body.weight(.semibold))
+                .frame(width: 38, height: 38)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .accessibilityLabel(title)
     }
 
     private var placeholderView: some View {
         VStack(spacing: 16) {
             switch session.connectionState {
             case .connecting:
-                ProgressView()
-                    .controlSize(.large)
-                Text("Connecting...")
-                    .foregroundStyle(.secondary)
-
+                ProgressView().controlSize(.large)
+                Text("Connecting...").foregroundStyle(.secondary)
             case .connected:
-                ProgressView()
-                    .controlSize(.large)
-                Text("Waiting for framebuffer...")
-                    .foregroundStyle(.secondary)
-
+                ProgressView().controlSize(.large)
+                Text("Waiting for framebuffer...").foregroundStyle(.secondary)
             case .failed(let reason):
                 Image(systemName: "exclamationmark.triangle")
                     .font(.largeTitle)
                     .foregroundStyle(.red)
-                Text("Connection Failed")
-                    .font(.headline)
+                Text("Connection Failed").font(.headline)
                 Text(reason)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
-
             case .disconnected:
                 Image(systemName: "rectangle.slash")
                     .font(.largeTitle)
                     .foregroundStyle(.secondary)
-                Text("Disconnected")
-                    .foregroundStyle(.secondary)
-
+                Text("Disconnected").foregroundStyle(.secondary)
             case .idle, .disconnecting:
                 Image(systemName: "desktopcomputer")
                     .font(.largeTitle)
                     .foregroundStyle(.secondary)
-                Text("No Active Connection")
-                    .foregroundStyle(.secondary)
+                Text("No Active Connection").foregroundStyle(.secondary)
             }
         }
     }
 
-    // MARK: - Gestures
-
-    private func tapGesture(
+    #if !canImport(UIKit)
+    private func fallbackTapGesture(
         viewSize: CGSize,
-        fbSize: CGSize,
-        fitScale: CGFloat
+        framebufferSize: CGSize
     ) -> some Gesture {
         SpatialTapGesture()
             .onEnded { value in
-                let fbPoint = viewToFramebuffer(
-                    viewPoint: value.location,
+                guard let point = remotePoint(
+                    value.location,
                     viewSize: viewSize,
-                    fbSize: fbSize,
-                    fitScale: fitScale
-                )
-                guard let point = fbPoint else { return }
-                touchHandler.handleTap(x: UInt16(point.x), y: UInt16(point.y))
+                    framebufferSize: framebufferSize) else { return }
+                touchHandler.handleTap(x: point.x, y: point.y)
             }
     }
 
-    private func dragGesture(
+    private func fallbackDragGesture(
         viewSize: CGSize,
-        fbSize: CGSize,
-        fitScale: CGFloat
+        framebufferSize: CGSize
     ) -> some Gesture {
-        DragGesture(minimumDistance: 1)
+        DragGesture(minimumDistance: 2)
             .onChanged { value in
-                if isPanning {
-                    // Two-finger pan: move the viewport
-                    let delta = CGSize(
-                        width: value.translation.width - lastDragPosition.width,
-                        height: value.translation.height - lastDragPosition.height
-                    )
-                    offset = CGSize(
-                        width: offset.width + delta.width,
-                        height: offset.height + delta.height
-                    )
-                    lastDragPosition = value.translation
-                } else {
-                    // Single-finger drag: move the pointer
-                    let fbPoint = viewToFramebuffer(
-                        viewPoint: value.location,
-                        viewSize: viewSize,
-                        fbSize: fbSize,
-                        fitScale: fitScale
-                    )
-                    guard let point = fbPoint else { return }
-                    touchHandler.handleMove(x: UInt16(point.x), y: UInt16(point.y))
-                }
+                guard let point = remotePoint(
+                    value.location,
+                    viewSize: viewSize,
+                    framebufferSize: framebufferSize) else { return }
+                fallbackDragRemotePoint = CGPoint(x: CGFloat(point.x), y: CGFloat(point.y))
+                touchHandler.handleDrag(x: point.x, y: point.y)
             }
-            .onEnded { _ in
-                lastDragPosition = .zero
+            .onEnded { value in
+                let mapped = remotePoint(
+                    value.location,
+                    viewSize: viewSize,
+                    framebufferSize: framebufferSize)
+                let finalPoint = mapped ?? fallbackDragRemotePoint.map({
+                    (x: UInt16($0.x), y: UInt16($0.y))
+                })
+                fallbackDragRemotePoint = nil
+                guard let finalPoint else { return }
+                touchHandler.handleDragEnd(x: finalPoint.x, y: finalPoint.y)
             }
     }
 
-    private func magnificationGesture() -> some Gesture {
+    private func fallbackMagnificationGesture(
+        viewSize: CGSize,
+        framebufferSize: CGSize
+    ) -> some Gesture {
         MagnifyGesture()
             .onChanged { value in
-                let newScale = max(0.5, min(5.0, value.magnification))
-                scale = newScale
-            }
-    }
-
-    #if os(macOS)
-    private func scrollGesture(
-        viewSize: CGSize,
-        fbSize: CGSize,
-        fitScale: CGFloat
-    ) -> some Gesture {
-        DragGesture(minimumDistance: 0)
-            .modifiers(.option)
-            .onChanged { value in
-                let fbPoint = viewToFramebuffer(
-                    viewPoint: value.location,
+                let incremental = value.magnification / lastFallbackMagnification
+                viewport.zoom(
+                    by: incremental,
+                    around: value.startAnchor.point(in: viewSize),
                     viewSize: viewSize,
-                    fbSize: fbSize,
-                    fitScale: fitScale
-                )
-                guard let point = fbPoint else { return }
-                let deltaY = value.translation.height - lastDragPosition.height
-                lastDragPosition = CGSize(width: 0, height: value.translation.height)
-                touchHandler.handleScroll(
-                    x: UInt16(point.x),
-                    y: UInt16(point.y),
-                    deltaY: deltaY
-                )
+                    framebufferSize: framebufferSize)
+                lastFallbackMagnification = value.magnification
             }
             .onEnded { _ in
-                lastDragPosition = .zero
+                lastFallbackMagnification = 1
             }
     }
-    #endif
 
-    // MARK: - Coordinate Conversion
-
-    /// Convert a point in view coordinates to framebuffer coordinates.
-    ///
-    /// Returns `nil` if the point is outside the framebuffer area.
-    private func viewToFramebuffer(
-        viewPoint: CGPoint,
+    private func remotePoint(
+        _ point: CGPoint,
         viewSize: CGSize,
-        fbSize: CGSize,
-        fitScale: CGFloat
-    ) -> CGPoint? {
-        let effectiveScale = fitScale * scale
-
-        // Calculate the displayed image size and position
-        let displayedWidth = fbSize.width * effectiveScale
-        let displayedHeight = fbSize.height * effectiveScale
-        let imageOriginX = (viewSize.width - displayedWidth) / 2 + offset.width
-        let imageOriginY = (viewSize.height - displayedHeight) / 2 + offset.height
-
-        // Convert view point to image-relative coordinates
-        let relativeX = viewPoint.x - imageOriginX
-        let relativeY = viewPoint.y - imageOriginY
-
-        // Convert to framebuffer coordinates
-        let fbX = relativeX / effectiveScale
-        let fbY = relativeY / effectiveScale
-
-        // Clamp to framebuffer bounds
-        guard fbX >= 0, fbX < fbSize.width,
-              fbY >= 0, fbY < fbSize.height else {
-            return nil
-        }
-
-        return CGPoint(x: fbX, y: fbY)
+        framebufferSize: CGSize
+    ) -> (x: UInt16, y: UInt16)? {
+        guard let mapped = viewport.framebufferPoint(
+            for: point,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize) else { return nil }
+        return (UInt16(mapped.x), UInt16(mapped.y))
     }
+    #endif
+}
 
-    /// Calculate the scale factor to fit the framebuffer in the view
-    /// while maintaining aspect ratio.
-    private func fitScale(framebufferSize: CGSize, viewSize: CGSize) -> CGFloat {
-        guard framebufferSize.width > 0, framebufferSize.height > 0 else { return 1.0 }
-        let scaleX = viewSize.width / framebufferSize.width
-        let scaleY = viewSize.height / framebufferSize.height
-        return min(scaleX, scaleY)
+#if !canImport(UIKit)
+private extension UnitPoint {
+    func point(in size: CGSize) -> CGPoint {
+        CGPoint(x: x * size.width, y: y * size.height)
     }
 }
+#endif

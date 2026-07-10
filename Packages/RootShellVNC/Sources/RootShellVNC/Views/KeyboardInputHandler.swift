@@ -63,10 +63,12 @@ public struct KeyboardInputHandler {
     public nonisolated static let keysymControlL:   UInt32 = 0xFFE3
     public nonisolated static let keysymControlR:   UInt32 = 0xFFE4
     public nonisolated static let keysymCapsLock:   UInt32 = 0xFFE5
-    public nonisolated static let keysymMetaL:      UInt32 = 0xFFE7   // Command/Super
+    public nonisolated static let keysymMetaL:      UInt32 = 0xFFE7
     public nonisolated static let keysymMetaR:      UInt32 = 0xFFE8
     public nonisolated static let keysymAltL:       UInt32 = 0xFFE9   // Option/Alt
     public nonisolated static let keysymAltR:       UInt32 = 0xFFEA
+    public nonisolated static let keysymSuperL:     UInt32 = 0xFFEB   // Command
+    public nonisolated static let keysymSuperR:     UInt32 = 0xFFEC
 
     // MARK: - Properties
 
@@ -113,6 +115,14 @@ public struct KeyboardInputHandler {
         let keysym = Self.keysymForCharacter(character)
         sendKeyEvent(true, keysym)
         sendKeyEvent(false, keysym)
+    }
+
+    /// Send an already-converted X11 keysym. Platform responder adapters use
+    /// this for hardware-keyboard HID events so key-down and key-up remain
+    /// distinct.
+    public func handleKeysym(downFlag: Bool, keysym: UInt32) {
+        guard keysym != 0 else { return }
+        sendKeyEvent(downFlag, keysym)
     }
 
     // MARK: - Keysym Conversion
@@ -194,5 +204,43 @@ public struct KeyboardInputHandler {
     public nonisolated static func keysymForFunctionKey(_ number: Int) -> UInt32 {
         guard number >= 1 && number <= 12 else { return 0 }
         return keysymF1 + UInt32(number - 1)
+    }
+
+    /// Convert a USB keyboard HID usage and its printable characters to an X11
+    /// keysym. UIKit exposes hardware-keyboard events in this form on iPhone,
+    /// iPad, and Mac Catalyst.
+    public nonisolated static func keysymForHIDUsage(
+        _ usage: UInt32,
+        characters: String
+    ) -> UInt32 {
+        switch usage {
+        case 0x28: return keysymReturn
+        case 0x29: return keysymEscape
+        case 0x2A: return keysymBackspace
+        case 0x2B: return keysymTab
+        case 0x39: return keysymCapsLock
+        case 0x3A...0x45: return keysymF1 + usage - 0x3A
+        case 0x49: return keysymInsert
+        case 0x4A: return keysymHome
+        case 0x4B: return keysymPageUp
+        case 0x4C: return keysymDelete
+        case 0x4D: return keysymEnd
+        case 0x4E: return keysymPageDown
+        case 0x4F: return keysymRight
+        case 0x50: return keysymLeft
+        case 0x51: return keysymDown
+        case 0x52: return keysymUp
+        case 0xE0: return keysymControlL
+        case 0xE1: return keysymShiftL
+        case 0xE2: return keysymAltL
+        case 0xE3: return keysymSuperL
+        case 0xE4: return keysymControlR
+        case 0xE5: return keysymShiftR
+        case 0xE6: return keysymAltR
+        case 0xE7: return keysymSuperR
+        default:
+            guard let character = characters.first else { return 0 }
+            return keysymForCharacter(character)
+        }
     }
 }

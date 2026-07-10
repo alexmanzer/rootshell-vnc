@@ -62,6 +62,13 @@ public final class VNCSession {
     private var videoStreamManager: VideoStreamManager?
     private var eventTask: Task<Void, Never>?
     private var frameRequestTask: Task<Void, Never>?
+    /// Tail of the ordered input chain. Gesture callbacks are synchronous, but
+    /// transport writes are async; unrelated Tasks could otherwise allow a
+    /// release event to overtake its press under load.
+    @ObservationIgnored
+    private var inputTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var inputGeneration: UInt64 = 0
     private let diagnostics = ConnectionDiagnostics()
     private let logger = VNCLogger(category: "Session")
     /// GPU renderer for the high-performance HEVC screen bands. The
@@ -108,8 +115,13 @@ public final class VNCSession {
             throw VNCError.alreadyConnected
         }
 
+        invalidateInputQueue()
         connectionState = .connecting
         lastError = nil
+        currentImage = nil
+        isHighPerformanceMode = false
+        diagnostics.isHighPerformanceMode = false
+        videoBandRenderer.reset()
         diagnostics.reset()
         diagnostics.connectionStartTime = Date()
 
@@ -169,6 +181,7 @@ public final class VNCSession {
         // Cancel background tasks
         eventTask?.cancel()
         eventTask = nil
+        invalidateInputQueue()
 
         // Close the transport
         if let transport = transportSession {
@@ -181,6 +194,9 @@ public final class VNCSession {
         // Clear rendering state
         framebuffer = nil
         renderer = nil
+        currentImage = nil
+        isHighPerformanceMode = false
+        videoBandRenderer.reset()
         videoStreamManager?.stopStream()
         videoStreamManager = nil
 
@@ -195,7 +211,7 @@ public final class VNCSession {
     ///   - downFlag: `true` for key press, `false` for key release.
     ///   - key: The X11 keysym value for the key.
     public func sendKeyEvent(downFlag: Bool, key: UInt32) {
-        guard connectionState.isConnected, let transport = transportSession else { return }
+        guard connectionState.isConnected, transportSession != nil else { return }
 
         if isTraceEnabled {
             diagnostics.protocolTrace.recordSent(
@@ -205,9 +221,7 @@ public final class VNCSession {
             )
         }
 
-        Task {
-            try? await transport.sendKeyEvent(downFlag: downFlag, key: key)
-        }
+        enqueueInput(.key(downFlag: downFlag, keysym: key))
     }
 
     /// Send a pointer (mouse/touch) event to the VNC server.
@@ -218,7 +232,7 @@ public final class VNCSession {
     ///   - x: The X coordinate in framebuffer pixels.
     ///   - y: The Y coordinate in framebuffer pixels.
     public func sendPointerEvent(buttonMask: UInt8, x: UInt16, y: UInt16) {
-        guard connectionState.isConnected, let transport = transportSession else { return }
+        guard connectionState.isConnected, transportSession != nil else { return }
 
         if isTraceEnabled {
             diagnostics.protocolTrace.recordSent(
@@ -228,16 +242,14 @@ public final class VNCSession {
             )
         }
 
-        Task {
-            try? await transport.sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
-        }
+        enqueueInput(.pointer(buttonMask: buttonMask, x: x, y: y))
     }
 
     /// Send clipboard text to the VNC server.
     ///
     /// - Parameter text: The text to place on the server's clipboard.
     public func sendClipboardText(_ text: String) {
-        guard connectionState.isConnected, let transport = transportSession else { return }
+        guard connectionState.isConnected, transportSession != nil else { return }
 
         if isTraceEnabled {
             diagnostics.protocolTrace.recordSent(
@@ -247,9 +259,7 @@ public final class VNCSession {
             )
         }
 
-        Task {
-            try? await transport.sendClipboardText(text)
-        }
+        enqueueInput(.clipboard(text))
     }
 
     // MARK: - Diagnostics
@@ -496,6 +506,7 @@ public final class VNCSession {
     private func handleDisconnected() {
         logger.info("Disconnected")
 
+        invalidateInputQueue()
         transportSession = nil
         videoStreamManager?.stopStream()
         videoStreamManager = nil
@@ -512,7 +523,53 @@ public final class VNCSession {
     private func cleanupTransport() {
         eventTask?.cancel()
         eventTask = nil
+        invalidateInputQueue()
         transportSession = nil
+    }
+
+    private enum QueuedInput: Sendable {
+        case key(downFlag: Bool, keysym: UInt32)
+        case pointer(buttonMask: UInt8, x: UInt16, y: UInt16)
+        case clipboard(String)
+    }
+
+    /// Append an event to one shared chain so key, pointer, and clipboard
+    /// messages reach the RFB actor in exactly the order the UI produced them.
+    private func enqueueInput(_ event: QueuedInput) {
+        guard connectionState.isConnected,
+              let transport = transportSession else { return }
+
+        let previous = inputTask
+        let generation = inputGeneration
+        inputTask = Task { [weak self, weak transport] in
+            await previous?.value
+            guard !Task.isCancelled,
+                  let self,
+                  let transport,
+                  self.inputGeneration == generation,
+                  self.transportSession === transport,
+                  self.connectionState.isConnected else { return }
+
+            switch event {
+            case .key(let downFlag, let keysym):
+                try? await transport.sendKeyEvent(
+                    downFlag: downFlag,
+                    key: keysym)
+            case .pointer(let buttonMask, let x, let y):
+                try? await transport.sendPointerEvent(
+                    buttonMask: buttonMask,
+                    x: x,
+                    y: y)
+            case .clipboard(let text):
+                try? await transport.sendClipboardText(text)
+            }
+        }
+    }
+
+    private func invalidateInputQueue() {
+        inputGeneration &+= 1
+        inputTask?.cancel()
+        inputTask = nil
     }
 
     private var isTraceEnabled: Bool {
