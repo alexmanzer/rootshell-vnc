@@ -2,8 +2,9 @@ import XCTest
 import Foundation
 @testable import RFBRendering
 
-/// Replays a real decrypted-RTP capture and verifies that the interleaved band
-/// SSRCs produce output through independent public tile decoders.
+/// Replays a real decrypted-RTP capture through the experimental interleaved
+/// tile path. This is a transport/reordering regression test; public per-SSRC
+/// decoders do not reproduce Apple's private reference-picture remapping.
 ///
 ///   ROOTSHELL_VNC_DECODED_RTP=/tmp/vnccap/local_rtp.bin \
 ///   swift test --filter ReorderRecoveryTests

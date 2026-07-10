@@ -30,9 +30,10 @@ final class AppleMediaNegotiationTests: XCTestCase {
         let screen = try XCTUnwrap(root.message(5))
         XCTAssertEqual(screen.varint(1), 0xa1b2_c3d4)
         XCTAssertEqual(screen.varint(2), 0)
-        // Public per-tile VideoToolbox sessions reproduce the reference-state
-        // isolation performed by AVConference's private tiled decoder.
-        XCTAssertEqual(screen.varint(6), 4)
+        // Public VideoToolbox consumes the conventional one-image reference
+        // timeline. Apple's tiled decoder contract is private and is not
+        // advertised by default.
+        XCTAssertEqual(screen.varint(6), 1)
         XCTAssertEqual(screen.varint(7), 1)
         XCTAssertEqual(screen.varint(8), 63)
         XCTAssertEqual(screen.varint(9), 1)

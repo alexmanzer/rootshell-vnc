@@ -3,6 +3,26 @@ import Darwin
 import Foundation
 import RFBProtocol
 
+/// Selects the portable Apple screen-video profile.
+///
+/// A one-tile stream is a conventional HEVC reference timeline accepted by
+/// public VideoToolbox on macOS, iOS, and iPadOS. Apple's four-tile stream
+/// requires subframe reference-picture remapping performed by its private VCP
+/// decoder. Keep that mode opt-in until the same semantics are reproduced with
+/// public APIs; advertising it without those semantics decodes one picture and
+/// then stalls on missing references.
+public enum AppleMediaVideoMode {
+    public static var usesExperimentalTiledHEVC: Bool {
+        ProcessInfo.processInfo.environment[
+            "ROOTSHELL_VNC_EXPERIMENTAL_TILED_HEVC"
+        ] == "1"
+    }
+
+    public static var negotiatedTilesPerFrame: UInt64 {
+        usesExperimentalTiledHEVC ? 4 : 1
+    }
+}
+
 /// Portable encoder for the Viceroy v1 media-negotiation message used by
 /// Apple's RFB media-stream extension.
 ///
@@ -12,12 +32,11 @@ import RFBProtocol
 /// from advertising the wrong client, reusing an SSRC and creation time can be
 /// interpreted as a colliding or stale media session.
 struct AppleMediaNegotiationProfile: Sendable {
-    /// Apple multiplexes four independently referenced horizontal HEVC tiles
-    /// through one private VideoProcessing decoder by attaching TileID and
-    /// TileOrder to each sample. The portable equivalent is four ordinary,
-    /// public VideoToolbox sessions (one per RTP tile) followed by GPU band
-    /// composition. Viceroy negotiates the minimum of the peers' values.
-    static let publicDecoderTilesPerFrame: UInt64 = 4
+    /// Viceroy negotiates the minimum of the peers' values. The portable
+    /// default is one; four remains available for bounded diagnostics only.
+    static var publicDecoderTilesPerFrame: UInt64 {
+        AppleMediaVideoMode.negotiatedTilesPerFrame
+    }
 
     enum MediaKind: Sendable {
         case audio

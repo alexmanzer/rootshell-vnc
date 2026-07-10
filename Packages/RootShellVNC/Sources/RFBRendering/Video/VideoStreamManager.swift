@@ -42,37 +42,29 @@ public struct VideoStreamFeedResult: Sendable, Equatable {
     }
 }
 
-/// Generates synthetic monotonic PTS values. Conventional video has one
-/// timeline; Apple's screen tiles have independent reference timelines, so a
-/// quiet tile must not consume or block another tile's presentation sequence.
+/// Generates synthetic monotonic PTS values for the single HEVC decode order.
+/// Apple's tiled transport interleaves its bands on this same DON timeline;
+/// the SSRC identifies the output band, not a separate presentation timeline.
 struct HEVCPresentationTimeline {
     private var sequentialCounter: Int64 = 0
-    private var tileCounters: [UInt32: Int64] = [:]
 
-    mutating func next(source: UInt32, independentTiles: Bool) -> CMTimeValue {
-        if independentTiles {
-            let counter = tileCounters[source, default: 0]
-            tileCounters[source] = counter + 1
-            return CMTimeValue(counter * 3000)
-        }
+    mutating func next() -> CMTimeValue {
         defer { sequentialCounter += 1 }
         return CMTimeValue(sequentialCounter * 3000)
     }
 
     mutating func reset() {
         sequentialCounter = 0
-        tileCounters.removeAll(keepingCapacity: false)
     }
 }
 
 /// Manages the accelerated HEVC video stream for high-performance VNC mode.
 ///
-/// Supports both Apple HEVC RTP modes. The native multi-tile mode round-robins
-/// a DON timeline across several SSRCs; each SSRC is an independently
-/// referenced horizontal tile and therefore owns a public VideoToolbox
-/// session. The one-tile mode is a normal sequential RTP stream without DONL
-/// metadata and uses one session. This mirrors the state isolation performed
-/// by Apple's private `NumberOfTiles`/`TileID` decoder path without calling it.
+/// Supports the portable one-tile Apple HEVC RTP mode and an opt-in diagnostic
+/// implementation of the native multi-tile transport. The latter round-robins
+/// a DON timeline across several SSRCs, but those sources are not independent
+/// public-VideoToolbox reference chains: Apple's private decoder remaps them
+/// with `NumberOfTiles`, `TileID`, and `TileOrder` metadata.
 public final class VideoStreamManager: @unchecked Sendable {
 
     /// Delivers a decoded frame and the source SSRC (which screen band it is).
@@ -80,7 +72,6 @@ public final class VideoStreamManager: @unchecked Sendable {
 
     private let lock = NSLock()
     private var decoder: HEVCDecoder?
-    private var tileDecoders: [UInt32: HEVCDecoder] = [:]
     private var demuxer: RTPDemuxer
     private var frameCallback: FrameCallback?
     private var _isActive: Bool = false
@@ -219,16 +210,13 @@ public final class VideoStreamManager: @unchecked Sendable {
         demuxer = RTPDemuxer(
             usesDecodingOrderNumbers: usesDecodingOrderNumbers)
 
-        // Hardware callbacks can arrive out of submission order. The one-tile
-        // stream has one orderer. Multi-tile streams create one orderer and one
-        // decoder per SSRC lazily, because their reference/PTS timelines are
-        // independent (Apple's private decoder performs the same isolation).
-        if !usesDecodingOrderNumbers {
-            decoder = makeDecoder(
-                source: nil,
-                generation: streamGeneration,
-                frameCallback: frameCallback)
-        }
+        // Both wire modes are one encoded reference timeline. In tiled mode,
+        // DON restores the interleaved SSRCs to that order before this shared
+        // public VideoToolbox session sees them. Splitting the SSRCs across
+        // decoder sessions loses sibling reference pictures after frame one.
+        decoder = makeDecoder(
+            generation: streamGeneration,
+            frameCallback: frameCallback)
         lock.unlock()
         retireDecoders(retiredDecoders)
     }
@@ -345,7 +333,7 @@ public final class VideoStreamManager: @unchecked Sendable {
                         continue
                     }
                     let pts = CMTime(
-                        value: nextPresentationTimeValue(for: accessUnit.ssrc),
+                        value: nextPresentationTimeValue(),
                         timescale: 90000)
                     try decoderRef.decode(
                         nalUnits: nalUnits,
@@ -457,12 +445,10 @@ public final class VideoStreamManager: @unchecked Sendable {
 
     // MARK: - Private
 
-    private func nextPresentationTimeValue(for ssrc: UInt32) -> CMTimeValue {
+    private func nextPresentationTimeValue() -> CMTimeValue {
         lock.lock()
         defer { lock.unlock() }
-        return presentationTimeline.next(
-            source: ssrc,
-            independentTiles: usesDecodingOrderNumbers)
+        return presentationTimeline.next()
     }
 
     /// Detach decoder callbacks while holding `lock`, but never wait for
@@ -470,10 +456,8 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// progress through the same lock and would otherwise deadlock shutdown.
     private func _stopStreamLocked() -> [HEVCDecoder] {
         streamGeneration &+= 1
-        var retiredDecoders = [decoder].compactMap { $0 }
+        let retiredDecoders = [decoder].compactMap { $0 }
         decoder = nil
-        retiredDecoders.append(contentsOf: tileDecoders.values)
-        tileDecoders.removeAll()
         demuxer.reset()
         frameCallback = nil
         _isActive = false
@@ -561,7 +545,7 @@ public final class VideoStreamManager: @unchecked Sendable {
             lock.unlock()
             return
         }
-        let decoderRefs = [decoder].compactMap { $0 } + Array(tileDecoders.values)
+        let decoderRefs = [decoder].compactMap { $0 }
         let vps = pendingVPS
         lock.unlock()
 
@@ -613,7 +597,7 @@ public final class VideoStreamManager: @unchecked Sendable {
                 continue
             }
             let pts = CMTime(
-                value: nextPresentationTimeValue(for: item.ssrc),
+                value: nextPresentationTimeValue(),
                 timescale: 90000)
             do {
                 try decoderRef.decode(
@@ -627,51 +611,17 @@ public final class VideoStreamManager: @unchecked Sendable {
         }
     }
 
-    /// Return the conventional one-tile decoder or lazily create the public
-    /// decoder that owns one multi-tile SSRC's reference-picture state.
+    /// All SSRCs belong to one ordered HEVC reference timeline. The source is
+    /// carried as a frame tag so decoded bands can still be composited.
     private func decoderForSource(_ ssrc: UInt32) -> HEVCDecoder? {
+        _ = ssrc
         lock.lock()
-        if !usesDecodingOrderNumbers {
-            let decoderRef = decoder
-            lock.unlock()
-            return decoderRef
-        }
-        if let decoderRef = tileDecoders[ssrc] {
-            lock.unlock()
-            return decoderRef
-        }
-        guard let callback = frameCallback else {
-            lock.unlock()
-            return nil
-        }
-
-        let decoderRef = makeDecoder(
-            source: ssrc,
-            generation: streamGeneration,
-            frameCallback: callback)
-        tileDecoders[ssrc] = decoderRef
-        let tileDecoderCount = tileDecoders.count
-        let sps = pendingSPS
-        let pps = pendingPPS
-        let vps = pendingVPS
+        let decoderRef = decoder
         lock.unlock()
-
-        log.info(
-            "Creating independent HEVC tile decoder "
-                + "SSRC=\(ssrc) tileCount=\(tileDecoderCount)")
-
-        if let sps, let pps {
-            do {
-                try decoderRef.updateFormatDescription(sps: sps, pps: pps, vps: vps)
-            } catch {
-                log.warning("Failed to configure HEVC tile \(ssrc): \(error.localizedDescription)")
-            }
-        }
         return decoderRef
     }
 
     private func makeDecoder(
-        source: UInt32?,
         generation: UInt64,
         frameCallback: @escaping FrameCallback
     ) -> HEVCDecoder {
@@ -683,7 +633,7 @@ public final class VideoStreamManager: @unchecked Sendable {
             orderer.submit(
                 pixelBuffer: pixelBuffer,
                 pts: pts,
-                ssrc: source ?? frameTag)
+                ssrc: frameTag)
         }
     }
 
