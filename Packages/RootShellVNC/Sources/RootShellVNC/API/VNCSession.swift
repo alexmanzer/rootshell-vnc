@@ -497,14 +497,9 @@ public final class VNCSession {
 
         let streamGeneration = manager.decodeProgress.streamGeneration
 
-        // Dead-band watchdog. If any packet of the initial burst is lost, the
-        // affected band misses its ONLY IRAP and never decodes a frame — and
-        // on a static screen it never heals, because gradual intra refresh
-        // only repaints CHANGED content and keyframe requests do not produce
-        // new IRAPs on this stream. Detect "band arrived at the transport but
-        // decoded nothing" shortly after stream start and force the whole
-        // screen dirty with a non-incremental framebuffer update request, so
-        // the sweep repaints every band.
+        // Startup liveness watchdog. Recovery remains in the negotiated media
+        // protocol: repeat an observed AVConference frame-loss report instead
+        // of dirtying the framebuffer or restarting the VNC connection.
         if let transport = transportSession {
             let watchdogManager = manager
             let log = logger
@@ -518,22 +513,21 @@ public final class VNCSession {
                         if attempt > 1 { log.info("Dead-band watchdog: recovered, \(decoded)/\(sources) bands decoding") }
                         return
                     }
-                    log.warning("Dead-band watchdog: \(decoded)/\(sources) bands decoding (attempt \(attempt)); forcing full refresh")
-                    try? await transport.requestFramebufferUpdate(incremental: false)
-                    await transport.requestVideoKeyframe()
+                    log.warning("Startup media watchdog: \(decoded)/\(sources) sources decoding "
+                        + "(attempt \(attempt)); repeating observed frame-loss feedback")
+                    await transport.repeatLastVideoLossFeedback()
                 }
             }
         }
 
         // Long-running decode-output watchdog. A static desktop naturally
         // produces no decode submissions, so silence by itself is not a fault.
-        // We recover only when complete pictures KEEP being submitted while no
-        // frame reaches the renderer. This catches a VideoToolbox/reference
-        // stall without examining image contents and stops requesting refreshes
-        // as soon as output advances.
+        // If submitted pictures stop producing output, rebuild only the public
+        // decoder and repeat real loss feedback on the existing media session.
         if let transport = transportSession {
             let watchdogManager = manager
             let log = logger
+            let recoveryQueue = mediaQueue
             Task { [weak transport, weak watchdogManager] in
                 var detector = DecodeOutputStallDetector()
                 while !Task.isCancelled {
@@ -548,28 +542,53 @@ public final class VNCSession {
                         deliveredFrameCount: decodedBands.frameCount,
                         nowNanos: DispatchTime.now().uptimeNanoseconds
                     ) {
-                        log.warning("Decode-output stall while compressed frames continue; forcing one full refresh")
-                        try? await transport.requestFramebufferUpdate(incremental: false)
-                        await transport.requestVideoKeyframe()
+                        log.warning("Decode-output stall while compressed frames continue; "
+                            + "rebuilding decoder in media session")
+                        guard await transport.hasObservedVideoLossFeedback() else {
+                            log.warning("Decoder stall has no observed RTP loss report; "
+                                + "leaving the current media session untouched")
+                            continue
+                        }
+                        recoveryQueue.async { [transport, m] in
+                            guard m.recoverDecoderAfterOutputStall() else {
+                                return
+                            }
+                            Task { [transport] in
+                                await transport.repeatLastVideoLossFeedback()
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Loss recovery: ONE full-refresh/keyframe request per fresh loss event.
-        // The keyframe feedback alone is not always honored by the screen
-        // encoder; marking the framebuffer dirty makes the server produce the
-        // intra-refresh content needed to rebuild the broken reference chain.
-        // This is event-driven rather than periodic, avoiding the continuous
-        // refresh sweeps that previously caused visible quality pulsing.
+        // Transport-confirmed RTP loss already sends native AFB type-6 feedback
+        // before releasing the post-gap packet. Do not layer PLI/FIR or full
+        // framebuffer updates on top; those were the source of quality pulses.
+        manager.onLossDetected = nil
+
+        // VideoToolbox can accept a damaged sample synchronously and report its
+        // missing-reference failure later. Rebuild it on the serial media queue,
+        // retain the last rendered surface, and repeat the observed loss report.
         if let transport = transportSession {
-            manager.onLossDetected = { [weak transport] ssrc in
-                Task {
-                    guard let transport else { return }
-                    try? await transport.requestFramebufferUpdate(incremental: false)
-                    await transport.requestVideoKeyframe(ssrc: ssrc)
+            let recoveryQueue = mediaQueue
+            let recoveryManager = manager
+            manager.onDecoderFailure = { [weak transport, weak recoveryManager] failure in
+                guard let transport, let recoveryManager else { return }
+                Task { [transport, recoveryManager] in
+                    guard await transport.hasObservedVideoLossFeedback(ssrc: failure.ssrc) else {
+                        return
+                    }
+                    recoveryQueue.async { [transport, recoveryManager] in
+                        guard recoveryManager.recoverDecoderInSession() else { return }
+                        Task { [transport] in
+                            await transport.repeatLastVideoLossFeedback(ssrc: failure.ssrc)
+                        }
+                    }
                 }
             }
+        } else {
+            manager.onDecoderFailure = nil
         }
 
         // Fast path for the high-rate video RTP: deliver decrypted packets
@@ -581,12 +600,12 @@ public final class VNCSession {
         // Installed SYNCHRONOUSLY (awaited) inside offer handling, before the
         // event loop touches the next event. The previous fire-and-forget Task
         // raced the stream start: the first packets — parameter sets and the
-        // session's ONLY IRAP — could flow through the (buffered, slower)
+        // session's initial IRAP — could flow through the (buffered, slower)
         // events path while later packets took the sink path, reordering the
         // stream right at the decoder bootstrap. One scramble there and every
         // band renders garbage for the rest of the session, because this
-        // stream never sends another IRAP (it heals via gradual intra refresh
-        // only). This was the GUI-only "macroblock mess": headless probes that
+        // stream could not be recovered without its negotiated loss feedback.
+        // This was the GUI-only "macroblock mess": headless probes that
         // awaited the sink install decoded the same stream pixel-perfectly.
         if let transport = transportSession {
             let queue = mediaQueue

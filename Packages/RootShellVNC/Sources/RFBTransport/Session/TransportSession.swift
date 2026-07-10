@@ -115,6 +115,10 @@ public actor TransportSession {
     /// keyframe requests go back on the right connected socket.
     private var appleMediaVideoSSRCChannels: [UInt32: PosixUDPChannel] = [:]
     private var appleLastKeyframeRequestNanos: UInt64 = 0
+    /// Most recent native frame-loss report for each source. Decoder recovery
+    /// can repeat the same observed report; it never fabricates wire fields.
+    private var appleMediaLastFrameLossFeedback: [UInt32: AppleMediaFrameLossFeedback] = [:]
+    private var appleMediaMostRecentFrameLossSSRC: UInt32?
     /// RTP-shaped datagrams no configured SRTP key could authenticate (dropped).
     private var appleMediaUnprotectFailures: UInt64 = 0
     /// True once the session is known to be encrypted (ComCryption configured),
@@ -2295,6 +2299,8 @@ public actor TransportSession {
         appleMediaLastTransmitTimestampQ10 = 0
         appleMediaVideoSSRCChannels.removeAll()
         appleMediaReceptionStats.removeAll()
+        appleMediaLastFrameLossFeedback.removeAll()
+        appleMediaMostRecentFrameLossSSRC = nil
         appleMediaPreKeyDatagrams.removeAll()
         appleLastKeyframeRequestNanos = 0
         for task in udpReadTasks {
@@ -2445,7 +2451,7 @@ public actor TransportSession {
 
     private nonisolated func dumpAppleMediaOutgoingRTCPIfRequested(plaintext: Data, protected: Data) {
         guard let path = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DUMP_OUTGOING_RTCP"] else { return }
-        let line = "PLI plaintext=\(plaintext.map { String(format: "%02x", $0) }.joined()) "
+        let line = "RTCP plaintext=\(plaintext.map { String(format: "%02x", $0) }.joined()) "
             + "protected=\(protected.map { String(format: "%02x", $0) }.joined())\n"
         if let data = line.data(using: .utf8) {
             if FileManager.default.fileExists(atPath: path),
@@ -2633,16 +2639,89 @@ public actor TransportSession {
                 controller.update(now: now)
             }
 
-            guard ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_KEYFRAMES"] != "1",
-                  let channel = appleMediaVideoSSRCChannels[gap.ssrc] else { continue }
+            guard let channel = appleMediaVideoSSRCChannels[gap.ssrc] else { continue }
+            let feedback = AppleMediaFrameLossFeedback(
+                frameRTPTimestamp: gap.frameRTPTimestamp,
+                receivedPacketCount: UInt16(truncatingIfNeeded:
+                    appleMediaReceptionStats[gap.ssrc]?.received ?? 0),
+                framePacketCount: UInt8(clamping: max(
+                    gap.missingPacketCount,
+                    gap.estimatedFramePacketCount)),
+                lostPacketCount: UInt8(clamping: gap.missingPacketCount))
+            appleMediaLastFrameLossFeedback[gap.ssrc] = feedback
+            appleMediaMostRecentFrameLossSSRC = gap.ssrc
             log.warning("Confirmed video RTP loss ssrc=0x\(String(gap.ssrc, radix: 16)) "
-                + "missing=\(gap.missingPacketCount)")
-            requestAppleMediaKeyframeRateLimited(ssrc: gap.ssrc, channel: channel)
+                + "missing=\(gap.missingPacketCount) framePackets=\(feedback.framePacketCount) "
+                + "frameTimestamp=\(feedback.frameRTPTimestamp)")
+            Task { [weak self] in
+                await self?.sendAppleMediaFrameLossFeedback(
+                    feedback,
+                    mediaSSRC: gap.ssrc,
+                    on: channel)
+            }
         }
 
         for packet in result.packets {
             emitAppleMediaRTPPacket(packet)
         }
+    }
+
+    /// Send AVConference's negotiated frame-loss feedback (PSFB AFB type 6).
+    /// Unlike PLI/FIR, this is the resiliency signal used by the Screen Sharing
+    /// encoder to produce the recovery IDR for an LTR-enabled screen stream.
+    private func sendAppleMediaFrameLossFeedback(
+        _ feedback: AppleMediaFrameLossFeedback,
+        mediaSSRC: UInt32,
+        on channel: PosixUDPChannel
+    ) async {
+        guard let srtcp = appleMediaSRTCPContext else { return }
+        let sender = appleMediaLocalSSRC
+        var compound = Data()
+        if let rr = buildAppleMediaReceiverReport() { compound.append(rr) }
+        compound.append(appleMediaFrameLossPacket(
+            senderSSRC: sender,
+            mediaSSRC: mediaSSRC,
+            feedback: feedback))
+
+        guard let protected = try? srtcp.protect(compound, senderSSRC: sender) else { return }
+        dumpAppleMediaOutgoingRTCPIfRequested(plaintext: compound, protected: protected)
+        try? await channel.send(protected)
+        log.info("Sent AVConference frame-loss feedback ssrc=0x\(String(mediaSSRC, radix: 16)) "
+            + "received=\(feedback.receivedPacketCount) framePackets=\(feedback.framePacketCount) "
+            + "lost=\(feedback.lostPacketCount)")
+    }
+
+    /// Repeat a previously derived loss report after an asynchronous decoder
+    /// failure. A repeat stays entirely inside the existing media session and
+    /// intentionally does nothing if no real packet loss has been observed.
+    public func hasObservedVideoLossFeedback(ssrc requestedSSRC: UInt32? = nil) -> Bool {
+        if let requestedSSRC,
+           appleMediaLastFrameLossFeedback[requestedSSRC] != nil {
+            return appleMediaVideoSSRCChannels[requestedSSRC] != nil
+        }
+        guard let recent = appleMediaMostRecentFrameLossSSRC else { return false }
+        return appleMediaLastFrameLossFeedback[recent] != nil
+            && appleMediaVideoSSRCChannels[recent] != nil
+    }
+
+    public func repeatLastVideoLossFeedback(ssrc requestedSSRC: UInt32? = nil) async {
+        let selectedSSRC: UInt32?
+        if let requestedSSRC,
+           appleMediaLastFrameLossFeedback[requestedSSRC] != nil {
+            selectedSSRC = requestedSSRC
+        } else {
+            selectedSSRC = appleMediaMostRecentFrameLossSSRC
+        }
+        guard let ssrc = selectedSSRC,
+              let feedback = appleMediaLastFrameLossFeedback[ssrc],
+              let channel = appleMediaVideoSSRCChannels[ssrc] else {
+            log.warning("Cannot repeat frame-loss feedback: no observed loss report is available")
+            return
+        }
+        await sendAppleMediaFrameLossFeedback(
+            feedback,
+            mediaSSRC: ssrc,
+            on: channel)
     }
 
     /// Ask the server to retransmit missing RTP packets while the per-SSRC

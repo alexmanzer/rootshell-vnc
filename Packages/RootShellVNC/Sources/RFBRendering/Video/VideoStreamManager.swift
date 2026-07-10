@@ -42,6 +42,38 @@ public struct VideoStreamFeedResult: Sendable, Equatable {
     }
 }
 
+/// The first asynchronous decoder failure that poisoned a stream generation.
+/// VideoToolbox reports reference loss from its output callback after frame
+/// submission has already succeeded, so this is distinct from a feed error.
+public struct VideoDecoderFailure: Sendable, Equatable {
+    public let status: OSStatus
+    public let ssrc: UInt32
+
+    public init(status: OSStatus, ssrc: UInt32) {
+        self.status = status
+        self.ssrc = ssrc
+    }
+}
+
+/// Latches one terminal decoder failure per stream generation. Once the
+/// hardware decoder enters its wait-for-IDR state, feeding more dependent
+/// pictures only floods its callback with the same error.
+struct VideoDecoderFailureLatch {
+    private(set) var failure: VideoDecoderFailure?
+
+    var hasFailed: Bool { failure != nil }
+
+    mutating func record(_ candidate: VideoDecoderFailure) -> Bool {
+        guard failure == nil else { return false }
+        failure = candidate
+        return true
+    }
+
+    mutating func reset() {
+        failure = nil
+    }
+}
+
 /// Generates synthetic monotonic PTS values for the single HEVC decode order.
 /// Apple's tiled transport interleaves its bands on this same DON timeline;
 /// the SSRC identifies the output band, not a separate presentation timeline.
@@ -89,36 +121,34 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var pendingVPS: Data?
     private var pendingSPS: Data?
     private var pendingPPS: Data?
+    private var decoderFailureLatch = VideoDecoderFailureLatch()
     private let log = VNCLogger(category: "VideoStream")
 
     // MARK: - Loss detection & recovery
     //
-    // The stream never carries IRAP frames after startup: measured live, a
-    // 30 s session with 4 bands decodes exactly ONE IRAP NAL total, and 40
-    // keyframe requests during a loss produced zero new ones. The server heals
-    // corruption by GRADUAL INTRA REFRESH — a rolling intra-coded sweep inside
-    // ordinary P-frames. Two consequences:
-    //   1. After a loss we must KEEP DECODING: the sweep can only rebuild the
-    //      reference chain if the decoder consumes the frames carrying it.
-    //      (An earlier fix dropped frames until the next IRAP — that froze the
-    //      stream forever.)
-    //   2. "Healed" cannot be detected by NAL type; we treat the stream as
-    //      recovering for a fixed window after the last detected loss, during
-    //      which the recovery loop keeps nudging the server for a refresh.
-    // The old drop-until-IRAP gate is kept behind ROOTSHELL_VNC_ENABLE_IRAP_GATE=1
-    // for experiments against servers that do answer with real IDRs.
+    // AVConference does not submit dependent pictures after it detects a lost
+    // base-layer frame. Its VCP wrapper enters a skip state, sends its frame-
+    // loss feedback through RTCP, and resumes only on HEVC IDR_N_LP (type 20).
+    // Public VideoToolbox needs the same pre-decode gate: once a damaged P-frame
+    // reaches the hardware session it reports a missing reference and remains
+    // poisoned even though later packet assembly is valid.
     private var seenVideoSSRCs: Set<UInt32> = []
     private var awaitingIRAP: Set<UInt32> = []
     private var lastVideoSeq: [UInt32: UInt16] = [:]
     private var lastLossNanos: UInt64 = 0
-    private let healWindowNanos: UInt64 = 1_500_000_000
     /// Kill-switch for A/B testing: ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY=1.
     var lossRecoveryEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY"] != "1"
-    /// Experimental drop-until-IRAP gate (see above). Default OFF.
-    var irapGateEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_ENABLE_IRAP_GATE"] == "1"
+    /// Native-equivalent drop-until-IDR gate. The opt-out exists only for
+    /// diagnostics against non-Apple senders.
+    var irapGateEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_IRAP_GATE"] != "1"
     /// Fired (off-lock) when a fresh loss is detected while no recovery is in
     /// flight. VNCSession wires this to the transport's keyframe request.
     public var onLossDetected: (@Sendable (UInt32?) -> Void)?
+
+    /// Fired once when VideoToolbox asynchronously rejects a submitted frame.
+    /// A missing reference leaves Apple's hardware decoder waiting for an IDR;
+    /// the session owner schedules an in-session public-VideoToolbox rebuild.
+    public var onDecoderFailure: (@Sendable (VideoDecoderFailure) -> Void)?
 
     /// Counters for tests/diagnostics.
     public struct LossStats: Sendable, Equatable {
@@ -168,16 +198,11 @@ public final class VideoStreamManager: @unchecked Sendable {
         return s
     }
 
-    /// True while the stream is considered to be recovering from loss: with
-    /// the IRAP gate on, until every band saw a fresh IRAP; otherwise for a
-    /// fixed window after the last detected loss (intra-refresh streams give
-    /// no in-band "healed" signal). Drives the recovery request loop.
+    /// True while dependent pictures are withheld pending a recovery IDR.
     public var hasGatedBands: Bool {
         lock.lock()
         defer { lock.unlock() }
-        if irapGateEnabled { return !awaitingIRAP.isEmpty }
-        return lastLossNanos != 0
-            && DispatchTime.now().uptimeNanoseconds &- lastLossNanos < healWindowNanos
+        return irapGateEnabled && !awaitingIRAP.isEmpty
     }
 
     public init() {
@@ -326,6 +351,12 @@ public final class VideoStreamManager: @unchecked Sendable {
                     // dropping one leaves the band dead all session). Buffer
                     // until the format description exists, then drain in order.
                     guard let decoderRef = decoderForSource(accessUnit.ssrc) else {
+                        // An IDR can race the asynchronous VT error callback.
+                        // Preserve it while the media queue rebuilds the public
+                        // decoder instead of consuming the only recovery frame.
+                        if isDecoderRecoveryPending {
+                            bufferEarlyVCL(nals: nalUnits, ssrc: accessUnit.ssrc)
+                        }
                         continue
                     }
                     guard decoderRef.isReady else {
@@ -400,34 +431,48 @@ public final class VideoStreamManager: @unchecked Sendable {
         let fresh: Bool
         if irapGateEnabled {
             fresh = awaitingIRAP.isEmpty
-            if let affectedSSRC {
-                awaitingIRAP.insert(affectedSSRC)
-            } else {
-                awaitingIRAP.formUnion(seenVideoSSRCs)
-            }
+            // All SSRCs feed one VideoToolbox reference timeline. A missing
+            // picture poisons that timeline globally, not just its screen band.
+            awaitingIRAP.formUnion(seenVideoSSRCs)
+            if let affectedSSRC { awaitingIRAP.insert(affectedSSRC) }
         } else {
-            fresh = lastLossNanos == 0 || now &- lastLossNanos > healWindowNanos
+            fresh = lastLossNanos == 0
         }
         lastLossNanos = now
         return fresh
     }
 
     /// Whether a VCL NAL should reach the decoder, updating recovery state.
-    /// Default (intra-refresh) mode decodes EVERYTHING — the rolling intra
-    /// sweep can only heal if the decoder consumes it. With the experimental
-    /// IRAP gate on, non-IRAP VCL from a gated band is dropped until that
-    /// band's next IRAP (BLA 16-18, IDR 19-20, CRA 21).
+    /// AVConference's VCP wrapper resumes specifically for HEVC NAL type 20
+    /// (IDR_N_LP); CRA and dependent pictures remain withheld.
     private func shouldDecodeVCL(nalType: UInt8, ssrc: UInt32) -> Bool {
+        _ = ssrc
         lock.lock()
         defer { lock.unlock() }
-        if (16...21).contains(nalType) {
+        if nalType == 20 {
             lossStats.irapsDecoded += 1
-            awaitingIRAP.remove(ssrc)
+            awaitingIRAP.removeAll()
+            lastLossNanos = 0
             return true
         }
-        guard irapGateEnabled, awaitingIRAP.contains(ssrc) else { return true }
+        guard irapGateEnabled, !awaitingIRAP.isEmpty else { return true }
         lossStats.framesDroppedWhileGated += 1
         return false
+    }
+
+    /// Rebuild a VideoToolbox session without touching the VNC or media
+    /// connection. The caller runs this on the serial media queue, so incoming
+    /// RTP cannot overtake decoder invalidation and parameter-set restoration.
+    @discardableResult
+    public func recoverDecoderInSession() -> Bool {
+        rebuildDecoderInSession(requireLatchedFailure: true)
+    }
+
+    /// Liveness fallback for the rare case where submissions stop producing
+    /// callbacks without a reported OSStatus. It uses the same in-media reset.
+    @discardableResult
+    public func recoverDecoderAfterOutputStall() -> Bool {
+        rebuildDecoderInSession(requireLatchedFailure: false)
     }
 
     public func stopStream() {
@@ -471,6 +516,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         pendingVPS = nil
         pendingSPS = nil
         pendingPPS = nil
+        decoderFailureLatch.reset()
         fullFrameHeight = 0
         seenVideoSSRCs.removeAll()
         awaitingIRAP.removeAll()
@@ -531,6 +577,97 @@ public final class VideoStreamManager: @unchecked Sendable {
         decoderOutputCount &+= 1
         lastDecoderOutputNanos = DispatchTime.now().uptimeNanoseconds
         lock.unlock()
+        return true
+    }
+
+    private func recordDecoderFailure(
+        generation: UInt64,
+        status: OSStatus,
+        ssrc: UInt32
+    ) {
+        let failure = VideoDecoderFailure(status: status, ssrc: ssrc)
+        let callback: (@Sendable (VideoDecoderFailure) -> Void)?
+
+        lock.lock()
+        guard generation == streamGeneration,
+              _isActive,
+              decoderFailureLatch.record(failure) else {
+            lock.unlock()
+            return
+        }
+        _ = markLossLocked(affectedSSRC: ssrc)
+        callback = onDecoderFailure
+        lock.unlock()
+
+        log.error(
+            "VideoToolbox decoder failed asynchronously status=\(status) "
+                + "ssrc=0x\(String(ssrc, radix: 16)); rebuilding in media session")
+        callback?(failure)
+    }
+
+    private var isDecoderRecoveryPending: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return decoderFailureLatch.hasFailed
+    }
+
+    private func rebuildDecoderInSession(requireLatchedFailure: Bool) -> Bool {
+        let oldDecoder: HEVCDecoder
+        let replacement: HEVCDecoder
+        let generation: UInt64
+        let vps: Data?
+        let sps: Data
+        let pps: Data
+
+        lock.lock()
+        guard _isActive,
+              (!requireLatchedFailure || decoderFailureLatch.hasFailed),
+              let currentDecoder = decoder,
+              let callback = frameCallback,
+              let configuredSPS = pendingSPS,
+              let configuredPPS = pendingPPS else {
+            lock.unlock()
+            return false
+        }
+        generation = streamGeneration
+        oldDecoder = currentDecoder
+        replacement = makeDecoder(
+            generation: generation,
+            frameCallback: callback)
+        vps = pendingVPS
+        sps = configuredSPS
+        pps = configuredPPS
+        decoder = nil
+        _ = markLossLocked(affectedSSRC: nil)
+        lock.unlock()
+
+        // Waiting here is safe because this method is never invoked from the
+        // VideoToolbox callback thread. It drains late callbacks before the
+        // failure latch is cleared, preventing an old generation from poisoning
+        // the replacement session.
+        oldDecoder.reset()
+        do {
+            try replacement.updateFormatDescription(sps: sps, pps: pps, vps: vps)
+        } catch {
+            log.error("Could not rebuild HEVC decoder in session: \(error.localizedDescription)")
+            replacement.reset()
+            return false
+        }
+
+        lock.lock()
+        guard _isActive,
+              streamGeneration == generation,
+              decoder == nil else {
+            lock.unlock()
+            replacement.reset()
+            return false
+        }
+        decoder = replacement
+        decoderFailureLatch.reset()
+        lock.unlock()
+
+        log.info("Rebuilt public VideoToolbox decoder; waiting for recovery IDR")
+        drainEarlyVCLIfReady()
         return true
     }
 
@@ -616,7 +753,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     private func decoderForSource(_ ssrc: UInt32) -> HEVCDecoder? {
         _ = ssrc
         lock.lock()
-        let decoderRef = decoder
+        let decoderRef = decoderFailureLatch.hasFailed ? nil : decoder
         lock.unlock()
         return decoderRef
     }
@@ -626,15 +763,22 @@ public final class VideoStreamManager: @unchecked Sendable {
         frameCallback: @escaping FrameCallback
     ) -> HEVCDecoder {
         let orderer = DecodedFrameOrderer(callback: frameCallback)
-        return HEVCDecoder { [weak self] pixelBuffer, pts, frameTag in
-            guard self?.recordDecoderOutput(generation: generation) == true else {
-                return
-            }
-            orderer.submit(
-                pixelBuffer: pixelBuffer,
-                pts: pts,
-                ssrc: frameTag)
-        }
+        return HEVCDecoder(
+            frameCallback: { [weak self] pixelBuffer, pts, frameTag in
+                guard self?.recordDecoderOutput(generation: generation) == true else {
+                    return
+                }
+                orderer.submit(
+                    pixelBuffer: pixelBuffer,
+                    pts: pts,
+                    ssrc: frameTag)
+            },
+            failureCallback: { [weak self] status, _, frameTag in
+                self?.recordDecoderFailure(
+                    generation: generation,
+                    status: status,
+                    ssrc: frameTag)
+            })
     }
 
     private func logMultiNALAccessUnitIfNeeded(don: UInt16, count: Int) {

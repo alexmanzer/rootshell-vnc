@@ -72,6 +72,34 @@ final class AppleMediaRTPIngressTests: XCTestCase {
         XCTAssertEqual(result.gaps, [.init(ssrc: 7, missingPacketCount: 1)])
     }
 
+    func testConfirmedGapReportsObservedRTPFrameTimestampAndPacketCount() {
+        var reorder = makeReorderBuffer()
+        let first = rtpPacket(
+            sequence: 10,
+            timestamp: 0x0102_0304,
+            marker: false,
+            payload: 1)
+        let afterGap = rtpPacket(
+            sequence: 12,
+            timestamp: 0x0102_0304,
+            marker: true,
+            payload: 3)
+
+        _ = reorder.insert(packet: first, ssrc: 7, sequence: 10, nowNanos: 0)
+        XCTAssertEqual(reorder.flushExpired(nowNanos: 8).packets, [first])
+        _ = reorder.insert(packet: afterGap, ssrc: 7, sequence: 12, nowNanos: 9)
+        let result = reorder.flushExpired(nowNanos: 39)
+
+        XCTAssertEqual(result.packets, [afterGap])
+        XCTAssertEqual(result.gaps, [
+            .init(
+                ssrc: 7,
+                missingPacketCount: 1,
+                frameRTPTimestamp: 0x0102_0304,
+                estimatedFramePacketCount: 3),
+        ])
+    }
+
     func testRetransmittedPacketClosesGapAndReleasesInOrder() {
         var reorder = makeReorderBuffer()
         _ = reorder.insert(packet: packet(10), ssrc: 7, sequence: 10, nowNanos: 0)
@@ -108,6 +136,25 @@ final class AppleMediaRTPIngressTests: XCTestCase {
     }
 
     private func packet(_ value: UInt8) -> Data { Data([value]) }
+
+    private func rtpPacket(
+        sequence: UInt16,
+        timestamp: UInt32,
+        marker: Bool,
+        payload: UInt8
+    ) -> Data {
+        Data([
+            0x80,
+            (marker ? 0x80 : 0x00) | 100,
+            UInt8(sequence >> 8), UInt8(sequence & 0xff),
+            UInt8((timestamp >> 24) & 0xff),
+            UInt8((timestamp >> 16) & 0xff),
+            UInt8((timestamp >> 8) & 0xff),
+            UInt8(timestamp & 0xff),
+            0x00, 0x00, 0x00, 0x07,
+            payload,
+        ])
+    }
 }
 
 private final class LockedPackets: @unchecked Sendable {

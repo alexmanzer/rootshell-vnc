@@ -3,6 +3,26 @@ import XCTest
 @testable import RFBTransport
 
 final class AppleMediaFeedbackTests: XCTestCase {
+    func testFrameLossFeedbackWireLayoutMatchesAVConferenceAFBTypeSix() {
+        let packet = appleMediaFrameLossPacket(
+            senderSSRC: 0x1122_3344,
+            mediaSSRC: 0x5566_7788,
+            feedback: AppleMediaFrameLossFeedback(
+                frameRTPTimestamp: 0x99aa_bbcc,
+                receivedPacketCount: 0xddee,
+                framePacketCount: 0xf0,
+                lostPacketCount: 0x0f))
+
+        XCTAssertEqual(packet, Data([
+            0x8f, 0xce, 0x00, 0x05,
+            0x11, 0x22, 0x33, 0x44,
+            0x55, 0x66, 0x77, 0x88,
+            0x00, 0x00, 0x00, 0x06,
+            0x99, 0xaa, 0xbb, 0xcc,
+            0xdd, 0xee, 0xf0, 0x0f,
+        ]))
+    }
+
     func testGenericNACKPacksContiguousAndSparseSequenceNumbers() {
         XCTAssertEqual(
             appleMediaGenericNACKEntries(missingSequences: [100, 101, 103, 117, 118]),

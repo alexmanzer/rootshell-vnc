@@ -42,27 +42,39 @@ public final class HEVCDecoder: @unchecked Sendable {
     /// tag passed to `decode(...)` (used to route each frame to its screen band).
     public typealias FrameCallback = @Sendable (CVPixelBuffer, CMTime, UInt32) -> Void
 
+    /// Reports an asynchronous VideoToolbox failure for the submitted frame.
+    /// `VTDecompressionSessionDecodeFrame` can return success and report a
+    /// missing-reference error only later through its output callback, so this
+    /// cannot be represented by `decode(...)` throwing.
+    public typealias FailureCallback = @Sendable (OSStatus, CMTime, UInt32) -> Void
+
+    private struct CallbackBundle {
+        let frame: FrameCallback
+        let failure: FailureCallback?
+    }
+
     // MARK: - Private state
 
     private var decompressionSession: VTDecompressionSession?
     private var formatDescription: CMFormatDescription?
-    private let frameCallback: FrameCallback
     private let lock = NSLock()
-    private var callbackStorage: UnsafeMutablePointer<FrameCallback>?
+    private var callbackStorage: UnsafeMutablePointer<CallbackBundle>?
 
     // MARK: - Init
 
-    public init(frameCallback: @escaping FrameCallback) {
-        self.frameCallback = frameCallback
+    public init(
+        frameCallback: @escaping FrameCallback,
+        failureCallback: FailureCallback? = nil
+    ) {
         // Allocate the callback trampoline storage once and keep it alive for
         // the decoder's whole lifetime. VideoToolbox may invoke the output
         // callback asynchronously *after* a session is invalidated (e.g. when a
-        // new IDR's parameter sets force a session recreate). If the storage
-        // were freed per-session, that late callback would dereference a freed
-        // closure and jump to a garbage address. The frame callback never
-        // changes, so a single stable allocation is both correct and simpler.
-        let storage = UnsafeMutablePointer<FrameCallback>.allocate(capacity: 1)
-        storage.initialize(to: frameCallback)
+        // new IDR's parameter sets force a session recreate). A single bundle
+        // also gives the C callback a stable path for asynchronous failures.
+        let storage = UnsafeMutablePointer<CallbackBundle>.allocate(capacity: 1)
+        storage.initialize(to: CallbackBundle(
+            frame: frameCallback,
+            failure: failureCallback))
         self.callbackStorage = storage
     }
 
@@ -194,22 +206,20 @@ public final class HEVCDecoder: @unchecked Sendable {
                     presentationTimeStamp: CMTime,
                     presentationDuration: CMTime
                 ) in
-                if status != noErr || imageBuffer == nil {
+                let tag = UInt32(truncatingIfNeeded: UInt(bitPattern: sourceFrameRefCon))
+                guard let refCon = decompressionOutputRefCon else { return }
+                let callbacks = refCon.assumingMemoryBound(to: CallbackBundle.self).pointee
+
+                if status != noErr {
                     if ProcessInfo.processInfo.environment["ROOTSHELL_VNC_TRACE_DECODE"] == "1" {
                         print("VT callback: status=\(status) flags=\(infoFlags.rawValue) hasImage=\(imageBuffer != nil)")
                     }
-                }
-                guard status == noErr,
-                      let pixelBuffer = imageBuffer,
-                      let refCon = decompressionOutputRefCon else {
+                    callbacks.failure?(status, presentationTimeStamp, tag)
                     return
                 }
+                guard let pixelBuffer = imageBuffer else { return }
 
-                let tag = UInt32(truncatingIfNeeded: UInt(bitPattern: sourceFrameRefCon))
-                let callbackPtr = refCon.assumingMemoryBound(
-                    to: (@Sendable (CVPixelBuffer, CMTime, UInt32) -> Void).self
-                )
-                callbackPtr.pointee(pixelBuffer, presentationTimeStamp, tag)
+                callbacks.frame(pixelBuffer, presentationTimeStamp, tag)
             },
             decompressionOutputRefCon: nil
         )
