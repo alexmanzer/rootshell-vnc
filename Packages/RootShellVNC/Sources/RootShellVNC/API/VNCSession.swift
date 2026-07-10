@@ -63,6 +63,8 @@ public final class VNCSession {
     private var framebuffer: Framebuffer?
     private var renderer: FramebufferRenderer?
     private var videoStreamManager: VideoStreamManager?
+    @ObservationIgnored
+    private var remoteAudioPlayer: AppleRemoteAudioPlayer?
     private var eventTask: Task<Void, Never>?
     private var frameRequestTask: Task<Void, Never>?
     @ObservationIgnored
@@ -117,6 +119,7 @@ public final class VNCSession {
     }
 
     deinit {
+        remoteAudioPlayer?.stop()
         #if canImport(UIKit)
         backgroundLifecycleTask?.cancel()
         foregroundLifecycleTask?.cancel()
@@ -150,6 +153,8 @@ public final class VNCSession {
         videoBandRenderer.reset()
         diagnostics.reset()
         diagnostics.connectionStartTime = Date()
+        remoteAudioPlayer?.stop()
+        remoteAudioPlayer = nil
 
         let traceEnabled: Bool
         #if DEBUG
@@ -228,6 +233,8 @@ public final class VNCSession {
         videoBandRenderer.reset()
         videoStreamManager?.stopStream()
         videoStreamManager = nil
+        remoteAudioPlayer?.stop()
+        remoteAudioPlayer = nil
 
         connectionState = .disconnected
     }
@@ -440,12 +447,10 @@ public final class VNCSession {
             await startVideoStream(offer: offer)
 
         case .udpDatagram(let datagram):
-            let manager = videoStreamManager
-            mediaQueue.async { manager?.feedUDPData(datagram) }
+            routeAppleMediaRTPPacket(datagram)
 
         case .appleMediaRTPPacket(let packet):
-            let manager = videoStreamManager
-            mediaQueue.async { manager?.feedRTPData(packet) }
+            routeAppleMediaRTPPacket(packet)
 
         case .appleMediaUDPStarted(let localPort):
             logger.info("Apple media UDP started on local port \(localPort)")
@@ -623,6 +628,8 @@ public final class VNCSession {
         transportSession = nil
         videoStreamManager?.stopStream()
         videoStreamManager = nil
+        remoteAudioPlayer?.stop()
+        remoteAudioPlayer = nil
 
         if connectionState != .disconnecting {
             connectionState = .disconnected
@@ -641,6 +648,8 @@ public final class VNCSession {
         lastRequestedClientDisplaySize = nil
         invalidateInputQueue()
         transportSession = nil
+        remoteAudioPlayer?.stop()
+        remoteAudioPlayer = nil
     }
 
     /// Append input to one ordered, bounded pump. Redundant pointer positions
@@ -722,9 +731,9 @@ public final class VNCSession {
     private func noteMediaInterruptionBoundary() {
         guard connectionState.isConnected,
               isHighPerformanceMode,
-              let transport = transportSession,
-              let manager = videoStreamManager else { return }
-        manager.noteMediaInterruption()
+              let transport = transportSession else { return }
+        videoStreamManager?.noteMediaInterruption()
+        remoteAudioPlayer?.reset()
         Task { [transport] in
             await transport.noteAppleMediaInterruption()
         }
@@ -743,6 +752,19 @@ public final class VNCSession {
         let manager = videoStreamManager ?? VideoStreamManager()
         videoStreamManager = manager
         videoBandRenderer.reset()
+
+        if configuration.enableRemoteAudio {
+            if remoteAudioPlayer == nil {
+                do {
+                    remoteAudioPlayer = try AppleRemoteAudioPlayer()
+                } catch {
+                        logger.error("Could not initialize remote audio: \(error.localizedDescription)")
+                }
+            }
+        } else {
+            remoteAudioPlayer?.stop()
+            remoteAudioPlayer = nil
+        }
 
         let width = framebufferWidth > 0 ? framebufferWidth : Int(offer.width)
         let height = framebufferHeight > 0 ? framebufferHeight : Int(offer.height)
@@ -935,6 +957,7 @@ public final class VNCSession {
         if let transport = transportSession {
             let queue = mediaQueue
             let sinkManager = manager // VideoStreamManager is Sendable
+            let sinkAudioPlayer = remoteAudioPlayer
             let generationCoalescer = coalescer
             await transport.setAppleMediaGenerationSink { generation in
                 queue.async {
@@ -942,10 +965,30 @@ public final class VNCSession {
                         mediaGeneration: generation)
                     generationCoalescer.beginStreamGeneration(generation)
                 }
+                // A media generation installs fresh SRTP keys for audio as
+                // well as video. Reset once at that real codec boundary; the
+                // repeated stream-offer path above intentionally does not.
+                sinkAudioPlayer?.reset()
             }
             await transport.setAppleMediaRTPSink { packet in
-                queue.async { sinkManager.feedRTPData(packet) }
+                if AppleRemoteAudioPlayer.canHandleRTPPacket(packet) {
+                    sinkAudioPlayer?.enqueueRTPPacket(packet)
+                } else {
+                    queue.async { sinkManager.feedRTPData(packet) }
+                }
             }
+        }
+    }
+
+    /// Route decrypted Apple media without allowing system audio to enter the
+    /// HEVC demuxer. This also covers the brief event-stream path before the
+    /// transport installs its direct high-rate sink.
+    private func routeAppleMediaRTPPacket(_ packet: Data) {
+        if AppleRemoteAudioPlayer.canHandleRTPPacket(packet) {
+            remoteAudioPlayer?.enqueueRTPPacket(packet)
+        } else {
+            let manager = videoStreamManager
+            mediaQueue.async { manager?.feedRTPData(packet) }
         }
     }
 

@@ -3,6 +3,7 @@ import Foundation
 import CoreVideo
 @testable import RootShellVNC
 import RFBProtocol
+import RFBRendering
 
 // MARK: - VNCCredentials Tests
 
@@ -45,6 +46,20 @@ final class VNCCredentialsTests: XCTestCase {
         XCTAssertEqual(creds.host, "")
         XCTAssertEqual(creds.password, "")
     }
+
+    func testLastConnectionRecordRoundTripsAllCredentialFields() throws {
+        let credentials = VNCCredentials(
+            host: "studio-mac.local",
+            port: 5907,
+            password: "correct horse battery staple",
+            username: "kit")
+        let encoded = try JSONEncoder().encode(
+            LastConnectionRecord(credentials: credentials))
+        let restored = try JSONDecoder().decode(
+            LastConnectionRecord.self,
+            from: encoded).credentials
+        XCTAssertEqual(restored, credentials)
+    }
 }
 
 // MARK: - VNCConfiguration Tests
@@ -58,6 +73,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(config.enableHighPerformanceMode)
         XCTAssertEqual(config.videoQualityMode, .adaptive)
         XCTAssertEqual(config.displaySizingMode, .matchClient)
+        XCTAssertTrue(config.enableRemoteAudio)
         XCTAssertEqual(config.targetFrameRate, 30)
         XCTAssertFalse(config.enableProtocolTrace)
     }
@@ -68,6 +84,7 @@ final class VNCConfigurationTests: XCTestCase {
             preferredEncodings: [.raw, .zrle],
             enableHighPerformanceMode: false,
             displaySizingMode: .remoteDisplay,
+            enableRemoteAudio: false,
             targetFrameRate: 60,
             enableProtocolTrace: true
         )
@@ -75,6 +92,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(config.preferredEncodings, [.raw, .zrle])
         XCTAssertFalse(config.enableHighPerformanceMode)
         XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
+        XCTAssertFalse(config.enableRemoteAudio)
         XCTAssertEqual(config.targetFrameRate, 60)
         XCTAssertTrue(config.enableProtocolTrace)
     }
@@ -184,6 +202,115 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(
             VNCConfiguration.DisplaySizingMode.matchClient.title,
             "Match Client")
+    }
+}
+
+// MARK: - Apple Remote Audio Tests
+
+final class AppleRemoteAudioRTPTests: XCTestCase {
+
+    func testRFC3640PacketParsesMultipleAccessUnits() throws {
+        let data = makeAudioRTPPacket(
+            sequence: 0x1234,
+            timestamp: 96_000,
+            ssrc: 0x1020_3040,
+            accessUnits: [Data([1, 2, 3]), Data([4, 5])])
+
+        XCTAssertTrue(AppleRemoteAudioRTPDepacketizer.canHandle(data))
+        let packet = try AppleRemoteAudioRTPDepacketizer.parse(
+            data,
+            packetization: .rfc3640)
+        XCTAssertEqual(packet.sequenceNumber, 0x1234)
+        XCTAssertEqual(packet.timestamp, 96_000)
+        XCTAssertEqual(packet.ssrc, 0x1020_3040)
+        XCTAssertEqual(packet.accessUnits, [Data([1, 2, 3]), Data([4, 5])])
+    }
+
+    func testCodecBundledPayloadIsOneCompleteAccessUnit() throws {
+        var data = makeAudioRTPPacket(
+            sequence: 1,
+            timestamp: 0,
+            ssrc: 1,
+            accessUnits: [Data([1, 2, 3])])
+        data.removeLast()
+
+        let rtpPayload = Data(data.dropFirst(12))
+        let packet = try AppleRemoteAudioRTPDepacketizer.parse(data)
+        XCTAssertEqual(packet.accessUnits, [rtpPayload])
+    }
+
+    func testLiveModeEightInactiveFrameIsPreservedAsCodecAccessUnit() throws {
+        let inactiveFrame = Data([0x00, 0x68, 0x34, 0x00])
+        var data = Data([
+            0x80, AppleRemoteAudioRTPDepacketizer.payloadType,
+            0, 1, 0, 0, 1, 0, 0, 0, 0, 7,
+        ])
+        data.append(inactiveFrame)
+
+        let packet = try AppleRemoteAudioRTPDepacketizer.parse(data)
+        XCTAssertEqual(packet.accessUnits, [inactiveFrame])
+    }
+
+    func testReorderBufferRestoresShortNetworkReordering() {
+        var buffer = AppleRemoteAudioRTPReorderBuffer()
+        let ten = packet(sequence: 10)
+        let eleven = packet(sequence: 11)
+        let twelve = packet(sequence: 12)
+
+        XCTAssertEqual(buffer.enqueue(ten).map(\.sequenceNumber), [10])
+        XCTAssertTrue(buffer.enqueue(twelve).isEmpty)
+        XCTAssertEqual(buffer.enqueue(eleven).map(\.sequenceNumber), [11, 12])
+    }
+
+    func testReorderBufferSkipsConfirmedLossInsteadOfFreezing() {
+        var buffer = AppleRemoteAudioRTPReorderBuffer(gapConfirmationPacketCount: 3)
+        XCTAssertEqual(buffer.enqueue(packet(sequence: 20)).map(\.sequenceNumber), [20])
+        XCTAssertTrue(buffer.enqueue(packet(sequence: 22)).isEmpty)
+        XCTAssertTrue(buffer.enqueue(packet(sequence: 23)).isEmpty)
+        XCTAssertEqual(
+            buffer.enqueue(packet(sequence: 24)).map(\.sequenceNumber),
+            [22, 23, 24])
+    }
+
+    func testReorderBufferHandlesSequenceWraparound() {
+        var buffer = AppleRemoteAudioRTPReorderBuffer()
+        XCTAssertEqual(buffer.enqueue(packet(sequence: .max)).map(\.sequenceNumber), [.max])
+        XCTAssertEqual(buffer.enqueue(packet(sequence: 0)).map(\.sequenceNumber), [0])
+    }
+
+    private func packet(sequence: UInt16) -> AppleRemoteAudioRTPPacket {
+        AppleRemoteAudioRTPPacket(
+            sequenceNumber: sequence,
+            timestamp: UInt32(sequence) * 480,
+            ssrc: 7,
+            marker: true,
+            accessUnits: [Data([UInt8(truncatingIfNeeded: sequence)])])
+    }
+
+    private func makeAudioRTPPacket(
+        sequence: UInt16,
+        timestamp: UInt32,
+        ssrc: UInt32,
+        accessUnits: [Data]
+    ) -> Data {
+        var data = Data([
+            0x80, AppleRemoteAudioRTPDepacketizer.payloadType,
+            UInt8(sequence >> 8), UInt8(sequence & 0xff),
+            UInt8(timestamp >> 24), UInt8((timestamp >> 16) & 0xff),
+            UInt8((timestamp >> 8) & 0xff), UInt8(timestamp & 0xff),
+            UInt8(ssrc >> 24), UInt8((ssrc >> 16) & 0xff),
+            UInt8((ssrc >> 8) & 0xff), UInt8(ssrc & 0xff),
+        ])
+        let headerBits = UInt16(accessUnits.count * 16)
+        data.append(UInt8(headerBits >> 8))
+        data.append(UInt8(headerBits & 0xff))
+        for accessUnit in accessUnits {
+            let header = UInt16(accessUnit.count) << 3
+            data.append(UInt8(header >> 8))
+            data.append(UInt8(header & 0xff))
+        }
+        for accessUnit in accessUnits { data.append(accessUnit) }
+        return data
     }
 }
 

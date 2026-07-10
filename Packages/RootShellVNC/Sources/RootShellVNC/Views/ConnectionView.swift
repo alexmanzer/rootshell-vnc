@@ -1,5 +1,6 @@
 import SwiftUI
 import RFBProtocol
+import os
 
 /// A form view for entering VNC server connection details and initiating a connection.
 ///
@@ -23,6 +24,11 @@ public struct ConnectionView: View {
     @State private var isConnecting: Bool = false
     @State private var errorMessage: String?
     @State private var showRemoteDesktop: Bool = false
+    @State private var restoredSavedConnection: Bool = false
+
+    private let logger = Logger(
+        subsystem: "com.rootshell.vnc",
+        category: "Credentials")
 
     // MARK: - Init
 
@@ -40,6 +46,7 @@ public struct ConnectionView: View {
             Form {
                 serverSection
                 authenticationSection
+                audioSection
                 qualitySection
                 displaySizingSection
                 statusSection
@@ -79,6 +86,9 @@ public struct ConnectionView: View {
                     break
                 }
             }
+            .task {
+                restoreLastConnectionIfNeeded()
+            }
         }
     }
 
@@ -96,6 +106,7 @@ public struct ConnectionView: View {
                     .autocapitalization(.none)
                     #endif
                     .disableAutocorrection(true)
+                    .submitLabel(.next)
             }
 
             HStack {
@@ -105,6 +116,7 @@ public struct ConnectionView: View {
                     #if os(iOS)
                     .keyboardType(.numberPad)
                     #endif
+                    .submitLabel(.next)
             }
         }
     }
@@ -120,6 +132,7 @@ public struct ConnectionView: View {
                     .autocapitalization(.none)
                     #endif
                     .disableAutocorrection(true)
+                    .submitLabel(.next)
             }
 
             HStack {
@@ -127,7 +140,18 @@ public struct ConnectionView: View {
                     .frame(width: 80, alignment: .leading)
                 SecureField("required", text: $password)
                     .textContentType(.password)
+                    .submitLabel(.go)
+                    .onSubmit(initiateConnection)
             }
+        }
+    }
+
+    private var audioSection: some View {
+        Section("Audio") {
+            Toggle("Play Remote Audio", isOn: $session.configuration.enableRemoteAudio)
+            Text("Play the remote Mac's system audio when the server offers it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -199,7 +223,10 @@ public struct ConnectionView: View {
     // MARK: - Actions
 
     private var canConnect: Bool {
-        !host.isEmpty && !isConnecting && session.connectionState.canConnect
+        !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && UInt16(port).map { $0 > 0 } == true
+            && !isConnecting
+            && session.connectionState.canConnect
     }
 
     private func initiateConnection() {
@@ -208,21 +235,48 @@ public struct ConnectionView: View {
         errorMessage = nil
         isConnecting = true
 
-        let portNumber = UInt16(port) ?? 5900
+        guard let portNumber = UInt16(port), portNumber > 0 else {
+            errorMessage = "Enter a valid port between 1 and 65535."
+            isConnecting = false
+            return
+        }
+        let normalizedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
         let credentials = VNCCredentials(
-            host: host,
+            host: normalizedHost,
             port: portNumber,
             password: password,
-            username: username.isEmpty ? nil : username
+            username: normalizedUsername.isEmpty ? nil : normalizedUsername
         )
 
         Task {
             do {
                 try await session.connect(credentials: credentials)
+                do {
+                    try LastConnectionCredentialStore.save(credentials)
+                } catch {
+                    logger.error(
+                        "Could not save last connection in Keychain: \(error.localizedDescription, privacy: .public)")
+                }
             } catch {
                 errorMessage = error.localizedDescription
                 isConnecting = false
             }
+        }
+    }
+
+    private func restoreLastConnectionIfNeeded() {
+        guard !restoredSavedConnection else { return }
+        restoredSavedConnection = true
+        do {
+            guard let credentials = try LastConnectionCredentialStore.load() else { return }
+            host = credentials.host
+            port = String(credentials.port)
+            username = credentials.username ?? ""
+            password = credentials.password
+        } catch {
+            logger.error(
+                "Could not restore last connection from Keychain: \(error.localizedDescription, privacy: .public)")
         }
     }
 }

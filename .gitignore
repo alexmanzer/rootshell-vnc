@@ -5,6 +5,7 @@
 .build/
 **/.build/
 **/.swiftpm/xcode/xcuserdata/
+.swift-module-cache/
 
 # Xcode
 DerivedData/

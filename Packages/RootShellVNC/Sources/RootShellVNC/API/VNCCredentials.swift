@@ -1,7 +1,7 @@
 import Foundation
 
 /// Connection credentials for a VNC server.
-public struct VNCCredentials: Sendable {
+public struct VNCCredentials: Sendable, Equatable {
     /// The hostname or IP address of the VNC server.
     public let host: String
 

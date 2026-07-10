@@ -68,6 +68,9 @@ public struct VNCConfiguration: Sendable {
     /// Whether a capable server should render at the client viewport size.
     public var displaySizingMode: DisplaySizingMode
 
+    /// Whether negotiated remote system audio should play on this device.
+    public var enableRemoteAudio: Bool
+
     /// Preferred pixel format to request from the server.
     ///
     /// When `nil`, the server's default pixel format is used.
@@ -112,6 +115,7 @@ public struct VNCConfiguration: Sendable {
         enableHighPerformanceMode: Bool = true,
         videoQualityMode: VideoQualityMode = .adaptive,
         displaySizingMode: DisplaySizingMode = .matchClient,
+        enableRemoteAudio: Bool = true,
         targetFrameRate: Int = 30,
         enableProtocolTrace: Bool = false
     ) {
@@ -120,6 +124,7 @@ public struct VNCConfiguration: Sendable {
         self.enableHighPerformanceMode = enableHighPerformanceMode
         self.videoQualityMode = videoQualityMode
         self.displaySizingMode = displaySizingMode
+        self.enableRemoteAudio = enableRemoteAudio
         self.targetFrameRate = max(1, min(120, targetFrameRate))
         self.enableProtocolTrace = enableProtocolTrace
     }
