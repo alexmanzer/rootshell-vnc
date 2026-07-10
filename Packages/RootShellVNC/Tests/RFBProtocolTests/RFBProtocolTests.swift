@@ -2,6 +2,53 @@ import XCTest
 import Foundation
 @testable import RFBProtocol
 
+final class PersistentZlibEncodingTests: XCTestCase {
+    /// Two consecutive pieces produced by one RFC zlib stream, each terminated
+    /// with Z_SYNC_FLUSH. This is the rectangle boundary used by RFB ZRLE.
+    private let firstChunk = Data([
+        0x78, 0x9c, 0x62, 0x64, 0x60, 0xf8,
+        0x0f, 0x00, 0x00, 0x00, 0xff, 0xff,
+    ])
+    private let secondChunk = Data([
+        0x62, 0xfc, 0xcf, 0xc0, 0x00,
+        0x00, 0x00, 0x00, 0xff, 0xff,
+    ])
+
+    func testZRLEDecodesConsecutiveSyncFlushedRectangles() throws {
+        let decoder = ZRLEDecoder()
+        let rect = FramebufferRect(
+            x: 0, y: 0, width: 1, height: 1, encoding: .zrle)
+
+        var firstReader = MessageReader(data: wirePayload(firstChunk))
+        XCTAssertEqual(
+            try decoder.decode(
+                reader: &firstReader,
+                rect: rect,
+                pixelFormat: .bgra8888),
+            .pixels(Data([0x00, 0x00, 0xff, 0xff])))
+
+        var secondReader = MessageReader(data: wirePayload(secondChunk))
+        XCTAssertEqual(
+            try decoder.decode(
+                reader: &secondReader,
+                rect: rect,
+                pixelFormat: .bgra8888),
+            .pixels(Data([0xff, 0x00, 0x00, 0xff])))
+    }
+
+    private func wirePayload(_ compressed: Data) -> Data {
+        let count = UInt32(compressed.count)
+        var result = Data([
+            UInt8((count >> 24) & 0xff),
+            UInt8((count >> 16) & 0xff),
+            UInt8((count >> 8) & 0xff),
+            UInt8(count & 0xff),
+        ])
+        result.append(compressed)
+        return result
+    }
+}
+
 final class AppleServerCapabilitiesTests: XCTestCase {
     func testParsesStructuredServerInitPrefixAndDesktopName() {
         var field = Data([

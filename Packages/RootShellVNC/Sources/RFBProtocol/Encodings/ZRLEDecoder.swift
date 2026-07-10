@@ -1,5 +1,4 @@
 import Foundation
-import Compression
 
 /// Decodes the ZRLE encoding (type 16) — Zlib Run-Length Encoding.
 ///
@@ -19,24 +18,10 @@ import Compression
 /// and {red,green,blue}-max all 255, cpixel is 3 bytes instead of 4.
 public final class ZRLEDecoder: EncodingDecoder, @unchecked Sendable {
 
-    // MARK: - Decompression state
+    private let inflater: RFBZlibStreamInflater?
 
-    private var streamInitialized = false
-    // Initialize with placeholder values; real pointers are set before each use.
-    nonisolated(unsafe) private var stream = compression_stream(
-        dst_ptr: UnsafeMutablePointer<UInt8>(bitPattern: 1)!,
-        dst_size: 0,
-        src_ptr: UnsafeMutablePointer<UInt8>(bitPattern: 1)!,
-        src_size: 0,
-        state: nil
-    )
-
-    public init() {}
-
-    deinit {
-        if streamInitialized {
-            compression_stream_destroy(&stream)
-        }
+    public init() {
+        inflater = try? RFBZlibStreamInflater()
     }
 
     // MARK: - EncodingDecoder
@@ -57,7 +42,13 @@ public final class ZRLEDecoder: EncodingDecoder, @unchecked Sendable {
         // Decompress — we over-allocate because the decompressed size isn't
         // known exactly up front (tiles + metadata can exceed raw pixel size).
         let maxDecompressed = totalPixels * bpp + totalPixels + 65536
-        let decompressed = try decompress(compressedData, maxOutputSize: maxDecompressed)
+        guard let inflater else {
+            throw VNCProtocolError.protocolViolation(
+                "Failed to initialize system zlib stream")
+        }
+        let decompressed = try inflater.decompress(
+            compressedData,
+            maxOutputSize: maxDecompressed)
 
         // Decode tiles from the decompressed data
         var tileReader = MessageReader(data: decompressed)
@@ -334,50 +325,4 @@ public final class ZRLEDecoder: EncodingDecoder, @unchecked Sendable {
         }
     }
 
-    // MARK: - Zlib decompression
-
-    private func decompress(_ input: Data, maxOutputSize: Int) throws -> Data {
-        if !streamInitialized {
-            let status = compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB)
-            guard status == COMPRESSION_STATUS_OK else {
-                throw VNCProtocolError.protocolViolation("Failed to initialize ZRLE zlib stream")
-            }
-            streamInitialized = true
-        }
-
-        // We decompress in a loop, growing the buffer as needed.
-        var outputBuffer = Data(count: maxOutputSize)
-        var totalProduced = 0
-
-        try input.withUnsafeBytes { inputPtr in
-            guard let inputBase = inputPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                throw VNCProtocolError.protocolViolation("Empty ZRLE compressed data")
-            }
-
-            stream.src_ptr = inputBase
-            stream.src_size = input.count
-
-            try outputBuffer.withUnsafeMutableBytes { outputPtr in
-                guard let outputBase = outputPtr.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                    throw VNCProtocolError.protocolViolation("Failed to allocate ZRLE output buffer")
-                }
-
-                stream.dst_ptr = outputBase
-                stream.dst_size = maxOutputSize
-
-                let status = compression_stream_process(&stream, 0)
-
-                switch status {
-                case COMPRESSION_STATUS_OK, COMPRESSION_STATUS_END:
-                    totalProduced = maxOutputSize - stream.dst_size
-                case COMPRESSION_STATUS_ERROR:
-                    throw VNCProtocolError.protocolViolation("ZRLE zlib decompression error")
-                default:
-                    throw VNCProtocolError.protocolViolation("Unexpected ZRLE compression status: \(status)")
-                }
-            }
-        }
-
-        return outputBuffer.prefix(totalProduced)
-    }
 }

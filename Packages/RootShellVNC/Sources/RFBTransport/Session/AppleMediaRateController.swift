@@ -3,21 +3,18 @@ import Foundation
 /// Receiver-side capacity estimator for Apple's adaptive HEVC stream.
 ///
 /// The previous implementation advertised its requested target as measured
-/// bandwidth and then sent the same value as a hard TMMBR ceiling. That feedback
-/// loop could never discover spare capacity quickly. This controller keeps a
-/// capacity estimate separate from observed screen activity and decreases only
-/// for confirmed loss—not for idle screen content. It starts at the negotiated
-/// wire ceiling: passive observation cannot discover unused capacity while the
-/// sender is application-limited, and starting at an arbitrary low ceiling
-/// creates a self-fulfilling low-quality stream. Confirmed loss multiplicatively
-/// reduces the estimate; clean intervals recover it toward the ceiling. RCTL is
-/// advisory feedback; this class does not impose a second TMMBR ceiling.
+/// bandwidth. That feedback loop could never discover spare capacity quickly.
+/// This controller keeps a
+/// capacity estimate separate from observed screen activity. Confirmed loss or
+/// measured receiver queueing multiplicatively reduces the estimate. Recovery
+/// is deliberately utilization-gated: an idle desktop is not evidence that a
+/// link can sustain a higher motion bitrate. RCTL is advisory feedback; this
+/// class does not impose a second congestion controller.
 final class AppleMediaRateController {
-    /// ScreenSharing's `AVCVideoStreamConfig` validates a 20 Mbps receive
-    /// minimum and 40 Mbps receive maximum for its 60 fps screen profile.
-    /// Keep these as named protocol-profile values rather than saturating the
-    /// RCTL UInt16 kbps field (65.535 Mbps), which overloads both network and
-    /// receive pipeline compared with the native client.
+    /// AVConference's RemoteDesktopScreenSharing settings return 20 Mbps from
+    /// `minBandwidth`; captured negotiation also contains 40/60 Mbps screen
+    /// maxima. Receiver feedback may still report a lower path estimate, so the
+    /// controller must not clamp its RCTL value to the media arbitration range.
     static let nativeScreenMinimumBitrateBps: Double = 20_000_000
     static let nativeScreenMaximumBitrateBps: Double = 40_000_000
 
@@ -27,41 +24,67 @@ final class AppleMediaRateController {
         let initialCapacity: Double
         let targetUtilization: Double
         let rampFactor: Double
+        let startupRampFactor: Double
         let decreaseFactor: Double
+        let utilizationThreshold: Double
         let headroomFactor: Double
         let rampInterval: Double
+        let startupRampInterval: Double
         let cooldown: Double
+        let backoffInterval: Double
+        let queueDelayThreshold: Double
         let throughputWindow: Double
         let updateInterval: Double
 
-        static func fromEnvironment(maximumCapacity: Double) -> Config {
+        static func fromEnvironment(
+            maximumCapacity: Double,
+            defaultInitialCapacity: Double?
+        ) -> Config {
             let env = ProcessInfo.processInfo.environment
             func value(_ key: String, default fallback: Double) -> Double {
                 env[key].flatMap(Double.init) ?? fallback
             }
-            let minimum = value(
-                "ROOTSHELL_VNC_RC_MIN_KBPS",
-                default: AppleMediaRateController.nativeScreenMinimumBitrateBps / 1_000
-            ) * 1_000
+            let minimum = value("ROOTSHELL_VNC_RC_MIN_KBPS", default: 4_000) * 1_000
             let maximum = value(
                 "ROOTSHELL_VNC_RC_MAX_KBPS",
                 default: maximumCapacity / 1_000) * 1_000
             let initial = value(
                 "ROOTSHELL_VNC_RC_INIT_KBPS",
-                default: maximum / 1_000) * 1_000
+                default: (defaultInitialCapacity ?? maximum) / 1_000) * 1_000
             return Config(
                 minimumCapacity: minimum,
                 maximumCapacity: max(minimum, maximum),
                 initialCapacity: min(maximum, max(minimum, initial)),
                 // The negotiated Viceroy profile already owns its codec
-                // headroom. Applying another 90% factor here kept every TMMBR
-                // request below the profile's real 20/40/60/75/100 Mbps tiers.
+                // headroom. Applying another factor here kept feedback below
+                // the profile's real 20/40/60/75/100 Mbps tiers.
                 targetUtilization: value("ROOTSHELL_VNC_RC_TARGET_UTILIZATION", default: 1.0),
-                rampFactor: value("ROOTSHELL_VNC_RC_RAMP_FACTOR", default: 1.50),
-                decreaseFactor: value("ROOTSHELL_VNC_RC_DECREASE_FACTOR", default: 0.80),
-                headroomFactor: value("ROOTSHELL_VNC_RC_HEADROOM", default: 1.25),
-                rampInterval: value("ROOTSHELL_VNC_RC_RAMP_INTERVAL", default: 0.50),
-                cooldown: value("ROOTSHELL_VNC_RC_COOLDOWN", default: 2.0),
+                // Conservative AIMD: native VCRC's low-latency controller logs
+                // exponential congestion backoff and continuous recovery. A
+                // 10% probe avoids our former 32 -> 40 Mbps one-step pulse.
+                rampFactor: value("ROOTSHELL_VNC_RC_RAMP_FACTOR", default: 1.10),
+                // Before the first congestion signal, quickly test beyond the
+                // route prior. This lets excellent 5G/Wi-Fi links reach full
+                // quality without treating their radio class as a cap.
+                startupRampFactor: value(
+                    "ROOTSHELL_VNC_RC_STARTUP_RAMP_FACTOR",
+                    default: 1.35),
+                decreaseFactor: value("ROOTSHELL_VNC_RC_DECREASE_FACTOR", default: 0.75),
+                utilizationThreshold: value(
+                    "ROOTSHELL_VNC_RC_UTILIZATION_THRESHOLD",
+                    default: 0.80),
+                headroomFactor: value("ROOTSHELL_VNC_RC_HEADROOM", default: 1.10),
+                rampInterval: value("ROOTSHELL_VNC_RC_RAMP_INTERVAL", default: 1.0),
+                startupRampInterval: value(
+                    "ROOTSHELL_VNC_RC_STARTUP_RAMP_INTERVAL",
+                    default: 0.5),
+                cooldown: value("ROOTSHELL_VNC_RC_COOLDOWN", default: 5.0),
+                backoffInterval: value("ROOTSHELL_VNC_RC_BACKOFF_INTERVAL", default: 0.25),
+                // One 60 fps frame period of ingress queueing means the viewer
+                // is already rendering stale content and must reduce pressure.
+                queueDelayThreshold: value(
+                    "ROOTSHELL_VNC_RC_QUEUE_DELAY_MS",
+                    default: 1000.0 / 60.0) / 1_000,
                 throughputWindow: value("ROOTSHELL_VNC_RC_TPUT_WINDOW", default: 0.50),
                 updateInterval: value("ROOTSHELL_VNC_RC_UPDATE_INTERVAL", default: 0.05))
         }
@@ -81,14 +104,22 @@ final class AppleMediaRateController {
     private var lastUpdate: Double?
     private var lastRamp: Double?
     private var cooldownUntil: Double = 0
+    private var lastBackoff: Double?
+    private var hasExperiencedCongestion = false
+    private var lastCongestionTime: Double?
     private var confirmedLossPending = false
     private var intervalReceived = 0
     private var intervalLost = 0
+    private var intervalMaximumQueueDelay = 0.0
+    private(set) var lastMaximumQueueDelaySeconds = 0.0
+    private(set) var peakQueueDelaySeconds = 0.0
 
-    init(maxTargetBps: Double) {
-        config = Config.fromEnvironment(maximumCapacity: maxTargetBps)
+    init(maxTargetBps: Double, initialTargetBps: Double? = nil) {
+        config = Config.fromEnvironment(
+            maximumCapacity: maxTargetBps,
+            defaultInitialCapacity: initialTargetBps)
         capacityEstimate = config.initialCapacity
-        target = config.initialCapacity * config.targetUtilization
+        target = capacityEstimate * config.targetUtilization
     }
 
     var targetBitrateBps: UInt32 {
@@ -109,6 +140,7 @@ final class AppleMediaRateController {
         rtpTimestamp: UInt32,
         bytes: Int,
         endOfFrame: Bool = false,
+        queueDelaySeconds: Double = 0,
         now: Double
     ) {
         _ = ssrc
@@ -118,6 +150,9 @@ final class AppleMediaRateController {
         byteSamples.append(ByteSample(time: now, bytes: bytes))
         byteSampleTotal += bytes
         intervalReceived += 1
+        let queueDelay = max(0, queueDelaySeconds)
+        intervalMaximumQueueDelay = max(intervalMaximumQueueDelay, queueDelay)
+        peakQueueDelaySeconds = max(peakQueueDelaySeconds, queueDelay)
         trimSamples(now: now)
     }
 
@@ -125,6 +160,7 @@ final class AppleMediaRateController {
         guard count > 0 else { return }
         intervalLost += count
         confirmedLossPending = true
+        lastCongestionTime = now
         cooldownUntil = max(cooldownUntil, now + config.cooldown)
     }
 
@@ -152,26 +188,39 @@ final class AppleMediaRateController {
         let observed = throughputBps(now: now)
         let expected = intervalReceived + intervalLost
         let lossFraction = expected > 0 ? Double(intervalLost) / Double(expected) : 0
-        let congested = confirmedLossPending || lossFraction > 0.01
+        let queueCongested = intervalMaximumQueueDelay >= config.queueDelayThreshold
+        let congested = confirmedLossPending || lossFraction > 0.01 || queueCongested
+        let mayBackoff = lastBackoff.map { now - $0 >= config.backoffInterval } ?? true
 
-        if congested {
-            // Screen content can be nearly idle, so observed bitrate is not a
-            // link-capacity ceiling. One unrecovered packet gets one bounded
-            // reduction; it must not collapse a 20 Mbps session to the 4 Mbps
-            // floor merely because the desktop was static at that instant.
-            capacityEstimate *= config.decreaseFactor
+        if congested, mayBackoff {
+            // Loss severity strengthens a bounded exponential reduction. A
+            // lone missing packet gets ordinary AIMD backoff; losing a material
+            // portion of a frame can halve the estimate in one response.
+            let severityAdjustment = intervalLost > 1
+                ? min(0.25, lossFraction)
+                : 0
+            let factor = max(0.50, config.decreaseFactor - severityAdjustment)
+            capacityEstimate *= factor
+            hasExperiencedCongestion = true
+            lastCongestionTime = now
             cooldownUntil = max(cooldownUntil, now + config.cooldown)
             confirmedLossPending = false
+            intervalLost = 0
+            lastBackoff = now
             lastRamp = now
         } else if now >= cooldownUntil,
-                  now - (lastRamp ?? now) >= config.rampInterval {
-            // An idle or low-complexity desktop is application-limited, not
-            // evidence of a low-capacity link. Recover toward the advertised
-            // ceiling even when observed bitrate is below the current estimate.
-            let probed = max(
-                capacityEstimate * config.rampFactor,
-                observed * config.headroomFactor)
-            capacityEstimate = min(config.maximumCapacity, probed)
+                  now - (lastRamp ?? now) >= (hasExperiencedCongestion
+                    ? config.rampInterval
+                    : config.startupRampInterval),
+                  observed >= capacityEstimate * config.utilizationThreshold {
+            // Probe only while active content is using most of the current
+            // allowance. This prevents idle periods from restoring 40 Mbps and
+            // recreating the same burst-loss cycle on the next window move.
+            let nextProbe = capacityEstimate * (hasExperiencedCongestion
+                ? config.rampFactor
+                : config.startupRampFactor)
+            let demand = max(capacityEstimate, observed * config.headroomFactor)
+            capacityEstimate = min(config.maximumCapacity, nextProbe, demand)
             lastRamp = now
         }
 
@@ -181,9 +230,22 @@ final class AppleMediaRateController {
         target = min(
             config.maximumCapacity,
             max(config.minimumCapacity, capacityEstimate * config.targetUtilization))
+
         intervalReceived = 0
-        intervalLost = 0
+        if !confirmedLossPending { intervalLost = 0 }
+        lastMaximumQueueDelaySeconds = intervalMaximumQueueDelay
+        intervalMaximumQueueDelay = 0
         return targetBitrateBps
+    }
+
+    /// A full intra picture is a large burst. Request it only after the sender
+    /// has converged near our advertised receive rate and the path has remained
+    /// gap-free long enough for queued traffic to drain.
+    func isReadyForKeyframeRecovery(now: Double) -> Bool {
+        let observed = throughputBps(now: now)
+        guard observed <= target * 1.25 else { return false }
+        guard let lastCongestionTime else { return true }
+        return now - lastCongestionTime >= 0.75
     }
 
     private func trimSamples(now: Double) {

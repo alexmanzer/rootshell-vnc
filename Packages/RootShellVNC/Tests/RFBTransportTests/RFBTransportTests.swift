@@ -5,6 +5,15 @@ import CryptoKit
 import RFBProtocol
 
 final class AppleScrollFallbackTests: XCTestCase {
+    func testAppleStandardSessionUsesPreciseInputWithoutCapabilityBlock() {
+        XCTAssertTrue(TransportSession.shouldUseApplePreciseInput(
+            serverVersion: .apple,
+            capabilities: nil))
+        XCTAssertFalse(TransportSession.shouldUseApplePreciseInput(
+            serverVersion: .v3_8,
+            capabilities: nil))
+    }
+
     func testVerticalFallbackMatchesNativeCGEventDirection() {
         let up = AppleScrollEvent(deltaY: 1, x: 10, y: 20)
         let down = AppleScrollEvent(deltaY: -1, x: 10, y: 20)
@@ -34,6 +43,30 @@ final class AppleScrollFallbackTests: XCTestCase {
                 for: event,
                 includeHorizontal: true),
             [0x40, 0x08])
+    }
+
+    func testFallbackPreservesAcceleratedWheelMagnitude() {
+        let event = AppleScrollEvent(
+            deltaX: -2,
+            deltaY: 4,
+            x: 10,
+            y: 20)
+
+        XCTAssertEqual(
+            AppleScrollFallback.wheelButtonMasks(
+                for: event,
+                includeHorizontal: true),
+            [0x40, 0x40, 0x08, 0x08, 0x08, 0x08])
+    }
+
+    func testFallbackBoundsOneAcceleratedSample() {
+        let event = AppleScrollEvent(deltaY: .max, x: 10, y: 20)
+        let masks = AppleScrollFallback.wheelButtonMasks(
+            for: event,
+            includeHorizontal: false)
+
+        XCTAssertEqual(masks.count, 32)
+        XCTAssertTrue(masks.allSatisfy { $0 == 0x08 })
     }
 
     func testZeroDeltaPhaseEventDoesNotCreateFallbackWheelClick() {

@@ -1,6 +1,5 @@
 import Foundation
 import CoreGraphics
-import Compression
 import RFBProtocol
 
 // MARK: - Rendering Errors
@@ -24,6 +23,14 @@ public enum RenderingError: Error, Sendable, LocalizedError {
             return "Invalid tile data: \(detail)"
         }
     }
+}
+
+/// Result of applying one complete server framebuffer update off the UI actor.
+public struct FramebufferRenderBatchResult: @unchecked Sendable {
+    public let image: CGImage?
+    public let resizedWidth: UInt16?
+    public let resizedHeight: UInt16?
+    public let issues: [String]
 }
 
 // MARK: - FramebufferRenderer
@@ -67,6 +74,57 @@ public final class FramebufferRenderer: @unchecked Sendable {
         default:
             throw RenderingError.unsupportedEncoding(rect.encoding)
         }
+    }
+
+    /// Apply every rectangle in one server update in wire order and snapshot
+    /// once. Keeping this operation on a serial rendering queue preserves the
+    /// persistent Zlib/ZRLE dictionary without blocking the main actor.
+    public func applyBatch(
+        _ rects: [(FramebufferRect, Data)]
+    ) -> FramebufferRenderBatchResult {
+        var resizedWidth: UInt16?
+        var resizedHeight: UInt16?
+        var issues: [String] = []
+
+        for (rect, data) in rects {
+            switch rect.encoding {
+            case .copyRect:
+                guard data.count >= 4 else {
+                    issues.append("CopyRect payload is shorter than 4 bytes")
+                    continue
+                }
+                let srcX = UInt16(data[data.startIndex]) << 8
+                    | UInt16(data[data.startIndex + 1])
+                let srcY = UInt16(data[data.startIndex + 2]) << 8
+                    | UInt16(data[data.startIndex + 3])
+                applyCopyRect(rect: rect, srcX: srcX, srcY: srcY)
+
+            case .desktopSize, .extendedDesktopSize:
+                guard rect.isSuccessfulDesktopResize else { continue }
+                handleDesktopResize(width: rect.width, height: rect.height)
+                resizedWidth = rect.width
+                resizedHeight = rect.height
+
+            case .cursor, .encryptionInfo, .serverDisplayInfo,
+                 .mediaStreamOffer, .mediaStreamAnswer:
+                break
+
+            default:
+                do {
+                    try applyRect(rect: rect, data: data)
+                } catch {
+                    issues.append(
+                        "Failed to apply rect (\(rect.encoding)): "
+                            + error.localizedDescription)
+                }
+            }
+        }
+
+        return FramebufferRenderBatchResult(
+            image: snapshot(),
+            resizedWidth: resizedWidth,
+            resizedHeight: resizedHeight,
+            issues: issues)
     }
 
     /// Apply a CopyRect (data contains srcX, srcY as 2 UInt16s).
@@ -120,27 +178,7 @@ struct RawEncodingRenderer {
 /// Maintains a persistent zlib decompression stream across rectangles,
 /// as required by the RFB specification.
 final class ZlibEncodingRenderer {
-
-    private var stream: UnsafeMutablePointer<compression_stream>
-    private var streamInitialized: Bool = false
-
-    init() {
-        stream = .allocate(capacity: 1)
-        stream.pointee = compression_stream(
-            dst_ptr: UnsafeMutablePointer<UInt8>(bitPattern: 1)!,
-            dst_size: 0,
-            src_ptr: UnsafePointer<UInt8>(bitPattern: 1)!,
-            src_size: 0,
-            state: nil
-        )
-    }
-
-    deinit {
-        if streamInitialized {
-            compression_stream_destroy(stream)
-        }
-        stream.deallocate()
-    }
+    private let inflater = try? RFBZlibStreamInflater()
 
     func render(
         rect: FramebufferRect,
@@ -167,7 +205,24 @@ final class ZlibEncodingRenderer {
         }
 
         let compressedSlice = compressedData.prefix(compressedLength)
-        let decompressed = try decompress(compressedSlice)
+        guard let inflater else {
+            throw RenderingError.decompressionFailed(
+                "Failed to initialize system zlib stream")
+        }
+        let expectedSize = Int(rect.width) * Int(rect.height)
+            * pixelFormat.bytesPerPixel
+        let decompressed: Data
+        do {
+            decompressed = try inflater.decompress(
+                Data(compressedSlice),
+                maxOutputSize: expectedSize)
+        } catch {
+            throw RenderingError.decompressionFailed(error.localizedDescription)
+        }
+        guard decompressed.count == expectedSize else {
+            throw RenderingError.decompressionFailed(
+                "Zlib rectangle decoded \(decompressed.count) bytes; expected \(expectedSize)")
+        }
 
         framebuffer.update(
             x: Int(rect.x),
@@ -176,78 +231,6 @@ final class ZlibEncodingRenderer {
             height: Int(rect.height),
             data: decompressed
         )
-    }
-
-    private func decompress(_ data: Data) throws -> Data {
-        // Initialize the stream on first use. The zlib stream is persistent
-        // across rectangles as per the RFB spec.
-        if !streamInitialized {
-            let status = compression_stream_init(
-                stream,
-                COMPRESSION_STREAM_DECODE,
-                COMPRESSION_ZLIB
-            )
-            guard status == COMPRESSION_STATUS_OK else {
-                throw RenderingError.decompressionFailed("Failed to initialize zlib stream")
-            }
-            streamInitialized = true
-        }
-
-        return try data.withUnsafeBytes { srcBuffer -> Data in
-            guard let srcBase = srcBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                throw RenderingError.decompressionFailed("Empty compressed data")
-            }
-
-            stream.pointee.src_ptr = srcBase
-            stream.pointee.src_size = srcBuffer.count
-
-            // Use a manually managed buffer so the pointer remains stable
-            var outputCapacity = max(srcBuffer.count * 4, 4096)
-            var outputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: outputCapacity)
-            var totalWritten = 0
-
-            while true {
-                stream.pointee.dst_ptr = outputBuffer.advanced(by: totalWritten)
-                stream.pointee.dst_size = outputCapacity - totalWritten
-
-                let status = compression_stream_process(stream, 0)
-
-                let bytesWritten = (outputCapacity - totalWritten) - stream.pointee.dst_size
-                totalWritten += bytesWritten
-
-                switch status {
-                case COMPRESSION_STATUS_OK:
-                    if stream.pointee.src_size == 0 {
-                        // All input consumed
-                        let result = Data(bytes: outputBuffer, count: totalWritten)
-                        outputBuffer.deallocate()
-                        return result
-                    }
-                    // Need more output space — reallocate
-                    let newCapacity = outputCapacity * 2
-                    let newBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: newCapacity)
-                    newBuffer.initialize(from: outputBuffer, count: totalWritten)
-                    outputBuffer.deallocate()
-                    outputBuffer = newBuffer
-                    outputCapacity = newCapacity
-                    continue
-
-                case COMPRESSION_STATUS_END:
-                    let result = Data(bytes: outputBuffer, count: totalWritten)
-                    outputBuffer.deallocate()
-                    return result
-
-                case COMPRESSION_STATUS_ERROR:
-                    outputBuffer.deallocate()
-                    throw RenderingError.decompressionFailed("Zlib decompression error")
-
-                default:
-                    let result = Data(bytes: outputBuffer, count: totalWritten)
-                    outputBuffer.deallocate()
-                    return result
-                }
-            }
-        }
     }
 }
 
@@ -259,27 +242,7 @@ final class ZlibEncodingRenderer {
 /// Wire format: 4-byte length, then zlib-compressed tile data.
 /// Tile data is processed in 64x64 pixel tiles, left-to-right, top-to-bottom.
 final class ZRLEEncodingRenderer {
-
-    private var stream: UnsafeMutablePointer<compression_stream>
-    private var streamInitialized: Bool = false
-
-    init() {
-        stream = .allocate(capacity: 1)
-        stream.pointee = compression_stream(
-            dst_ptr: UnsafeMutablePointer<UInt8>(bitPattern: 1)!,
-            dst_size: 0,
-            src_ptr: UnsafePointer<UInt8>(bitPattern: 1)!,
-            src_size: 0,
-            state: nil
-        )
-    }
-
-    deinit {
-        if streamInitialized {
-            compression_stream_destroy(stream)
-        }
-        stream.deallocate()
-    }
+    private let inflater = try? RFBZlibStreamInflater()
 
     func render(
         rect: FramebufferRect,
@@ -305,7 +268,21 @@ final class ZRLEEncodingRenderer {
         }
 
         let compressedSlice = compressedData.prefix(compressedLength)
-        let tileData = try decompress(compressedSlice)
+        guard let inflater else {
+            throw RenderingError.decompressionFailed(
+                "Failed to initialize system zlib stream")
+        }
+        let totalPixels = Int(rect.width) * Int(rect.height)
+        let maximumTileBytes = totalPixels * pixelFormat.bytesPerPixel
+            + totalPixels + 65_536
+        let tileData: Data
+        do {
+            tileData = try inflater.decompress(
+                Data(compressedSlice),
+                maxOutputSize: maximumTileBytes)
+        } catch {
+            throw RenderingError.decompressionFailed(error.localizedDescription)
+        }
 
         // ZRLE uses "CPIXELs" — for 32bpp true-colour with certain conditions,
         // CPIXELs are 3 bytes; otherwise they are bytesPerPixel bytes.
@@ -319,6 +296,21 @@ final class ZRLEEncodingRenderer {
         let rectY = Int(rect.y)
         let rectW = Int(rect.width)
         let rectH = Int(rect.height)
+
+        // This is the format negotiated by the production client and by
+        // ordinary 32-bit true-colour RFB servers. Decode straight from the
+        // inflated tile stream into the framebuffer under one lock instead of
+        // building a Data allocation per tile and locking once per tile/row.
+        if cpixelSize == 3 && framebuffer.bytesPerPixel == 4 {
+            try renderCompactBGRATiles(
+                tileData,
+                rectX: rectX,
+                rectY: rectY,
+                rectWidth: rectW,
+                rectHeight: rectH,
+                to: framebuffer)
+            return
+        }
 
         // Process tiles in 64x64 blocks
         var tileY = 0
@@ -590,6 +582,256 @@ final class ZRLEEncodingRenderer {
 
     // MARK: - CPIXEL expansion
 
+    /// Fast path for the standard 3-byte BGR CPIXEL to 4-byte BGRA format.
+    /// Tile decoding writes through a UInt32 pointer, eliminating intermediate
+    /// pixels, rows, and tile buffers from the latency-sensitive path.
+    private func renderCompactBGRATiles(
+        _ tileData: Data,
+        rectX: Int,
+        rectY: Int,
+        rectWidth: Int,
+        rectHeight: Int,
+        to framebuffer: Framebuffer
+    ) throws {
+        try framebuffer.withUnsafeMutablePixelBytes {
+            destination, framebufferWidth, framebufferHeight, bytesPerRow, bytesPerPixel in
+            guard bytesPerPixel == 4,
+                  rectX >= 0, rectY >= 0,
+                  rectWidth >= 0, rectHeight >= 0,
+                  rectX + rectWidth <= framebufferWidth,
+                  rectY + rectHeight <= framebufferHeight else {
+                throw RenderingError.invalidTileData(
+                    "ZRLE rectangle lies outside the framebuffer")
+            }
+
+            try tileData.withUnsafeBytes { rawTileBytes in
+                guard let source = rawTileBytes.baseAddress?
+                    .assumingMemoryBound(to: UInt8.self) else {
+                    if rectWidth == 0 || rectHeight == 0 { return }
+                    throw RenderingError.invalidTileData("Empty ZRLE tile data")
+                }
+
+                let sourceCount = rawTileBytes.count
+                var offset = 0
+                var tileY = 0
+                while tileY < rectHeight {
+                    let tileHeight = min(64, rectHeight - tileY)
+                    var tileX = 0
+
+                    while tileX < rectWidth {
+                        let tileWidth = min(64, rectWidth - tileX)
+                        let tilePixels = tileWidth * tileHeight
+                        guard offset < sourceCount else {
+                            throw RenderingError.invalidTileData(
+                                "Ran out of compact ZRLE tile data")
+                        }
+                        let subencoding = Int(source[offset])
+                        offset += 1
+
+                        @inline(__always)
+                        func pixel(at sourceOffset: Int) -> UInt32 {
+                            UInt32(source[sourceOffset])
+                                | (UInt32(source[sourceOffset + 1]) << 8)
+                                | (UInt32(source[sourceOffset + 2]) << 16)
+                                | 0xFF00_0000
+                        }
+
+                        @inline(__always)
+                        func destinationRow(_ row: Int) -> UnsafeMutablePointer<UInt32> {
+                            destination.advanced(
+                                by: (rectY + tileY + row) * bytesPerRow
+                                    + (rectX + tileX) * 4)
+                                .assumingMemoryBound(to: UInt32.self)
+                        }
+
+                        @inline(__always)
+                        func writeRun(
+                            _ value: UInt32,
+                            startingAt start: Int,
+                            count: Int
+                        ) {
+                            var remaining = count
+                            var position = start
+                            while remaining > 0 {
+                                let row = position / tileWidth
+                                let column = position % tileWidth
+                                let span = min(remaining, tileWidth - column)
+                                let rowPointer = destinationRow(row)
+                                for index in 0..<span {
+                                    rowPointer[column + index] = value
+                                }
+                                position += span
+                                remaining -= span
+                            }
+                        }
+
+                        switch subencoding {
+                        case 0:
+                            let needed = tilePixels * 3
+                            guard offset + needed <= sourceCount else {
+                                throw RenderingError.invalidTileData(
+                                    "Raw compact tile needs \(needed) bytes")
+                            }
+                            for row in 0..<tileHeight {
+                                let rowPointer = destinationRow(row)
+                                var sourceOffset = offset + row * tileWidth * 3
+                                for column in 0..<tileWidth {
+                                    rowPointer[column] = pixel(at: sourceOffset)
+                                    sourceOffset += 3
+                                }
+                            }
+                            offset += needed
+
+                        case 1:
+                            guard offset + 3 <= sourceCount else {
+                                throw RenderingError.invalidTileData(
+                                    "Solid compact tile needs 3 bytes")
+                            }
+                            let value = pixel(at: offset)
+                            offset += 3
+                            writeRun(value, startingAt: 0, count: tilePixels)
+
+                        case 2...16:
+                            let paletteSize = subencoding
+                            let paletteByteCount = paletteSize * 3
+                            guard offset + paletteByteCount <= sourceCount else {
+                                throw RenderingError.invalidTileData(
+                                    "Compact palette needs \(paletteByteCount) bytes")
+                            }
+                            var palette = [UInt32](
+                                repeating: 0, count: paletteSize)
+                            for index in 0..<paletteSize {
+                                palette[index] = pixel(at: offset + index * 3)
+                            }
+                            offset += paletteByteCount
+
+                            let bitsPerIndex: Int
+                            switch paletteSize {
+                            case 2: bitsPerIndex = 1
+                            case 3...4: bitsPerIndex = 2
+                            default: bitsPerIndex = 4
+                            }
+                            let indicesPerByte = 8 / bitsPerIndex
+                            let mask = (1 << bitsPerIndex) - 1
+                            let bytesForRow = (tileWidth * bitsPerIndex + 7) / 8
+                            guard offset + bytesForRow * tileHeight <= sourceCount else {
+                                throw RenderingError.invalidTileData(
+                                    "Ran out of compact packed-palette data")
+                            }
+
+                            for row in 0..<tileHeight {
+                                let rowPointer = destinationRow(row)
+                                let packedRow = offset + row * bytesForRow
+                                for column in 0..<tileWidth {
+                                    let packed = Int(source[
+                                        packedRow + column / indicesPerByte])
+                                    let position = column % indicesPerByte
+                                    let shift = (indicesPerByte - 1 - position)
+                                        * bitsPerIndex
+                                    let index = (packed >> shift) & mask
+                                    rowPointer[column] = index < palette.count
+                                        ? palette[index] : 0
+                                }
+                            }
+                            offset += bytesForRow * tileHeight
+
+                        case 128:
+                            var pixelsWritten = 0
+                            while pixelsWritten < tilePixels {
+                                guard offset + 3 <= sourceCount else {
+                                    throw RenderingError.invalidTileData(
+                                        "Compact RLE ran out of pixel data")
+                                }
+                                let value = pixel(at: offset)
+                                offset += 3
+                                var runLength = 1
+                                var foundRunEnd = false
+                                while offset < sourceCount {
+                                    let byte = Int(source[offset])
+                                    offset += 1
+                                    runLength += byte
+                                    if byte != 255 {
+                                        foundRunEnd = true
+                                        break
+                                    }
+                                }
+                                guard foundRunEnd else {
+                                    throw RenderingError.invalidTileData(
+                                        "Compact RLE has an incomplete run")
+                                }
+                                let clippedRun = min(
+                                    runLength, tilePixels - pixelsWritten)
+                                writeRun(
+                                    value,
+                                    startingAt: pixelsWritten,
+                                    count: clippedRun)
+                                pixelsWritten += clippedRun
+                            }
+
+                        case 130...255:
+                            let paletteSize = subencoding - 128
+                            let paletteByteCount = paletteSize * 3
+                            guard offset + paletteByteCount <= sourceCount else {
+                                throw RenderingError.invalidTileData(
+                                    "Compact RLE palette needs \(paletteByteCount) bytes")
+                            }
+                            var palette = [UInt32](
+                                repeating: 0, count: paletteSize)
+                            for index in 0..<paletteSize {
+                                palette[index] = pixel(at: offset + index * 3)
+                            }
+                            offset += paletteByteCount
+
+                            var pixelsWritten = 0
+                            while pixelsWritten < tilePixels {
+                                guard offset < sourceCount else {
+                                    throw RenderingError.invalidTileData(
+                                        "Compact palette RLE ran out of data")
+                                }
+                                let indexByte = Int(source[offset])
+                                offset += 1
+                                let paletteIndex = indexByte & 0x7F
+                                let value = paletteIndex < palette.count
+                                    ? palette[paletteIndex] : 0
+                                var runLength = 1
+                                if indexByte & 0x80 != 0 {
+                                    var foundRunEnd = false
+                                    while offset < sourceCount {
+                                        let byte = Int(source[offset])
+                                        offset += 1
+                                        runLength += byte
+                                        if byte != 255 {
+                                            foundRunEnd = true
+                                            break
+                                        }
+                                    }
+                                    guard foundRunEnd else {
+                                        throw RenderingError.invalidTileData(
+                                            "Compact palette RLE has an incomplete run")
+                                    }
+                                }
+                                let clippedRun = min(
+                                    runLength, tilePixels - pixelsWritten)
+                                writeRun(
+                                    value,
+                                    startingAt: pixelsWritten,
+                                    count: clippedRun)
+                                pixelsWritten += clippedRun
+                            }
+
+                        default:
+                            throw RenderingError.invalidTileData(
+                                "Invalid ZRLE subencoding: \(subencoding)")
+                        }
+
+                        tileX += 64
+                    }
+                    tileY += 64
+                }
+            }
+        }
+    }
+
     /// Expand a CPIXEL (compact pixel) to a full pixel in framebuffer format.
     /// For 32bpp true-colour, CPIXELs are 3 bytes in little-endian order: B, G, R
     /// and we expand to 4-byte BGRA.
@@ -635,74 +877,4 @@ final class ZRLEEncodingRenderer {
         }
     }
 
-    // MARK: - Decompression
-
-    private func decompress(_ data: Data) throws -> Data {
-        if !streamInitialized {
-            let status = compression_stream_init(
-                stream,
-                COMPRESSION_STREAM_DECODE,
-                COMPRESSION_ZLIB
-            )
-            guard status == COMPRESSION_STATUS_OK else {
-                throw RenderingError.decompressionFailed("Failed to initialize zlib stream")
-            }
-            streamInitialized = true
-        }
-
-        return try data.withUnsafeBytes { srcBuffer -> Data in
-            guard let srcBase = srcBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                throw RenderingError.decompressionFailed("Empty compressed data")
-            }
-
-            stream.pointee.src_ptr = srcBase
-            stream.pointee.src_size = srcBuffer.count
-
-            // Use a manually managed buffer so the pointer remains stable
-            var outputCapacity = max(srcBuffer.count * 4, 4096)
-            var outputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: outputCapacity)
-            var totalWritten = 0
-
-            while true {
-                stream.pointee.dst_ptr = outputBuffer.advanced(by: totalWritten)
-                stream.pointee.dst_size = outputCapacity - totalWritten
-
-                let status = compression_stream_process(stream, 0)
-
-                let bytesWritten = (outputCapacity - totalWritten) - stream.pointee.dst_size
-                totalWritten += bytesWritten
-
-                switch status {
-                case COMPRESSION_STATUS_OK:
-                    if stream.pointee.src_size == 0 {
-                        let result = Data(bytes: outputBuffer, count: totalWritten)
-                        outputBuffer.deallocate()
-                        return result
-                    }
-                    // Need more output space — reallocate
-                    let newCapacity = outputCapacity * 2
-                    let newBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: newCapacity)
-                    newBuffer.initialize(from: outputBuffer, count: totalWritten)
-                    outputBuffer.deallocate()
-                    outputBuffer = newBuffer
-                    outputCapacity = newCapacity
-                    continue
-
-                case COMPRESSION_STATUS_END:
-                    let result = Data(bytes: outputBuffer, count: totalWritten)
-                    outputBuffer.deallocate()
-                    return result
-
-                case COMPRESSION_STATUS_ERROR:
-                    outputBuffer.deallocate()
-                    throw RenderingError.decompressionFailed("ZRLE zlib decompression error")
-
-                default:
-                    let result = Data(bytes: outputBuffer, count: totalWritten)
-                    outputBuffer.deallocate()
-                    return result
-                }
-            }
-        }
-    }
 }

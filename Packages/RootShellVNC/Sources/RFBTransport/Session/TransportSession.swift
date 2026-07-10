@@ -96,6 +96,7 @@ public actor TransportSession {
     private var appleMediaRTPReorderFlushTask: Task<Void, Never>?
     private var appleMediaRTPReorderScheduledDeadlineNanos: UInt64?
     private var readTask: Task<Void, Never>?
+    private var framebufferRequestSentNanos: UInt64 = 0
     private var udpReadTasks: [Task<Void, Never>] = []
     private var udpChannels: [PosixUDPChannel] = []
     private let log = VNCLogger(category: "TransportSession")
@@ -103,6 +104,7 @@ public actor TransportSession {
     /// Legacy direct-transport switch for disabling adaptive rate control. The
     /// public Full Quality mode never enters the lossy media path at all.
     private let preferFullQualityVideo: Bool
+    private var appleMediaNetworkProfile: AppleMediaNetworkProfile = .unknown
     private var sentAppleMediaStreamConfiguration = false
     private var sentAppleMediaServerConfiguration = false
     private var sentAppleMediaPostAcceptEncodings = false
@@ -128,11 +130,21 @@ public actor TransportSession {
     /// video2). Incoming datagrams are matched to a context by SSRC.
     private var appleMediaSRTPContexts: [AppleSRTPContext] = []
     private var appleMediaSRTPContextBySSRC: [UInt32: AppleSRTPContext] = [:]
-    /// SRTCP protect context (viewer-to-server key) for outgoing RTCP feedback.
-    private var appleMediaSRTCPContext: AppleSRTCPContext?
-    /// Our RTCP sender SSRC. This is the RTP SSRC advertised by the primary
-    /// screen receiver negotiator, not a second independently generated value.
-    /// AVConference associates feedback with that negotiated receiver source.
+    private struct AppleMediaFeedbackRoute {
+        let receiveContext: AppleSRTPContext
+        let sendRTCPContext: AppleSRTCPContext
+        let receiveRTCPContext: AppleSRTCPContext
+        let localSSRC: UInt32
+        let streamIndex: Int
+    }
+
+    /// Each negotiated display has independent SRTP/SRTCP keys and its own
+    /// receiver SSRC. Remember the receive context that authenticated an
+    /// incoming source so feedback uses that display's matching send context.
+    private var appleMediaFeedbackRoutes: [AppleMediaFeedbackRoute] = []
+    private var appleMediaFeedbackRouteByRemoteSSRC: [UInt32: AppleMediaFeedbackRoute] = [:]
+    private var appleMediaVideoLocalSSRCs: [UInt32] = []
+    /// Primary receiver SSRC retained as a plaintext/debugging fallback.
     private var appleMediaLocalSSRC: UInt32 = 0
     /// Video SSRCs seen on the media path and the channel each arrived on, so
     /// keyframe requests go back on the right connected socket.
@@ -151,10 +163,8 @@ public actor TransportSession {
     /// replayed in order the moment the contexts are configured.
     private var appleMediaPreKeyDatagrams: [(Data, PosixUDPChannel)] = []
     private var appleKeyframeRequestTask: Task<Void, Never>?
-    /// SRTCP unprotect context (server-to-viewer key) for the server's Sender
-    /// Reports, and per-SSRC reception stats for the Receiver Reports we send
-    /// back so the server's congestion controller can adapt the bitrate.
-    private var appleMediaSRTCPRxContext: AppleSRTCPContext?
+    /// Per-SSRC reception stats for Receiver Reports sent back through the
+    /// matching display feedback route.
     private var appleMediaReceptionStats: [UInt32: AppleMediaReceptionStats] = [:]
     private var appleMediaLastSRLSR: UInt32 = 0
     private var appleMediaLastSRArrivalNanos: UInt64 = 0
@@ -169,11 +179,12 @@ public actor TransportSession {
     /// at a constant maximum bitrate. The burst-loss accumulator is reset after
     /// each report; the receive count is cumulative like the native client.
     private var appleRCTLFeedbackTask: Task<Void, Never>?
+    private var appleRCTLPacketsInterval: Int = 0
+    private var appleRCTLLostInterval: Int = 0
     private var appleRCTLBurstLostInterval: Int = 0
     private var appleRCTLLastDiagnosticNanos: UInt64 = 0
     /// Receiver-side capacity estimator used to populate RCTL. Apple's
-    /// feedback-only screen receiver sends RCTL by itself; it does not append a
-    /// second TMMBR controller to every feedback packet.
+    /// feedback-only screen receiver sends RCTL by itself.
     private var appleMediaRateController: AppleMediaRateController?
     private var appleRTCPReportTask: Task<Void, Never>?
 
@@ -308,6 +319,13 @@ public actor TransportSession {
 
         // Establish TCP
         try await tcp.connect()
+        appleMediaNetworkProfile = AppleMediaNetworkProfile.detect(
+            from: await tcp.pathCharacteristics(),
+            remoteHost: host)
+        log.info(
+            "Apple media bearer=\(appleMediaNetworkProfile.name) "
+                + "initialBWE=\(Int(appleMediaNetworkProfile.initialCapacityBps / 1_000))kbps "
+                + "screenTransport=local")
         let actions = stateMachine.handle(event: .connected)
         emitState()
         try await executeActions(actions)
@@ -335,40 +353,63 @@ public actor TransportSession {
     }
 
     /// Send precise scrolling when the Apple server explicitly advertises the
-    /// command, or conventional RFB wheel-button events on every other server.
+    /// command. Apple's Standard `0x1` ServerInit omits the structured command
+    /// bitmap, but an RFB 3.889 server still implements the same precise-input
+    /// extension used by its media connection. Conventional servers retain
+    /// ordinary RFB wheel-button events.
     public func sendScrollEvent(_ event: AppleScrollEvent) async throws {
-        if appleServerCapabilities?.supportsServerCommand(
-            AppleServerCapabilities.preciseScrollCommand) == true {
+        if supportsApplePreciseInput {
             try await sendClientPayload(
                 ClientMessage.appleScrollEvent(event).serialize())
             return
         }
 
         let isAppleServer = stateMachine.negotiatedVersion?.isApple == true
-        for wheelMask in AppleScrollFallback.wheelButtonMasks(
+        let wheelMasks = AppleScrollFallback.wheelButtonMasks(
             for: event,
-            includeHorizontal: isAppleServer) {
-            try await sendClientPayload(
-                ClientMessage.pointerEvent(
-                    buttonMask: pointerButtonMask | wheelMask,
-                    x: event.x,
-                    y: event.y).serialize())
-            try await sendClientPayload(
-                ClientMessage.pointerEvent(
-                    buttonMask: pointerButtonMask,
-                    x: event.x,
-                    y: event.y).serialize())
+            includeHorizontal: isAppleServer)
+        guard !wheelMasks.isEmpty else { return }
+
+        // RFB messages are self-framing on the TCP byte stream. Batch this
+        // sample's press/release pairs so accelerated scrolling does not turn
+        // into dozens of actor hops and socket writes while retaining every
+        // individual wheel transition on the wire.
+        var payload = Data(capacity: wheelMasks.count * 12)
+        for wheelMask in wheelMasks {
+            payload.append(ClientMessage.pointerEvent(
+                buttonMask: pointerButtonMask | wheelMask,
+                x: event.x,
+                y: event.y).serialize())
+            payload.append(ClientMessage.pointerEvent(
+                buttonMask: pointerButtonMask,
+                x: event.x,
+                y: event.y).serialize())
         }
+        try await sendClientPayload(payload)
     }
 
-    /// Send the native begin/end gesture envelope only when the Apple server
-    /// advertises the shared precise-input command. Conventional RFB servers
-    /// have no equivalent message; their wheel fallback remains unchanged.
+    /// Send the native begin/end gesture envelope for both Apple Standard and
+    /// media connections. Conventional RFB servers have no equivalent message;
+    /// their wheel fallback remains unchanged.
     public func sendGestureEvent(_ event: AppleGestureEvent) async throws {
-        guard appleServerCapabilities?.supportsServerCommand(
-            AppleServerCapabilities.preciseScrollCommand) == true else { return }
+        guard supportsApplePreciseInput else { return }
         try await sendClientPayload(
             ClientMessage.appleGestureEvent(event).serialize())
+    }
+
+    private var supportsApplePreciseInput: Bool {
+        Self.shouldUseApplePreciseInput(
+            serverVersion: stateMachine.negotiatedVersion,
+            capabilities: appleServerCapabilities)
+    }
+
+    static func shouldUseApplePreciseInput(
+        serverVersion: ProtocolVersion?,
+        capabilities: AppleServerCapabilities?
+    ) -> Bool {
+        capabilities?.supportsServerCommand(
+            AppleServerCapabilities.preciseScrollCommand) == true
+            || serverVersion?.isApple == true
     }
 
     /// Send clipboard text to the server.
@@ -400,6 +441,23 @@ public actor TransportSession {
             height: fbHeight
         )
         try await sendClientPayload(msg.serialize())
+        framebufferRequestSentNanos = DispatchTime.now().uptimeNanoseconds
+    }
+
+    /// Acknowledge that the consumer finished decoding and presenting one
+    /// framebuffer update. Standard RFB encodings can carry persistent codec
+    /// state, so updates must not be dropped; consumer-driven acknowledgement
+    /// provides backpressure instead of allowing an unbounded event backlog.
+    public func finishFramebufferUpdate(
+        _ rects: [FramebufferRect]
+    ) async throws {
+        if requestAppleMediaStream,
+           rects.contains(where: { $0.encoding == .mediaStreamOffer }) {
+            log.debug("Suppressing framebuffer update request after Apple media stream offer")
+            return
+        }
+        let actions = stateMachine.handle(event: .receivedFramebufferUpdate(rects))
+        try await executeActions(actions)
     }
 
     /// Request one remote display matching the client viewport. Apple servers
@@ -620,7 +678,13 @@ public actor TransportSession {
     }
 
     private func sendClientInit() async throws {
-        // Native Screen Sharing uses 0xc1 for High Performance sessions.
+        // Native Screen Sharing exposes `DRUnavailableInStandardConnection`:
+        // Apple's capability-bearing 0xc1 mode and virtual displays belong to
+        // its media connection, not to a Zlib/ZRLE Standard session. Forcing
+        // 0xc1 without completing media setup leaves the server waiting and the
+        // framebuffer black. Standard uses the ordinary shared-session flag;
+        // its pending Match Client request may still use public SetDesktopSize
+        // when a regular RFB server advertises ExtendedDesktopSize support.
         let flags: UInt8 = requestAppleMediaStream ? 0xc1 : 0x01
         try await tcp.send(Data([flags]))
         log.debug("Sent ClientInit flags=0x\(String(flags, radix: 16))")
@@ -671,6 +735,18 @@ public actor TransportSession {
         self.pixelFormat = pf
 
         log.info("ServerInit: \(width)x\(height) '\(name)'")
+
+        // A client-sized request may have been staged before connecting. Send
+        // Apple's virtual-display description as soon as ServerInit confirms
+        // support and, critically, before SetEncodings starts media setup. This
+        // prevents a constrained remote viewer from first receiving a physical
+        // 5K reference frame and only resizing after the video path is already
+        // congested.
+        if let pendingRemoteDisplaySize,
+           appleServerCapabilities?.supportsServerCommand(
+               AppleServerCapabilities.displayConfigurationCommand) == true {
+            try await sendAppleVirtualDisplaySize(pendingRemoteDisplaySize)
+        }
 
         let actions = stateMachine.handle(event: .receivedServerInit(serverInit))
         emitState()
@@ -882,17 +958,22 @@ public actor TransportSession {
             try await acceptFramebufferResize(width: resize.width, height: resize.height)
         }
 
-        continuation?.yield(.framebufferUpdate(rectsWithData))
-
-        let rects = rectsWithData.map { $0.0 }
-        if requestAppleMediaStream && rects.contains(where: { $0.encoding == .mediaStreamOffer }) {
-            log.debug("Suppressing framebuffer update request after Apple media stream offer")
-            return
+        let now = DispatchTime.now().uptimeNanoseconds
+        if framebufferRequestSentNanos != 0 {
+            let milliseconds = (now &- framebufferRequestSentNanos) / 1_000_000
+            if milliseconds >= 100 {
+                let payloadBytes = rectsWithData.reduce(0) { $0 + $1.1.count }
+                let encodings = rectsWithData.map { String(describing: $0.0.encoding) }
+                    .joined(separator: ",")
+                log.info(
+                    "Framebuffer server/network wait=\(milliseconds)ms "
+                        + "rects=\(rectsWithData.count) payload=\(payloadBytes)B "
+                        + "encodings=\(encodings)")
+            }
+            framebufferRequestSentNanos = 0
         }
 
-        // Auto-request next incremental update
-        let actions = stateMachine.handle(event: .receivedFramebufferUpdate(rects))
-        try await executeActions(actions)
+        continuation?.yield(.framebufferUpdate(rectsWithData))
     }
 
     private func handleSetColorMapEntries() async throws {
@@ -988,6 +1069,7 @@ public actor TransportSession {
                 height: height
             )
             try await sendClientPayload(msg.serialize())
+            framebufferRequestSentNanos = DispatchTime.now().uptimeNanoseconds
 
         case .updateFramebuffer:
             // Handled via the event stream, no additional action needed
@@ -2235,10 +2317,24 @@ public actor TransportSession {
         guard !sentAppleMediaServerConfiguration else { return }
 
         let configuration = try appleMediaServerConfigurationMessage()
+        if rateControlEnabled, appleMediaRateController == nil {
+            appleMediaRateController = AppleMediaRateController(
+                maxTargetBps: appleMediaRateControllerMaxBps,
+                initialTargetBps: appleMediaNetworkProfile.initialCapacityBps)
+        }
         rebuildAppleMediaSRTPContexts()
         try await sendAppleEncryptedClientPayload(configuration)
         sentAppleMediaServerConfiguration = true
         log.debug("Sent Apple media server configuration message length=\(configuration.count)")
+
+        // Native feedback-only AVConference starts its 50 ms RCTL source as
+        // soon as the receiver is configured, before the first inbound RTP.
+        // That outgoing authenticated packet also establishes cellular/VPN
+        // NAT mappings. Waiting for video first deadlocks: the server cannot
+        // reach our UDP socket until we send, and we previously did not send
+        // until the server reached it.
+        startAppleRCTLFeedbackLoop()
+        await sendAppleMediaRCTLFeedback()
     }
 
     private func appleMediaServerConfigurationMessage() throws -> Data {
@@ -2254,8 +2350,16 @@ public actor TransportSession {
         // RTCPAddFIR reads the receiver context's local/negotiated RTP SSRC for
         // its sender field. Using an unrelated random SSRC produces a valid
         // SRTCP packet that the server does not associate with this receiver.
+        appleMediaVideoLocalSSRCs = [generatedVideoOffer.ssrc]
+        if let generatedVideo2Offer {
+            appleMediaVideoLocalSSRCs.append(generatedVideo2Offer.ssrc)
+        }
         appleMediaLocalSSRC = generatedVideoOffer.ssrc
-        log.debug("Using negotiated screen receiver ssrc=0x\(String(appleMediaLocalSSRC, radix: 16)) for RTCP")
+        log.debug(
+            "Using negotiated screen receiver SSRCs "
+                + appleMediaVideoLocalSSRCs.map { "0x\(String($0, radix: 16))" }
+                    .joined(separator: ", ")
+                + " for RTCP")
         let audioSendKey = try randomBytes(count: 46)
         let audioReceiveKey = try randomBytes(count: 46)
         let videoSendKey = try randomBytes(count: 46)
@@ -2456,8 +2560,9 @@ public actor TransportSession {
         appleMediaSRTPKeys = nil
         appleMediaSRTPContexts.removeAll(keepingCapacity: true)
         appleMediaSRTPContextBySSRC.removeAll(keepingCapacity: true)
-        appleMediaSRTCPContext = nil
-        appleMediaSRTCPRxContext = nil
+        appleMediaFeedbackRoutes.removeAll(keepingCapacity: true)
+        appleMediaFeedbackRouteByRemoteSSRC.removeAll(keepingCapacity: true)
+        appleMediaVideoLocalSSRCs.removeAll(keepingCapacity: true)
         appleMediaExpectsSRTP = true
         appleMediaPreKeyDatagrams.removeAll(keepingCapacity: true)
         appleMediaUnprotectFailures = 0
@@ -2472,9 +2577,17 @@ public actor TransportSession {
         appleRCTLPreviousRTPTimestamp = nil
         appleRCTLEchoTimestampArrivalNanos = 0
         appleRCTLTotalPacketsReceived = 0
+        appleRCTLPacketsInterval = 0
+        appleRCTLLostInterval = 0
         appleRCTLBurstLostInterval = 0
         appleRCTLLastDiagnosticNanos = 0
-        appleMediaRateController = nil
+        // A display resize installs fresh media keys and SSRCs but does not
+        // change the network path. Preserve the capacity learned by generation
+        // one; resetting to the route prior here can immediately lose the new
+        // generation's reference picture on a constrained path.
+        if !transition.isReconfiguration {
+            appleMediaRateController = nil
+        }
         appleLastKeyframeRequestNanos = 0
         appleMediaLocalSSRC = 0
 
@@ -2604,8 +2717,11 @@ public actor TransportSession {
         let readTask = Task { [weak self, channel] in
             while !Task.isCancelled {
                 do {
-                    let datagram = try await channel.receive()
-                    await self?.handleAppleMediaUDPDatagram(datagram, from: channel)
+                    let datagram = try await channel.receiveDatagram()
+                    await self?.handleAppleMediaUDPDatagram(
+                        datagram.data,
+                        arrivalNanos: datagram.arrivalNanos,
+                        from: channel)
                 } catch is CancellationError {
                     break
                 } catch {
@@ -2633,6 +2749,8 @@ public actor TransportSession {
         appleRTCPReportTask = nil
         appleRCTLFeedbackTask?.cancel()
         appleRCTLFeedbackTask = nil
+        appleRCTLPacketsInterval = 0
+        appleRCTLLostInterval = 0
         appleRCTLBurstLostInterval = 0
         appleRCTLLastDiagnosticNanos = 0
         appleMediaRateController = nil
@@ -2645,6 +2763,13 @@ public actor TransportSession {
         appleMediaLastFrameLossFeedback.removeAll()
         appleMediaMostRecentFrameLossSSRC = nil
         appleMediaPreKeyDatagrams.removeAll()
+        appleMediaSRTPKeys = nil
+        appleMediaSRTPContexts.removeAll()
+        appleMediaSRTPContextBySSRC.removeAll()
+        appleMediaFeedbackRoutes.removeAll()
+        appleMediaFeedbackRouteByRemoteSSRC.removeAll()
+        appleMediaVideoLocalSSRCs.removeAll()
+        appleMediaLocalSSRC = 0
         appleLastKeyframeRequestNanos = 0
         for task in udpReadTasks {
             task.cancel()
@@ -2663,29 +2788,58 @@ public actor TransportSession {
     /// packets by SSRC on first use.
     private func rebuildAppleMediaSRTPContexts() {
         guard let keys = appleMediaSRTPKeys else { return }
-        let mediaKeys = [
-            keys.videoServerToViewer,
-            keys.video2ServerToViewer,
-            keys.audioServerToViewer,
-        ].compactMap { $0 }.filter { $0.count >= 46 }
-
-        appleMediaSRTPContexts = mediaKeys.compactMap { try? AppleSRTPContext(mediaKey: $0) }
+        appleMediaSRTPContexts.removeAll(keepingCapacity: true)
         appleMediaSRTPContextBySSRC.removeAll(keepingCapacity: true)
+        appleMediaFeedbackRoutes.removeAll(keepingCapacity: true)
+        appleMediaFeedbackRouteByRemoteSSRC.removeAll(keepingCapacity: true)
 
-        // SRTCP protect uses the viewer-to-server video key (the key the server
-        // decrypts our RTCP feedback with); unprotect (server Sender Reports)
-        // uses the server-to-viewer key.
-        if keys.videoViewerToServer.count >= 46 {
-            appleMediaSRTCPContext = try? AppleSRTCPContext(mediaKey: keys.videoViewerToServer)
+        func addVideoRoute(
+            streamIndex: Int,
+            serverToViewer: Data?,
+            viewerToServer: Data?,
+            localSSRC: UInt32?
+        ) {
+            guard let serverToViewer,
+                  let viewerToServer,
+                  let localSSRC,
+                  serverToViewer.count >= 46,
+                  viewerToServer.count >= 46,
+                  let receiveContext = try? AppleSRTPContext(mediaKey: serverToViewer),
+                  let sendRTCPContext = try? AppleSRTCPContext(mediaKey: viewerToServer),
+                  let receiveRTCPContext = try? AppleSRTCPContext(mediaKey: serverToViewer)
+            else { return }
+            appleMediaSRTPContexts.append(receiveContext)
+            appleMediaFeedbackRoutes.append(AppleMediaFeedbackRoute(
+                receiveContext: receiveContext,
+                sendRTCPContext: sendRTCPContext,
+                receiveRTCPContext: receiveRTCPContext,
+                localSSRC: localSSRC,
+                streamIndex: streamIndex))
         }
-        if keys.videoServerToViewer.count >= 46 {
-            appleMediaSRTCPRxContext = try? AppleSRTCPContext(mediaKey: keys.videoServerToViewer)
+
+        addVideoRoute(
+            streamIndex: 1,
+            serverToViewer: keys.videoServerToViewer,
+            viewerToServer: keys.videoViewerToServer,
+            localSSRC: appleMediaVideoLocalSSRCs.first)
+        addVideoRoute(
+            streamIndex: 2,
+            serverToViewer: keys.video2ServerToViewer,
+            viewerToServer: keys.video2ViewerToServer,
+            localSSRC: appleMediaVideoLocalSSRCs.count > 1
+                ? appleMediaVideoLocalSSRCs[1]
+                : nil)
+
+        if keys.audioServerToViewer.count >= 46,
+           let audioContext = try? AppleSRTPContext(mediaKey: keys.audioServerToViewer) {
+            appleMediaSRTPContexts.append(audioContext)
         }
         if appleMediaLocalSSRC == 0 {
             appleMediaLocalSSRC = generateAppleMediaLocalSSRC()
         }
-        let hasSRTCP = appleMediaSRTCPContext != nil
-        log.debug("Configured \(appleMediaSRTPContexts.count) Apple media SRTP receive contexts, SRTCP=\(hasSRTCP)")
+        log.debug(
+            "Configured \(appleMediaSRTPContexts.count) Apple media SRTP receive contexts, "
+                + "videoFeedbackRoutes=\(appleMediaFeedbackRoutes.count)")
 
         // Replay any media that raced ahead of the keys, in arrival order.
         // This is what makes startup deterministic: the burst right after the
@@ -2696,7 +2850,12 @@ public actor TransportSession {
             appleMediaPreKeyDatagrams.removeAll()
             log.info("Replaying \(buffered.count) media datagrams buffered before SRTP keys arrived")
             for (datagram, channel) in buffered {
-                handleAppleMediaUDPDatagram(datagram, from: channel)
+                handleAppleMediaUDPDatagram(
+                    datagram,
+                    // Waiting for the control-plane key record is not receiver
+                    // congestion. Start arrival accounting when replay begins.
+                    arrivalNanos: DispatchTime.now().uptimeNanoseconds,
+                    from: channel)
             }
         }
     }
@@ -2719,10 +2878,14 @@ public actor TransportSession {
     /// the same compound packet; AVConference's negotiated receiver uses the
     /// RFC 5104 FIR form emitted by `RTCPAddFIR`.
     private func sendAppleMediaKeyframeRequest(mediaSSRC: UInt32, on channel: PosixUDPChannel) async {
-        guard let srtcp = appleMediaSRTCPContext else { return }
-        let sender = appleMediaLocalSSRC
+        guard let route = appleMediaFeedbackRoute(forRemoteSSRC: mediaSSRC) else { return }
+        let sender = route.localSSRC
         var compound = Data()
-        if let rr = buildAppleMediaReceiverReport() { compound.append(rr) }
+        if let rr = buildAppleMediaReceiverReport(
+            senderSSRC: sender,
+            mediaSSRC: mediaSSRC) {
+            compound.append(rr)
+        }
 
         appleMediaFIRSeq &+= 1
         compound.append(appleMediaFullIntraRequestPacket(
@@ -2730,11 +2893,13 @@ public actor TransportSession {
             mediaSSRC: mediaSSRC,
             sequenceNumber: appleMediaFIRSeq))
 
-        guard let protected = try? srtcp.protect(compound, senderSSRC: sender) else { return }
+        guard let protected = try? route.sendRTCPContext.protect(
+            compound,
+            senderSSRC: sender) else { return }
         dumpAppleMediaOutgoingRTCPIfRequested(plaintext: compound, protected: protected)
         try? await channel.send(protected)
         log.warning("Sent native no-video-displayed FIR media ssrc=0x\(String(mediaSSRC, radix: 16)) "
-            + "sequence=\(self.appleMediaFIRSeq)")
+            + "feedbackStream=\(route.streamIndex) sequence=\(self.appleMediaFIRSeq)")
     }
 
 
@@ -2820,7 +2985,11 @@ public actor TransportSession {
         }
     }
 
-    private func handleAppleMediaUDPDatagram(_ datagram: Data, from channel: PosixUDPChannel) {
+    private func handleAppleMediaUDPDatagram(
+        _ datagram: Data,
+        arrivalNanos: UInt64,
+        from channel: PosixUDPChannel
+    ) {
         dumpAppleMediaUDPDatagramIfRequested(datagram)
 
         if isAppleMediaRTCPPacket(datagram) {
@@ -2853,7 +3022,14 @@ public actor TransportSession {
         // Fast path: SSRC already bound to a context.
         if let context = appleMediaSRTPContextBySSRC[ssrc],
            let packet = try? context.unprotect(datagram) {
-            acceptAppleMediaRTPPacket(packet, wireByteCount: datagram.count, from: channel)
+            bindAppleMediaFeedbackRouteIfAvailable(
+                receiveContext: context,
+                remoteSSRC: ssrc)
+            acceptAppleMediaRTPPacket(
+                packet,
+                wireByteCount: datagram.count,
+                arrivalNanos: arrivalNanos,
+                from: channel)
             return
         }
 
@@ -2861,7 +3037,14 @@ public actor TransportSession {
         for context in appleMediaSRTPContexts {
             if let packet = try? context.unprotect(datagram) {
                 appleMediaSRTPContextBySSRC[ssrc] = context
-                acceptAppleMediaRTPPacket(packet, wireByteCount: datagram.count, from: channel)
+                bindAppleMediaFeedbackRouteIfAvailable(
+                    receiveContext: context,
+                    remoteSSRC: ssrc)
+                acceptAppleMediaRTPPacket(
+                    packet,
+                    wireByteCount: datagram.count,
+                    arrivalNanos: arrivalNanos,
+                    from: channel)
                 return
             }
         }
@@ -2882,7 +3065,33 @@ public actor TransportSession {
             return
         }
 
-        acceptAppleMediaRTPPacket(datagram, wireByteCount: datagram.count, from: channel)
+        acceptAppleMediaRTPPacket(
+            datagram,
+            wireByteCount: datagram.count,
+            arrivalNanos: arrivalNanos,
+            from: channel)
+    }
+
+    private func bindAppleMediaFeedbackRouteIfAvailable(
+        receiveContext: AppleSRTPContext,
+        remoteSSRC: UInt32
+    ) {
+        guard appleMediaFeedbackRouteByRemoteSSRC[remoteSSRC] == nil,
+              let route = appleMediaFeedbackRoutes.first(where: {
+                  $0.receiveContext === receiveContext
+              }) else { return }
+        appleMediaFeedbackRouteByRemoteSSRC[remoteSSRC] = route
+        log.info(
+            "Bound remote video ssrc=0x\(String(remoteSSRC, radix: 16)) "
+                + "to feedback stream=\(route.streamIndex) localSSRC=0x"
+                + String(route.localSSRC, radix: 16))
+    }
+
+    private func appleMediaFeedbackRoute(
+        forRemoteSSRC remoteSSRC: UInt32
+    ) -> AppleMediaFeedbackRoute? {
+        appleMediaFeedbackRouteByRemoteSSRC[remoteSSRC]
+            ?? appleMediaFeedbackRoutes.first
     }
 
     /// Accept one decrypted RTP packet. Video packets pass through the bounded
@@ -2890,6 +3099,7 @@ public actor TransportSession {
     private func acceptAppleMediaRTPPacket(
         _ packet: Data,
         wireByteCount: Int,
+        arrivalNanos: UInt64,
         from channel: PosixUDPChannel
     ) {
         guard let header = parseAppleMediaRTPHeader(packet) else { return }
@@ -2904,12 +3114,17 @@ public actor TransportSession {
             log.info("First video RTP for ssrc=0x\(String(header.ssrc, radix: 16))")
         }
 
-        let nowNanos = DispatchTime.now().uptimeNanoseconds
+        let processingNanos = DispatchTime.now().uptimeNanoseconds
+        let ingressQueueDelayNanos = processingNanos >= arrivalNanos
+            ? processingNanos - arrivalNanos
+            : 0
+        let nowNanos = arrivalNanos
         let unique = updateAppleMediaReceptionStats(
             ssrc: header.ssrc,
             sequence: header.sequenceNumber)
         if unique {
             appleRCTLTotalPacketsReceived &+= 1
+            appleRCTLPacketsInterval += 1
             updateAppleRCTLEchoTimestamp(
                 header.timestamp,
                 arrivalNanos: nowNanos)
@@ -2918,16 +3133,19 @@ public actor TransportSession {
 
             if rateControlEnabled {
                 let controller = appleMediaRateController ?? {
-                    let created = AppleMediaRateController(maxTargetBps: appleMediaRateControllerMaxBps)
+                    let created = AppleMediaRateController(
+                        maxTargetBps: appleMediaRateControllerMaxBps,
+                        initialTargetBps: appleMediaNetworkProfile.initialCapacityBps)
                     appleMediaRateController = created
                     return created
                 }()
-                let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+                let now = Double(arrivalNanos) / 1_000_000_000
                 controller.onVideoPacket(
                     ssrc: header.ssrc,
                     rtpTimestamp: header.timestamp,
                     bytes: wireByteCount,
                     endOfFrame: header.marker,
+                    queueDelaySeconds: Double(ingressQueueDelayNanos) / 1_000_000_000,
                     now: now)
                 controller.update(now: now)
             }
@@ -2954,13 +3172,16 @@ public actor TransportSession {
         }
 
         for gap in result.gaps {
+            appleRCTLLostInterval += gap.missingPacketCount
             appleRCTLBurstLostInterval = max(
                 appleRCTLBurstLostInterval,
                 gap.missingPacketCount)
 
             if rateControlEnabled {
                 let controller = appleMediaRateController ?? {
-                    let created = AppleMediaRateController(maxTargetBps: appleMediaRateControllerMaxBps)
+                    let created = AppleMediaRateController(
+                        maxTargetBps: appleMediaRateControllerMaxBps,
+                        initialTargetBps: appleMediaNetworkProfile.initialCapacityBps)
                     appleMediaRateController = created
                     return created
                 }()
@@ -3005,21 +3226,27 @@ public actor TransportSession {
         mediaSSRC: UInt32,
         on channel: PosixUDPChannel
     ) async {
-        guard let srtcp = appleMediaSRTCPContext else { return }
-        let sender = appleMediaLocalSSRC
+        guard let route = appleMediaFeedbackRoute(forRemoteSSRC: mediaSSRC) else { return }
+        let sender = route.localSSRC
         var compound = Data()
-        if let rr = buildAppleMediaReceiverReport() { compound.append(rr) }
+        if let rr = buildAppleMediaReceiverReport(
+            senderSSRC: sender,
+            mediaSSRC: mediaSSRC) {
+            compound.append(rr)
+        }
         compound.append(appleMediaFrameLossPacket(
             senderSSRC: sender,
             mediaSSRC: mediaSSRC,
             feedback: feedback))
 
-        guard let protected = try? srtcp.protect(compound, senderSSRC: sender) else { return }
+        guard let protected = try? route.sendRTCPContext.protect(
+            compound,
+            senderSSRC: sender) else { return }
         dumpAppleMediaOutgoingRTCPIfRequested(plaintext: compound, protected: protected)
         try? await channel.send(protected)
         log.warning("Sent AVConference frame-loss feedback ssrc=0x\(String(mediaSSRC, radix: 16)) "
             + "received=\(feedback.receivedPacketCount) framePackets=\(feedback.framePacketCount) "
-            + "lost=\(feedback.lostPacketCount)")
+            + "lost=\(feedback.lostPacketCount) feedbackStream=\(route.streamIndex)")
     }
 
     /// Confirm that a decode gate corresponds to transport-observed packet
@@ -3034,6 +3261,15 @@ public actor TransportSession {
             && appleMediaVideoSSRCChannels[recent] != nil
     }
 
+    /// Whether the receive controller considers the path quiet enough for a
+    /// large recovery IDR. Sending FIR while packets are still being lost just
+    /// creates another undecodable burst and prolongs the black screen.
+    public func isReadyForVideoKeyframeRecovery() -> Bool {
+        guard let controller = appleMediaRateController else { return true }
+        return controller.isReadyForKeyframeRecovery(
+            now: Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000)
+    }
+
     /// Ask the server to retransmit missing RTP packets while the per-SSRC
     /// jitter buffer holds newer packets. AVConference has a dedicated NACK/
     /// retransmission-cache path; without this step a single lost fragment
@@ -3043,13 +3279,17 @@ public actor TransportSession {
         mediaSSRC: UInt32,
         on channel: PosixUDPChannel
     ) async {
-        guard let srtcp = appleMediaSRTCPContext else { return }
+        guard let route = appleMediaFeedbackRoute(forRemoteSSRC: mediaSSRC) else { return }
         let entries = appleMediaGenericNACKEntries(missingSequences: missingSequences)
         guard !entries.isEmpty else { return }
 
-        let sender = appleMediaLocalSSRC
+        let sender = route.localSSRC
         var compound = Data()
-        if let rr = buildAppleMediaReceiverReport() { compound.append(rr) }
+        if let rr = buildAppleMediaReceiverReport(
+            senderSSRC: sender,
+            mediaSSRC: mediaSSRC) {
+            compound.append(rr)
+        }
 
         compound.append(0x81) // V=2, P=0, FMT=1 (Generic NACK)
         compound.append(0xcd) // PT=205 (RTPFB)
@@ -3065,11 +3305,13 @@ public actor TransportSession {
             compound.append(UInt8(entry.bitmask & 0xff))
         }
 
-        guard let protected = try? srtcp.protect(compound, senderSSRC: sender) else { return }
+        guard let protected = try? route.sendRTCPContext.protect(
+            compound,
+            senderSSRC: sender) else { return }
         dumpAppleMediaOutgoingRTCPIfRequested(plaintext: compound, protected: protected)
         try? await channel.send(protected)
         log.debug("Requested RTP retransmission ssrc=0x\(String(mediaSSRC, radix: 16)) "
-            + "missing=\(missingSequences.count)")
+            + "missing=\(missingSequences.count) feedbackStream=\(route.streamIndex)")
     }
 
     private func scheduleAppleMediaReorderFlush(nowNanos: UInt64) {
@@ -3167,9 +3409,14 @@ public actor TransportSession {
     /// Parse the server's SRTCP Sender Report to capture the LSR/DLSR round-trip
     /// timestamp the server needs to estimate RTT.
     private func handleAppleMediaServerSenderReport(_ datagram: Data) {
-        guard let context = appleMediaSRTCPRxContext,
-              let rtcp = try? context.unprotect(datagram),
-              rtcp.count >= 20 else { return }
+        var decoded: Data?
+        for route in appleMediaFeedbackRoutes {
+            if let rtcp = try? route.receiveRTCPContext.unprotect(datagram) {
+                decoded = rtcp
+                break
+            }
+        }
+        guard let rtcp = decoded, rtcp.count >= 20 else { return }
         let base = rtcp.startIndex
         guard rtcp[base + 1] == 200 else { return } // PT = Sender Report
         // NTP timestamp is 8 bytes at offset 8; LSR is its middle 32 bits.
@@ -3239,11 +3486,31 @@ public actor TransportSession {
     /// 20-byte payload carries our measured received bitrate (kbps), loss,
     /// one-way delay and timestamps so the server can size its encoder to us.
     private func sendAppleMediaRCTLFeedback() async {
-        guard let srtcp = appleMediaSRTCPContext,
-              let channel = appleMediaVideoSSRCChannels.values.first else { return }
+        guard !appleMediaFeedbackRoutes.isEmpty else { return }
+
+        let targets: [(AppleMediaFeedbackRoute, [PosixUDPChannel])]
+        if appleMediaFeedbackRouteByRemoteSSRC.isEmpty {
+            targets = appleMediaFeedbackRoutes.map { ($0, udpChannels) }
+        } else {
+            var resolved: [(AppleMediaFeedbackRoute, [PosixUDPChannel])] =
+                appleMediaFeedbackRouteByRemoteSSRC.compactMap { remoteSSRC, route in
+                guard let channel = appleMediaVideoSSRCChannels[remoteSSRC] else { return nil }
+                return (route, [channel])
+            }
+            let resolvedStreams = Set(resolved.map { $0.0.streamIndex })
+            resolved.append(contentsOf: appleMediaFeedbackRoutes
+                .filter { !resolvedStreams.contains($0.streamIndex) }
+                .map { ($0, udpChannels) })
+            targets = resolved
+        }
+        guard targets.contains(where: { !$0.1.isEmpty }) else { return }
 
         let now = DispatchTime.now().uptimeNanoseconds
+        let intervalPackets = appleRCTLPacketsInterval
+        let intervalLost = appleRCTLLostInterval
         let burst = appleRCTLBurstLostInterval
+        appleRCTLPacketsInterval = 0
+        appleRCTLLostInterval = 0
         appleRCTLBurstLostInterval = 0
 
         let nowSeconds = Double(now) / 1_000_000_000
@@ -3252,8 +3519,7 @@ public actor TransportSession {
         }
 
         // RCTL carries estimated receive capacity. It is the feedback input to
-        // the peer's encoder controller, not a request to install a separate
-        // TMMBR ceiling.
+        // the peer's encoder controller, not an observed activity bitrate.
         let estimatedKbps = rateControlEnabled
             ? Double(appleMediaRateController?.bandwidthEstimateBps
                 ?? UInt32(appleMediaRateControllerMaxBps)) / 1_000
@@ -3263,6 +3529,9 @@ public actor TransportSession {
         let bwe = UInt16(min(65_535, max(0, bweKbps.rounded())))
 
         let burstyLoss = UInt8(min(15, burst))
+        let lossPercent = appleMediaRCTLIntervalLossPercent(
+            received: intervalPackets,
+            lost: intervalLost)
         let cumulativeReceivedPacketCount = UInt16(
             truncatingIfNeeded: appleRCTLTotalPacketsReceived)
         let owrdSeconds = appleMediaRateController?.owrdSeconds ?? 0
@@ -3274,9 +3543,7 @@ public actor TransportSession {
             : (now &- appleRCTLEchoTimestampArrivalNanos) / 1_000_000
         let age = UInt16(min(UInt64(UInt16.max), ageMilliseconds))
         let feedback = AppleMediaRCTLFeedback(
-            // Feedback-only AVConference leaves the generic loss-percentage
-            // field at zero and reports the worst confirmed burst separately.
-            lossPercent: 0,
+            lossPercent: lossPercent,
             echoTimestamp: echo,
             measurementAgeMilliseconds: age,
             localTimestampQ10: ts,
@@ -3285,27 +3552,50 @@ public actor TransportSession {
             cumulativeReceivedPacketCount: cumulativeReceivedPacketCount,
             bandwidthEstimateKbps: bwe)
 
-        let sender = appleMediaLocalSSRC
-        let app = appleMediaRCTLPacket(senderSSRC: sender, feedback: feedback)
+        if intervalLost > 0 {
+            log.warning(
+                "RCTL congestion feedback bwe=\(bwe)kbps receivedPackets="
+                    + "\(intervalPackets) lostPackets=\(intervalLost) "
+                    + "loss=\(lossPercent)% burst=\(burstyLoss)")
+        }
 
         if appleRCTLLastDiagnosticNanos == 0
             || now &- appleRCTLLastDiagnosticNanos >= 1_000_000_000 {
             appleRCTLLastDiagnosticNanos = now
             let receivedKbps = Int(
                 (appleMediaRateController?.throughputBps(now: nowSeconds) ?? 0) / 1_000)
-            log.debug(
+            let queuePeakMilliseconds = Int(
+                (appleMediaRateController?.peakQueueDelaySeconds ?? 0) * 1_000)
+            log.info(
                 "RCTL bwe=\(bwe)kbps received=\(receivedKbps)kbps "
-                    + "echoQ10=\(echo) age=\(age)ms burst=\(burstyLoss) "
-                    + "packetCount=\(cumulativeReceivedPacketCount & 0x0fff)")
+                    + "echoQ10=\(echo) age=\(age)ms loss=\(lossPercent)% "
+                    + "burst=\(burstyLoss) "
+                    + "packetCount=\(cumulativeReceivedPacketCount & 0x0fff) "
+                    + "ingressQueuePeak=\(queuePeakMilliseconds)ms")
         }
 
         // AVConference's `VCVideoStreamRateAdaptationFeedbackOnly` passes a
         // parameter block containing only the RCTL flag to
         // `RTPSendRateControlPacket`. Keep the wire shape identical: ordinary
         // Receiver Reports have their own 1 Hz loop below.
-        guard let protected = try? srtcp.protect(app, senderSSRC: sender) else { return }
-        dumpAppleMediaOutgoingRTCPIfRequested(plaintext: app, protected: protected)
-        try? await channel.send(protected)
+        for (route, channels) in targets {
+            let app = appleMediaRCTLPacket(
+                senderSSRC: route.localSSRC,
+                feedback: feedback)
+            guard let protected = try? route.sendRTCPContext.protect(
+                app,
+                senderSSRC: route.localSSRC) else { continue }
+            dumpAppleMediaOutgoingRTCPIfRequested(
+                plaintext: app,
+                protected: protected)
+            // Before RTP identifies the display socket, send each display's
+            // own SRTCP packet on every candidate. Afterwards the authenticated
+            // receive mapping selects one route and one channel.
+            for channel in channels {
+                try? await channel.send(protected)
+            }
+        }
+
     }
 
     private var rctlEnabled: Bool {
@@ -3325,18 +3615,28 @@ public actor TransportSession {
     }
 
     private func sendAppleMediaReceiverReport() async {
-        guard let context = appleMediaSRTCPContext,
-              let channel = appleMediaVideoSSRCChannels.values.first,
-              let rr = buildAppleMediaReceiverReport(),
-              let protected = try? context.protect(rr, senderSSRC: appleMediaLocalSSRC) else { return }
-        try? await channel.send(protected)
+        for (mediaSSRC, channel) in appleMediaVideoSSRCChannels {
+            guard let route = appleMediaFeedbackRoute(forRemoteSSRC: mediaSSRC),
+                  let rr = buildAppleMediaReceiverReport(
+                    senderSSRC: route.localSSRC,
+                    mediaSSRC: mediaSSRC),
+                  let protected = try? route.sendRTCPContext.protect(
+                    rr,
+                    senderSSRC: route.localSSRC) else { continue }
+            try? await channel.send(protected)
+        }
     }
 
     /// Build an RTCP Receiver Report (RFC 3550) reporting reception quality for
     /// each video source, so the server's congestion controller can size the
     /// bitrate to the link.
-    private func buildAppleMediaReceiverReport() -> Data? {
-        let sources = appleMediaReceptionStats.filter { $0.value.initialized }
+    private func buildAppleMediaReceiverReport(
+        senderSSRC: UInt32,
+        mediaSSRC: UInt32? = nil
+    ) -> Data? {
+        let sources = appleMediaReceptionStats.filter { ssrc, stats in
+            stats.initialized && (mediaSSRC == nil || mediaSSRC == ssrc)
+        }
         guard !sources.isEmpty else { return nil }
 
         let now = DispatchTime.now().uptimeNanoseconds
@@ -3356,7 +3656,7 @@ public actor TransportSession {
         rr.append(201) // PT = Receiver Report
         rr.append(UInt8((lengthWords >> 8) & 0xff))
         rr.append(UInt8(lengthWords & 0xff))
-        appendUInt32BE(appleMediaLocalSSRC, to: &rr)
+        appendUInt32BE(senderSSRC, to: &rr)
 
         for (ssrc, original) in sources.prefix(reportCount) {
             var stats = original

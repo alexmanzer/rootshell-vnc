@@ -39,6 +39,10 @@ public struct VNCConfiguration: Sendable {
         /// "Adapt quality to network conditions" — the server may lower bitrate
         /// and drop resolution/quality on static regions under pressure.
         case adaptive
+        /// Portable lossless RFB over the ordered TCP channel. This avoids the
+        /// Apple HEVC/UDP media floor on constrained or UDP-hostile paths while
+        /// retaining compressed updates and CopyRect acceleration.
+        case standard
         /// "Show the screen at full quality" — mirrors Screen Sharing mode 4
         /// by using lossless Zlib/ZRLE instead of lossy AVConference video.
         case fullQuality
@@ -48,6 +52,7 @@ public struct VNCConfiguration: Sendable {
         public var title: String {
             switch self {
             case .adaptive: "Adaptive"
+            case .standard: "Standard"
             case .fullQuality: "Full Quality"
             }
         }
@@ -55,7 +60,9 @@ public struct VNCConfiguration: Sendable {
         public var explanation: String {
             switch self {
             case .adaptive:
-                "Hardware-accelerated video that adapts to network conditions."
+                "Low-latency HEVC over UDP for networks that can sustain the video stream."
+            case .standard:
+                "Reliable compressed RFB over TCP for constrained networks, VPNs, and non-Mac servers."
             case .fullQuality:
                 "Lossless framebuffer updates with higher bandwidth and CPU use."
             }
@@ -154,6 +161,19 @@ public struct VNCConfiguration: Sendable {
                 if !encodings.contains(encoding) {
                     encodings.append(encoding)
                 }
+            }
+        } else if videoQualityMode == .standard {
+            // Match Apple's lossless preference order: ordinary Zlib is much
+            // cheaper to encode and decode than tile-wise ZRLE and therefore
+            // has substantially lower interactive latency. ZRLE remains the
+            // bandwidth-efficient portable fallback. Keep CopyRect ahead of
+            // raw so window moves need not resend pixels.
+            let standardEncodings: [Encoding] = [
+                .zlib, .zrle, .copyRect, .raw,
+            ]
+            for encoding in standardEncodings.reversed() {
+                encodings.removeAll { $0 == encoding }
+                encodings.insert(encoding, at: 0)
             }
         } else if videoQualityMode == .fullQuality {
             for encoding in [Encoding.zrle, .zlib] where !encodings.contains(encoding) {

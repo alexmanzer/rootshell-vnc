@@ -62,6 +62,24 @@ public final class Framebuffer: @unchecked Sendable {
 
     // MARK: - Write operations
 
+    /// Perform one compound render operation while holding the framebuffer
+    /// lock. ZRLE consists of hundreds or thousands of 64×64 tiles; exposing a
+    /// scoped buffer avoids acquiring the lock once per tile (or once per
+    /// palette row) while keeping the raw storage private and thread-safe.
+    func withUnsafeMutablePixelBytes<Result>(
+        _ body: (
+            UnsafeMutableRawPointer,
+            Int,
+            Int,
+            Int,
+            Int
+        ) throws -> Result
+    ) rethrows -> Result {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body(pixelData, width, height, bytesPerRow, bytesPerPixel)
+    }
+
     /// Write raw pixel data for a rectangle region. Thread-safe.
     public func update(x: Int, y: Int, width w: Int, height h: Int, data: Data) {
         guard w > 0, h > 0 else { return }
@@ -140,29 +158,40 @@ public final class Framebuffer: @unchecked Sendable {
     /// Fill a rectangle with a solid color. Thread-safe.
     /// `pixel` should contain exactly `bytesPerPixel` bytes representing the fill color.
     public func fillRect(x: Int, y: Int, width w: Int, height h: Int, pixel: Data) {
-        guard w > 0, h > 0 else { return }
+        guard w > 0, h > 0,
+              pixel.count >= bytesPerPixel else { return }
 
         lock.lock()
         defer { lock.unlock() }
 
         pixel.withUnsafeBytes { pixelBuffer in
             guard let pixelBase = pixelBuffer.baseAddress else { return }
-            let pixelSize = min(pixelBuffer.count, bytesPerPixel)
+            let startX = max(0, x)
+            let endX = min(self.width, x + w)
+            let startY = max(0, y)
+            let endY = min(self.height, y + h)
+            guard startX < endX, startY < endY else { return }
 
-            for row in 0 ..< h {
-                let dstY = y + row
-                guard dstY >= 0, dstY < self.height else { continue }
+            let rowBytes = (endX - startX) * bytesPerPixel
+            let firstRowOffset = startY * bytesPerRow + startX * bytesPerPixel
+            let firstRow = pixelData.advanced(by: firstRowOffset)
 
-                for col in 0 ..< w {
-                    let dstX = x + col
-                    guard dstX >= 0, dstX < self.width else { continue }
+            // Seed one pixel, then double the initialized span. A 64-pixel
+            // solid ZRLE tile takes six copies instead of 4096 tiny memcpys.
+            memcpy(firstRow, pixelBase, bytesPerPixel)
+            var initializedBytes = bytesPerPixel
+            while initializedBytes < rowBytes {
+                let copyBytes = min(initializedBytes, rowBytes - initializedBytes)
+                memcpy(firstRow.advanced(by: initializedBytes), firstRow, copyBytes)
+                initializedBytes += copyBytes
+            }
 
-                    let dstOffset = dstY * bytesPerRow + dstX * bytesPerPixel
-                    memcpy(
-                        pixelData.advanced(by: dstOffset),
-                        pixelBase,
-                        pixelSize
-                    )
+            // Every later scanline is identical to the first.
+            if endY - startY > 1 {
+                for row in (startY + 1) ..< endY {
+                    let destination = pixelData.advanced(
+                        by: row * bytesPerRow + startX * bytesPerPixel)
+                    memcpy(destination, firstRow, rowBytes)
                 }
             }
         }

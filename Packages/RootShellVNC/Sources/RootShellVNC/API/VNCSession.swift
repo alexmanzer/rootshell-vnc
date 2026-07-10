@@ -8,6 +8,20 @@ import RFBRendering
 import UIKit
 #endif
 
+private actor MediaRecoveryCoordinator {
+    private var active = false
+
+    func begin() -> Bool {
+        guard !active else { return false }
+        active = true
+        return true
+    }
+
+    func finish() {
+        active = false
+    }
+}
+
 /// Main VNC session observable object for SwiftUI integration.
 ///
 /// `VNCSession` is the primary entry point for consumers of the RootShellVNC
@@ -71,6 +85,13 @@ public final class VNCSession {
     private var remoteDisplayResizeTask: Task<Void, Never>?
     @ObservationIgnored
     private var lastRequestedClientDisplaySize: RemoteDisplaySize?
+    /// Most recent client viewport, retained across connections so Match Client
+    /// can be staged before Apple media setup starts. Without this, the server
+    /// begins by encoding the physical display and a remote phone must receive
+    /// a multi-megabyte reference picture before it can request its virtual
+    /// display.
+    @ObservationIgnored
+    private var preparedClientDisplaySize: RemoteDisplaySize?
     /// Single drain task for the ordered input queue. Gesture callbacks are
     /// synchronous, but transport writes are async; one pump prevents a release
     /// from overtaking its press while coalescing stale movement samples.
@@ -93,6 +114,15 @@ public final class VNCSession {
     /// serial queue preserves packet order.
     @ObservationIgnored
     private let mediaQueue = DispatchQueue(label: "com.rootshell.vnc.media", qos: .userInitiated)
+    /// Serial queue for persistent Zlib/ZRLE decode and framebuffer snapshots.
+    /// Keeping it separate from HEVC and the main actor preserves codec order
+    /// while input remains responsive during large standard-mode updates.
+    @ObservationIgnored
+    private let framebufferRenderQueue = DispatchQueue(
+        label: "com.rootshell.vnc.framebuffer",
+        qos: .userInitiated)
+    @ObservationIgnored
+    private var lastFramebufferRenderDiagnosticNanos: UInt64 = 0
     /// Rejects late geometry callbacks from a decoder retired by a newer AVC
     /// negotiation generation.
     @ObservationIgnored
@@ -176,6 +206,19 @@ public final class VNCSession {
             preferFullQualityVideo: configuration.videoQualityMode == .fullQuality
         )
         self.transportSession = transport
+
+        // Stage Match Client before the handshake. TransportSession retains the
+        // request until ServerInit advertises the appropriate Apple or standard
+        // resize capability, allowing Apple media setup to use the virtual
+        // display from its first negotiation rather than resizing afterward.
+        if configuration.displaySizingMode == .matchClient,
+           let preparedClientDisplaySize {
+            _ = try await transport.requestRemoteDisplaySize(
+                pixelWidth: preparedClientDisplaySize.pixelWidth,
+                pixelHeight: preparedClientDisplaySize.pixelHeight,
+                pointWidth: preparedClientDisplaySize.pointWidth,
+                pointHeight: preparedClientDisplaySize.pointHeight)
+        }
 
         // Start processing events before connecting so we don't miss any
         startEventProcessing(transport: transport)
@@ -339,11 +382,22 @@ public final class VNCSession {
         displayScale: CGFloat
     ) {
         guard configuration.displaySizingMode == .matchClient,
-              connectionState.isConnected,
-              let transport = transportSession,
               let requested = RemoteDisplaySize.matching(
                 viewSize: viewSize,
-                displayScale: displayScale),
+                // Standard RFB must software-decode and snapshot every changed
+                // pixel. A 2× backing store quadruples that work and provides
+                // little benefit once the desktop is scaled into the client
+                // view, so keep the logical workspace but render it at 1×.
+                displayScale: configuration.videoQualityMode == .standard
+                    ? 1
+                    : displayScale) else { return }
+
+        // ConnectionView supplies the viewport before connecting; the remote
+        // desktop view keeps it current for window changes and device rotation.
+        preparedClientDisplaySize = requested
+
+        guard connectionState.isConnected,
+              let transport = transportSession,
               requested != lastRequestedClientDisplaySize else { return }
 
         lastRequestedClientDisplaySize = requested
@@ -409,7 +463,42 @@ public final class VNCSession {
             handleServerInit(serverInit)
 
         case .framebufferUpdate(let rects):
-            handleFramebufferUpdate(rects)
+            let frameStarted = DispatchTime.now().uptimeNanoseconds
+
+            // Keep exactly one update in flight while this one is rendered.
+            // The event loop cannot dequeue the prefetched update until the
+            // current render returns, so this overlaps server encode/transfer
+            // without allowing the AsyncStream or persistent Zlib dictionary
+            // to build an unbounded backlog.
+            do {
+                guard let updateTransport = transportSession else { break }
+                try await updateTransport.finishFramebufferUpdate(rects.map(\.0))
+            } catch is CancellationError {
+                break
+            } catch {
+                logger.warning(
+                    "Failed to prefetch next framebuffer update: "
+                        + error.localizedDescription)
+            }
+
+            await handleFramebufferUpdate(rects)
+
+            // Pace presentation relative to total processing time rather than
+            // always sleeping a full interval after decoding. Slow frames add
+            // no artificial delay; very cheap frames still honor target FPS.
+            let elapsed = DispatchTime.now().uptimeNanoseconds &- frameStarted
+            let targetInterval = UInt64(1_000_000_000 / max(
+                1, configuration.targetFrameRate))
+            if elapsed < targetInterval {
+                do {
+                    try await Task.sleep(
+                        for: .nanoseconds(Int64(targetInterval - elapsed)))
+                } catch is CancellationError {
+                    break
+                } catch {
+                    break
+                }
+            }
 
         case .clipboardText(let text):
             logger.debug("Server clipboard: \(text.prefix(100))")
@@ -498,7 +587,9 @@ public final class VNCSession {
         connectionState = .connected
     }
 
-    private func handleFramebufferUpdate(_ rects: [(FramebufferRect, Data)]) {
+    private func handleFramebufferUpdate(
+        _ rects: [(FramebufferRect, Data)]
+    ) async {
         guard let renderer else { return }
 
         for (rect, data) in rects {
@@ -510,50 +601,53 @@ public final class VNCSession {
                 )
             }
 
-            switch rect.encoding {
-            case .copyRect:
-                guard data.count >= 4 else { continue }
-                let srcX = UInt16(data[data.startIndex]) << 8 | UInt16(data[data.startIndex + 1])
-                let srcY = UInt16(data[data.startIndex + 2]) << 8 | UInt16(data[data.startIndex + 3])
-                renderer.applyCopyRect(rect: rect, srcX: srcX, srcY: srcY)
-
-            case .desktopSize, .extendedDesktopSize:
-                guard rect.isSuccessfulDesktopResize else {
-                    logger.warning(
-                        "Ignoring rejected/invalid desktop resize status=\(rect.y) "
-                            + "size=\(rect.width)x\(rect.height)")
-                    continue
-                }
-                applyDesktopResize(width: rect.width, height: rect.height, renderer: renderer)
-
-            case .cursor:
-                // Cursor pseudo-encoding: handled at the rendering layer if needed
-                break
-
-            case .encryptionInfo, .serverDisplayInfo, .mediaStreamOffer, .mediaStreamAnswer:
-                // Pseudo-encodings handled via dedicated SessionEvent cases
-                break
-
-            default:
-                do {
-                    try renderer.applyRect(rect: rect, data: data)
-                } catch {
-                    logger.warning("Failed to apply rect (\(rect.encoding)): \(error.localizedDescription)")
-                }
+            if (rect.encoding == .desktopSize
+                    || rect.encoding == .extendedDesktopSize),
+               !rect.isSuccessfulDesktopResize {
+                logger.warning(
+                    "Ignoring rejected/invalid desktop resize status=\(rect.y) "
+                        + "size=\(rect.width)x\(rect.height)")
             }
         }
 
-        // Update the displayed image
-        currentImage = renderer.snapshot()
+        let renderStarted = DispatchTime.now().uptimeNanoseconds
+        let result = await withCheckedContinuation { continuation in
+            framebufferRenderQueue.async {
+                continuation.resume(returning: renderer.applyBatch(rects))
+            }
+        }
+        let renderFinished = DispatchTime.now().uptimeNanoseconds
+        let renderMilliseconds = (renderFinished &- renderStarted) / 1_000_000
+        if renderMilliseconds >= 100,
+           (lastFramebufferRenderDiagnosticNanos == 0
+                || renderFinished &- lastFramebufferRenderDiagnosticNanos
+                    >= 1_000_000_000) {
+            lastFramebufferRenderDiagnosticNanos = renderFinished
+            let payloadBytes = rects.reduce(0) { $0 + $1.1.count }
+            let encodings = rects.map { String(describing: $0.0.encoding) }
+                .joined(separator: ",")
+            logger.info(
+                "Framebuffer decode/snapshot=\(renderMilliseconds)ms "
+                    + "rects=\(rects.count) payload=\(payloadBytes)B "
+                    + "encodings=\(encodings)")
+        }
+
+        for issue in result.issues {
+            logger.warning("\(issue)")
+        }
+        if let width = result.resizedWidth,
+           let height = result.resizedHeight {
+            applyDesktopResizeMetadata(width: width, height: height)
+        }
+        currentImage = result.image
     }
 
     /// Apply one live geometry transition to every consumer of framebuffer
     /// dimensions. The media stream remains connected; new SPS/PPS parameter
     /// sets reconfigure the public VideoToolbox session when they arrive.
-    private func applyDesktopResize(
+    private func applyDesktopResizeMetadata(
         width: UInt16,
-        height: UInt16,
-        renderer: FramebufferRenderer
+        height: UInt16
     ) {
         let newWidth = Int(width)
         let newHeight = Int(height)
@@ -563,7 +657,6 @@ public final class VNCSession {
         logger.info(
             "Applying desktop resize \(framebufferWidth)x\(framebufferHeight) "
                 + "-> \(newWidth)x\(newHeight)")
-        renderer.handleDesktopResize(width: width, height: height)
         framebufferWidth = newWidth
         framebufferHeight = newHeight
         videoBandRenderer.setScreenSize(width: newWidth, height: newHeight)
@@ -812,6 +905,7 @@ public final class VNCSession {
         )
 
         let streamGeneration = manager.decodeProgress.streamGeneration
+        let recoveryCoordinator = MediaRecoveryCoordinator()
 
         // Startup liveness watchdog. Recovery remains in the negotiated media
         // protocol: request a fresh intra picture instead of dirtying the
@@ -819,19 +913,28 @@ public final class VNCSession {
         if let transport = transportSession {
             let watchdogManager = manager
             let log = logger
-            Task { [weak transport, weak watchdogManager] in
-                for attempt in 1...3 {
-                    try? await Task.sleep(for: .milliseconds(2500))
+            Task { [weak transport, weak watchdogManager, recoveryCoordinator] in
+                var firAttempts = 0
+                for _ in 1...20 where firAttempts < 3 {
+                    try? await Task.sleep(for: .seconds(1))
                     guard let transport, let m = watchdogManager, m.isStreamActive else { return }
                     let sources = await transport.videoSourceCount
                     let decoded = decodedBands.count
                     if sources > 0 && decoded >= sources {
-                        if attempt > 1 { log.info("Dead-band watchdog: recovered, \(decoded)/\(sources) bands decoding") }
+                        if firAttempts > 0 {
+                            log.info("Dead-band watchdog: recovered, \(decoded)/\(sources) bands decoding")
+                        }
                         return
                     }
+                    guard await transport.isReadyForVideoKeyframeRecovery(),
+                          await recoveryCoordinator.begin() else {
+                        continue
+                    }
+                    firAttempts += 1
                     log.warning("Startup media watchdog: \(decoded)/\(sources) sources decoding "
-                        + "(attempt \(attempt)); requesting native FIR")
+                        + "(attempt \(firAttempts)); requesting native FIR after rate settled")
                     await transport.requestVideoKeyframe()
+                    await recoveryCoordinator.finish()
                 }
             }
         }
@@ -882,24 +985,39 @@ public final class VNCSession {
             let recoveryManager = manager
             let log = logger
             let recoveryQueue = mediaQueue
-            manager.onLossDetected = { [weak transport, weak recoveryManager] ssrc in
+            manager.onLossDetected = { [weak transport, weak recoveryManager, recoveryCoordinator] ssrc in
                 guard let transport, let recoveryManager else { return }
-                Task { [transport, recoveryManager] in
+                Task { [transport, recoveryManager, recoveryCoordinator] in
                     guard await transport.hasObservedVideoLossFeedback(ssrc: ssrc) else {
                         log.warning("Compressed stream gated without a matching observed RTP loss report")
                         return
                     }
+                    guard await recoveryCoordinator.begin() else { return }
+                    defer {
+                        Task { await recoveryCoordinator.finish() }
+                    }
 
                     var attempt = 0
+                    var hasWaitedForDisplay = false
                     while recoveryManager.isStreamActive,
                           recoveryManager.hasGatedBands {
                         // Native names this its no-video-display fail-safe. A
                         // two-second display silence gives retransmission and
                         // the initial AFB time to work without pulsing quality.
-                        try? await Task.sleep(for: .seconds(2))
+                        // Once that expires, poll capacity promptly: waiting
+                        // another two seconds after every deferred check leaves
+                        // a recovered mobile path black unnecessarily.
+                        try? await Task.sleep(for: hasWaitedForDisplay
+                            ? .milliseconds(250)
+                            : .seconds(2))
+                        hasWaitedForDisplay = true
                         guard !Task.isCancelled,
                               recoveryManager.isStreamActive,
                               recoveryManager.hasGatedBands else { return }
+                        guard await transport.isReadyForVideoKeyframeRecovery() else {
+                            log.info("Deferring FIR while video rate/loss is still unsettled")
+                            continue
+                        }
                         attempt += 1
                         log.warning("No video displayed after RTP loss; applying native FIR "
                             + "fail-safe (attempt \(attempt))")
@@ -910,6 +1028,7 @@ public final class VNCSession {
                             }
                         }
                         await transport.requestVideoKeyframe(ssrc: ssrc)
+                        hasWaitedForDisplay = false
                     }
                 }
             }

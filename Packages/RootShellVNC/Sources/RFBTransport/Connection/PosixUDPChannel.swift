@@ -6,8 +6,21 @@ import RFBProtocol
 /// actor. `Array.removeFirst()` shifts every remaining element and made the old
 /// queue progressively more expensive precisely when an RTP burst built a
 /// backlog. This queue advances a head index and compacts only occasionally.
+public struct PosixUDPDatagram: Sendable, Equatable {
+    public let data: Data
+    /// Monotonic timestamp captured as the datagram is drained from the socket.
+    /// Keeping this with the bytes lets congestion control see userspace/actor
+    /// queueing instead of mistaking delayed processing for network arrival.
+    public let arrivalNanos: UInt64
+
+    public init(data: Data, arrivalNanos: UInt64) {
+        self.data = data
+        self.arrivalNanos = arrivalNanos
+    }
+}
+
 struct BoundedDatagramFIFO {
-    private var storage: [Data] = []
+    private var storage: [PosixUDPDatagram] = []
     private var head = 0
     let capacity: Int
 
@@ -21,7 +34,7 @@ struct BoundedDatagramFIFO {
 
     /// Appends datagrams in order and, if the hard memory bound is exceeded,
     /// drops the oldest entries. Returns the number dropped.
-    mutating func append(contentsOf datagrams: [Data]) -> Int {
+    mutating func append(contentsOf datagrams: [PosixUDPDatagram]) -> Int {
         guard !datagrams.isEmpty else { return 0 }
         storage.append(contentsOf: datagrams)
         let overflow = max(0, count - capacity)
@@ -30,7 +43,7 @@ struct BoundedDatagramFIFO {
         return overflow
     }
 
-    mutating func popFirst() -> Data? {
+    mutating func popFirst() -> PosixUDPDatagram? {
         guard head < storage.count else { return nil }
         let value = storage[head]
         head += 1
@@ -94,7 +107,10 @@ public actor PosixUDPChannel {
     private let stateLock = NSLock()
     private nonisolated(unsafe) var pendingDatagrams = BoundedDatagramFIFO(
         capacity: 8192)
-    private nonisolated(unsafe) var receiveWaiters: [CheckedContinuation<Data, Error>] = []
+    private nonisolated(unsafe) var receiveWaiters: [
+        CheckedContinuation<PosixUDPDatagram, Error>
+    ] = []
+    private nonisolated(unsafe) var lastBacklogLogNanos: UInt64 = 0
     private nonisolated(unsafe) var lockedClosed = false
     /// Soft cap so a stalled consumer degrades like a kernel buffer overflow
     /// (bounded memory, oldest dropped) instead of growing without bound.
@@ -215,6 +231,13 @@ public actor PosixUDPChannel {
     /// Receive the next datagram (payload only; connected peer filtering applied).
     /// Datagrams are delivered in exact socket-drain order.
     public func receive() async throws -> Data {
+        try await receiveDatagram().data
+    }
+
+    /// Receive bytes together with their socket-drain time. The timestamp is
+    /// required by the media congestion controller; `receive()` remains as the
+    /// compatibility convenience for callers that need only bytes.
+    public func receiveDatagram() async throws -> PosixUDPDatagram {
         try await withCheckedThrowingContinuation { continuation in
             stateLock.lock()
             if let datagram = pendingDatagrams.popFirst() {
@@ -286,11 +309,13 @@ public actor PosixUDPChannel {
             // on this serial read queue — NEVER via a spawned Task, which has
             // no FIFO guarantee and reordered batches under load.
             var buffer = [UInt8](repeating: 0, count: 65_536)
-            var batch: [Data] = []
+            var batch: [PosixUDPDatagram] = []
             while true {
                 let n = recv(capturedFD, &buffer, buffer.count, 0)
                 if n > 0 {
-                    batch.append(Data(buffer[0..<n]))
+                    batch.append(PosixUDPDatagram(
+                        data: Data(buffer[0..<n]),
+                        arrivalNanos: DispatchTime.now().uptimeNanoseconds))
                 } else {
                     break
                 }
@@ -306,16 +331,23 @@ public actor PosixUDPChannel {
     /// Append a drained batch and satisfy any waiting `receive()` calls, all
     /// under the state lock so socket-drain order is exactly delivery order.
     /// `nonisolated` — runs on the serial read queue, not the actor.
-    private nonisolated func publishBatchInOrder(_ batch: [Data]) {
+    private nonisolated func publishBatchInOrder(_ batch: [PosixUDPDatagram]) {
         stateLock.lock()
         let dropped = pendingDatagrams.append(contentsOf: batch)
-        var resumes: [(CheckedContinuation<Data, Error>, Data)] = []
+        let queued = pendingDatagrams.count
+        let now = DispatchTime.now().uptimeNanoseconds
+        let shouldLogBacklog = queued >= 512
+            && (lastBacklogLogNanos == 0 || now &- lastBacklogLogNanos >= 1_000_000_000)
+        if shouldLogBacklog { lastBacklogLogNanos = now }
+        var resumes: [(CheckedContinuation<PosixUDPDatagram, Error>, PosixUDPDatagram)] = []
         while !receiveWaiters.isEmpty, let datagram = pendingDatagrams.popFirst() {
             resumes.append((receiveWaiters.removeFirst(), datagram))
         }
         stateLock.unlock()
         if dropped > 0 {
             log.error("UDP userspace receive queue overflow; dropped \(dropped) oldest datagrams")
+        } else if shouldLogBacklog {
+            log.warning("UDP userspace receive backlog=\(queued) datagrams")
         }
         for (cont, datagram) in resumes {
             cont.resume(returning: datagram)

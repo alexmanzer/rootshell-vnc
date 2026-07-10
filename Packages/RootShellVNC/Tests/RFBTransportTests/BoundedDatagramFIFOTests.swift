@@ -28,13 +28,17 @@ final class BoundedDatagramFIFOTests: XCTestCase {
         XCTAssertEqual(drain(&fifo), [packet(3), packet(4), packet(5)])
     }
 
-    private func drain(_ fifo: inout BoundedDatagramFIFO) -> [Data] {
-        var result: [Data] = []
+    private func drain(_ fifo: inout BoundedDatagramFIFO) -> [PosixUDPDatagram] {
+        var result: [PosixUDPDatagram] = []
         while let packet = fifo.popFirst() { result.append(packet) }
         return result
     }
 
-    private func packet(_ value: Int) -> Data {
+    private func packet(_ value: Int) -> PosixUDPDatagram {
+        PosixUDPDatagram(data: packetData(value), arrivalNanos: UInt64(value))
+    }
+
+    private func packetData(_ value: Int) -> Data {
         var bigEndian = UInt32(value).bigEndian
         return Data(bytes: &bigEndian, count: MemoryLayout<UInt32>.size)
     }

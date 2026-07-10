@@ -22,7 +22,8 @@ let package = Package(
         .target(
             name: "RFBProtocol",
             dependencies: [],
-            swiftSettings: [.swiftLanguageMode(.v6)]
+            swiftSettings: [.swiftLanguageMode(.v6)],
+            linkerSettings: [.linkedLibrary("z")]
         ),
 
         // MARK: - RFBTransport (network I/O, crypto, auth)

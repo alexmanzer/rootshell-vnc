@@ -16,6 +16,7 @@ public struct ConnectionView: View {
     // MARK: - Properties
 
     @Bindable var session: VNCSession
+    @Environment(\.displayScale) private var displayScale
 
     @State private var host: String = ""
     @State private var port: String = "5900"
@@ -51,6 +52,31 @@ public struct ConnectionView: View {
                 displaySizingSection
                 statusSection
                 connectSection
+            }
+            .background {
+                // Capture the window/phone viewport before Connect is tapped.
+                // Match Client can then be negotiated before the first Apple
+                // media stream instead of after navigation to the desktop.
+                GeometryReader { geometry in
+                    Color.clear
+                        .onAppear {
+                            prepareRemoteDisplaySize(geometry.size)
+                        }
+                        .onChange(of: geometry.size) { _, newSize in
+                            prepareRemoteDisplaySize(newSize)
+                        }
+                        .onChange(of: displayScale) { _, _ in
+                            prepareRemoteDisplaySize(geometry.size)
+                        }
+                        .onChange(of: session.configuration.displaySizingMode) { _, mode in
+                            if mode == .matchClient {
+                                prepareRemoteDisplaySize(geometry.size)
+                            }
+                        }
+                        .onChange(of: session.configuration.videoQualityMode) { _, _ in
+                            prepareRemoteDisplaySize(geometry.size)
+                        }
+                }
             }
             .navigationTitle("Connect to VNC Server")
             #if os(iOS)
@@ -162,7 +188,9 @@ public struct ConnectionView: View {
                     Text(mode.title).tag(mode)
                 }
             }
-            .pickerStyle(.segmented)
+            // Three descriptive modes do not fit reliably in an iPhone-width
+            // segmented control; the menu preserves their complete labels.
+            .pickerStyle(.menu)
 
             Text(session.configuration.videoQualityMode.explanation)
                 .font(.caption)
@@ -182,6 +210,16 @@ public struct ConnectionView: View {
             Text(session.configuration.displaySizingMode.explanation)
                 .font(.caption)
                 .foregroundStyle(.secondary)
+
+            if session.configuration.displaySizingMode == .matchClient,
+               session.configuration.videoQualityMode != .adaptive {
+                Text(
+                    "Apple servers support Match Client only in Adaptive mode. "
+                        + "Standard VNC servers may still resize when they advertise "
+                        + "ExtendedDesktopSize support.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -278,5 +316,11 @@ public struct ConnectionView: View {
             logger.error(
                 "Could not restore last connection from Keychain: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    private func prepareRemoteDisplaySize(_ size: CGSize) {
+        session.updateRemoteDisplaySize(
+            viewSize: size,
+            displayScale: displayScale)
     }
 }

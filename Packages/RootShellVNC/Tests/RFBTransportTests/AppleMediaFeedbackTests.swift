@@ -124,6 +124,14 @@ final class AppleMediaFeedbackTests: XCTestCase {
         XCTAssertEqual(packet.suffix(20), feedback.serialized())
     }
 
+    func testRCTLIntervalLossIncludesMissingPacketsInExpectedTotal() {
+        XCTAssertEqual(appleMediaRCTLIntervalLossPercent(received: 0, lost: 0), 0)
+        XCTAssertEqual(appleMediaRCTLIntervalLossPercent(received: 90, lost: 10), 10)
+        XCTAssertEqual(appleMediaRCTLIntervalLossPercent(received: 1, lost: 1), 50)
+        XCTAssertEqual(appleMediaRCTLIntervalLossPercent(received: 0, lost: 10), 100)
+        XCTAssertEqual(appleMediaRCTLIntervalLossPercent(received: -1, lost: -1), 0)
+    }
+
     func testAppleMediaRTPFrameExtensionMatchesCapturedScreenPacket() {
         // Prefix of a decrypted Screen Sharing HEVC packet captured from the
         // native server. The apparent 0x9311 "profile" is media-control
@@ -204,8 +212,8 @@ final class AppleMediaFeedbackTests: XCTestCase {
         controller.onConfirmedLoss(count: 1, now: 0.1)
         _ = controller.update(now: 0.1)
 
-        XCTAssertEqual(controller.bandwidthEstimateBps, 48_000_000)
-        XCTAssertEqual(controller.targetBitrateBps, 48_000_000)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 45_000_000)
+        XCTAssertEqual(controller.targetBitrateBps, 45_000_000)
         XCTAssertEqual(controller.owrdSeconds, 0)
     }
 
@@ -220,7 +228,90 @@ final class AppleMediaFeedbackTests: XCTestCase {
         controller.onConfirmedLoss(count: 1, now: 0.1)
         _ = controller.update(now: 0.1)
 
-        XCTAssertEqual(controller.bandwidthEstimateBps, 80_000_000)
-        XCTAssertEqual(controller.targetBitrateBps, 80_000_000)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 75_000_000)
+        XCTAssertEqual(controller.targetBitrateBps, 75_000_000)
+    }
+
+    func testRateControllerDoesNotRampDuringIdleCooldown() {
+        let controller = AppleMediaRateController(maxTargetBps: 40_000_000)
+        _ = controller.update(now: 0)
+        controller.onConfirmedLoss(count: 1, now: 0.1)
+        _ = controller.update(now: 0.1)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 30_000_000)
+
+        _ = controller.update(now: 10)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 30_000_000)
+    }
+
+    func testRateControllerProbesGraduallyOnlyUnderUtilization() {
+        let controller = AppleMediaRateController(maxTargetBps: 40_000_000)
+        _ = controller.update(now: 0)
+        controller.onConfirmedLoss(count: 1, now: 0.1)
+        _ = controller.update(now: 0.1)
+
+        for step in 0..<5 {
+            controller.onVideoPacket(
+                ssrc: 1,
+                rtpTimestamp: UInt32(step),
+                bytes: 500_000,
+                now: 5.1 + Double(step) * 0.1)
+        }
+        _ = controller.update(now: 5.6)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 33_000_000)
+    }
+
+    func testRateControllerBacksOffForReceiverQueueingBeforeLoss() {
+        let controller = AppleMediaRateController(maxTargetBps: 40_000_000)
+        _ = controller.update(now: 0)
+        controller.onVideoPacket(
+            ssrc: 1,
+            rtpTimestamp: 1,
+            bytes: 1_400,
+            queueDelaySeconds: 0.030,
+            now: 0.1)
+        _ = controller.update(now: 0.1)
+
+        XCTAssertEqual(controller.bandwidthEstimateBps, 30_000_000)
+        XCTAssertEqual(controller.peakQueueDelaySeconds, 0.030, accuracy: 0.000_001)
+    }
+
+    func testRoutePriorCanProbeQuicklyToFullCapacityBeforeCongestion() {
+        let controller = AppleMediaRateController(
+            maxTargetBps: 40_000_000,
+            initialTargetBps: 12_000_000)
+        _ = controller.update(now: 0)
+
+        for probe in 1...4 {
+            let start = Double(probe) * 0.5
+            for packet in 0..<5 {
+                controller.onVideoPacket(
+                    ssrc: 1,
+                    rtpTimestamp: UInt32(probe * 10 + packet),
+                    bytes: 500_000,
+                    now: start - 0.4 + Double(packet) * 0.1)
+            }
+            _ = controller.update(now: start)
+        }
+
+        XCTAssertGreaterThan(controller.bandwidthEstimateBps, 35_000_000)
+        XCTAssertLessThanOrEqual(controller.bandwidthEstimateBps, 40_000_000)
+    }
+
+    func testKeyframeRecoveryWaitsForOvershootAndQuietLossInterval() {
+        let controller = AppleMediaRateController(
+            maxTargetBps: 40_000_000,
+            initialTargetBps: 8_000_000)
+        _ = controller.update(now: 0)
+        controller.onConfirmedLoss(count: 10, now: 0.1)
+        _ = controller.update(now: 0.1)
+        controller.onVideoPacket(
+            ssrc: 1,
+            rtpTimestamp: 1,
+            bytes: 1_000_000,
+            now: 0.2)
+
+        XCTAssertFalse(controller.isReadyForKeyframeRecovery(now: 0.3))
+        XCTAssertFalse(controller.isReadyForKeyframeRecovery(now: 0.8))
+        XCTAssertTrue(controller.isReadyForKeyframeRecovery(now: 1.0))
     }
 }

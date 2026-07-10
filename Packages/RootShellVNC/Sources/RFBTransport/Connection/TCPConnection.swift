@@ -2,6 +2,21 @@ import Foundation
 import Network
 import RFBProtocol
 
+enum NetworkPathInterfaceKind: Sendable, Equatable {
+    case cellular
+    case wifi
+    case wiredEthernet
+    case loopback
+    case other
+}
+
+struct NetworkPathCharacteristics: Sendable, Equatable {
+    let interface: NetworkPathInterfaceKind
+    let usesOtherInterface: Bool
+    let isExpensive: Bool
+    let isConstrained: Bool
+}
+
 /// Async wrapper around NWConnection for TCP communication with an RFB server.
 ///
 /// This actor provides a clean async/await interface over Apple's Network framework,
@@ -155,6 +170,30 @@ public actor TCPConnection {
     /// Whether the connection is currently established.
     public var isConnected: Bool {
         connected
+    }
+
+    /// Snapshot the route selected for the actual RFB connection. This is more
+    /// accurate than a process-wide path monitor when a VPN or multiple active
+    /// interfaces are present.
+    func pathCharacteristics() -> NetworkPathCharacteristics? {
+        guard let path = connection?.currentPath else { return nil }
+        let interface: NetworkPathInterfaceKind
+        if path.usesInterfaceType(.cellular) {
+            interface = .cellular
+        } else if path.usesInterfaceType(.wiredEthernet) {
+            interface = .wiredEthernet
+        } else if path.usesInterfaceType(.wifi) {
+            interface = .wifi
+        } else if path.usesInterfaceType(.loopback) {
+            interface = .loopback
+        } else {
+            interface = .other
+        }
+        return NetworkPathCharacteristics(
+            interface: interface,
+            usesOtherInterface: path.usesInterfaceType(.other),
+            isExpensive: path.isExpensive,
+            isConstrained: path.isConstrained)
     }
 }
 

@@ -91,6 +91,45 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertEqual(hdrScreen.varint(9), 9)
     }
 
+    func testScreenNegotiationAlwaysAdvertisesLogicalLocalTransport() throws {
+        let profile = AppleMediaNegotiationProfile(
+            framebufferWidth: 2556,
+            framebufferHeight: 1179,
+            supportsHDR: false)
+        let root = try ProtoMessage(profile.mediaBlob(
+            kind: .screen,
+            ssrc: 1,
+            ntpTimestamp: 2))
+
+        XCTAssertEqual(root.varint(18), 1)
+        let screen = try XCTUnwrap(root.message(5))
+        for payload in screen.messages(3) {
+            for rule in payload.messages(2) {
+                XCTAssertEqual(rule.varint(1), 1)
+            }
+        }
+    }
+
+    func testPrivateAndOverlayHostDetection() {
+        XCTAssertTrue(AppleMediaNetworkProfile.isPrivateOrOverlayHost("192.168.58.66"))
+        XCTAssertTrue(AppleMediaNetworkProfile.isPrivateOrOverlayHost("100.100.20.30"))
+        XCTAssertTrue(AppleMediaNetworkProfile.isPrivateOrOverlayHost("mac.tail123.ts.net"))
+        XCTAssertFalse(AppleMediaNetworkProfile.isPrivateOrOverlayHost("203.0.113.8"))
+    }
+
+    func testCellularVPNUsesConservativeCapacityPriorWithoutChangingNegotiation() {
+        let profile = AppleMediaNetworkProfile.detect(
+            from: NetworkPathCharacteristics(
+                interface: .cellular,
+                usesOtherInterface: true,
+                isExpensive: true,
+                isConstrained: false),
+            remoteHost: "mac.tail123.ts.net")
+
+        XCTAssertEqual(profile.initialCapacityBps, 6_000_000)
+        XCTAssertTrue(profile.name.hasSuffix("over private/VPN"))
+    }
+
     func testAudioBlobCarriesAudioSettingsInsteadOfScreenSettings() throws {
         let profile = AppleMediaNegotiationProfile(
             framebufferWidth: 2048,

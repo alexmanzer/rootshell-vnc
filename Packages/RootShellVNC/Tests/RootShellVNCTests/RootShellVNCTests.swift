@@ -5,6 +5,54 @@ import CoreVideo
 import RFBProtocol
 import RFBRendering
 
+final class StandardFramebufferPipelineTests: XCTestCase {
+    func testProductionRendererPreservesZRLEStreamAcrossPresentedBatches() {
+        let framebuffer = Framebuffer(
+            width: 2,
+            height: 1,
+            pixelFormat: .bgra8888)
+        let renderer = FramebufferRenderer(
+            framebuffer: framebuffer,
+            pixelFormat: .bgra8888)
+        let chunks = [
+            Data([
+                0x78, 0x9c, 0x62, 0x64, 0x60, 0xf8,
+                0x0f, 0x00, 0x00, 0x00, 0xff, 0xff,
+            ]),
+            Data([
+                0x62, 0xfc, 0xcf, 0xc0, 0x00,
+                0x00, 0x00, 0x00, 0xff, 0xff,
+            ]),
+        ]
+
+        for (x, chunk) in chunks.enumerated() {
+            let rect = FramebufferRect(
+                x: UInt16(x), y: 0, width: 1, height: 1, encoding: .zrle)
+            let result = renderer.applyBatch([(rect, wirePayload(chunk))])
+            XCTAssertTrue(result.issues.isEmpty)
+        }
+
+        XCTAssertEqual(
+            framebuffer.getPixels(x: 0, y: 0, width: 2, height: 1),
+            Data([
+                0x00, 0x00, 0xff, 0xff,
+                0xff, 0x00, 0x00, 0xff,
+            ]))
+    }
+
+    private func wirePayload(_ compressed: Data) -> Data {
+        let count = UInt32(compressed.count)
+        var result = Data([
+            UInt8((count >> 24) & 0xff),
+            UInt8((count >> 16) & 0xff),
+            UInt8((count >> 8) & 0xff),
+            UInt8(count & 0xff),
+        ])
+        result.append(compressed)
+        return result
+    }
+}
+
 // MARK: - VNCCredentials Tests
 
 final class VNCCredentialsTests: XCTestCase {
@@ -166,11 +214,21 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(effective.contains(.zrle))
     }
 
+    func testStandardUsesBestImplementedPortableEncodingProfile() {
+        let config = VNCConfiguration(videoQualityMode: .standard)
+        let effective = config.effectiveEncodings
+        XCTAssertFalse(effective.contains(.appleH264))
+        XCTAssertFalse(effective.contains(.appleMultiVariantScreenshare))
+        XCTAssertFalse(effective.contains(.mediaStreamOffer))
+        XCTAssertEqual(Array(effective.prefix(4)), [.zlib, .zrle, .copyRect, .raw])
+    }
+
     func testQualityModesExposeGUILabels() {
         XCTAssertEqual(
             VNCConfiguration.VideoQualityMode.allCases,
-            [.adaptive, .fullQuality])
+            [.adaptive, .standard, .fullQuality])
         XCTAssertEqual(VNCConfiguration.VideoQualityMode.adaptive.title, "Adaptive")
+        XCTAssertEqual(VNCConfiguration.VideoQualityMode.standard.title, "Standard")
         XCTAssertEqual(VNCConfiguration.VideoQualityMode.fullQuality.title, "Full Quality")
     }
 
@@ -318,6 +376,18 @@ final class AppleRemoteAudioRTPTests: XCTestCase {
 
 final class RemoteDisplaySizeTests: XCTestCase {
 
+    func testPhoneViewportExpandsToUsableMacWorkspace() {
+        XCTAssertEqual(
+            RemoteDisplaySize.matching(
+                viewSize: CGSize(width: 852, height: 393),
+                displayScale: 2),
+            RemoteDisplaySize(
+                pixelWidth: 2600,
+                pixelHeight: 1200,
+                pointWidth: 1301,
+                pointHeight: 600))
+    }
+
     func testIPadViewportProducesTwoTimesHiDPIFramebuffer() {
         XCTAssertEqual(
             RemoteDisplaySize.matching(
@@ -336,10 +406,10 @@ final class RemoteDisplaySizeTests: XCTestCase {
                 viewSize: CGSize(width: 1000, height: 700),
                 displayScale: 3),
             RemoteDisplaySize(
-                pixelWidth: 2000,
-                pixelHeight: 1400,
-                pointWidth: 1000,
-                pointHeight: 700))
+                pixelWidth: 2048,
+                pixelHeight: 1432,
+                pointWidth: 1024,
+                pointHeight: 717))
     }
 
     func testLandscapeViewportFitsExactFourKServerLimit() {
@@ -362,8 +432,8 @@ final class RemoteDisplaySizeTests: XCTestCase {
             RemoteDisplaySize(
                 pixelWidth: 1618,
                 pixelHeight: 2160,
-                pointWidth: 809,
-                pointHeight: 1080))
+                pointWidth: 1024,
+                pointHeight: 1366))
     }
 
     func testInvalidViewportIsIgnored() {

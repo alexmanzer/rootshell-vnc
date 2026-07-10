@@ -6,6 +6,19 @@ func appleMediaRCTLLowPrecisionEchoTimestamp(_ timestamp: UInt32) -> UInt16 {
     UInt16(truncatingIfNeeded: timestamp >> 8)
 }
 
+/// Convert one feedback interval's RTP reception statistics to the whole-
+/// percent field used by VCRC. Confirmed missing packets count in the expected
+/// total; intervals without traffic report zero rather than stale loss.
+func appleMediaRCTLIntervalLossPercent(received: Int, lost: Int) -> UInt8 {
+    let safeReceived = max(0, received)
+    let safeLost = max(0, lost)
+    let expected = safeReceived + safeLost
+    guard expected > 0 else { return 0 }
+    return UInt8(min(
+        100,
+        Int((Double(safeLost) * 100 / Double(expected)).rounded())))
+}
+
 /// Verified 20-byte payload used by AVConference's RTCP APP `RCTL` packet.
 /// The packed word at bytes 16...17 is bursty-loss (high nibble) plus the low
 /// 12 bits of the cumulative received-packet count. It is not jitter depth or
@@ -72,6 +85,13 @@ func appleMediaRCTLPacket(
     packet.append(contentsOf: "RCTL".utf8)
     packet.append(feedback.serialized())
     return packet
+}
+
+private func appendUInt32BE(_ value: UInt32, to data: inout Data) {
+    data.append(UInt8((value >> 24) & 0xff))
+    data.append(UInt8((value >> 16) & 0xff))
+    data.append(UInt8((value >> 8) & 0xff))
+    data.append(UInt8(value & 0xff))
 }
 
 /// One RFC 4585 Generic NACK feedback-control entry. `packetID` identifies the

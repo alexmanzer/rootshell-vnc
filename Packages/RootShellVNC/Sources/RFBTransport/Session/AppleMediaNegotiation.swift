@@ -62,6 +62,13 @@ public enum AppleMediaVideoMode {
 /// from advertising the wrong client, reusing an SSRC and creation time can be
 /// interpreted as a colliding or stale media session.
 struct AppleMediaNegotiationProfile: Sendable {
+    /// The Viceroy screen stream is negotiated as a logical local-network
+    /// transport even when the device reaches that network through cellular
+    /// and a VPN. Advertising cellular-only screen rules completes the control
+    /// handshake but leaves the peers without a compatible video source.
+    private static let screenAccessNetworkType: UInt64 = 1
+    private static let screenVideoTransportType: UInt64 = 1
+
     /// Viceroy negotiates the minimum of the peers' values. The portable
     /// default is one; four remains available for bounded diagnostics only.
     static var publicDecoderTilesPerFrame: UInt64 {
@@ -141,7 +148,11 @@ struct AppleMediaNegotiationProfile: Sendable {
     let aspectRatio: AspectRatio
     let supportsHDR: Bool
 
-    init(framebufferWidth: UInt16, framebufferHeight: UInt16, supportsHDR: Bool) {
+    init(
+        framebufferWidth: UInt16,
+        framebufferHeight: UInt16,
+        supportsHDR: Bool
+    ) {
         // The dimensions are intentionally accepted as session context but do
         // not rewrite the native codec capability pair.
         _ = framebufferWidth
@@ -198,7 +209,7 @@ struct AppleMediaNegotiationProfile: Sendable {
         blob.varint(field: 13, ntpTimestamp)
         blob.varint(field: 14, 2) // VCMediaNegotiationBlob version
         blob.varint(field: 16, 0) // mediaControlInfoVersion
-        blob.varint(field: 18, 1) // local access-network type
+        blob.varint(field: 18, Self.screenAccessNetworkType)
         return blob.data
     }
 
@@ -268,7 +279,7 @@ struct AppleMediaNegotiationProfile: Sendable {
 
     private func videoRule(operation: VideoOperation) -> Data {
         var rule = ProtobufEncoder()
-        rule.varint(field: 1, 1) // NEGOTIATION_TRANSPORT_TYPE_WIFI/local network
+        rule.varint(field: 1, Self.screenVideoTransportType)
         rule.varint(field: 2, operation.rawValue)
         rule.varint(field: 3, 50_115) // supported format bitmap
         rule.varint(field: 4, 0)      // preferred format index
