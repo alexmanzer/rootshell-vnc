@@ -135,18 +135,18 @@ public actor TransportSession {
     private var appleMediaReceptionStats: [UInt32: AppleMediaReceptionStats] = [:]
     private var appleMediaLastSRLSR: UInt32 = 0
     private var appleMediaLastSRArrivalNanos: UInt64 = 0
-    /// Q10 sender clock from the latest Apple 0x9311 RTP media-control
-    /// extension. Native echoes this in RCTL; it is unrelated to RTCP LSR.
-    private var appleMediaLastTransmitTimestampQ10: UInt16 = 0
+    /// Low-precision form of the standard RTP timestamp echoed by native RCTL.
+    /// This is unrelated to the RTP media-control extension and RTCP LSR.
+    private var appleMediaLastRTPEchoTimestampQ10: UInt16 = 0
+    private var appleRCTLPreviousRTPTimestamp: UInt32?
+    private var appleRCTLEchoTimestampArrivalNanos: UInt64 = 0
+    private var appleRCTLTotalPacketsReceived: UInt32 = 0
     /// RTCP APP "RCTL" rate-control feedback (drives the server's adaptive
     /// encoder bitrate). Native sends this ~20 Hz; without it the server encodes
-    /// at a constant maximum bitrate. Interval accumulators for received bitrate
-    /// / loss, reset each report.
+    /// at a constant maximum bitrate. The burst-loss accumulator is reset after
+    /// each report; the receive count is cumulative like the native client.
     private var appleRCTLFeedbackTask: Task<Void, Never>?
-    private var appleRCTLPacketsInterval: Int = 0
-    private var appleRCTLLostInterval: Int = 0
     private var appleRCTLBurstLostInterval: Int = 0
-    private var appleRCTLLastSendNanos: UInt64 = 0
     private var appleRCTLLastDiagnosticNanos: UInt64 = 0
     /// Receiver-side capacity estimator used to populate RCTL. Apple's
     /// feedback-only screen receiver sends RCTL by itself; it does not append a
@@ -2291,12 +2291,13 @@ public actor TransportSession {
         appleRTCPReportTask = nil
         appleRCTLFeedbackTask?.cancel()
         appleRCTLFeedbackTask = nil
-        appleRCTLPacketsInterval = 0
-        appleRCTLLostInterval = 0; appleRCTLBurstLostInterval = 0
-        appleRCTLLastSendNanos = 0
+        appleRCTLBurstLostInterval = 0
         appleRCTLLastDiagnosticNanos = 0
         appleMediaRateController = nil
-        appleMediaLastTransmitTimestampQ10 = 0
+        appleMediaLastRTPEchoTimestampQ10 = 0
+        appleRCTLPreviousRTPTimestamp = nil
+        appleRCTLEchoTimestampArrivalNanos = 0
+        appleRCTLTotalPacketsReceived = 0
         appleMediaVideoSSRCChannels.removeAll()
         appleMediaReceptionStats.removeAll()
         appleMediaLastFrameLossFeedback.removeAll()
@@ -2573,14 +2574,15 @@ public actor TransportSession {
             log.info("First video RTP for ssrc=0x\(String(header.ssrc, radix: 16))")
         }
 
+        let nowNanos = DispatchTime.now().uptimeNanoseconds
         let unique = updateAppleMediaReceptionStats(
             ssrc: header.ssrc,
             sequence: header.sequenceNumber)
         if unique {
-            if let transmitTimestamp = appleMediaRTPTransmitTimestampQ10(packet) {
-                appleMediaLastTransmitTimestampQ10 = transmitTimestamp
-            }
-            appleRCTLPacketsInterval += 1
+            appleRCTLTotalPacketsReceived &+= 1
+            updateAppleRCTLEchoTimestamp(
+                header.timestamp,
+                arrivalNanos: nowNanos)
             startAppleRTCPReportLoop()
             startAppleRCTLFeedbackLoop()
 
@@ -2601,7 +2603,6 @@ public actor TransportSession {
             }
         }
 
-        let nowNanos = DispatchTime.now().uptimeNanoseconds
         let result = appleMediaRTPReorderBuffer.insert(
             packet: packet,
             ssrc: header.ssrc,
@@ -2623,7 +2624,6 @@ public actor TransportSession {
         }
 
         for gap in result.gaps {
-            appleRCTLLostInterval += gap.missingPacketCount
             appleRCTLBurstLostInterval = max(
                 appleRCTLBurstLostInterval,
                 gap.missingPacketCount)
@@ -2652,7 +2652,8 @@ public actor TransportSession {
             appleMediaMostRecentFrameLossSSRC = gap.ssrc
             log.warning("Confirmed video RTP loss ssrc=0x\(String(gap.ssrc, radix: 16)) "
                 + "missing=\(gap.missingPacketCount) framePackets=\(feedback.framePacketCount) "
-                + "frameTimestamp=\(feedback.frameRTPTimestamp)")
+                + "frameTimestamp=\(feedback.frameRTPTimestamp) "
+                + "frameSequence=\(gap.frameSequenceNumber.map(String.init) ?? "unknown")")
             Task { [weak self] in
                 await self?.sendAppleMediaFrameLossFeedback(
                     feedback,
@@ -2908,6 +2909,25 @@ public actor TransportSession {
         }
     }
 
+    /// Mirror feedback-only AVConference's RTP receive accounting. It updates
+    /// the echo only when a forward-moving RTP timestamp begins, then sends the
+    /// low-precision form selected by Apple's video-stream configuration.
+    private func updateAppleRCTLEchoTimestamp(
+        _ timestamp: UInt32,
+        arrivalNanos: UInt64
+    ) {
+        guard let previous = appleRCTLPreviousRTPTimestamp else {
+            appleRCTLPreviousRTPTimestamp = timestamp
+            return
+        }
+        let distance = timestamp &- previous
+        guard distance != 0, distance < 0x8000_0000 else { return }
+        appleRCTLPreviousRTPTimestamp = timestamp
+        appleMediaLastRTPEchoTimestampQ10 =
+            appleMediaRCTLLowPrecisionEchoTimestamp(timestamp)
+        appleRCTLEchoTimestampArrivalNanos = arrivalNanos
+    }
+
     /// Build and send one RTCP APP "RCTL" rate-control feedback packet:
     /// `80 CC 00 07 [SSRC] "RCTL" [20-byte payload]`, SRTCP-protected. The
     /// 20-byte payload carries our measured received bitrate (kbps), loss,
@@ -2917,15 +2937,8 @@ public actor TransportSession {
               let channel = appleMediaVideoSSRCChannels.values.first else { return }
 
         let now = DispatchTime.now().uptimeNanoseconds
-        let intervalNanos = appleRCTLLastSendNanos == 0 ? 50_000_000 : (now &- appleRCTLLastSendNanos)
-        appleRCTLLastSendNanos = now
-        let intervalSeconds = max(0.001, Double(intervalNanos) / 1_000_000_000)
-
-        let lost = appleRCTLLostInterval
-        let packets = appleRCTLPacketsInterval
         let burst = appleRCTLBurstLostInterval
-        appleRCTLPacketsInterval = 0
-        appleRCTLLostInterval = 0; appleRCTLBurstLostInterval = 0
+        appleRCTLBurstLostInterval = 0
 
         let nowSeconds = Double(now) / 1_000_000_000
         if let controller = appleMediaRateController {
@@ -2943,26 +2956,27 @@ public actor TransportSession {
             .flatMap(Double.init) ?? estimatedKbps
         let bwe = UInt16(min(65_535, max(0, bweKbps.rounded())))
 
-        let expected = packets + lost
-        let fakeCongestion = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_RCTL_FAKE_CONGESTION"] == "1"
-        let lossFrac = fakeCongestion ? 0.4 : (expected > 0 ? Double(lost) / Double(expected) : 0)
-        let burstyLoss = UInt8(fakeCongestion ? 15 : min(15, burst))
-        let jitterQueueSize = UInt16(fakeCongestion
-            ? 0x0fff
-            : min(0x0fff, appleMediaRTPReorderBuffer.queuedPacketCount))
-        let owrdSeconds = fakeCongestion ? 0.5 : (appleMediaRateController?.owrdSeconds ?? 0)
+        let burstyLoss = UInt8(min(15, burst))
+        let cumulativeReceivedPacketCount = UInt16(
+            truncatingIfNeeded: appleRCTLTotalPacketsReceived)
+        let owrdSeconds = appleMediaRateController?.owrdSeconds ?? 0
         let owrd = UInt16(min(65535, (owrdSeconds * 8192).rounded()))
         let ts = UInt16(truncatingIfNeeded: Int(nowSeconds * 1024))          // Q10 s
-        let echo = appleMediaLastTransmitTimestampQ10                        // reflect RTP Tx clock
-        let age = UInt16(min(65535, (intervalSeconds * 1000).rounded()))
+        let echo = appleMediaLastRTPEchoTimestampQ10
+        let ageMilliseconds = appleRCTLEchoTimestampArrivalNanos == 0
+            ? 0
+            : (now &- appleRCTLEchoTimestampArrivalNanos) / 1_000_000
+        let age = UInt16(min(UInt64(UInt16.max), ageMilliseconds))
         let feedback = AppleMediaRCTLFeedback(
-            lossPercent: UInt8(min(100, max(0, (lossFrac * 100).rounded()))),
+            // Feedback-only AVConference leaves the generic loss-percentage
+            // field at zero and reports the worst confirmed burst separately.
+            lossPercent: 0,
             echoTimestamp: echo,
             measurementAgeMilliseconds: age,
             localTimestampQ10: ts,
             owrdQ13: owrd,
             burstyLoss: burstyLoss,
-            jitterQueueSize: jitterQueueSize,
+            cumulativeReceivedPacketCount: cumulativeReceivedPacketCount,
             bandwidthEstimateKbps: bwe)
 
         let sender = appleMediaLocalSSRC
@@ -2975,7 +2989,8 @@ public actor TransportSession {
                 (appleMediaRateController?.throughputBps(now: nowSeconds) ?? 0) / 1_000)
             log.debug(
                 "RCTL bwe=\(bwe)kbps received=\(receivedKbps)kbps "
-                    + "echoQ10=\(echo) loss=\(feedback.lossPercent)% queue=\(jitterQueueSize)")
+                    + "echoQ10=\(echo) age=\(age)ms burst=\(burstyLoss) "
+                    + "packetCount=\(cumulativeReceivedPacketCount & 0x0fff)")
         }
 
         // AVConference's `VCVideoStreamRateAdaptationFeedbackOnly` passes a

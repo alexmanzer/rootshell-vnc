@@ -101,18 +101,21 @@ struct AppleMediaRTPReorderBuffer {
         let missingPacketCount: Int
         let frameRTPTimestamp: UInt32
         let estimatedFramePacketCount: Int
+        let frameSequenceNumber: UInt16?
 
         init(
             ssrc: UInt32,
             missingPacketCount: Int,
             frameRTPTimestamp: UInt32 = 0,
-            estimatedFramePacketCount: Int? = nil
+            estimatedFramePacketCount: Int? = nil,
+            frameSequenceNumber: UInt16? = nil
         ) {
             self.ssrc = ssrc
             self.missingPacketCount = missingPacketCount
             self.frameRTPTimestamp = frameRTPTimestamp
             self.estimatedFramePacketCount = estimatedFramePacketCount
                 ?? missingPacketCount
+            self.frameSequenceNumber = frameSequenceNumber
         }
     }
 
@@ -171,6 +174,8 @@ struct AppleMediaRTPReorderBuffer {
         /// the observed damaged-frame size instead of inventing a constant.
         var activeFrameTimestamp: UInt32?
         var activeFrameReceivedPacketCount = 0
+        var activeFrameExpectedPacketCount: Int?
+        var activeFrameSequenceNumber: UInt16?
     }
 
     private let startupHoldNanos: UInt64
@@ -327,7 +332,8 @@ struct AppleMediaRTPReorderBuffer {
                     ssrc: ssrc,
                     missingPacketCount: missing,
                     frameRTPTimestamp: frame.timestamp,
-                    estimatedFramePacketCount: frame.packetCount))
+                    estimatedFramePacketCount: frame.packetCount,
+                    frameSequenceNumber: frame.sequenceNumber))
                 next = nearest
                 state.nextSequence = nearest
                 state.gapDeadlineNanos = nil
@@ -372,6 +378,8 @@ struct AppleMediaRTPReorderBuffer {
     private struct RTPFrameBoundary {
         let timestamp: UInt32
         let marker: Bool
+        let expectedPacketCount: Int?
+        let sequenceNumber: UInt16?
     }
 
     /// Read only standard RTP fields. The full RTP parser remains in the
@@ -384,9 +392,12 @@ struct AppleMediaRTPReorderBuffer {
             | UInt32(packet[base + 5]) << 16
             | UInt32(packet[base + 6]) << 8
             | UInt32(packet[base + 7])
+        let mediaControl = appleMediaRTPMediaControlInfo(packet)
         return RTPFrameBoundary(
             timestamp: timestamp,
-            marker: packet[base + 1] & 0x80 != 0)
+            marker: packet[base + 1] & 0x80 != 0,
+            expectedPacketCount: mediaControl?.totalPacketsPerFrame.map(Int.init),
+            sequenceNumber: mediaControl?.frameSequenceNumber)
     }
 
     private func noteReleasedFramePacket(
@@ -394,31 +405,47 @@ struct AppleMediaRTPReorderBuffer {
         state: inout StreamState
     ) {
         guard let boundary = frameBoundary(in: packet) else { return }
-        if state.activeFrameTimestamp != boundary.timestamp {
+        let changedFrame = state.activeFrameTimestamp != boundary.timestamp
+            || (state.activeFrameSequenceNumber != nil
+                && boundary.sequenceNumber != nil
+                && state.activeFrameSequenceNumber != boundary.sequenceNumber)
+        if changedFrame {
             state.activeFrameTimestamp = boundary.timestamp
             state.activeFrameReceivedPacketCount = 0
+            state.activeFrameExpectedPacketCount = boundary.expectedPacketCount
+            state.activeFrameSequenceNumber = boundary.sequenceNumber
+        } else {
+            state.activeFrameExpectedPacketCount = boundary.expectedPacketCount
+                ?? state.activeFrameExpectedPacketCount
+            state.activeFrameSequenceNumber = boundary.sequenceNumber
+                ?? state.activeFrameSequenceNumber
         }
         state.activeFrameReceivedPacketCount += 1
         if boundary.marker {
             state.activeFrameTimestamp = nil
             state.activeFrameReceivedPacketCount = 0
+            state.activeFrameExpectedPacketCount = nil
+            state.activeFrameSequenceNumber = nil
         }
     }
 
-    /// Estimate the damaged frame size from packets actually present on both
-    /// sides of the hole. Missing RTP marker packets make an exact frame split
-    /// unknowable from standard RTP alone, but the estimate remains derived
-    /// from this frame's observed boundaries and is bounded on serialization.
+    /// Use Apple's advertised packets-per-frame value when present. Standard
+    /// RTP marker/timestamp accounting remains the fallback for peers that omit
+    /// the version-2 frame extension.
     private func estimateDamagedFrame(
         state: StreamState,
         nearestSequence: UInt16,
         missingPacketCount: Int
-    ) -> (timestamp: UInt32, packetCount: Int) {
+    ) -> (timestamp: UInt32, packetCount: Int, sequenceNumber: UInt16?) {
         let nearestBoundary = state.pending[nearestSequence]
             .flatMap { frameBoundary(in: $0.data) }
         let timestamp = state.activeFrameTimestamp
             ?? nearestBoundary?.timestamp
             ?? 0
+        let exactPacketCount = state.activeFrameExpectedPacketCount
+            ?? nearestBoundary?.expectedPacketCount
+        let frameSequenceNumber = state.activeFrameSequenceNumber
+            ?? nearestBoundary?.sequenceNumber
         var received = state.activeFrameTimestamp == nil
             ? 0
             : state.activeFrameReceivedPacketCount
@@ -427,11 +454,17 @@ struct AppleMediaRTPReorderBuffer {
         while let buffered = state.pending[sequence],
               let boundary = frameBoundary(in: buffered.data) {
             if received > 0, boundary.timestamp != timestamp { break }
+            if let frameSequenceNumber,
+               let sequenceNumber = boundary.sequenceNumber,
+               sequenceNumber != frameSequenceNumber { break }
             received += 1
             if boundary.marker { break }
             sequence &+= 1
         }
-        return (timestamp, max(missingPacketCount, received + missingPacketCount))
+        return (
+            timestamp,
+            max(missingPacketCount, exactPacketCount ?? (received + missingPacketCount)),
+            frameSequenceNumber)
     }
 
     private static func signedDistance(_ sequence: UInt16, from reference: UInt16) -> Int {

@@ -46,12 +46,12 @@ final class AppleMediaFeedbackTests: XCTestCase {
             localTimestampQ10: 0x9abc,
             owrdQ13: 0xdef0,
             burstyLoss: 5,
-            jitterQueueSize: 0x234,
+            cumulativeReceivedPacketCount: 0x234,
             bandwidthEstimateKbps: 0x3456
         ).serialized()
 
         XCTAssertEqual(data, Data([
-            0x85, 0x07, 0x00, 0x04,
+            0x8d, 0x07, 0x00, 0x04,
             0x12, 0x34, 0x00, 0x00,
             0x00, 0x00, 0x56, 0x78,
             0x9a, 0xbc, 0xde, 0xf0,
@@ -59,7 +59,7 @@ final class AppleMediaFeedbackTests: XCTestCase {
         ]))
     }
 
-    func testRCTLClampsPackedQueueFields() {
+    func testRCTLClampsPackedReceiveStatistics() {
         let data = AppleMediaRCTLFeedback(
             lossPercent: 0,
             echoTimestamp: 0,
@@ -67,12 +67,18 @@ final class AppleMediaFeedbackTests: XCTestCase {
             localTimestampQ10: 0,
             owrdQ13: 0,
             burstyLoss: .max,
-            jitterQueueSize: .max,
+            cumulativeReceivedPacketCount: .max,
             bandwidthEstimateKbps: .max
         ).serialized()
 
         XCTAssertEqual(data[16], 0xff)
         XCTAssertEqual(data[17], 0xff)
+    }
+
+    func testRCTLUsesNativeLowPrecisionStandardRTPTimestamp() {
+        XCTAssertEqual(
+            appleMediaRCTLLowPrecisionEchoTimestamp(0x1234_5678),
+            0x3456)
     }
 
     func testRCTLPacketIsStandaloneAVConferenceAPPReport() {
@@ -83,7 +89,7 @@ final class AppleMediaFeedbackTests: XCTestCase {
             localTimestampQ10: 1,
             owrdQ13: 0,
             burstyLoss: 0,
-            jitterQueueSize: 0,
+            cumulativeReceivedPacketCount: 0,
             bandwidthEstimateKbps: 60_000)
         let packet = appleMediaRCTLPacket(
             senderSSRC: 0x1234_5678,
@@ -98,25 +104,55 @@ final class AppleMediaFeedbackTests: XCTestCase {
         XCTAssertEqual(packet.suffix(20), feedback.serialized())
     }
 
-    func testAppleMediaRTPTransmitTimestampIsConvertedFromQ18ToQ10() {
+    func testAppleMediaRTPFrameExtensionMatchesCapturedScreenPacket() {
         // Prefix of a decrypted Screen Sharing HEVC packet captured from the
-        // native server: RTP X bit, 0x9311 profile, one extension word.
+        // native server. The apparent 0x9311 "profile" is media-control
+        // version/status plus flags/LTR bits.
         let packet = Data([
             0x90, 0x64, 0x30, 0x9f, 0, 0, 0, 0,
             0x07, 0x0d, 0xfa, 0x0e,
             0x93, 0x11, 0x00, 0x01, 0x00, 0x3c, 0x77, 0xc0,
         ])
 
-        XCTAssertEqual(appleMediaRTPTransmitTimestampQ10(packet), 0x3c77)
+        XCTAssertEqual(
+            appleMediaRTPMediaControlInfo(packet),
+            AppleMediaRTPMediaControlInfo(
+                version: 2,
+                cameraStatus: 0x13,
+                ltrBits: 1,
+                ltrTimestamp: nil,
+                totalPacketsPerFrame: 60,
+                frameSequenceNumber: 0x77c0))
     }
 
-    func testAppleMediaRTPTransmitTimestampRejectsOtherExtensions() {
-        var packet = Data(repeating: 0, count: 20)
-        packet[0] = 0x90
-        packet[12] = 0xbe
-        packet[13] = 0xde
-        packet[15] = 1
-        XCTAssertNil(appleMediaRTPTransmitTimestampQ10(packet))
+    func testAppleMediaRTPMediaControlParsesLTRTimestampAndFrameFields() {
+        let packet = Data([
+            0x90, 0x64, 0x30, 0x9f, 0, 0, 0, 0,
+            0x07, 0x0d, 0xfa, 0x0e,
+            0x80, 0xa3, 0x00, 0x02,
+            0x78, 0x56, 0x34, 0x12,
+            0x00, 0x2a, 0xbe, 0xef,
+        ])
+
+        XCTAssertEqual(
+            appleMediaRTPMediaControlInfo(packet),
+            AppleMediaRTPMediaControlInfo(
+                version: 2,
+                cameraStatus: 0,
+                ltrBits: 0x0a,
+                ltrTimestamp: 0x1234_5678,
+                totalPacketsPerFrame: 42,
+                frameSequenceNumber: 0xbeef))
+    }
+
+    func testAppleMediaRTPMediaControlRejectsTruncatedOptionalFields() {
+        let packet = Data([
+            0x90, 0x64, 0x30, 0x9f, 0, 0, 0, 0,
+            0x07, 0x0d, 0xfa, 0x0e,
+            0x80, 0x03, 0x00, 0x01,
+            0x78, 0x56, 0x34, 0x12,
+        ])
+        XCTAssertNil(appleMediaRTPMediaControlInfo(packet))
     }
 
     func testRateControllerStartsAtAvailableCeilingAndHoldsWithoutLoss() {
