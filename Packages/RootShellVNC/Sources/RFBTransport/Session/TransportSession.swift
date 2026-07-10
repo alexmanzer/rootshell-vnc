@@ -1205,7 +1205,7 @@ public actor TransportSession {
             pointWidth: UInt32(requested.pointWidth),
             pointHeight: UInt32(requested.pointHeight))
         let display = AppleVirtualDisplay(
-            name: "RootShell Virtual Display",
+            name: "Rootshell Virtual Display",
             widthInMillimeters: Float(requested.pointWidth) * millimetersPerPoint,
             heightInMillimeters: Float(requested.pointHeight) * millimetersPerPoint,
             maximumPixelWidth: UInt32(requested.pixelWidth),
