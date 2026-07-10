@@ -47,6 +47,23 @@ public enum SessionEvent: Sendable {
     case disconnected
 }
 
+/// How a client-sized remote display request was handled by the transport.
+public enum RemoteDisplayResizeDisposition: Sendable, Equatable {
+    /// Apple's negotiated virtual-display command was sent.
+    case appleVirtualDisplay
+    /// Standard RFB SetDesktopSize was sent after capability announcement.
+    case standardSetDesktopSize
+    /// The request is retained until the server announces support.
+    case waitingForServerSupport
+}
+
+private struct PendingRemoteDisplaySize: Sendable, Equatable {
+    let pixelWidth: UInt16
+    let pixelHeight: UInt16
+    let pointWidth: UInt16
+    let pointHeight: UInt16
+}
+
 /// An actor that manages the full lifecycle of a VNC connection.
 ///
 /// `TransportSession` owns a `TCPConnection` for network I/O, a
@@ -222,6 +239,12 @@ public actor TransportSession {
     /// This remains nil for regular RFB servers, which therefore use standard
     /// wheel-button input.
     private var appleServerCapabilities: AppleServerCapabilities?
+    /// A regular RFB server may receive SetDesktopSize only after it sends an
+    /// ExtendedDesktopSize rectangle. Retain that screen identity and any
+    /// early client-size request until the announcement arrives.
+    private var standardDesktopLayout: ExtendedDesktopSizePayload?
+    private var pendingRemoteDisplaySize: PendingRemoteDisplaySize?
+    private var lastSentRemoteDisplaySize: PendingRemoteDisplaySize?
     /// Non-wheel pointer buttons currently held, preserved across fallback
     /// wheel press/release pairs just like the native client.
     private var pointerButtonMask: UInt8 = 0
@@ -377,6 +400,45 @@ public actor TransportSession {
             height: fbHeight
         )
         try await sendClientPayload(msg.serialize())
+    }
+
+    /// Request one remote display matching the client viewport. Apple servers
+    /// use the capability-gated virtual-display command behind Dynamic
+    /// Resolution; regular servers use standard SetDesktopSize only after
+    /// announcing ExtendedDesktopSize support.
+    public func requestRemoteDisplaySize(
+        pixelWidth: UInt16,
+        pixelHeight: UInt16,
+        pointWidth: UInt16,
+        pointHeight: UInt16
+    ) async throws -> RemoteDisplayResizeDisposition {
+        let requested = PendingRemoteDisplaySize(
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight,
+            pointWidth: pointWidth,
+            pointHeight: pointHeight)
+        guard requested != lastSentRemoteDisplaySize else {
+            return appleServerCapabilities?.supportsServerCommand(
+                AppleServerCapabilities.displayConfigurationCommand) == true
+                ? .appleVirtualDisplay
+                : .standardSetDesktopSize
+        }
+
+        pendingRemoteDisplaySize = requested
+        if appleServerCapabilities?.supportsServerCommand(
+            AppleServerCapabilities.displayConfigurationCommand) == true {
+            try await sendAppleVirtualDisplaySize(requested)
+            return .appleVirtualDisplay
+        }
+        if standardDesktopLayout != nil {
+            try await sendStandardDesktopSize(requested)
+            return .standardSetDesktopSize
+        }
+
+        log.info(
+            "Retaining client-sized display request \(pixelWidth)x\(pixelHeight) "
+                + "until the server announces resize support")
+        return .waitingForServerSupport
     }
 
     /// Disconnect from the server.
@@ -585,8 +647,11 @@ public actor TransportSession {
                 fromServerInitNameField: serverInitNameField)
             let preciseScroll = capabilities.supportsServerCommand(
                 AppleServerCapabilities.preciseScrollCommand)
+            let dynamicDisplay = capabilities.supportsServerCommand(
+                AppleServerCapabilities.displayConfigurationCommand)
             log.info(
-                "Apple ServerInit capabilities: flags=0x\(String(capabilities.serverFlags, radix: 16)) preciseScroll=\(preciseScroll)")
+                "Apple ServerInit capabilities: flags=0x\(String(capabilities.serverFlags, radix: 16)) "
+                    + "preciseScroll=\(preciseScroll) dynamicDisplay=\(dynamicDisplay)")
         } else {
             appleServerCapabilities = nil
         }
@@ -735,7 +800,8 @@ public actor TransportSession {
                 if remaining > 0 {
                     payload.append(try await tcp.read(exactly: remaining))
                 }
-                _ = try ExtendedDesktopSizePayload(data: payload)
+                let layout = try ExtendedDesktopSizePayload(data: payload)
+                try await noteStandardDesktopSizeSupport(layout)
                 pixelData = payload
 
             case .encryptionInfo:
@@ -1095,6 +1161,67 @@ public actor TransportSession {
         return data
     }
 
+    private func noteStandardDesktopSizeSupport(
+        _ layout: ExtendedDesktopSizePayload
+    ) async throws {
+        standardDesktopLayout = layout
+        guard let pendingRemoteDisplaySize,
+              appleServerCapabilities?.supportsServerCommand(
+                AppleServerCapabilities.displayConfigurationCommand) != true else { return }
+        try await sendStandardDesktopSize(pendingRemoteDisplaySize)
+    }
+
+    private func sendStandardDesktopSize(
+        _ requested: PendingRemoteDisplaySize
+    ) async throws {
+        let existing = standardDesktopLayout?.screens.first
+        let screen = SetDesktopSizeScreen(
+            id: existing?.id ?? 0,
+            width: requested.pixelWidth,
+            height: requested.pixelHeight,
+            flags: existing?.flags ?? 0)
+        let message = ClientMessage.setDesktopSize(SetDesktopSizeRequest(
+            width: requested.pixelWidth,
+            height: requested.pixelHeight,
+            screens: [screen]))
+        try await sendClientPayload(message.serialize())
+        lastSentRemoteDisplaySize = requested
+        pendingRemoteDisplaySize = nil
+        log.info(
+            "Requested standard remote desktop \(requested.pixelWidth)x"
+                + "\(requested.pixelHeight)")
+    }
+
+    private func sendAppleVirtualDisplaySize(
+        _ requested: PendingRemoteDisplaySize
+    ) async throws {
+        // Screen Sharing describes a 2× virtual display with both pixel and
+        // point dimensions. A nominal 110 points/inch gives the virtual display
+        // a stable physical size without affecting its explicit HiDPI mode.
+        let millimetersPerPoint = Float(25.4 / 110.0)
+        let mode = AppleVirtualDisplayMode(
+            pixelWidth: UInt32(requested.pixelWidth),
+            pixelHeight: UInt32(requested.pixelHeight),
+            pointWidth: UInt32(requested.pointWidth),
+            pointHeight: UInt32(requested.pointHeight))
+        let display = AppleVirtualDisplay(
+            name: "RootShell Virtual Display",
+            widthInMillimeters: Float(requested.pointWidth) * millimetersPerPoint,
+            heightInMillimeters: Float(requested.pointHeight) * millimetersPerPoint,
+            maximumPixelWidth: UInt32(requested.pixelWidth),
+            maximumPixelHeight: UInt32(requested.pixelHeight),
+            modes: [mode])
+        let message = ClientMessage.appleDisplayConfiguration(
+            AppleDisplayConfiguration(displays: [display]))
+        try await sendClientPayload(message.serialize())
+        lastSentRemoteDisplaySize = requested
+        pendingRemoteDisplaySize = nil
+        log.info(
+            "Requested Apple dynamic virtual display \(requested.pixelWidth)x"
+                + "\(requested.pixelHeight) pixels (\(requested.pointWidth)x"
+                + "\(requested.pointHeight) points)")
+    }
+
     private nonisolated func appleMediaServerControl(_ payload: Data) -> (encoding: UInt16, body: Data)? {
         parseAppleMediaServerControl(payload, encodingOffset: 14)
             ?? parseAppleMediaServerControl(payload, encodingOffset: 16)
@@ -1359,7 +1486,8 @@ public actor TransportSession {
             let pixelData = Data(appleDecryptedRFBBuffer[offset..<offset + pixelDataLength])
             offset += pixelDataLength
             if rect.encoding == .extendedDesktopSize {
-                _ = try ExtendedDesktopSizePayload(data: pixelData)
+                let layout = try ExtendedDesktopSizePayload(data: pixelData)
+                try await noteStandardDesktopSizeSupport(layout)
             }
             rectsWithData.append((rect, pixelData))
             if rect.isSuccessfulDesktopResize {

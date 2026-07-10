@@ -21,6 +21,9 @@ public enum ClientMessage: Sendable, Equatable {
     /// Message type 6: The client's clipboard text has changed.
     case clientCutText(String)
 
+    /// Standard message type 251: request a new framebuffer/screen layout.
+    case setDesktopSize(SetDesktopSizeRequest)
+
     /// Apple message type 23: a precise, phased scroll-wheel event.
     case appleScrollEvent(AppleScrollEvent)
 
@@ -33,6 +36,9 @@ public enum ClientMessage: Sendable, Equatable {
     /// Apple message type 18: request/open an accelerated media stream.
     case appleMediaStreamRequest
 
+    /// Apple message type 29: configure one or two virtual displays.
+    case appleDisplayConfiguration(AppleDisplayConfiguration)
+
     // MARK: - Message type IDs
 
     /// The RFB message-type byte for this message.
@@ -44,10 +50,12 @@ public enum ClientMessage: Sendable, Equatable {
         case .keyEvent:                    return 4
         case .pointerEvent:                return 5
         case .clientCutText:               return 6
+        case .setDesktopSize:              return SetDesktopSizeRequest.messageType
         case .appleScrollEvent:            return AppleScrollEvent.messageType
         case .appleGestureEvent:           return AppleGestureEvent.messageType
         case .appleMediaStreamConfiguration: return 0x21
         case .appleMediaStreamRequest:     return 0x12
+        case .appleDisplayConfiguration:   return AppleDisplayConfiguration.messageType
         }
     }
 
@@ -70,6 +78,8 @@ public enum ClientMessage: Sendable, Equatable {
             return MessageWriter.writePointerEvent(buttonMask: mask, x: x, y: y)
         case .clientCutText(let text):
             return MessageWriter.writeClientCutText(text)
+        case .setDesktopSize(let request):
+            return MessageWriter.writeSetDesktopSize(request)
         case .appleScrollEvent(let event):
             return MessageWriter.writeAppleScrollEvent(event)
         case .appleGestureEvent(let event):
@@ -78,6 +88,8 @@ public enum ClientMessage: Sendable, Equatable {
             return MessageWriter.writeAppleMediaStreamConfiguration()
         case .appleMediaStreamRequest:
             return MessageWriter.writeAppleMediaStreamRequest()
+        case .appleDisplayConfiguration(let configuration):
+            return MessageWriter.writeAppleDisplayConfiguration(configuration)
         }
     }
 }

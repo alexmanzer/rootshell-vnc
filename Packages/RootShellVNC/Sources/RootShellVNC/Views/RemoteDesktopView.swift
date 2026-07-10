@@ -5,6 +5,7 @@ import RFBProtocol
 /// Adaptive video and Full Quality framebuffer rendering.
 public struct RemoteDesktopView: View {
     @Bindable var session: VNCSession
+    @Environment(\.displayScale) private var displayScale
 
     @State private var viewport = RemoteViewportState()
     @State private var keyboardActive = false
@@ -64,11 +65,28 @@ public struct RemoteDesktopView: View {
                 viewport.clampOffset(
                     viewSize: newSize,
                     framebufferSize: framebufferSize)
+                updateRemoteDisplaySize(for: newSize)
             }
             .onChange(of: framebufferSize) { _, newSize in
                 viewport.clampOffset(
                     viewSize: geometry.size,
                     framebufferSize: newSize)
+            }
+            .onAppear {
+                updateRemoteDisplaySize(for: geometry.size)
+            }
+            .onChange(of: displayScale) { _, _ in
+                updateRemoteDisplaySize(for: geometry.size)
+            }
+            .onChange(of: session.connectionState) { _, newState in
+                if newState.isConnected {
+                    updateRemoteDisplaySize(for: geometry.size)
+                }
+            }
+            .onChange(of: session.configuration.displaySizingMode) { _, mode in
+                if mode == .matchClient {
+                    updateRemoteDisplaySize(for: geometry.size)
+                }
             }
         }
         #if os(iOS)
@@ -200,6 +218,12 @@ public struct RemoteDesktopView: View {
                 Text("No Active Connection").foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func updateRemoteDisplaySize(for viewSize: CGSize) {
+        session.updateRemoteDisplaySize(
+            viewSize: viewSize,
+            displayScale: displayScale)
     }
 
     #if !canImport(UIKit)

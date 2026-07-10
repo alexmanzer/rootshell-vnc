@@ -7,6 +7,32 @@ import RFBProtocol
 /// All properties have sensible defaults.
 public struct VNCConfiguration: Sendable {
 
+    /// How the server chooses the remote framebuffer dimensions.
+    public enum DisplaySizingMode: String, Sendable, Equatable, CaseIterable, Identifiable {
+        /// Keep the server's existing physical or virtual display size.
+        case remoteDisplay
+        /// Ask a capable server to render a display matching this client.
+        case matchClient
+
+        public var id: Self { self }
+
+        public var title: String {
+            switch self {
+            case .remoteDisplay: "Remote Display"
+            case .matchClient: "Match Client"
+            }
+        }
+
+        public var explanation: String {
+            switch self {
+            case .remoteDisplay:
+                "Keep the remote computer's existing display dimensions."
+            case .matchClient:
+                "Match this window or iPad aspect ratio. Supported Macs use a separate virtual display; other VNC servers resize only when they advertise support."
+            }
+        }
+    }
+
     /// High-performance video quality profile, mirroring the native client's
     /// Quality setting.
     public enum VideoQualityMode: String, Sendable, Equatable, CaseIterable, Identifiable {
@@ -38,6 +64,9 @@ public struct VNCConfiguration: Sendable {
 
     /// Which high-performance video quality profile to offer the server.
     public var videoQualityMode: VideoQualityMode
+
+    /// Whether a capable server should render at the client viewport size.
+    public var displaySizingMode: DisplaySizingMode
 
     /// Preferred pixel format to request from the server.
     ///
@@ -82,6 +111,7 @@ public struct VNCConfiguration: Sendable {
         preferredEncodings: [Encoding] = [.copyRect, .raw],
         enableHighPerformanceMode: Bool = true,
         videoQualityMode: VideoQualityMode = .adaptive,
+        displaySizingMode: DisplaySizingMode = .matchClient,
         targetFrameRate: Int = 30,
         enableProtocolTrace: Bool = false
     ) {
@@ -89,6 +119,7 @@ public struct VNCConfiguration: Sendable {
         self.preferredEncodings = preferredEncodings
         self.enableHighPerformanceMode = enableHighPerformanceMode
         self.videoQualityMode = videoQualityMode
+        self.displaySizingMode = displaySizingMode
         self.targetFrameRate = max(1, min(120, targetFrameRate))
         self.enableProtocolTrace = enableProtocolTrace
     }
@@ -125,9 +156,14 @@ public struct VNCConfiguration: Sendable {
             }
         }
 
-        // Always advertise desktop resize support
+        // Advertise both the legacy notification and the bidirectional screen
+        // layout extension. SetDesktopSize is sent only after a server proves
+        // support by returning ExtendedDesktopSize.
         if !encodings.contains(.desktopSize) {
             encodings.append(.desktopSize)
+        }
+        if !encodings.contains(.extendedDesktopSize) {
+            encodings.append(.extendedDesktopSize)
         }
 
         // Always include cursor pseudo-encoding

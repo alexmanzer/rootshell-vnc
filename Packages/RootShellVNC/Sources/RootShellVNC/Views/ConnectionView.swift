@@ -41,6 +41,7 @@ public struct ConnectionView: View {
                 serverSection
                 authenticationSection
                 qualitySection
+                displaySizingSection
                 statusSection
                 connectSection
             }
@@ -140,6 +141,21 @@ public struct ConnectionView: View {
             .pickerStyle(.segmented)
 
             Text(session.configuration.videoQualityMode.explanation)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var displaySizingSection: some View {
+        Section("Remote Display Size") {
+            Picker("Sizing", selection: $session.configuration.displaySizingMode) {
+                ForEach(VNCConfiguration.DisplaySizingMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            Text(session.configuration.displaySizingMode.explanation)
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }

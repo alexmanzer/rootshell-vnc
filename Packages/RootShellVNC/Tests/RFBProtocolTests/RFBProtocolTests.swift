@@ -794,6 +794,88 @@ final class MessageWriterTests: XCTestCase {
         XCTAssertEqual(data[1], 0)
     }
 
+    func testWriteStandardSetDesktopSize() {
+        let request = SetDesktopSizeRequest(
+            width: 2732,
+            height: 2048,
+            screens: [SetDesktopSizeScreen(
+                id: 0x0102_0304,
+                width: 2732,
+                height: 2048,
+                flags: 0xaabb_ccdd)])
+
+        XCTAssertEqual(MessageWriter.writeSetDesktopSize(request), Data([
+            0xfb, 0x00, 0x0a, 0xac, 0x08, 0x00, 0x01, 0x00,
+            0x01, 0x02, 0x03, 0x04,
+            0x00, 0x00, 0x00, 0x00,
+            0x0a, 0xac, 0x08, 0x00,
+            0xaa, 0xbb, 0xcc, 0xdd,
+        ]))
+    }
+
+    func testWriteAppleDisplayConfigurationUsesTypedNativeLayout() {
+        let mode = AppleVirtualDisplayMode(
+            pixelWidth: 2732,
+            pixelHeight: 2048,
+            pointWidth: 1366,
+            pointHeight: 1024,
+            refreshRate: 60,
+            flags: 0x1122_3344)
+        let display = AppleVirtualDisplay(
+            name: "iPad",
+            widthInMillimeters: 123.5,
+            heightInMillimeters: 45.25,
+            maximumPixelWidth: 3840,
+            maximumPixelHeight: 2160,
+            originX: 5,
+            originY: 6,
+            identifier: 7,
+            modes: [mode])
+
+        let data = MessageWriter.writeAppleDisplayConfiguration(
+            AppleDisplayConfiguration(displays: [display]))
+
+        // Command header: type 29, payload bytes after the first four bytes,
+        // version 1, one display, and a reserved zero word.
+        XCTAssertEqual(data.count, 196)
+        XCTAssertEqual(Data(data[0..<12]), Data([
+            0x1d, 0x00, 0x00, 0xc0,
+            0x00, 0x01, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00,
+        ]))
+
+        // Fixed display record reconstructed field-for-field from Apple's
+        // serializer. The name occupies a zero-padded 120-byte field.
+        XCTAssertEqual(Data(data[12..<14]), Data([0x00, 0xb8]))
+        XCTAssertEqual(Data(data[14..<19]), Data([0x69, 0x50, 0x61, 0x64, 0x00]))
+        XCTAssertEqual(Data(data[134..<142]), Data([
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00,
+        ]))
+        XCTAssertEqual(Data(data[142..<150]), Data([
+            0x42, 0xf7, 0x00, 0x00,
+            0x42, 0x35, 0x00, 0x00,
+        ]))
+        XCTAssertEqual(Data(data[150..<168]), Data([
+            0x00, 0x00, 0x0f, 0x00,
+            0x00, 0x00, 0x08, 0x70,
+            0x00, 0x05, 0x00, 0x06,
+            0x00, 0x00, 0x00, 0x07,
+            0x00, 0x01,
+        ]))
+
+        // One 28-byte HiDPI mode: pixels, points, IEEE-754 refresh rate,
+        // then flags, all in network byte order.
+        XCTAssertEqual(Data(data[168..<196]), Data([
+            0x00, 0x00, 0x0a, 0xac,
+            0x00, 0x00, 0x08, 0x00,
+            0x00, 0x00, 0x05, 0x56,
+            0x00, 0x00, 0x04, 0x00,
+            0x40, 0x4e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x11, 0x22, 0x33, 0x44,
+        ]))
+    }
+
     func testWriteApplePreciseScrollEvent() {
         let event = AppleScrollEvent(
             deltaX: 0x1234,

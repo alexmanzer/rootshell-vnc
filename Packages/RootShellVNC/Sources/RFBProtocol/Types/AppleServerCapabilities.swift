@@ -14,6 +14,10 @@ public struct AppleServerCapabilities: Sendable, Equatable {
     /// pointer wheel-button events instead.
     public static let preciseScrollCommand = AppleScrollEvent.messageType
 
+    /// Virtual-display configuration command used by Dynamic Resolution.
+    public static let displayConfigurationCommand =
+        AppleDisplayConfiguration.messageType
+
     public let serverFlags: UInt32
     public let serverCommandBitmap: Data
 

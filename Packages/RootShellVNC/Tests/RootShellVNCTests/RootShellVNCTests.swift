@@ -57,6 +57,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(config.preferredEncodings, [.copyRect, .raw])
         XCTAssertTrue(config.enableHighPerformanceMode)
         XCTAssertEqual(config.videoQualityMode, .adaptive)
+        XCTAssertEqual(config.displaySizingMode, .matchClient)
         XCTAssertEqual(config.targetFrameRate, 30)
         XCTAssertFalse(config.enableProtocolTrace)
     }
@@ -66,12 +67,14 @@ final class VNCConfigurationTests: XCTestCase {
             preferredPixelFormat: .bgra8888,
             preferredEncodings: [.raw, .zrle],
             enableHighPerformanceMode: false,
+            displaySizingMode: .remoteDisplay,
             targetFrameRate: 60,
             enableProtocolTrace: true
         )
         XCTAssertEqual(config.preferredPixelFormat, .bgra8888)
         XCTAssertEqual(config.preferredEncodings, [.raw, .zrle])
         XCTAssertFalse(config.enableHighPerformanceMode)
+        XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
         XCTAssertEqual(config.targetFrameRate, 60)
         XCTAssertTrue(config.enableProtocolTrace)
     }
@@ -113,6 +116,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(effective.contains(.encryptionInfo))
         XCTAssertTrue(effective.contains(.serverDisplayInfo))
         XCTAssertTrue(effective.contains(.desktopSize))
+        XCTAssertTrue(effective.contains(.extendedDesktopSize))
         XCTAssertTrue(effective.contains(.cursor))
         XCTAssertTrue(effective.contains(.raw))
     }
@@ -129,6 +133,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertFalse(effective.contains(.mediaStreamOffer))
         XCTAssertFalse(effective.contains(.mediaStreamAnswer))
         XCTAssertTrue(effective.contains(.desktopSize))
+        XCTAssertTrue(effective.contains(.extendedDesktopSize))
         XCTAssertTrue(effective.contains(.cursor))
         XCTAssertTrue(effective.contains(.raw))
     }
@@ -165,10 +170,82 @@ final class VNCConfigurationTests: XCTestCase {
     }
 
     func testEffectiveEncodingsDoesNotDuplicateDesktopSize() {
-        let config = VNCConfiguration(preferredEncodings: [.desktopSize, .raw])
+        let config = VNCConfiguration(
+            preferredEncodings: [.desktopSize, .extendedDesktopSize, .raw])
         let effective = config.effectiveEncodings
-        let count = effective.filter { $0 == .desktopSize }.count
-        XCTAssertEqual(count, 1)
+        XCTAssertEqual(effective.filter { $0 == .desktopSize }.count, 1)
+        XCTAssertEqual(effective.filter { $0 == .extendedDesktopSize }.count, 1)
+    }
+
+    func testDisplaySizingModesExposeGUIChoices() {
+        XCTAssertEqual(
+            VNCConfiguration.DisplaySizingMode.allCases,
+            [.remoteDisplay, .matchClient])
+        XCTAssertEqual(
+            VNCConfiguration.DisplaySizingMode.matchClient.title,
+            "Match Client")
+    }
+}
+
+// MARK: - Remote Display Size Tests
+
+final class RemoteDisplaySizeTests: XCTestCase {
+
+    func testIPadViewportProducesTwoTimesHiDPIFramebuffer() {
+        XCTAssertEqual(
+            RemoteDisplaySize.matching(
+                viewSize: CGSize(width: 1366, height: 1024),
+                displayScale: 2),
+            RemoteDisplaySize(
+                pixelWidth: 2732,
+                pixelHeight: 2048,
+                pointWidth: 1366,
+                pointHeight: 1024))
+    }
+
+    func testScaleIsCappedAtTwoTimes() {
+        XCTAssertEqual(
+            RemoteDisplaySize.matching(
+                viewSize: CGSize(width: 1000, height: 700),
+                displayScale: 3),
+            RemoteDisplaySize(
+                pixelWidth: 2000,
+                pixelHeight: 1400,
+                pointWidth: 1000,
+                pointHeight: 700))
+    }
+
+    func testLandscapeViewportFitsExactFourKServerLimit() {
+        XCTAssertEqual(
+            RemoteDisplaySize.matching(
+                viewSize: CGSize(width: 1920, height: 1080),
+                displayScale: 2),
+            RemoteDisplaySize(
+                pixelWidth: 3840,
+                pixelHeight: 2160,
+                pointWidth: 1920,
+                pointHeight: 1080))
+    }
+
+    func testPortraitViewportPreservesAspectInsideServerLimit() {
+        XCTAssertEqual(
+            RemoteDisplaySize.matching(
+                viewSize: CGSize(width: 1024, height: 1366),
+                displayScale: 2),
+            RemoteDisplaySize(
+                pixelWidth: 1618,
+                pixelHeight: 2160,
+                pointWidth: 809,
+                pointHeight: 1080))
+    }
+
+    func testInvalidViewportIsIgnored() {
+        XCTAssertNil(RemoteDisplaySize.matching(
+            viewSize: CGSize(width: 0, height: 1024),
+            displayScale: 2))
+        XCTAssertNil(RemoteDisplaySize.matching(
+            viewSize: CGSize(width: 1024, height: CGFloat.infinity),
+            displayScale: 2))
     }
 }
 

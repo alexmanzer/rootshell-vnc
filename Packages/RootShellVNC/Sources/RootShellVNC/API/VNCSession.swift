@@ -65,6 +65,10 @@ public final class VNCSession {
     private var videoStreamManager: VideoStreamManager?
     private var eventTask: Task<Void, Never>?
     private var frameRequestTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var remoteDisplayResizeTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var lastRequestedClientDisplaySize: RemoteDisplaySize?
     /// Single drain task for the ordered input queue. Gesture callbacks are
     /// synchronous, but transport writes are async; one pump prevents a release
     /// from overtaking its press while coalescing stale movement samples.
@@ -139,6 +143,9 @@ public final class VNCSession {
         lastError = nil
         currentImage = nil
         isHighPerformanceMode = false
+        remoteDisplayResizeTask?.cancel()
+        remoteDisplayResizeTask = nil
+        lastRequestedClientDisplaySize = nil
         diagnostics.isHighPerformanceMode = false
         videoBandRenderer.reset()
         diagnostics.reset()
@@ -200,6 +207,9 @@ public final class VNCSession {
         // Cancel background tasks
         eventTask?.cancel()
         eventTask = nil
+        remoteDisplayResizeTask?.cancel()
+        remoteDisplayResizeTask = nil
+        lastRequestedClientDisplaySize = nil
         invalidateInputQueue()
 
         // Close the transport
@@ -312,6 +322,54 @@ public final class VNCSession {
         }
 
         enqueueInput(.clipboard(text))
+    }
+
+    /// Debounce viewport/rotation changes and request a matching remote display
+    /// when the user selected Match Client. The transport capability-gates both
+    /// Apple's virtual-display command and standard RFB SetDesktopSize.
+    public func updateRemoteDisplaySize(
+        viewSize: CGSize,
+        displayScale: CGFloat
+    ) {
+        guard configuration.displaySizingMode == .matchClient,
+              connectionState.isConnected,
+              let transport = transportSession,
+              let requested = RemoteDisplaySize.matching(
+                viewSize: viewSize,
+                displayScale: displayScale),
+              requested != lastRequestedClientDisplaySize else { return }
+
+        lastRequestedClientDisplaySize = requested
+        remoteDisplayResizeTask?.cancel()
+        remoteDisplayResizeTask = Task { [weak self, weak transport] in
+            do {
+                try await Task.sleep(for: .milliseconds(300))
+                try Task.checkCancellation()
+                guard let self,
+                      let transport,
+                      self.transportSession === transport,
+                      self.connectionState.isConnected,
+                      self.configuration.displaySizingMode == .matchClient else { return }
+                let disposition = try await transport.requestRemoteDisplaySize(
+                    pixelWidth: requested.pixelWidth,
+                    pixelHeight: requested.pixelHeight,
+                    pointWidth: requested.pointWidth,
+                    pointHeight: requested.pointHeight)
+                self.logger.info(
+                    "Client-sized display \(requested.pixelWidth)x"
+                        + "\(requested.pixelHeight): \(String(describing: disposition))")
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self else { return }
+                if self.lastRequestedClientDisplaySize == requested {
+                    self.lastRequestedClientDisplaySize = nil
+                }
+                self.logger.warning(
+                    "Failed to request client-sized display: "
+                        + error.localizedDescription)
+            }
+        }
     }
 
     // MARK: - Diagnostics
@@ -558,6 +616,9 @@ public final class VNCSession {
     private func handleDisconnected() {
         logger.info("Disconnected")
 
+        remoteDisplayResizeTask?.cancel()
+        remoteDisplayResizeTask = nil
+        lastRequestedClientDisplaySize = nil
         invalidateInputQueue()
         transportSession = nil
         videoStreamManager?.stopStream()
@@ -575,6 +636,9 @@ public final class VNCSession {
     private func cleanupTransport() {
         eventTask?.cancel()
         eventTask = nil
+        remoteDisplayResizeTask?.cancel()
+        remoteDisplayResizeTask = nil
+        lastRequestedClientDisplaySize = nil
         invalidateInputQueue()
         transportSession = nil
     }

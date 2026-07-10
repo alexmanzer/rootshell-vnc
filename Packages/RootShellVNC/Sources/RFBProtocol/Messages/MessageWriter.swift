@@ -98,6 +98,94 @@ public enum MessageWriter: Sendable {
         return data
     }
 
+    /// Serialize standard RFB `SetDesktopSize` (message 251).
+    public static func writeSetDesktopSize(_ request: SetDesktopSizeRequest) -> Data {
+        let totalSize = SetDesktopSizeRequest.headerWireSize
+            + request.screens.count * ExtendedDesktopSizePayload.screenWireSize
+        var data = Data(count: totalSize)
+        data[0] = SetDesktopSizeRequest.messageType
+        data[1] = 0
+        writeUInt16(request.width, into: &data, at: 2)
+        writeUInt16(request.height, into: &data, at: 4)
+        data[6] = UInt8(request.screens.count)
+        data[7] = 0
+
+        var offset = SetDesktopSizeRequest.headerWireSize
+        for screen in request.screens {
+            writeUInt32(screen.id, into: &data, at: offset)
+            writeUInt16(screen.x, into: &data, at: offset + 4)
+            writeUInt16(screen.y, into: &data, at: offset + 6)
+            writeUInt16(screen.width, into: &data, at: offset + 8)
+            writeUInt16(screen.height, into: &data, at: offset + 10)
+            writeUInt32(screen.flags, into: &data, at: offset + 12)
+            offset += ExtendedDesktopSizePayload.screenWireSize
+        }
+        return data
+    }
+
+    /// Serialize Apple's negotiated virtual-display configuration command.
+    public static func writeAppleDisplayConfiguration(
+        _ configuration: AppleDisplayConfiguration
+    ) -> Data {
+        let recordsSize = configuration.displays.reduce(0) { $0 + $1.wireSize }
+        let totalSize = AppleDisplayConfiguration.headerWireSize + recordsSize
+        precondition(totalSize - 4 <= Int(UInt16.max))
+
+        var data = Data(count: totalSize)
+        data[0] = AppleDisplayConfiguration.messageType
+        data[1] = 0
+        writeUInt16(UInt16(totalSize - 4), into: &data, at: 2)
+        writeUInt16(AppleDisplayConfiguration.version, into: &data, at: 4)
+        data[6] = 0
+        data[7] = UInt8(configuration.displays.count)
+        writeUInt32(0, into: &data, at: 8)
+
+        var offset = AppleDisplayConfiguration.headerWireSize
+        for display in configuration.displays {
+            writeUInt16(UInt16(display.wireSize), into: &data, at: offset)
+
+            let nameBytes = Data(display.name.utf8.prefix(
+                AppleVirtualDisplay.nameByteCount - 1))
+            if !nameBytes.isEmpty {
+                data.replaceSubrange(
+                    (offset + 2)..<(offset + 2 + nameBytes.count),
+                    with: nameBytes)
+            }
+
+            writeUInt32(display.flags, into: &data, at: offset + 122)
+            writeUInt32(display.attributes, into: &data, at: offset + 126)
+            writeUInt32(
+                display.widthInMillimeters.bitPattern,
+                into: &data,
+                at: offset + 130)
+            writeUInt32(
+                display.heightInMillimeters.bitPattern,
+                into: &data,
+                at: offset + 134)
+            writeUInt32(display.maximumPixelWidth, into: &data, at: offset + 138)
+            writeUInt32(display.maximumPixelHeight, into: &data, at: offset + 142)
+            writeUInt16(display.originX, into: &data, at: offset + 146)
+            writeUInt16(display.originY, into: &data, at: offset + 148)
+            writeUInt32(display.identifier, into: &data, at: offset + 150)
+            writeUInt16(UInt16(display.modes.count), into: &data, at: offset + 154)
+
+            var modeOffset = offset + AppleVirtualDisplay.fixedWireSize
+            for mode in display.modes {
+                writeUInt32(mode.pixelWidth, into: &data, at: modeOffset)
+                writeUInt32(mode.pixelHeight, into: &data, at: modeOffset + 4)
+                writeUInt32(mode.pointWidth, into: &data, at: modeOffset + 8)
+                writeUInt32(mode.pointHeight, into: &data, at: modeOffset + 12)
+                let rate = mode.refreshRate.bitPattern
+                writeUInt32(UInt32(rate >> 32), into: &data, at: modeOffset + 16)
+                writeUInt32(UInt32(rate & 0xffff_ffff), into: &data, at: modeOffset + 20)
+                writeUInt32(mode.flags, into: &data, at: modeOffset + 24)
+                modeOffset += AppleVirtualDisplayMode.wireSize
+            }
+            offset += display.wireSize
+        }
+        return data
+    }
+
     /// Serialize Apple's precise scroll-wheel command (message type 23).
     ///
     /// The 54-byte payload contains event kind 1, subtype 11, all three forms
