@@ -4,6 +4,52 @@ import CryptoKit
 @testable import RFBTransport
 import RFBProtocol
 
+final class AppleScrollFallbackTests: XCTestCase {
+    func testVerticalFallbackMatchesNativeCGEventDirection() {
+        let up = AppleScrollEvent(deltaY: 1, x: 10, y: 20)
+        let down = AppleScrollEvent(deltaY: -1, x: 10, y: 20)
+
+        XCTAssertEqual(
+            AppleScrollFallback.wheelButtonMasks(
+                for: up,
+                includeHorizontal: false),
+            [0x08])
+        XCTAssertEqual(
+            AppleScrollFallback.wheelButtonMasks(
+                for: down,
+                includeHorizontal: false),
+            [0x10])
+    }
+
+    func testHorizontalFallbackIsLimitedToAppleServers() {
+        let event = AppleScrollEvent(deltaX: -1, deltaY: 1, x: 10, y: 20)
+
+        XCTAssertEqual(
+            AppleScrollFallback.wheelButtonMasks(
+                for: event,
+                includeHorizontal: false),
+            [0x08])
+        XCTAssertEqual(
+            AppleScrollFallback.wheelButtonMasks(
+                for: event,
+                includeHorizontal: true),
+            [0x40, 0x08])
+    }
+
+    func testZeroDeltaPhaseEventDoesNotCreateFallbackWheelClick() {
+        let event = AppleScrollEvent(
+            scrollPhase: .ended,
+            flags: [.continuous],
+            x: 10,
+            y: 20)
+
+        XCTAssertTrue(
+            AppleScrollFallback.wheelButtonMasks(
+                for: event,
+                includeHorizontal: true).isEmpty)
+    }
+}
+
 // MARK: - VNCAuthenticator DES Bit Reversal Tests
 
 final class VNCAuthenticatorBitReversalTests: XCTestCase {

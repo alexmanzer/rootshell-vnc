@@ -141,6 +141,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var lastDecoderOutputNanos: UInt64 = 0
     private var droppedPacketLogCount = 0
     private var multiNALAccessUnitLogCount = 0
+    private var gatedIRAPLogCount = 0
     private var pendingVPS: Data?
     private var pendingSPS: Data?
     private var pendingPPS: Data?
@@ -158,6 +159,8 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var seenVideoSSRCs: Set<UInt32> = []
     private var awaitingIRAP: Set<UInt32> = []
     private var lastVideoSeq: [UInt32: UInt16] = [:]
+    private var lastVideoPacketArrivalNanos: [UInt32: UInt64] = [:]
+    private var mediaInterruptionPendingSSRCs: Set<UInt32> = []
     private var lastLossNanos: UInt64 = 0
     /// Kill-switch for A/B testing: ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY=1.
     var lossRecoveryEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY"] != "1"
@@ -284,6 +287,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         self.lastDecoderOutputNanos = 0
         self.droppedPacketLogCount = 0
         self.multiNALAccessUnitLogCount = 0
+        self.gatedIRAPLogCount = 0
         self._isActive = true
         demuxer = RTPDemuxer(
             usesDecodingOrderNumbers: usesDecodingOrderNumbers)
@@ -345,9 +349,12 @@ public final class VideoStreamManager: @unchecked Sendable {
         seenVideoSSRCs.removeAll()
         awaitingIRAP.removeAll()
         lastVideoSeq.removeAll()
+        lastVideoPacketArrivalNanos.removeAll()
+        mediaInterruptionPendingSSRCs.removeAll()
         lastLossNanos = 0
         earlyVCLBuffer.removeAll()
         lossStats = LossStats()
+        gatedIRAPLogCount = 0
         donReorderBuffer = CompoundHEVCDONReorderBuffer()
         sequentialAccessUnitAssembler.reset()
         lock.unlock()
@@ -511,6 +518,12 @@ public final class VideoStreamManager: @unchecked Sendable {
     ) -> (detected: Bool, shouldRequestRecovery: Bool) {
         lock.lock()
         defer { lock.unlock() }
+        let now = DispatchTime.now().uptimeNanoseconds
+        let followedLongSilence = lastVideoPacketArrivalNanos[ssrc].map {
+            now &- $0 >= 1_000_000_000
+        } ?? false
+        lastVideoPacketArrivalNanos[ssrc] = now
+        let followedKnownInterruption = mediaInterruptionPendingSSRCs.remove(ssrc) != nil
         seenVideoSSRCs.insert(ssrc)
         let last = lastVideoSeq[ssrc]
         lastVideoSeq[ssrc] = sequence
@@ -518,7 +531,10 @@ public final class VideoStreamManager: @unchecked Sendable {
         // A duplicate/late packet (seq <= last) is not a new hole in the chain;
         // only a forward jump means data was lost.
         let forward = sequence &- last
-        guard forward != 0 && forward < 0x8000 else { return (false, false) }
+        guard forward != 0,
+              forward < 0x8000 || followedLongSilence || followedKnownInterruption else {
+            return (false, false)
+        }
         lossStats.gapsDetected += 1
         guard lossRecoveryEnabled else { return (true, false) }
         return (true, markLossLocked(affectedSSRC: ssrc))
@@ -556,17 +572,34 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// AVConference's VCP wrapper resumes specifically for HEVC NAL type 20
     /// (IDR_N_LP); CRA and dependent pictures remain withheld.
     private func shouldDecodeVCL(nalType: UInt8, ssrc: UInt32) -> Bool {
-        _ = ssrc
         lock.lock()
-        defer { lock.unlock() }
         if nalType == 20 {
+            let wasGated = irapGateEnabled && !awaitingIRAP.isEmpty
             lossStats.irapsDecoded += 1
             awaitingIRAP.removeAll()
             lastLossNanos = 0
+            lock.unlock()
+            if wasGated {
+                log.warning(
+                    "Accepted recovery HEVC IDR_N_LP type=20 "
+                        + "ssrc=0x\(String(ssrc, radix: 16))")
+            }
             return true
         }
-        guard irapGateEnabled, !awaitingIRAP.isEmpty else { return true }
+        guard irapGateEnabled, !awaitingIRAP.isEmpty else {
+            lock.unlock()
+            return true
+        }
         lossStats.framesDroppedWhileGated += 1
+        let shouldLogIRAP = (16...21).contains(nalType)
+            && gatedIRAPLogCount < 8
+        if shouldLogIRAP { gatedIRAPLogCount += 1 }
+        lock.unlock()
+        if shouldLogIRAP {
+            log.warning(
+                "Withheld non-IDR recovery IRAP type=\(nalType) "
+                    + "ssrc=0x\(String(ssrc, radix: 16))")
+        }
         return false
     }
 
@@ -583,6 +616,32 @@ public final class VideoStreamManager: @unchecked Sendable {
     @discardableResult
     public func recoverDecoderAfterOutputStall() -> Bool {
         rebuildDecoderInSession(requireLatchedFailure: false)
+    }
+
+    /// Mirror AVConference's no-video-displayed fail-safe after it sends FIR:
+    /// discard receiver-side partial assembly and choose a fresh compound DON
+    /// origin from the recovery picture. Parameter sets and the working public
+    /// VideoToolbox session remain intact.
+    public func resetExpectedDecodingOrderForRecovery() {
+        lock.lock()
+        guard _isActive else {
+            lock.unlock()
+            return
+        }
+        demuxer.reset()
+        donReorderBuffer.reset()
+        sequentialAccessUnitAssembler.reset()
+        earlyVCLBuffer.removeAll(keepingCapacity: true)
+        lock.unlock()
+        log.warning("Reset expected HEVC decoding order while awaiting recovery IDR")
+    }
+
+    /// Allow the first packet after foregrounding to establish a forward
+    /// sequence discontinuity even if more than half the UInt16 space elapsed.
+    public func noteMediaInterruption() {
+        lock.lock()
+        mediaInterruptionPendingSSRCs.formUnion(seenVideoSSRCs)
+        lock.unlock()
     }
 
     public func stopStream() {
@@ -623,6 +682,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         lastDecoderOutputNanos = 0
         droppedPacketLogCount = 0
         multiNALAccessUnitLogCount = 0
+        gatedIRAPLogCount = 0
         pendingVPS = nil
         pendingSPS = nil
         pendingPPS = nil
@@ -635,6 +695,8 @@ public final class VideoStreamManager: @unchecked Sendable {
         seenVideoSSRCs.removeAll()
         awaitingIRAP.removeAll()
         lastVideoSeq.removeAll()
+        lastVideoPacketArrivalNanos.removeAll()
+        mediaInterruptionPendingSSRCs.removeAll()
         lastLossNanos = 0
         earlyVCLBuffer.removeAll()
         lossStats = LossStats()

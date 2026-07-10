@@ -22,6 +22,12 @@ public struct RemoteDesktopView: View {
         self.touchHandler = TouchInputHandler(
             sendPointerEvent: { [session] buttonMask, x, y in
                 session.sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
+            },
+            sendScrollEvent: { [session] event in
+                session.sendScrollEvent(event)
+            },
+            sendGestureEvent: { [session] event in
+                session.sendGestureEvent(event)
             })
         self.keyboardHandler = KeyboardInputHandler(
             sendKeyEvent: { [session] downFlag, key in

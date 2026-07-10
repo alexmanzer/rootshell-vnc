@@ -164,6 +164,8 @@ struct AppleMediaRTPReorderBuffer {
     private struct StreamState {
         var firstSequence: UInt16
         var startupDeadlineNanos: UInt64
+        var lastAcceptedArrivalNanos: UInt64
+        var interruptionPending = false
         var started = false
         var nextSequence: UInt16?
         var gapDeadlineNanos: UInt64?
@@ -181,6 +183,7 @@ struct AppleMediaRTPReorderBuffer {
     private let startupHoldNanos: UInt64
     private let maximumGapWaitNanos: UInt64
     private let nackRetryNanos: UInt64
+    private let discontinuitySilenceNanos: UInt64
     private let maximumBufferedPacketsPerStream: Int
     private var streams: [UInt32: StreamState] = [:]
     private var nextOrdinal: UInt64 = 0
@@ -194,14 +197,16 @@ struct AppleMediaRTPReorderBuffer {
         // ms before releasing newer packets.
         maximumGapWaitNanos: UInt64 = 300_000_000,
         nackRetryNanos: UInt64 = 25_000_000,
-        // At the negotiated 65 Mbps ceiling, 300 ms can contain roughly 1,700
-        // full-size RTP packets. The former 512-packet cap forced a loss before
-        // the time deadline during high-bitrate motion.
+        discontinuitySilenceNanos: UInt64 = 1_000_000_000,
+        // Leave generous headroom above the native 40 Mbps receive ceiling.
+        // The former 512-packet cap could force a loss before the time deadline
+        // during high-bitrate motion.
         maximumBufferedPacketsPerStream: Int = 4096
     ) {
         self.startupHoldNanos = startupHoldNanos
         self.maximumGapWaitNanos = maximumGapWaitNanos
         self.nackRetryNanos = nackRetryNanos
+        self.discontinuitySilenceNanos = discontinuitySilenceNanos
         self.maximumBufferedPacketsPerStream = maximumBufferedPacketsPerStream
     }
 
@@ -229,7 +234,8 @@ struct AppleMediaRTPReorderBuffer {
 
         var state = streams[ssrc] ?? StreamState(
             firstSequence: sequence,
-            startupDeadlineNanos: nowNanos &+ startupHoldNanos)
+            startupDeadlineNanos: nowNanos &+ startupHoldNanos,
+            lastAcceptedArrivalNanos: nowNanos)
 
         if state.pending[sequence] != nil {
             result.duplicateOrLatePacketCount += 1
@@ -237,19 +243,59 @@ struct AppleMediaRTPReorderBuffer {
             return result
         }
 
+        var interruptionGapPacketCount: Int?
         if state.started, let next = state.nextSequence {
             let forward = sequence &- next
-            if forward >= 0x8000 {
+            let followedLongSilence = nowNanos &- state.lastAcceptedArrivalNanos
+                >= discontinuitySilenceNanos
+            if forward != 0 && (state.interruptionPending || followedLongSilence) {
+                // After app suspension or a genuine media outage, more than
+                // half of the 16-bit sequence space can pass. That is a known
+                // forward discontinuity, not a permanently "late" packet.
+                // Drop stale buffered fragments and report the exact modulo
+                // distance immediately instead of waiting for impossible NACKs.
+                interruptionGapPacketCount = Int(forward)
+                state.pending.removeAll(keepingCapacity: true)
+                state.gapDeadlineNanos = nil
+                state.nextNACKDeadlineNanos = nil
+                state.activeFrameTimestamp = nil
+                state.activeFrameReceivedPacketCount = 0
+                state.activeFrameExpectedPacketCount = nil
+                state.activeFrameSequenceNumber = nil
+            } else if forward >= 0x8000 {
                 result.duplicateOrLatePacketCount += 1
                 streams[ssrc] = state
                 return result
             }
         }
 
+        state.interruptionPending = false
+        state.lastAcceptedArrivalNanos = nowNanos
         state.pending[sequence] = BufferedPacket(
             data: packet,
             arrivalNanos: nowNanos,
             ordinal: nextOrdinal)
+        if let missingPacketCount = interruptionGapPacketCount {
+            let frame = estimateDamagedFrame(
+                state: state,
+                nearestSequence: sequence,
+                missingPacketCount: missingPacketCount)
+            result.gaps.append(Gap(
+                ssrc: ssrc,
+                missingPacketCount: missingPacketCount,
+                frameRTPTimestamp: frame.timestamp,
+                estimatedFramePacketCount: frame.packetCount,
+                frameSequenceNumber: frame.sequenceNumber))
+            state.nextSequence = sequence
+            drain(
+                &state,
+                ssrc: ssrc,
+                nowNanos: nowNanos,
+                forceGap: false,
+                into: &result)
+            streams[ssrc] = state
+            return result
+        }
         if state.pending.count >= maximumBufferedPacketsPerStream {
             if !state.started { start(&state) }
             drain(&state, ssrc: ssrc, nowNanos: nowNanos, forceGap: true, into: &result)
@@ -282,6 +328,20 @@ struct AppleMediaRTPReorderBuffer {
     mutating func reset() {
         streams.removeAll(keepingCapacity: false)
         nextOrdinal = 0
+    }
+
+    /// Mark a known application/media interruption. Pending pre-suspension
+    /// fragments cannot complete after foregrounding, but retain the expected
+    /// sequence so the first new packet yields a real measured gap.
+    mutating func markMediaInterruption() {
+        for ssrc in Array(streams.keys) {
+            guard var state = streams[ssrc] else { continue }
+            state.pending.removeAll(keepingCapacity: true)
+            state.gapDeadlineNanos = nil
+            state.nextNACKDeadlineNanos = nil
+            state.interruptionPending = true
+            streams[ssrc] = state
+        }
     }
 
     private func start(_ state: inout StreamState) {

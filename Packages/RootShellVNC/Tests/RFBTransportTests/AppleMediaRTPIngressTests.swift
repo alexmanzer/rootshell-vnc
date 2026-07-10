@@ -159,6 +159,39 @@ final class AppleMediaRTPIngressTests: XCTestCase {
         XCTAssertTrue(result.gaps.isEmpty)
     }
 
+    func testKnownInterruptionAcceptsMoreThanHalfSequenceSpaceAsForwardGap() {
+        var reorder = makeReorderBuffer()
+        _ = reorder.insert(packet: packet(10), ssrc: 7, sequence: 10, nowNanos: 0)
+        _ = reorder.flushExpired(nowNanos: 8)
+        reorder.markMediaInterruption()
+
+        let resumed = reorder.insert(
+            packet: packet(40),
+            ssrc: 7,
+            sequence: 40_000,
+            nowNanos: 9)
+
+        XCTAssertEqual(resumed.packets, [packet(40)])
+        XCTAssertEqual(resumed.gaps, [
+            .init(ssrc: 7, missingPacketCount: 39_989),
+        ])
+    }
+
+    func testLongMediaSilenceAcceptsLargeForwardGapWithoutLifecycleSignal() {
+        var reorder = makeReorderBuffer()
+        _ = reorder.insert(packet: packet(10), ssrc: 7, sequence: 10, nowNanos: 0)
+        _ = reorder.flushExpired(nowNanos: 8)
+
+        let resumed = reorder.insert(
+            packet: packet(40),
+            ssrc: 7,
+            sequence: 40_000,
+            nowNanos: 1_000_000_001)
+
+        XCTAssertEqual(resumed.packets, [packet(40)])
+        XCTAssertEqual(resumed.gaps.map(\.missingPacketCount), [39_989])
+    }
+
     private func makeReorderBuffer() -> AppleMediaRTPReorderBuffer {
         AppleMediaRTPReorderBuffer(
             startupHoldNanos: 8,

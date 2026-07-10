@@ -24,6 +24,13 @@ public struct TouchInputHandler {
     ///   - x: X coordinate in framebuffer pixels.
     ///   - y: Y coordinate in framebuffer pixels.
     public typealias PointerEventHandler = @MainActor (UInt8, UInt16, UInt16) -> Void
+    /// A closure that sends one continuous scroll sample. The session chooses
+    /// precise Apple input or ordinary RFB wheel buttons from server capability
+    /// negotiation.
+    public typealias ScrollEventHandler = @MainActor (AppleScrollEvent) -> Void
+    /// A closure that sends the native begin/end envelope around precise
+    /// scrolling. Conventional RFB transports ignore these events.
+    public typealias GestureEventHandler = @MainActor (AppleGestureEvent) -> Void
 
     // MARK: - Button mask constants
 
@@ -41,6 +48,8 @@ public struct TouchInputHandler {
     // MARK: - Properties
 
     private let sendPointerEvent: PointerEventHandler
+    private let sendScrollEvent: ScrollEventHandler?
+    private let sendGestureEvent: GestureEventHandler?
 
     // MARK: - Init
 
@@ -50,6 +59,18 @@ public struct TouchInputHandler {
     ///   for each generated pointer event.
     public init(sendPointerEvent: @escaping PointerEventHandler) {
         self.sendPointerEvent = sendPointerEvent
+        self.sendScrollEvent = nil
+        self.sendGestureEvent = nil
+    }
+
+    public init(
+        sendPointerEvent: @escaping PointerEventHandler,
+        sendScrollEvent: @escaping ScrollEventHandler,
+        sendGestureEvent: GestureEventHandler? = nil
+    ) {
+        self.sendPointerEvent = sendPointerEvent
+        self.sendScrollEvent = sendScrollEvent
+        self.sendGestureEvent = sendGestureEvent
     }
 
     // MARK: - Gesture Handlers
@@ -118,23 +139,81 @@ public struct TouchInputHandler {
     /// Handle a scroll event at the given framebuffer coordinates.
     ///
     /// Translates vertical scroll deltas into VNC scroll-wheel button events.
-    /// Negative deltaY scrolls up, positive deltaY scrolls down.
+    /// Positive deltaY scrolls up and negative deltaY scrolls down, matching
+    /// the CGEvent convention used by Apple's native RFB fallback.
     ///
     /// - Parameters:
     ///   - x: X coordinate in framebuffer pixels.
     ///   - y: Y coordinate in framebuffer pixels.
-    ///   - deltaY: The vertical scroll amount. Negative = up, positive = down.
+    ///   - deltaY: The vertical scroll amount. Positive = up, negative = down.
     public func handleScroll(x: UInt16, y: UInt16, deltaY: CGFloat) {
         // VNC uses button 4 (bit 3) for scroll up and button 5 (bit 4) for scroll down.
         // Each click of the wheel is a separate press+release pair.
         guard deltaY != 0 else { return }
-        let steps = min(20, max(1, Int(abs(deltaY) / 10)))
-        let button: UInt8 = deltaY < 0 ? Self.scrollUp : Self.scrollDown
+        let magnitude = min(20, max(1, Int(abs(deltaY) / 10)))
+        handleScroll(
+            x: x,
+            y: y,
+            steps: deltaY > 0 ? magnitude : -magnitude)
+    }
 
-        for _ in 0..<steps {
+    /// Send an exact signed number of VNC wheel clicks. Positive values scroll
+    /// up and negative values scroll down.
+    public func handleScroll(x: UInt16, y: UInt16, steps: Int) {
+        guard steps != 0 else { return }
+        let magnitude = Int(min(UInt(20), steps.magnitude))
+        let button: UInt8 = steps > 0 ? Self.scrollUp : Self.scrollDown
+
+        for _ in 0..<magnitude {
             sendPointerEvent(button, x, y)
             sendPointerEvent(0, x, y)
         }
+    }
+
+    /// Forward a point-accurate scroll sample. UIKit exposes point movement and
+    /// gesture phase but not AppKit's separate 16.16 fixed-point line delta, so
+    /// those fields remain zero instead of inventing a scale. Coarse deltas are
+    /// retained as signs for the standards-compatible RFB fallback.
+    public func handleScroll(
+        x: UInt16,
+        y: UInt16,
+        pointDeltaX: Int32,
+        pointDeltaY: Int32,
+        scrollPhase: AppleScrollEvent.Phase,
+        momentumPhase: AppleScrollEvent.Phase = .none
+    ) {
+        let event = AppleScrollEvent(
+            deltaX: Self.coarseDelta(for: pointDeltaX),
+            deltaY: Self.coarseDelta(for: pointDeltaY),
+            pointDeltaX: pointDeltaX,
+            pointDeltaY: pointDeltaY,
+            scrollPhase: scrollPhase,
+            momentumPhase: momentumPhase,
+            flags: [.continuous],
+            x: x,
+            y: y)
+
+        if let sendScrollEvent {
+            sendScrollEvent(event)
+        } else if event.deltaY != 0 {
+            handleScroll(x: x, y: y, steps: Int(event.deltaY))
+        }
+    }
+
+    private nonisolated static func coarseDelta(for pointDelta: Int32) -> Int16 {
+        if pointDelta > 0 { return 1 }
+        if pointDelta < 0 { return -1 }
+        return 0
+    }
+
+    /// Forward the gesture envelope that native Screen Sharing places around
+    /// precise scroll-wheel records.
+    public func handleGesture(
+        kind: AppleGestureEvent.Kind,
+        x: UInt16,
+        y: UInt16
+    ) {
+        sendGestureEvent?(AppleGestureEvent(kind: kind, x: x, y: y))
     }
 
     /// Handle a double-tap at the given framebuffer coordinates.
@@ -147,5 +226,40 @@ public struct TouchInputHandler {
     public func handleDoubleTap(x: UInt16, y: UInt16) {
         handleTap(x: x, y: y)
         handleTap(x: x, y: y)
+    }
+}
+
+/// Converts fractional UIKit point movement to the integer point fields on the
+/// wire without losing sub-point motion between callbacks.
+struct ScrollPointAccumulator: Equatable, Sendable {
+    private(set) var remainderX: CGFloat = 0
+    private(set) var remainderY: CGFloat = 0
+
+    mutating func consume(deltaX: CGFloat, deltaY: CGFloat) -> (x: Int32, y: Int32) {
+        guard deltaX.isFinite, deltaY.isFinite else { return (0, 0) }
+        remainderX += deltaX
+        remainderY += deltaY
+        let x = Self.consumeAxis(&remainderX)
+        let y = Self.consumeAxis(&remainderY)
+        return (x, y)
+    }
+
+    mutating func reset() {
+        remainderX = 0
+        remainderY = 0
+    }
+
+    private static func consumeAxis(_ remainder: inout CGFloat) -> Int32 {
+        if remainder >= CGFloat(Int32.max) {
+            remainder = 0
+            return Int32.max
+        }
+        if remainder <= CGFloat(Int32.min) {
+            remainder = 0
+            return Int32.min
+        }
+        let whole = Int32(remainder.rounded(.towardZero))
+        remainder -= CGFloat(whole)
+        return whole
     }
 }

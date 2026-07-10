@@ -13,6 +13,14 @@ import Foundation
 /// reduces the estimate; clean intervals recover it toward the ceiling. RCTL is
 /// advisory feedback; this class does not impose a second TMMBR ceiling.
 final class AppleMediaRateController {
+    /// ScreenSharing's `AVCVideoStreamConfig` validates a 20 Mbps receive
+    /// minimum and 40 Mbps receive maximum for its 60 fps screen profile.
+    /// Keep these as named protocol-profile values rather than saturating the
+    /// RCTL UInt16 kbps field (65.535 Mbps), which overloads both network and
+    /// receive pipeline compared with the native client.
+    static let nativeScreenMinimumBitrateBps: Double = 20_000_000
+    static let nativeScreenMaximumBitrateBps: Double = 40_000_000
+
     private struct Config {
         let minimumCapacity: Double
         let maximumCapacity: Double
@@ -31,7 +39,10 @@ final class AppleMediaRateController {
             func value(_ key: String, default fallback: Double) -> Double {
                 env[key].flatMap(Double.init) ?? fallback
             }
-            let minimum = value("ROOTSHELL_VNC_RC_MIN_KBPS", default: 4_000) * 1_000
+            let minimum = value(
+                "ROOTSHELL_VNC_RC_MIN_KBPS",
+                default: AppleMediaRateController.nativeScreenMinimumBitrateBps / 1_000
+            ) * 1_000
             let maximum = value(
                 "ROOTSHELL_VNC_RC_MAX_KBPS",
                 default: maximumCapacity / 1_000) * 1_000

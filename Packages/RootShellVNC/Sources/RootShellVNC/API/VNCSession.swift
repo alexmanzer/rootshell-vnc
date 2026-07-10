@@ -4,6 +4,9 @@ import CoreVideo
 import RFBProtocol
 import RFBTransport
 import RFBRendering
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Main VNC session observable object for SwiftUI integration.
 ///
@@ -62,13 +65,15 @@ public final class VNCSession {
     private var videoStreamManager: VideoStreamManager?
     private var eventTask: Task<Void, Never>?
     private var frameRequestTask: Task<Void, Never>?
-    /// Tail of the ordered input chain. Gesture callbacks are synchronous, but
-    /// transport writes are async; unrelated Tasks could otherwise allow a
-    /// release event to overtake its press under load.
+    /// Single drain task for the ordered input queue. Gesture callbacks are
+    /// synchronous, but transport writes are async; one pump prevents a release
+    /// from overtaking its press while coalescing stale movement samples.
     @ObservationIgnored
     private var inputTask: Task<Void, Never>?
     @ObservationIgnored
     private var inputGeneration: UInt64 = 0
+    @ObservationIgnored
+    private var inputQueue = SessionInputQueue()
     private let diagnostics = ConnectionDiagnostics()
     private let logger = VNCLogger(category: "Session")
     /// GPU renderer for the high-performance HEVC screen bands. The
@@ -86,6 +91,14 @@ public final class VNCSession {
     /// negotiation generation.
     @ObservationIgnored
     private var appliedMediaGeometryGeneration: UInt64 = 0
+    #if canImport(UIKit)
+    @ObservationIgnored
+    private var backgroundLifecycleTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var foregroundLifecycleTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var mediaWasBackgrounded = false
+    #endif
 
     // MARK: - Init
 
@@ -94,10 +107,16 @@ public final class VNCSession {
     /// - Parameter configuration: Session configuration. Defaults to sensible values.
     public init(configuration: VNCConfiguration = VNCConfiguration()) {
         self.configuration = configuration
+        #if canImport(UIKit)
+        observeApplicationLifecycle()
+        #endif
     }
 
     deinit {
-        // Deinit for @MainActor class — tasks are cancelled by their own cancellation.
+        #if canImport(UIKit)
+        backgroundLifecycleTask?.cancel()
+        foregroundLifecycleTask?.cancel()
+        #endif
     }
 
     // MARK: - Connection
@@ -243,6 +262,39 @@ public final class VNCSession {
         }
 
         enqueueInput(.pointer(buttonMask: buttonMask, x: x, y: y))
+    }
+
+    /// Send one continuous scroll sample. Apple servers that advertise precise
+    /// scrolling receive the full event; all other servers receive ordinary
+    /// RFB wheel-button press/release events from the transport fallback.
+    public func sendScrollEvent(_ event: AppleScrollEvent) {
+        guard connectionState.isConnected, transportSession != nil else { return }
+
+        if isTraceEnabled {
+            diagnostics.protocolTrace.recordSent(
+                type: "ScrollEvent",
+                data: ClientMessage.appleScrollEvent(event).serialize(),
+                details: "delta=(\(event.pointDeltaX),\(event.pointDeltaY)) phase=\(event.scrollPhase.rawValue) pos=(\(event.x),\(event.y))"
+            )
+        }
+
+        enqueueInput(.scroll(event))
+    }
+
+    /// Send the begin/end envelope around a precise Apple scroll gesture.
+    /// The transport ignores it for conventional RFB servers.
+    public func sendGestureEvent(_ event: AppleGestureEvent) {
+        guard connectionState.isConnected, transportSession != nil else { return }
+
+        if isTraceEnabled {
+            diagnostics.protocolTrace.recordSent(
+                type: "GestureEvent",
+                data: ClientMessage.appleGestureEvent(event).serialize(),
+                details: "kind=\(event.kind.rawValue) source=\(event.sourceSubtype.rawValue) pos=(\(event.x),\(event.y))"
+            )
+        }
+
+        enqueueInput(.gesture(event))
     }
 
     /// Send clipboard text to the VNC server.
@@ -527,41 +579,44 @@ public final class VNCSession {
         transportSession = nil
     }
 
-    private enum QueuedInput: Sendable {
-        case key(downFlag: Bool, keysym: UInt32)
-        case pointer(buttonMask: UInt8, x: UInt16, y: UInt16)
-        case clipboard(String)
-    }
-
-    /// Append an event to one shared chain so key, pointer, and clipboard
-    /// messages reach the RFB actor in exactly the order the UI produced them.
-    private func enqueueInput(_ event: QueuedInput) {
+    /// Append input to one ordered, bounded pump. Redundant pointer positions
+    /// and queued continuous-scroll samples are coalesced while button/key and
+    /// gesture lifecycle transitions remain exact.
+    private func enqueueInput(_ event: SessionInputEvent) {
         guard connectionState.isConnected,
               let transport = transportSession else { return }
 
-        let previous = inputTask
+        inputQueue.enqueue(event)
+        guard inputTask == nil else { return }
+
         let generation = inputGeneration
         inputTask = Task { [weak self, weak transport] in
-            await previous?.value
-            guard !Task.isCancelled,
-                  let self,
-                  let transport,
+            guard let self, let transport else { return }
+            while !Task.isCancelled,
                   self.inputGeneration == generation,
                   self.transportSession === transport,
-                  self.connectionState.isConnected else { return }
-
-            switch event {
-            case .key(let downFlag, let keysym):
-                try? await transport.sendKeyEvent(
-                    downFlag: downFlag,
-                    key: keysym)
-            case .pointer(let buttonMask, let x, let y):
-                try? await transport.sendPointerEvent(
-                    buttonMask: buttonMask,
-                    x: x,
-                    y: y)
-            case .clipboard(let text):
-                try? await transport.sendClipboardText(text)
+                  self.connectionState.isConnected,
+                  let event = self.inputQueue.dequeue() {
+                switch event {
+                case .key(let downFlag, let keysym):
+                    try? await transport.sendKeyEvent(
+                        downFlag: downFlag,
+                        key: keysym)
+                case .pointer(let buttonMask, let x, let y):
+                    try? await transport.sendPointerEvent(
+                        buttonMask: buttonMask,
+                        x: x,
+                        y: y)
+                case .scroll(let event):
+                    try? await transport.sendScrollEvent(event)
+                case .gesture(let event):
+                    try? await transport.sendGestureEvent(event)
+                case .clipboard(let text):
+                    try? await transport.sendClipboardText(text)
+                }
+            }
+            if self.inputGeneration == generation {
+                self.inputTask = nil
             }
         }
     }
@@ -570,7 +625,47 @@ public final class VNCSession {
         inputGeneration &+= 1
         inputTask?.cancel()
         inputTask = nil
+        inputQueue.removeAll()
     }
+
+    #if canImport(UIKit)
+    /// UIKit can suspend the process long enough for RTP to advance beyond the
+    /// half-range rule normally used to distinguish a late UInt16 sequence.
+    /// Preserve the live TCP/media session and mark only receive-side ordering
+    /// state at both sides of the suspension boundary.
+    private func observeApplicationLifecycle() {
+        backgroundLifecycleTask = Task { @MainActor [weak self] in
+            for await _ in NotificationCenter.default.notifications(
+                named: UIApplication.didEnterBackgroundNotification
+            ) {
+                guard !Task.isCancelled, let self else { return }
+                mediaWasBackgrounded = true
+                noteMediaInterruptionBoundary()
+            }
+        }
+        foregroundLifecycleTask = Task { @MainActor [weak self] in
+            for await _ in NotificationCenter.default.notifications(
+                named: UIApplication.willEnterForegroundNotification
+            ) {
+                guard !Task.isCancelled, let self else { return }
+                guard mediaWasBackgrounded else { continue }
+                mediaWasBackgrounded = false
+                noteMediaInterruptionBoundary()
+            }
+        }
+    }
+
+    private func noteMediaInterruptionBoundary() {
+        guard connectionState.isConnected,
+              isHighPerformanceMode,
+              let transport = transportSession,
+              let manager = videoStreamManager else { return }
+        manager.noteMediaInterruption()
+        Task { [transport] in
+            await transport.noteAppleMediaInterruption()
+        }
+    }
+    #endif
 
     private var isTraceEnabled: Bool {
         #if DEBUG
@@ -633,8 +728,8 @@ public final class VNCSession {
         let streamGeneration = manager.decodeProgress.streamGeneration
 
         // Startup liveness watchdog. Recovery remains in the negotiated media
-        // protocol: repeat an observed AVConference frame-loss report instead
-        // of dirtying the framebuffer or restarting the VNC connection.
+        // protocol: request a fresh intra picture instead of dirtying the
+        // framebuffer or restarting the VNC connection.
         if let transport = transportSession {
             let watchdogManager = manager
             let log = logger
@@ -649,8 +744,8 @@ public final class VNCSession {
                         return
                     }
                     log.warning("Startup media watchdog: \(decoded)/\(sources) sources decoding "
-                        + "(attempt \(attempt)); repeating observed frame-loss feedback")
-                    await transport.repeatLastVideoLossFeedback()
+                        + "(attempt \(attempt)); requesting native FIR")
+                    await transport.requestVideoKeyframe()
                 }
             }
         }
@@ -658,7 +753,7 @@ public final class VNCSession {
         // Long-running decode-output watchdog. A static desktop naturally
         // produces no decode submissions, so silence by itself is not a fault.
         // If submitted pictures stop producing output, rebuild only the public
-        // decoder and repeat real loss feedback on the existing media session.
+        // decoder and request a fresh intra picture on the existing session.
         if let transport = transportSession {
             let watchdogManager = manager
             let log = logger
@@ -679,17 +774,12 @@ public final class VNCSession {
                     ) {
                         log.warning("Decode-output stall while compressed frames continue; "
                             + "rebuilding decoder in media session")
-                        guard await transport.hasObservedVideoLossFeedback() else {
-                            log.warning("Decoder stall has no observed RTP loss report; "
-                                + "leaving the current media session untouched")
-                            continue
-                        }
                         recoveryQueue.async { [transport, m] in
                             guard m.recoverDecoderAfterOutputStall() else {
                                 return
                             }
                             Task { [transport] in
-                                await transport.repeatLastVideoLossFeedback()
+                                await transport.requestVideoKeyframe()
                             }
                         }
                     }
@@ -697,27 +787,63 @@ public final class VNCSession {
             }
         }
 
-        // Transport-confirmed RTP loss already sends native AFB type-6 feedback
-        // before releasing the post-gap packet. Do not layer PLI/FIR or full
-        // framebuffer updates on top; those were the source of quality pulses.
-        manager.onLossDetected = nil
+        // Transport-confirmed RTP loss sends native AFB type-6 feedback before
+        // releasing the post-gap packet. If no video is displayed afterwards,
+        // AVConference's fail-safe escalates to PSFB FIR and resets expected
+        // decoding order. Mirror that two-stage behavior in the same media
+        // session; repeating one stale AFB forever does not recover the server.
+        if let transport = transportSession {
+            let recoveryManager = manager
+            let log = logger
+            let recoveryQueue = mediaQueue
+            manager.onLossDetected = { [weak transport, weak recoveryManager] ssrc in
+                guard let transport, let recoveryManager else { return }
+                Task { [transport, recoveryManager] in
+                    guard await transport.hasObservedVideoLossFeedback(ssrc: ssrc) else {
+                        log.warning("Compressed stream gated without a matching observed RTP loss report")
+                        return
+                    }
+
+                    var attempt = 0
+                    while recoveryManager.isStreamActive,
+                          recoveryManager.hasGatedBands {
+                        // Native names this its no-video-display fail-safe. A
+                        // two-second display silence gives retransmission and
+                        // the initial AFB time to work without pulsing quality.
+                        try? await Task.sleep(for: .seconds(2))
+                        guard !Task.isCancelled,
+                              recoveryManager.isStreamActive,
+                              recoveryManager.hasGatedBands else { return }
+                        attempt += 1
+                        log.warning("No video displayed after RTP loss; applying native FIR "
+                            + "fail-safe (attempt \(attempt))")
+                        await withCheckedContinuation { continuation in
+                            recoveryQueue.async {
+                                recoveryManager.resetExpectedDecodingOrderForRecovery()
+                                continuation.resume()
+                            }
+                        }
+                        await transport.requestVideoKeyframe(ssrc: ssrc)
+                    }
+                }
+            }
+        } else {
+            manager.onLossDetected = nil
+        }
 
         // VideoToolbox can accept a damaged sample synchronously and report its
         // missing-reference failure later. Rebuild it on the serial media queue,
-        // retain the last rendered surface, and repeat the observed loss report.
+        // retain the last rendered surface, and use native FIR to refresh it.
         if let transport = transportSession {
             let recoveryQueue = mediaQueue
             let recoveryManager = manager
             manager.onDecoderFailure = { [weak transport, weak recoveryManager] failure in
                 guard let transport, let recoveryManager else { return }
                 Task { [transport, recoveryManager] in
-                    guard await transport.hasObservedVideoLossFeedback(ssrc: failure.ssrc) else {
-                        return
-                    }
                     recoveryQueue.async { [transport, recoveryManager] in
                         guard recoveryManager.recoverDecoderInSession() else { return }
                         Task { [transport] in
-                            await transport.repeatLastVideoLossFeedback(ssrc: failure.ssrc)
+                            await transport.requestVideoKeyframe(ssrc: failure.ssrc)
                         }
                     }
                 }

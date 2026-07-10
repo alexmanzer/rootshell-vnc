@@ -23,6 +23,26 @@ final class AppleMediaFeedbackTests: XCTestCase {
         ]))
     }
 
+    func testFullIntraRequestMatchesAVConferenceRTCPAddFIR() {
+        XCTAssertEqual(
+            appleMediaFullIntraRequestPacket(
+                senderSSRC: 0x1122_3344,
+                mediaSSRC: 0x5566_7788,
+                sequenceNumber: 9),
+            Data([
+                0x84, 0xce, 0x00, 0x04,
+                0x11, 0x22, 0x33, 0x44,
+                0x00, 0x00, 0x00, 0x00,
+                0x55, 0x66, 0x77, 0x88,
+                0x09, 0x00, 0x00, 0x00,
+            ]))
+    }
+
+    func testNativeScreenRateProfileIsTwentyToFortyMegabits() {
+        XCTAssertEqual(AppleMediaRateController.nativeScreenMinimumBitrateBps, 20_000_000)
+        XCTAssertEqual(AppleMediaRateController.nativeScreenMaximumBitrateBps, 40_000_000)
+    }
+
     func testGenericNACKPacksContiguousAndSparseSequenceNumbers() {
         XCTAssertEqual(
             appleMediaGenericNACKEntries(missingSequences: [100, 101, 103, 117, 118]),

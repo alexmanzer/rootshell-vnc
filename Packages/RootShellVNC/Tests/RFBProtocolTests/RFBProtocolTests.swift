@@ -2,6 +2,53 @@ import XCTest
 import Foundation
 @testable import RFBProtocol
 
+final class AppleServerCapabilitiesTests: XCTestCase {
+    func testParsesStructuredServerInitPrefixAndDesktopName() {
+        var field = Data([
+            0x00, 0x00,
+            0x01, 0x02, 0x03, 0x04,
+            0x00, 0x00, 0x01,
+        ])
+        field.append(Data(repeating: 0, count: 13))
+        field.append(Data("Mac Studio".utf8))
+
+        let capabilities = AppleServerCapabilities(serverInitNameField: field)
+        XCTAssertEqual(capabilities?.serverFlags, 0x01020304)
+        XCTAssertEqual(
+            capabilities?.supportsServerCommand(
+                AppleServerCapabilities.preciseScrollCommand),
+            true)
+        XCTAssertEqual(
+            String(
+                data: AppleServerCapabilities.desktopNameData(
+                    fromServerInitNameField: field),
+                encoding: .utf8),
+            "Mac Studio")
+    }
+
+    func testCommandBitmapUsesMSBFirstBitOrder() {
+        var bitmap = Data(repeating: 0, count: 16)
+        bitmap[0] = 0x80
+        bitmap[15] = 0x01
+        let capabilities = AppleServerCapabilities(
+            serverFlags: 0,
+            serverCommandBitmap: bitmap)
+
+        XCTAssertTrue(capabilities.supportsServerCommand(0))
+        XCTAssertFalse(capabilities.supportsServerCommand(1))
+        XCTAssertTrue(capabilities.supportsServerCommand(127))
+    }
+
+    func testRegularDesktopNameIsNotTreatedAsCapabilityPrefix() {
+        let name = Data("Regular VNC server desktop".utf8)
+        XCTAssertNil(AppleServerCapabilities(serverInitNameField: name))
+        XCTAssertEqual(
+            AppleServerCapabilities.desktopNameData(
+                fromServerInitNameField: name),
+            name)
+    }
+}
+
 final class ProtocolVersionTests: XCTestCase {
 
     // MARK: - Parsing valid versions
@@ -747,6 +794,65 @@ final class MessageWriterTests: XCTestCase {
         XCTAssertEqual(data[1], 0)
     }
 
+    func testWriteApplePreciseScrollEvent() {
+        let event = AppleScrollEvent(
+            deltaX: 0x1234,
+            deltaY: -2,
+            deltaZ: Int16.min,
+            fixedDeltaX: 0x01020304,
+            fixedDeltaY: -2,
+            fixedDeltaZ: Int32.min,
+            pointDeltaX: 0x11223344,
+            pointDeltaY: -3,
+            pointDeltaZ: Int32.max,
+            scrollPhase: .changed,
+            momentumPhase: .ended,
+            scrollCount: 0x01020304,
+            flags: [.instantMouser, .continuous],
+            x: 0xabcd,
+            y: 0x1234)
+
+        XCTAssertEqual(MessageWriter.writeAppleScrollEvent(event), Data([
+            0x17, 0x00, 0x00, 0x36, 0x00, 0x01, 0x00, 0x0b,
+            0x12, 0x34, 0xff, 0xfe, 0x80, 0x00,
+            0x01, 0x02, 0x03, 0x04,
+            0xff, 0xff, 0xff, 0xfe,
+            0x80, 0x00, 0x00, 0x00,
+            0x11, 0x22, 0x33, 0x44,
+            0xff, 0xff, 0xff, 0xfd,
+            0x7f, 0xff, 0xff, 0xff,
+            0x00, 0x00, 0x00, 0x04,
+            0x00, 0x00, 0x00, 0x08,
+            0x01, 0x02, 0x03, 0x04,
+            0x00, 0x00, 0x00, 0x03,
+            0xab, 0xcd, 0x12, 0x34,
+        ]))
+    }
+
+    func testWriteAppleGestureEnvelopeMatchesScreenSharing() {
+        let begin = AppleGestureEvent(
+            kind: .began,
+            x: 0x1234,
+            y: 0x5678)
+        let end = AppleGestureEvent(
+            kind: .ended,
+            x: 0x1234,
+            y: 0x5678)
+
+        XCTAssertEqual(MessageWriter.writeAppleGestureEvent(begin), Data([
+            0x17, 0x00, 0x00, 0x0c,
+            0x00, 0x01, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x03,
+            0x12, 0x34, 0x56, 0x78,
+        ]))
+        XCTAssertEqual(MessageWriter.writeAppleGestureEvent(end), Data([
+            0x17, 0x00, 0x00, 0x0c,
+            0x00, 0x01, 0x00, 0x02,
+            0x00, 0x00, 0x00, 0x03,
+            0x12, 0x34, 0x56, 0x78,
+        ]))
+    }
+
     // MARK: - ClientCutText (type 6)
 
     func testWriteClientCutText() {
@@ -803,6 +909,14 @@ final class ClientMessageTests: XCTestCase {
         XCTAssertEqual(ClientMessage.keyEvent(downFlag: true, key: 0x41).messageType, 4)
         XCTAssertEqual(ClientMessage.pointerEvent(buttonMask: 0, x: 0, y: 0).messageType, 5)
         XCTAssertEqual(ClientMessage.clientCutText("hi").messageType, 6)
+        XCTAssertEqual(
+            ClientMessage.appleScrollEvent(
+                AppleScrollEvent(x: 0, y: 0)).messageType,
+            0x17)
+        XCTAssertEqual(
+            ClientMessage.appleGestureEvent(
+                AppleGestureEvent(kind: .began, x: 0, y: 0)).messageType,
+            0x17)
     }
 
     func testSerializeSetPixelFormat() {

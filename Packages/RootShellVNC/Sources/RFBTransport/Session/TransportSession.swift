@@ -111,17 +111,18 @@ public actor TransportSession {
     /// video2). Incoming datagrams are matched to a context by SSRC.
     private var appleMediaSRTPContexts: [AppleSRTPContext] = []
     private var appleMediaSRTPContextBySSRC: [UInt32: AppleSRTPContext] = [:]
-    /// SRTCP protect context (viewer-to-server key) for outgoing RTCP feedback
-    /// such as PLI keyframe requests.
+    /// SRTCP protect context (viewer-to-server key) for outgoing RTCP feedback.
     private var appleMediaSRTCPContext: AppleSRTCPContext?
-    /// Our RTCP sender SSRC (fixed per session).
+    /// Our RTCP sender SSRC. This is the RTP SSRC advertised by the primary
+    /// screen receiver negotiator, not a second independently generated value.
+    /// AVConference associates feedback with that negotiated receiver source.
     private var appleMediaLocalSSRC: UInt32 = 0
     /// Video SSRCs seen on the media path and the channel each arrived on, so
     /// keyframe requests go back on the right connected socket.
     private var appleMediaVideoSSRCChannels: [UInt32: PosixUDPChannel] = [:]
     private var appleLastKeyframeRequestNanos: UInt64 = 0
-    /// Most recent native frame-loss report for each source. Decoder recovery
-    /// can repeat the same observed report; it never fabricates wire fields.
+    /// Most recent native frame-loss report for each source. This lets the
+    /// decoder confirm that its gated source corresponds to observed RTP loss.
     private var appleMediaLastFrameLossFeedback: [UInt32: AppleMediaFrameLossFeedback] = [:]
     private var appleMediaMostRecentFrameLossSSRC: UInt32?
     /// RTP-shaped datagrams no configured SRTP key could authenticate (dropped).
@@ -217,6 +218,13 @@ public actor TransportSession {
     private var fbHeight: UInt16 = 0
     /// The negotiated pixel format.
     private var pixelFormat: PixelFormat = .bgra8888
+    /// Structured command support advertised by an Apple RFB 3.889 server.
+    /// This remains nil for regular RFB servers, which therefore use standard
+    /// wheel-button input.
+    private var appleServerCapabilities: AppleServerCapabilities?
+    /// Non-wheel pointer buttons currently held, preserved across fallback
+    /// wheel press/release pairs just like the native client.
+    private var pointerButtonMask: UInt8 = 0
 
     /// The async stream of session events for consumers.
     public nonisolated let events: AsyncStream<SessionEvent>
@@ -298,8 +306,46 @@ public actor TransportSession {
 
     /// Send a pointer (mouse/touch) event to the server.
     public func sendPointerEvent(buttonMask: UInt8, x: UInt16, y: UInt16) async throws {
+        pointerButtonMask = buttonMask
         let msg = ClientMessage.pointerEvent(buttonMask: buttonMask, x: x, y: y)
         try await sendClientPayload(msg.serialize())
+    }
+
+    /// Send precise scrolling when the Apple server explicitly advertises the
+    /// command, or conventional RFB wheel-button events on every other server.
+    public func sendScrollEvent(_ event: AppleScrollEvent) async throws {
+        if appleServerCapabilities?.supportsServerCommand(
+            AppleServerCapabilities.preciseScrollCommand) == true {
+            try await sendClientPayload(
+                ClientMessage.appleScrollEvent(event).serialize())
+            return
+        }
+
+        let isAppleServer = stateMachine.negotiatedVersion?.isApple == true
+        for wheelMask in AppleScrollFallback.wheelButtonMasks(
+            for: event,
+            includeHorizontal: isAppleServer) {
+            try await sendClientPayload(
+                ClientMessage.pointerEvent(
+                    buttonMask: pointerButtonMask | wheelMask,
+                    x: event.x,
+                    y: event.y).serialize())
+            try await sendClientPayload(
+                ClientMessage.pointerEvent(
+                    buttonMask: pointerButtonMask,
+                    x: event.x,
+                    y: event.y).serialize())
+        }
+    }
+
+    /// Send the native begin/end gesture envelope only when the Apple server
+    /// advertises the shared precise-input command. Conventional RFB servers
+    /// have no equivalent message; their wheel fallback remains unchanged.
+    public func sendGestureEvent(_ event: AppleGestureEvent) async throws {
+        guard appleServerCapabilities?.supportsServerCommand(
+            AppleServerCapabilities.preciseScrollCommand) == true else { return }
+        try await sendClientPayload(
+            ClientMessage.appleGestureEvent(event).serialize())
     }
 
     /// Send clipboard text to the server.
@@ -529,12 +575,20 @@ public actor TransportSession {
         let pf = try reader.readPixelFormat()
         let nameLen = try reader.readUInt32()
 
-        var nameData = try await tcp.read(exactly: Int(nameLen))
-        if requestAppleMediaStream, nameData.count > 20 {
-            nameData.removeFirst(20)
-            while nameData.first == 0 {
-                nameData.removeFirst()
-            }
+        let serverInitNameField = try await tcp.read(exactly: Int(nameLen))
+        var nameData = serverInitNameField
+        if stateMachine.negotiatedVersion?.isApple == true,
+           let capabilities = AppleServerCapabilities(
+               serverInitNameField: serverInitNameField) {
+            appleServerCapabilities = capabilities
+            nameData = AppleServerCapabilities.desktopNameData(
+                fromServerInitNameField: serverInitNameField)
+            let preciseScroll = capabilities.supportsServerCommand(
+                AppleServerCapabilities.preciseScrollCommand)
+            log.info(
+                "Apple ServerInit capabilities: flags=0x\(String(capabilities.serverFlags, radix: 16)) preciseScroll=\(preciseScroll)")
+        } else {
+            appleServerCapabilities = nil
         }
         let name = String(data: nameData, encoding: .utf8)
             ?? String(data: nameData, encoding: .isoLatin1)
@@ -2060,9 +2114,20 @@ public actor TransportSession {
     }
 
     private func appleMediaServerConfigurationMessage() throws -> Data {
-        let audioOffer = try appleAVCMediaStreamOffer(mode: 8)
-        let videoOffer = try appleAVCMediaStreamOffer(mode: 7)
-        let video2Offer = appleMediaDisplayCount > 1 ? try appleAVCMediaStreamOffer(mode: 7) : nil
+        let generatedAudioOffer = try appleAVCMediaStreamOffer(mode: 8)
+        let generatedVideoOffer = try appleAVCMediaStreamOffer(mode: 7)
+        let generatedVideo2Offer = appleMediaDisplayCount > 1
+            ? try appleAVCMediaStreamOffer(mode: 7)
+            : nil
+        let audioOffer = generatedAudioOffer.data
+        let videoOffer = generatedVideoOffer.data
+        let video2Offer = generatedVideo2Offer?.data
+
+        // RTCPAddFIR reads the receiver context's local/negotiated RTP SSRC for
+        // its sender field. Using an unrelated random SSRC produces a valid
+        // SRTCP packet that the server does not associate with this receiver.
+        appleMediaLocalSSRC = generatedVideoOffer.ssrc
+        log.debug("Using negotiated screen receiver ssrc=0x\(String(appleMediaLocalSSRC, radix: 16)) for RTCP")
         let audioSendKey = try randomBytes(count: 46)
         let audioReceiveKey = try randomBytes(count: 46)
         let videoSendKey = try randomBytes(count: 46)
@@ -2127,7 +2192,12 @@ public actor TransportSession {
         return message
     }
 
-    private func appleAVCMediaStreamOffer(mode: Int) throws -> Data {
+    private struct GeneratedAppleMediaOffer {
+        let data: Data
+        let ssrc: UInt32
+    }
+
+    private func appleAVCMediaStreamOffer(mode: Int) throws -> GeneratedAppleMediaOffer {
         // Mode 8 is Apple's system-audio profile and mode 7 is its screen-video
         // profile. Full Quality is not another media mode: the native client
         // leaves AVC entirely and requests lossless RFB encodings.
@@ -2150,12 +2220,13 @@ public actor TransportSession {
                 + "ssrc=\(ssrc) aspect=\(profile.aspectRatio.landscapeWidth)/"
                 + "\(profile.aspectRatio.landscapeHeight) hdr=\(appleMediaSupportsHDR)"
         )
-        return try profile.makeOffer(
+        let data = try profile.makeOffer(
             kind: mode == 8 ? .audio : .screen,
             mode: negotiatorMode,
             ssrc: ssrc,
             ntpTimestamp: AppleMediaNegotiationProfile.ntpTimestamp()
         )
+        return GeneratedAppleMediaOffer(data: data, ssrc: ssrc)
     }
 
     private func randomBytes(count: Int) throws -> Data {
@@ -2277,6 +2348,7 @@ public actor TransportSession {
         appleRCTLLastDiagnosticNanos = 0
         appleMediaRateController = nil
         appleLastKeyframeRequestNanos = 0
+        appleMediaLocalSSRC = 0
 
         if transition.isReconfiguration {
             log.info(
@@ -2512,52 +2584,29 @@ public actor TransportSession {
         return value
     }
 
-    /// Send a keyframe request for a media stream. The server uses long-GOP
-    /// encoding (one IDR at start, then P-frames), so a band whose reference
-    /// chain breaks (lost packet / dropped frame) stays corrupted until we ask
-    /// for a fresh IDR. The server expects the legacy RFC 2032 FIR (PT 192), not
-    /// the modern PSFB PLI/FIR (PT 206) — confirmed from a live capture (`80 c0
-    /// 00 01 [sender SSRC]`); our PLI (206) was ignored. The single SSRC is the
-    /// packet sender's (ours), the same SSRC we use in our Receiver Reports.
     private var appleMediaFIRSeq: UInt8 = 0
 
-    /// Request a fresh keyframe (IDR) for a corrupt/drifted reference chain. The
-    /// stream is single-IDR, so without this a dropped frame degrades forever.
-    /// Sent as one compound RTCP datagram — Receiver Report + PSFB PLI (PT 206
-    /// FMT 1, the HEVC path's lightweight keyframe request) + PSFB FIR (206 FMT 4)
-    /// + legacy FIR (PT 192) — so whichever the server honors, it fires. A
-    /// standalone feedback packet is dropped by the server, hence the RR prefix.
+    /// Native no-video-displayed recovery is RR + PSFB FIR, followed by a reset
+    /// of expected decoding order. Do not layer PLI and legacy FIR variants into
+    /// the same compound packet; AVConference's negotiated receiver uses the
+    /// RFC 5104 FIR form emitted by `RTCPAddFIR`.
     private func sendAppleMediaKeyframeRequest(mediaSSRC: UInt32, on channel: PosixUDPChannel) async {
         guard let srtcp = appleMediaSRTCPContext else { return }
         let sender = appleMediaLocalSSRC
         var compound = Data()
         if let rr = buildAppleMediaReceiverReport() { compound.append(rr) }
 
-        // PSFB PLI: V=2,P=0,FMT=1 | PT=206 | len=2 | senderSSRC | mediaSSRC
-        compound.append(0x81); compound.append(0xce)
-        compound.append(0x00); compound.append(0x02)
-        appendUInt32BE(sender, to: &compound)
-        appendUInt32BE(mediaSSRC, to: &compound)
-
-        // PSFB FIR: V=2,P=0,FMT=4 | PT=206 | len=4 | senderSSRC | mediaSSRC=0
-        //           | FCI: targetSSRC | seqNr(1) | reserved(3)
         appleMediaFIRSeq &+= 1
-        compound.append(0x84); compound.append(0xce)
-        compound.append(0x00); compound.append(0x04)
-        appendUInt32BE(sender, to: &compound)
-        appendUInt32BE(0, to: &compound)
-        appendUInt32BE(mediaSSRC, to: &compound)
-        compound.append(appleMediaFIRSeq); compound.append(0); compound.append(0); compound.append(0)
-
-        // Legacy RFC 2032 FIR (PT 192) fallback for the classic path.
-        compound.append(0x80); compound.append(0xc0)
-        compound.append(0x00); compound.append(0x01)
-        appendUInt32BE(sender, to: &compound)
+        compound.append(appleMediaFullIntraRequestPacket(
+            senderSSRC: sender,
+            mediaSSRC: mediaSSRC,
+            sequenceNumber: appleMediaFIRSeq))
 
         guard let protected = try? srtcp.protect(compound, senderSSRC: sender) else { return }
         dumpAppleMediaOutgoingRTCPIfRequested(plaintext: compound, protected: protected)
         try? await channel.send(protected)
-        log.debug("Sent keyframe request (RR+PLI206+FIR206+FIR192) media ssrc=0x\(String(mediaSSRC, radix: 16))")
+        log.warning("Sent native no-video-displayed FIR media ssrc=0x\(String(mediaSSRC, radix: 16)) "
+            + "sequence=\(self.appleMediaFIRSeq)")
     }
 
 
@@ -2575,6 +2624,17 @@ public actor TransportSession {
             log.error("Media startup buffer overflowed; dropped \(drained.droppedPacketCount) newest packets")
             requestAppleMediaRecoveryAfterIngressOverflow()
         }
+    }
+
+    /// Preserve the live control/media session across app suspension while
+    /// teaching the RTP reorderer that the next sequence can legitimately be
+    /// more than half a UInt16 space ahead.
+    public func noteAppleMediaInterruption() {
+        appleMediaRTPReorderFlushTask?.cancel()
+        appleMediaRTPReorderFlushTask = nil
+        appleMediaRTPReorderScheduledDeadlineNanos = nil
+        appleMediaRTPReorderBuffer.markMediaInterruption()
+        log.warning("Marked Apple media RTP stream interrupted; awaiting measured resume gap")
     }
 
     private func emitAppleMediaRTPPacket(_ packet: Data) {
@@ -2829,14 +2889,13 @@ public actor TransportSession {
         guard let protected = try? srtcp.protect(compound, senderSSRC: sender) else { return }
         dumpAppleMediaOutgoingRTCPIfRequested(plaintext: compound, protected: protected)
         try? await channel.send(protected)
-        log.info("Sent AVConference frame-loss feedback ssrc=0x\(String(mediaSSRC, radix: 16)) "
+        log.warning("Sent AVConference frame-loss feedback ssrc=0x\(String(mediaSSRC, radix: 16)) "
             + "received=\(feedback.receivedPacketCount) framePackets=\(feedback.framePacketCount) "
             + "lost=\(feedback.lostPacketCount)")
     }
 
-    /// Repeat a previously derived loss report after an asynchronous decoder
-    /// failure. A repeat stays entirely inside the existing media session and
-    /// intentionally does nothing if no real packet loss has been observed.
+    /// Confirm that a decode gate corresponds to transport-observed packet
+    /// loss before arming the no-video-displayed FIR fail-safe.
     public func hasObservedVideoLossFeedback(ssrc requestedSSRC: UInt32? = nil) -> Bool {
         if let requestedSSRC,
            appleMediaLastFrameLossFeedback[requestedSSRC] != nil {
@@ -2845,26 +2904,6 @@ public actor TransportSession {
         guard let recent = appleMediaMostRecentFrameLossSSRC else { return false }
         return appleMediaLastFrameLossFeedback[recent] != nil
             && appleMediaVideoSSRCChannels[recent] != nil
-    }
-
-    public func repeatLastVideoLossFeedback(ssrc requestedSSRC: UInt32? = nil) async {
-        let selectedSSRC: UInt32?
-        if let requestedSSRC,
-           appleMediaLastFrameLossFeedback[requestedSSRC] != nil {
-            selectedSSRC = requestedSSRC
-        } else {
-            selectedSSRC = appleMediaMostRecentFrameLossSSRC
-        }
-        guard let ssrc = selectedSSRC,
-              let feedback = appleMediaLastFrameLossFeedback[ssrc],
-              let channel = appleMediaVideoSSRCChannels[ssrc] else {
-            log.warning("Cannot repeat frame-loss feedback: no observed loss report is available")
-            return
-        }
-        await sendAppleMediaFrameLossFeedback(
-            feedback,
-            mediaSSRC: ssrc,
-            on: channel)
     }
 
     /// Ask the server to retransmit missing RTP packets while the per-SSRC
@@ -2938,12 +2977,9 @@ public actor TransportSession {
     }
 
     /// Request a fresh IDR for the video stream, from outside the transport.
-    /// Used by the decode pipeline's closed recovery loop: when it detects a
-    /// broken reference chain (gap/DON skip/parse error) it calls this every
-    /// few hundred ms until an intact IRAP heals the stream — unlike the
-    /// transport's own gap trigger, which is blind-rate-limited to 1 Hz and
-    /// never verifies the IDR actually arrived intact. A light 150 ms floor
-    /// here guards against a runaway caller.
+    /// Used by the decode pipeline's recovery paths when startup, a damaged
+    /// reference chain, or an asynchronous decoder failure needs a fresh IRAP.
+    /// A light 150 ms floor guards against concurrent recovery triggers.
     public func requestVideoKeyframe(ssrc requestedSSRC: UInt32? = nil) async {
         let target: (UInt32, PosixUDPChannel)?
         if let requestedSSRC, let channel = appleMediaVideoSSRCChannels[requestedSSRC] {
@@ -3157,7 +3193,7 @@ public actor TransportSession {
     /// as UInt16; estimates above that only delay a later loss response because
     /// several reductions would still encode as the same saturated value.
     private var appleMediaRateControllerMaxBps: Double {
-        Double(UInt16.max) * 1_000
+        AppleMediaRateController.nativeScreenMaximumBitrateBps
     }
 
     private func sendAppleMediaReceiverReport() async {

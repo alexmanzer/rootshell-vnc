@@ -211,6 +211,9 @@ final class KeyboardInputHandlerTests: XCTestCase {
         XCTAssertEqual(
             KeyboardInputHandler.keysymForHIDUsage(0x04, characters: "A"),
             0x41)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x1E, characters: "!"),
+            0x21)
     }
 
     func testFunctionKeyConstants() {
@@ -825,8 +828,8 @@ final class TouchInputHandlerTests: XCTestCase {
             events.append((mask, x, y))
         }
 
-        // Positive deltaY = scroll down
-        handler.handleScroll(x: 100, y: 100, deltaY: 10)
+        // Negative CGEvent deltaY = scroll down
+        handler.handleScroll(x: 100, y: 100, deltaY: -10)
         // At least one press+release pair
         XCTAssertGreaterThanOrEqual(events.count, 2)
         // Verify we get scrollDown button
@@ -841,8 +844,8 @@ final class TouchInputHandlerTests: XCTestCase {
             events.append((mask, x, y))
         }
 
-        // Negative deltaY = scroll up
-        handler.handleScroll(x: 100, y: 100, deltaY: -10)
+        // Positive CGEvent deltaY = scroll up
+        handler.handleScroll(x: 100, y: 100, deltaY: 10)
         let pressEvents = events.filter { $0.0 == TouchInputHandler.scrollUp }
         XCTAssertFalse(pressEvents.isEmpty)
     }
@@ -856,8 +859,152 @@ final class TouchInputHandlerTests: XCTestCase {
 
         // Large delta should produce multiple scroll steps
         handler.handleScroll(x: 100, y: 100, deltaY: 50)
-        let pressEvents = events.filter { $0.0 == TouchInputHandler.scrollDown }
+        let pressEvents = events.filter { $0.0 == TouchInputHandler.scrollUp }
         XCTAssertGreaterThanOrEqual(pressEvents.count, 5) // 50/10 = 5 steps
+    }
+
+    @MainActor
+    func testExactScrollSteps() {
+        var events: [(UInt8, UInt16, UInt16)] = []
+        let handler = TouchInputHandler { mask, x, y in
+            events.append((mask, x, y))
+        }
+
+        handler.handleScroll(x: 20, y: 30, steps: -3)
+
+        XCTAssertEqual(events.count, 6)
+        XCTAssertEqual(events.map(\.0), [
+            TouchInputHandler.scrollDown, 0,
+            TouchInputHandler.scrollDown, 0,
+            TouchInputHandler.scrollDown, 0,
+        ])
+    }
+
+    @MainActor
+    func testPreciseScrollPreservesPointsPhaseAndDirection() {
+        var scrollEvents: [AppleScrollEvent] = []
+        let handler = TouchInputHandler(
+            sendPointerEvent: { _, _, _ in
+                XCTFail("Precise input should go through the scroll event path")
+            },
+            sendScrollEvent: { scrollEvents.append($0) })
+
+        handler.handleScroll(
+            x: 20,
+            y: 30,
+            pointDeltaX: 1,
+            pointDeltaY: -4,
+            scrollPhase: .changed)
+
+        XCTAssertEqual(scrollEvents.count, 1)
+        let event = scrollEvents[0]
+        XCTAssertEqual(event.deltaX, 1)
+        XCTAssertEqual(event.deltaY, -1)
+        XCTAssertEqual(event.pointDeltaX, 1)
+        XCTAssertEqual(event.pointDeltaY, -4)
+        XCTAssertEqual(event.fixedDeltaX, 0)
+        XCTAssertEqual(event.fixedDeltaY, 0)
+        XCTAssertEqual(event.scrollPhase, .changed)
+        XCTAssertEqual(event.flags, [.continuous])
+        XCTAssertEqual(event.x, 20)
+        XCTAssertEqual(event.y, 30)
+    }
+
+    @MainActor
+    func testPreciseScrollGestureEnvelopeUsesTouchSource() {
+        var gestureEvents: [AppleGestureEvent] = []
+        let handler = TouchInputHandler(
+            sendPointerEvent: { _, _, _ in },
+            sendScrollEvent: { _ in },
+            sendGestureEvent: { gestureEvents.append($0) })
+
+        handler.handleGesture(kind: .began, x: 20, y: 30)
+        handler.handleGesture(kind: .ended, x: 21, y: 31)
+
+        XCTAssertEqual(gestureEvents, [
+            AppleGestureEvent(kind: .began, x: 20, y: 30),
+            AppleGestureEvent(kind: .ended, x: 21, y: 31),
+        ])
+    }
+
+    func testScrollPointAccumulatorPreservesSubpointMovement() {
+        var accumulator = ScrollPointAccumulator()
+
+        XCTAssertEqual(accumulator.consume(deltaX: 0.4, deltaY: -0.6).x, 0)
+        let second = accumulator.consume(deltaX: 0.7, deltaY: -0.6)
+        XCTAssertEqual(second.x, 1)
+        XCTAssertEqual(second.y, -1)
+        XCTAssertEqual(accumulator.remainderX, 0.1, accuracy: 0.0001)
+        XCTAssertEqual(accumulator.remainderY, -0.2, accuracy: 0.0001)
+    }
+
+    func testInputQueueCoalescesStalePointerPositionsButKeepsRunStart() {
+        var queue = SessionInputQueue()
+        queue.enqueue(.pointer(buttonMask: 1, x: 10, y: 20))
+        queue.enqueue(.pointer(buttonMask: 1, x: 11, y: 21))
+        queue.enqueue(.pointer(buttonMask: 1, x: 12, y: 22))
+        queue.enqueue(.pointer(buttonMask: 1, x: 13, y: 23))
+        queue.enqueue(.pointer(buttonMask: 0, x: 13, y: 23))
+
+        XCTAssertEqual(queue.pending, [
+            .pointer(buttonMask: 1, x: 10, y: 20),
+            .pointer(buttonMask: 1, x: 13, y: 23),
+            .pointer(buttonMask: 0, x: 13, y: 23),
+        ])
+    }
+
+    func testInputQueueMergesOnlyContinuousScrollSamples() {
+        func scroll(
+            _ y: Int32,
+            phase: AppleScrollEvent.Phase,
+            x: UInt16
+        ) -> SessionInputEvent {
+            .scroll(AppleScrollEvent(
+                deltaY: y == 0 ? 0 : (y > 0 ? 1 : -1),
+                pointDeltaY: y,
+                scrollPhase: phase,
+                scrollCount: 1,
+                flags: [.continuous],
+                x: x,
+                y: 20))
+        }
+
+        var queue = SessionInputQueue()
+        queue.enqueue(scroll(0, phase: .began, x: 10))
+        queue.enqueue(scroll(3, phase: .changed, x: 11))
+        queue.enqueue(scroll(4, phase: .changed, x: 12))
+        queue.enqueue(scroll(0, phase: .ended, x: 12))
+
+        XCTAssertEqual(queue.count, 3)
+        guard case .scroll(let merged) = queue.pending[1] else {
+            return XCTFail("Expected merged continuous scroll")
+        }
+        XCTAssertEqual(merged.deltaY, 2)
+        XCTAssertEqual(merged.pointDeltaY, 7)
+        XCTAssertEqual(merged.scrollCount, 2)
+        XCTAssertEqual(merged.x, 12)
+        XCTAssertEqual(merged.scrollPhase, .changed)
+    }
+
+    func testInputQueueKeepsGestureEnvelopeAsScrollOrderingBarrier() {
+        let changed = AppleScrollEvent(
+            pointDeltaY: 3,
+            scrollPhase: .changed,
+            flags: [.continuous],
+            x: 10,
+            y: 20)
+        let end = AppleGestureEvent(kind: .ended, x: 10, y: 20)
+        var queue = SessionInputQueue()
+
+        queue.enqueue(.scroll(changed))
+        queue.enqueue(.gesture(end))
+        queue.enqueue(.scroll(changed))
+
+        XCTAssertEqual(queue.pending, [
+            .scroll(changed),
+            .gesture(end),
+            .scroll(changed),
+        ])
     }
 
     @MainActor

@@ -98,6 +98,53 @@ public enum MessageWriter: Sendable {
         return data
     }
 
+    /// Serialize Apple's precise scroll-wheel command (message type 23).
+    ///
+    /// The 54-byte payload contains event kind 1, subtype 11, all three forms
+    /// of the three scroll axes, phase/count/flags, and pointer coordinates.
+    public static func writeAppleScrollEvent(_ event: AppleScrollEvent) -> Data {
+        var data = Data(count: AppleScrollEvent.wireByteCount)
+        data[0] = AppleScrollEvent.messageType
+        data[1] = 0
+        writeUInt16(AppleScrollEvent.payloadByteCount, into: &data, at: 2)
+        writeUInt16(AppleScrollEvent.inputEventVersion, into: &data, at: 4)
+        writeUInt16(AppleScrollEvent.scrollWheelEventSubtype, into: &data, at: 6)
+        writeInt16(event.deltaX, into: &data, at: 8)
+        writeInt16(event.deltaY, into: &data, at: 10)
+        writeInt16(event.deltaZ, into: &data, at: 12)
+        writeInt32(event.fixedDeltaX, into: &data, at: 14)
+        writeInt32(event.fixedDeltaY, into: &data, at: 18)
+        writeInt32(event.fixedDeltaZ, into: &data, at: 22)
+        writeInt32(event.pointDeltaX, into: &data, at: 26)
+        writeInt32(event.pointDeltaY, into: &data, at: 30)
+        writeInt32(event.pointDeltaZ, into: &data, at: 34)
+        writeUInt32(event.scrollPhase.rawValue, into: &data, at: 38)
+        writeUInt32(event.momentumPhase.rawValue, into: &data, at: 42)
+        writeUInt32(event.scrollCount, into: &data, at: 46)
+        writeUInt32(event.flags.rawValue, into: &data, at: 50)
+        writeUInt16(event.x, into: &data, at: 54)
+        writeUInt16(event.y, into: &data, at: 56)
+        return data
+    }
+
+    /// Serialize the gesture begin/end envelope used around Apple's precise
+    /// scroll stream.
+    ///
+    /// Wire layout (16 bytes): type 23, payload length 12, input version 1,
+    /// gesture kind 1/2, source subtype, and framebuffer coordinates.
+    public static func writeAppleGestureEvent(_ event: AppleGestureEvent) -> Data {
+        var data = Data(count: AppleGestureEvent.wireByteCount)
+        data[0] = AppleGestureEvent.messageType
+        data[1] = 0
+        writeUInt16(AppleGestureEvent.payloadByteCount, into: &data, at: 2)
+        writeUInt16(AppleGestureEvent.inputEventVersion, into: &data, at: 4)
+        writeUInt16(event.kind.rawValue, into: &data, at: 6)
+        writeUInt32(event.sourceSubtype.rawValue, into: &data, at: 8)
+        writeUInt16(event.x, into: &data, at: 12)
+        writeUInt16(event.y, into: &data, at: 14)
+        return data
+    }
+
     /// Serialize Apple's client media-stream configuration request.
     ///
     /// Current macOS Screen Sharing sends this `0x21` message after ServerInit
@@ -171,6 +218,10 @@ public enum MessageWriter: Sendable {
         data[offset + 1] = UInt8((value >> 16) & 0xFF)
         data[offset + 2] = UInt8((value >> 8)  & 0xFF)
         data[offset + 3] = UInt8(value & 0xFF)
+    }
+
+    private static func writeInt16(_ value: Int16, into data: inout Data, at offset: Int) {
+        writeUInt16(UInt16(bitPattern: value), into: &data, at: offset)
     }
 
     private static func writeInt32(_ value: Int32, into data: inout Data, at offset: Int) {

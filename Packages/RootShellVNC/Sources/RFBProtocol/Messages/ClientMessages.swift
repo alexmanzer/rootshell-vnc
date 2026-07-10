@@ -21,6 +21,12 @@ public enum ClientMessage: Sendable, Equatable {
     /// Message type 6: The client's clipboard text has changed.
     case clientCutText(String)
 
+    /// Apple message type 23: a precise, phased scroll-wheel event.
+    case appleScrollEvent(AppleScrollEvent)
+
+    /// Apple message type 23: begin/end envelope for a trackpad/touch gesture.
+    case appleGestureEvent(AppleGestureEvent)
+
     /// Apple message type 33: request accelerated media-stream configuration.
     case appleMediaStreamConfiguration
 
@@ -38,6 +44,8 @@ public enum ClientMessage: Sendable, Equatable {
         case .keyEvent:                    return 4
         case .pointerEvent:                return 5
         case .clientCutText:               return 6
+        case .appleScrollEvent:            return AppleScrollEvent.messageType
+        case .appleGestureEvent:           return AppleGestureEvent.messageType
         case .appleMediaStreamConfiguration: return 0x21
         case .appleMediaStreamRequest:     return 0x12
         }
@@ -62,6 +70,10 @@ public enum ClientMessage: Sendable, Equatable {
             return MessageWriter.writePointerEvent(buttonMask: mask, x: x, y: y)
         case .clientCutText(let text):
             return MessageWriter.writeClientCutText(text)
+        case .appleScrollEvent(let event):
+            return MessageWriter.writeAppleScrollEvent(event)
+        case .appleGestureEvent(let event):
+            return MessageWriter.writeAppleGestureEvent(event)
         case .appleMediaStreamConfiguration:
             return MessageWriter.writeAppleMediaStreamConfiguration()
         case .appleMediaStreamRequest:
