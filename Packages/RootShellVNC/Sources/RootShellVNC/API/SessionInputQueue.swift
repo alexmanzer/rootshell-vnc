@@ -66,6 +66,10 @@ struct SessionInputQueue: Sendable {
         return pending.removeFirst()
     }
 
+    func peek() -> SessionInputEvent? {
+        pending.first
+    }
+
     mutating func removeAll() {
         pending.removeAll(keepingCapacity: true)
     }

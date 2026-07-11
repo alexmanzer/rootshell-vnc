@@ -30,6 +30,8 @@ public struct FramebufferRenderBatchResult: @unchecked Sendable {
     public let image: CGImage?
     public let resizedWidth: UInt16?
     public let resizedHeight: UInt16?
+    /// Non-nil only when this update carried a Cursor pseudo-encoding rect.
+    public let cursorUpdate: RemoteCursorUpdate?
     public let issues: [String]
 }
 
@@ -79,11 +81,17 @@ public final class FramebufferRenderer: @unchecked Sendable {
     /// Apply every rectangle in one server update in wire order and snapshot
     /// once. Keeping this operation on a serial rendering queue preserves the
     /// persistent Zlib/ZRLE dictionary without blocking the main actor.
+    ///
+    /// Pass `snapshot: false` to apply rects without paying for the
+    /// full-framebuffer image copy — the result's `image` is nil and the
+    /// caller publishes a later snapshot instead.
     public func applyBatch(
-        _ rects: [(FramebufferRect, Data)]
+        _ rects: [(FramebufferRect, Data)],
+        snapshot takeSnapshot: Bool = true
     ) -> FramebufferRenderBatchResult {
         var resizedWidth: UInt16?
         var resizedHeight: UInt16?
+        var cursorUpdate: RemoteCursorUpdate?
         var issues: [String] = []
 
         for (rect, data) in rects {
@@ -105,7 +113,15 @@ public final class FramebufferRenderer: @unchecked Sendable {
                 resizedWidth = rect.width
                 resizedHeight = rect.height
 
-            case .cursor, .encryptionInfo, .serverDisplayInfo,
+            case .cursor:
+                // Cosmetic: the local system pointer adopts this shape.
+                // Never fail the update over a malformed cursor payload.
+                if let update = RemoteCursorDecoder.decode(
+                    rect: rect, data: data, pixelFormat: pixelFormat) {
+                    cursorUpdate = update
+                }
+
+            case .encryptionInfo, .serverDisplayInfo,
                  .mediaStreamOffer, .mediaStreamAnswer:
                 break
 
@@ -121,9 +137,10 @@ public final class FramebufferRenderer: @unchecked Sendable {
         }
 
         return FramebufferRenderBatchResult(
-            image: snapshot(),
+            image: takeSnapshot ? snapshot() : nil,
             resizedWidth: resizedWidth,
             resizedHeight: resizedHeight,
+            cursorUpdate: cursorUpdate,
             issues: issues)
     }
 

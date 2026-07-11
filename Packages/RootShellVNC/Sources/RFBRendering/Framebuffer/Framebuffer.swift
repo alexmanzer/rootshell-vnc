@@ -20,6 +20,7 @@ public final class Framebuffer: @unchecked Sendable {
     private var context: CGContext
     private let colorSpace: CGColorSpace
     private let bitmapInfo: UInt32
+    private let bitsPerComponent: Int
 
     // MARK: - Init
 
@@ -33,9 +34,18 @@ public final class Framebuffer: @unchecked Sendable {
         self.bytesPerRow = width * pixelFormat.bytesPerPixel
         self.colorSpace = CGColorSpaceCreateDeviceRGB()
 
-        // BGRA format native to macOS/iOS
-        self.bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
-            | CGBitmapInfo.byteOrder32Little.rawValue
+        if pixelFormat.bytesPerPixel == 2 {
+            // XRGB1555 little-endian — wire pixels from a 16bpp "thousands"
+            // session are stored (and displayed) without conversion.
+            self.bitmapInfo = CGImageAlphaInfo.noneSkipFirst.rawValue
+                | CGBitmapInfo.byteOrder16Little.rawValue
+            self.bitsPerComponent = 5
+        } else {
+            // BGRA format native to macOS/iOS
+            self.bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
+                | CGBitmapInfo.byteOrder32Little.rawValue
+            self.bitsPerComponent = 8
+        }
 
         let byteCount = bytesPerRow * height
         self.pixelData = UnsafeMutableRawPointer.allocate(
@@ -49,7 +59,7 @@ public final class Framebuffer: @unchecked Sendable {
             data: pixelData,
             width: width,
             height: height,
-            bitsPerComponent: 8,
+            bitsPerComponent: bitsPerComponent,
             bytesPerRow: bytesPerRow,
             space: colorSpace,
             bitmapInfo: bitmapInfo
@@ -288,7 +298,7 @@ public final class Framebuffer: @unchecked Sendable {
             data: pixelData,
             width: newWidth,
             height: newHeight,
-            bitsPerComponent: 8,
+            bitsPerComponent: bitsPerComponent,
             bytesPerRow: newBytesPerRow,
             space: colorSpace,
             bitmapInfo: bitmapInfo

@@ -64,6 +64,12 @@ private struct PendingRemoteDisplaySize: Sendable, Equatable {
     let pointHeight: UInt16
 }
 
+/// A basic key or pointer message eligible for single-write batching.
+public enum ClientInputEvent: Sendable, Equatable {
+    case key(downFlag: Bool, key: UInt32)
+    case pointer(buttonMask: UInt8, x: UInt16, y: UInt16)
+}
+
 /// An actor that manages the full lifecycle of a VNC connection.
 ///
 /// `TransportSession` owns a `TCPConnection` for network I/O, a
@@ -100,6 +106,21 @@ public actor TransportSession {
     private var appleMediaRTPReorderScheduledDeadlineNanos: UInt64?
     private var readTask: Task<Void, Never>?
     private var framebufferRequestSentNanos: UInt64 = 0
+
+    /// Updates yielded to the consumer but not yet acknowledged via
+    /// finishFramebufferUpdate(). Bounds the undecoded backlog: persistent
+    /// Zlib/ZRLE streams mean updates can never be dropped, so backpressure
+    /// comes from withholding the next request instead.
+    private var unacknowledgedUpdates = 0
+    /// Set when an update finished reading while the pipeline was full; the
+    /// deferred incremental request goes out on the next acknowledgement.
+    private var deferredUpdateRequest = false
+    /// One update being decoded plus one queued behind it.
+    private let maxUnacknowledgedUpdates = 2
+    /// Latched once an Apple media stream offer arrives: media negotiation
+    /// switches this channel to encrypted control records, so no further
+    /// framebuffer update requests may be sent.
+    private var framebufferRequestsSuppressed = false
     private var udpReadTasks: [Task<Void, Never>] = []
     private var udpChannels: [PosixUDPChannel] = []
     private let log = VNCLogger(category: "TransportSession")
@@ -364,6 +385,27 @@ public actor TransportSession {
         try await sendClientPayload(msg.serialize())
     }
 
+    /// Send a run of key/pointer events as one socket write. The queue-side
+    /// coalescing already bounds the run length; batching what remains keeps
+    /// a burst (typed text, pointer transitions) to a single send instead of
+    /// one awaited write per 6-8 byte message.
+    public func sendInputEvents(_ events: [ClientInputEvent]) async throws {
+        guard !events.isEmpty else { return }
+        var payload = Data()
+        for event in events {
+            switch event {
+            case .key(let downFlag, let key):
+                payload.append(ClientMessage.keyEvent(
+                    downFlag: downFlag, key: key).serialize())
+            case .pointer(let buttonMask, let x, let y):
+                pointerButtonMask = buttonMask
+                payload.append(ClientMessage.pointerEvent(
+                    buttonMask: buttonMask, x: x, y: y).serialize())
+            }
+        }
+        try await sendClientPayload(payload)
+    }
+
     /// Send a pointer (mouse/touch) event to the server.
     public func sendPointerEvent(buttonMask: UInt8, x: UInt16, y: UInt16) async throws {
         pointerButtonMask = buttonMask
@@ -474,19 +516,17 @@ public actor TransportSession {
     }
 
     /// Acknowledge that the consumer finished decoding and presenting one
-    /// framebuffer update. Standard RFB encodings can carry persistent codec
-    /// state, so updates must not be dropped; consumer-driven acknowledgement
-    /// provides backpressure instead of allowing an unbounded event backlog.
-    public func finishFramebufferUpdate(
-        _ rects: [FramebufferRect]
-    ) async throws {
-        if requestAppleMediaStream,
-           rects.contains(where: { $0.encoding == .mediaStreamOffer }) {
-            log.debug("Suppressing framebuffer update request after Apple media stream offer")
-            return
-        }
-        let actions = stateMachine.handle(event: .receivedFramebufferUpdate(rects))
-        try await executeActions(actions)
+    /// framebuffer update. Standard RFB encodings carry persistent codec
+    /// state, so updates must not be dropped; this credit return is the
+    /// backpressure that bounds the undecoded backlog. The next incremental
+    /// request itself is pipelined at wire-read time in
+    /// handleFramebufferUpdate; only a request deferred by a full pipeline
+    /// is sent from here.
+    public func finishFramebufferUpdate() async throws {
+        unacknowledgedUpdates = max(0, unacknowledgedUpdates - 1)
+        guard deferredUpdateRequest, !framebufferRequestsSuppressed else { return }
+        deferredUpdateRequest = false
+        try await requestFramebufferUpdate(incremental: true)
     }
 
     /// Request one remote display matching the client viewport. Apple servers
@@ -1021,6 +1061,31 @@ public actor TransportSession {
         }
 
         continuation?.yield(.framebufferUpdate(rectsWithData))
+
+        // Pipeline the next incremental request the moment this update is
+        // fully off the wire, so the server encodes the next frame while
+        // this one crosses the event stream and decodes. Once an Apple
+        // media stream offer arrives, stop requesting entirely: media
+        // negotiation switches this channel to encrypted control records.
+        let rects = rectsWithData.map(\.0)
+        if requestAppleMediaStream,
+           rects.contains(where: { $0.encoding == .mediaStreamOffer }) {
+            framebufferRequestsSuppressed = true
+            log.debug("Suppressing framebuffer update request after Apple media stream offer")
+            return
+        }
+        guard !framebufferRequestsSuppressed else { return }
+
+        unacknowledgedUpdates += 1
+        let actions = stateMachine.handle(event: .receivedFramebufferUpdate(rects))
+        for action in actions {
+            if case .sendFramebufferUpdateRequest = action,
+               unacknowledgedUpdates >= maxUnacknowledgedUpdates {
+                deferredUpdateRequest = true
+                continue
+            }
+            try await executeAction(action)
+        }
     }
 
     private func handleSetColorMapEntries() async throws {
@@ -1060,9 +1125,51 @@ public actor TransportSession {
     // MARK: - Action execution
 
     /// Execute a list of ConnectionActions. Some are async (sending data), some are sync.
+    ///
+    /// Consecutive plain client messages (the post-ServerInit burst of
+    /// SetPixelFormat + SetEncodings + first update request) are coalesced
+    /// into one socket write so the server receives them in a single
+    /// segment — the first framebuffer arrives one RTT sooner.
     private func executeActions(_ actions: [ConnectionAction]) async throws {
+        var pending = Data()
+
         for action in actions {
-            try await executeAction(action)
+            switch action {
+            case .sendSetPixelFormat(let pf):
+                pending.append(ClientMessage.setPixelFormat(pf).serialize())
+                self.pixelFormat = pf
+                log.debug("Queued SetPixelFormat")
+
+            case .sendSetEncodings(let encodings):
+                pending.append(ClientMessage.setEncodings(encodings).serialize())
+                log.debug("Queued SetEncodings (\(encodings.count) encodings)")
+                if requestAppleMediaStream && !sentAppleMediaStreamConfiguration {
+                    if !pending.isEmpty {
+                        try await sendClientPayload(pending)
+                        pending = Data()
+                    }
+                    try await sendAppleMediaStreamSetupIfNeeded()
+                }
+
+            case .sendFramebufferUpdateRequest(let incremental, let width, let height):
+                pending.append(ClientMessage.framebufferUpdateRequest(
+                    incremental: incremental,
+                    x: 0, y: 0,
+                    width: width,
+                    height: height
+                ).serialize())
+                framebufferRequestSentNanos = DispatchTime.now().uptimeNanoseconds
+
+            default:
+                if !pending.isEmpty {
+                    try await sendClientPayload(pending)
+                    pending = Data()
+                }
+                try await executeAction(action)
+            }
+        }
+        if !pending.isEmpty {
+            try await sendClientPayload(pending)
         }
     }
 

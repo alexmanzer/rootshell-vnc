@@ -31,6 +31,18 @@ public actor TCPConnection {
     private var connected: Bool = false
     private let log = VNCLogger(category: "TCPConnection")
 
+    /// User-space read buffer. RFB parsing does many tiny field-sized reads
+    /// (headers, length prefixes); serving them from one large kernel receive
+    /// avoids a Network.framework round-trip per field.
+    private var receiveBuffer = Data()
+    private var receiveOffset = 0
+    private var receivedEOF = false
+
+    /// Upper bound for a single kernel receive when filling the buffer.
+    private static let receiveChunkLimit = 256 * 1024
+    /// Compact the buffer once this much consumed prefix has accumulated.
+    private static let compactionThreshold = 64 * 1024
+
     // MARK: - Init
 
     public init(host: String, port: UInt16) {
@@ -44,8 +56,18 @@ public actor TCPConnection {
     public func connect() async throws {
         let nwHost = NWEndpoint.Host(host)
         let nwPort = NWEndpoint.Port(rawValue: port)!
-        let params = NWParameters.tcp
+        // RFB is a request/response protocol built from small messages
+        // (10-byte update requests, 6-byte pointer events). Nagle would hold
+        // those writes waiting for a delayed ACK, adding up to ~200ms per
+        // round trip, so disable it like every mainstream VNC client does.
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        tcpOptions.enableKeepalive = true
+        tcpOptions.keepaliveIdle = 15
+        tcpOptions.connectionTimeout = 10
+        let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.allowLocalEndpointReuse = true
+        params.serviceClass = .responsiveData
 
         let conn = NWConnection(host: nwHost, port: nwPort, using: params)
         self.connection = conn
@@ -89,49 +111,80 @@ public actor TCPConnection {
 
     /// Read exactly `count` bytes from the connection. Throws on error or EOF.
     public func read(exactly count: Int) async throws -> Data {
-        guard let conn = connection else {
-            throw VNCProtocolError.connectionClosed
-        }
-
-        return try await withCheckedThrowingContinuation { continuation in
-            conn.receive(minimumIncompleteLength: count, maximumLength: count) { content, _, isComplete, error in
-                if let error = error {
-                    continuation.resume(throwing: VNCProtocolError.ioError("Read error: \(error.localizedDescription)"))
-                } else if let data = content, data.count == count {
-                    continuation.resume(returning: data)
-                } else if isComplete {
-                    continuation.resume(throwing: VNCProtocolError.connectionClosed)
-                } else if let data = content {
-                    // Got fewer bytes than requested — should not happen with minimumIncompleteLength
-                    // but handle gracefully by treating as partial read failure
-                    continuation.resume(throwing: VNCProtocolError.ioError(
-                        "Short read: expected \(count) bytes, got \(data.count)"))
-                } else {
-                    continuation.resume(throwing: VNCProtocolError.connectionClosed)
-                }
+        while bufferedByteCount < count {
+            try await fillBuffer(minimum: count - bufferedByteCount)
+            if receivedEOF && bufferedByteCount < count {
+                throw VNCProtocolError.connectionClosed
             }
         }
+        return consumeBuffered(count)
     }
 
     /// Read up to `maxCount` bytes (at least 1). Useful when the exact size is unknown.
+    ///
+    /// Must drain the user-space buffer before touching the socket: earlier
+    /// large receives may already hold bytes that arrived glued to previous
+    /// records, and bypassing the buffer would reorder the stream.
     public func read(upTo maxCount: Int) async throws -> Data {
+        if bufferedByteCount == 0 {
+            try await fillBuffer(minimum: 1, limit: maxCount)
+            if bufferedByteCount == 0 {
+                throw VNCProtocolError.connectionClosed
+            }
+        }
+        return consumeBuffered(min(bufferedByteCount, maxCount))
+    }
+
+    private var bufferedByteCount: Int {
+        receiveBuffer.count - receiveOffset
+    }
+
+    /// One kernel receive appended to the buffer. Requests at least `minimum`
+    /// bytes but lets the kernel hand over whatever else has already arrived,
+    /// so the small header/length/payload reads that follow are served from
+    /// user space without further receives.
+    private func fillBuffer(minimum: Int, limit: Int = TCPConnection.receiveChunkLimit) async throws {
         guard let conn = connection else {
             throw VNCProtocolError.connectionClosed
         }
+        if receivedEOF {
+            throw VNCProtocolError.connectionClosed
+        }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            conn.receive(minimumIncompleteLength: 1, maximumLength: maxCount) { content, _, isComplete, error in
+        let (content, isComplete): (Data?, Bool) = try await withCheckedThrowingContinuation { continuation in
+            conn.receive(
+                minimumIncompleteLength: minimum,
+                maximumLength: max(minimum, limit)
+            ) { content, _, isComplete, error in
                 if let error = error {
                     continuation.resume(throwing: VNCProtocolError.ioError("Read error: \(error.localizedDescription)"))
-                } else if let data = content, !data.isEmpty {
-                    continuation.resume(returning: data)
-                } else if isComplete {
-                    continuation.resume(throwing: VNCProtocolError.connectionClosed)
                 } else {
-                    continuation.resume(throwing: VNCProtocolError.connectionClosed)
+                    continuation.resume(returning: (content, isComplete))
                 }
             }
         }
+
+        if let content, !content.isEmpty {
+            receiveBuffer.append(content)
+        }
+        if isComplete {
+            receivedEOF = true
+        }
+    }
+
+    private func consumeBuffered(_ count: Int) -> Data {
+        let start = receiveBuffer.startIndex + receiveOffset
+        let result = receiveBuffer.subdata(in: start..<(start + count))
+        receiveOffset += count
+
+        if receiveOffset == receiveBuffer.count {
+            receiveBuffer.removeAll(keepingCapacity: true)
+            receiveOffset = 0
+        } else if receiveOffset > Self.compactionThreshold {
+            receiveBuffer.removeFirst(receiveOffset)
+            receiveOffset = 0
+        }
+        return result
     }
 
     /// Send data to the server. Throws on error.
@@ -165,6 +218,9 @@ public actor TCPConnection {
         connection?.cancel()
         connection = nil
         connected = false
+        receiveBuffer.removeAll()
+        receiveOffset = 0
+        receivedEOF = false
     }
 
     /// Whether the connection is currently established.

@@ -66,6 +66,11 @@ public final class VNCSession {
     /// Whether the server is using high-performance (HEVC/H.264) mode.
     public var isHighPerformanceMode: Bool = false
 
+    /// The remote cursor shape from the Cursor pseudo-encoding, adopted by
+    /// the local system pointer. Nil when the server has not sent a shape
+    /// (or sent an explicit empty one) — callers fall back to the default.
+    public private(set) var remoteCursor: RemoteCursor?
+
     // MARK: - Configuration
 
     /// The configuration for this session.
@@ -80,7 +85,6 @@ public final class VNCSession {
     @ObservationIgnored
     private var remoteAudioPlayer: AppleRemoteAudioPlayer?
     private var eventTask: Task<Void, Never>?
-    private var frameRequestTask: Task<Void, Never>?
     @ObservationIgnored
     private var remoteDisplayResizeTask: Task<Void, Never>?
     @ObservationIgnored
@@ -123,6 +127,12 @@ public final class VNCSession {
         qos: .userInitiated)
     @ObservationIgnored
     private var lastFramebufferRenderDiagnosticNanos: UInt64 = 0
+    /// When the last framebuffer image was published to `currentImage`;
+    /// drives the publish-only targetFrameRate throttle.
+    @ObservationIgnored
+    private var lastImagePublishNanos: UInt64 = 0
+    @ObservationIgnored
+    private var trailingSnapshotTask: Task<Void, Never>?
     /// Rejects late geometry callbacks from a decoder retired by a newer AVC
     /// negotiation generation.
     @ObservationIgnored
@@ -175,7 +185,11 @@ public final class VNCSession {
         connectionState = .connecting
         lastError = nil
         currentImage = nil
+        remoteCursor = nil
         isHighPerformanceMode = false
+        trailingSnapshotTask?.cancel()
+        trailingSnapshotTask = nil
+        lastImagePublishNanos = 0
         remoteDisplayResizeTask?.cancel()
         remoteDisplayResizeTask = nil
         lastRequestedClientDisplaySize = nil
@@ -201,7 +215,7 @@ public final class VNCSession {
             port: credentials.port,
             password: credentials.password,
             username: credentials.username,
-            preferredPixelFormat: configuration.preferredPixelFormat ?? .bgra8888,
+            preferredPixelFormat: configuration.effectivePixelFormat,
             preferredEncodings: configuration.effectiveEncodings,
             preferFullQualityVideo: configuration.videoQualityMode == .fullQuality
         )
@@ -272,7 +286,11 @@ public final class VNCSession {
         framebuffer = nil
         renderer = nil
         currentImage = nil
+        remoteCursor = nil
         isHighPerformanceMode = false
+        trailingSnapshotTask?.cancel()
+        trailingSnapshotTask = nil
+        lastImagePublishNanos = 0
         videoBandRenderer.reset()
         videoStreamManager?.stopStream()
         videoStreamManager = nil
@@ -473,41 +491,22 @@ public final class VNCSession {
             handleServerInit(serverInit)
 
         case .framebufferUpdate(let rects):
-            let frameStarted = DispatchTime.now().uptimeNanoseconds
+            // The transport pipelines the next incremental request at
+            // wire-read time; decoding here and returning the credit below
+            // is the only backpressure. No artificial pacing: on slow links
+            // the cadence is network-bound, on fast links the server's own
+            // change detection paces delivery.
+            await handleFramebufferUpdate(rects)
 
-            // Keep exactly one update in flight while this one is rendered.
-            // The event loop cannot dequeue the prefetched update until the
-            // current render returns, so this overlaps server encode/transfer
-            // without allowing the AsyncStream or persistent Zlib dictionary
-            // to build an unbounded backlog.
             do {
                 guard let updateTransport = transportSession else { break }
-                try await updateTransport.finishFramebufferUpdate(rects.map(\.0))
+                try await updateTransport.finishFramebufferUpdate()
             } catch is CancellationError {
                 break
             } catch {
                 logger.warning(
-                    "Failed to prefetch next framebuffer update: "
+                    "Failed to acknowledge framebuffer update: "
                         + error.localizedDescription)
-            }
-
-            await handleFramebufferUpdate(rects)
-
-            // Pace presentation relative to total processing time rather than
-            // always sleeping a full interval after decoding. Slow frames add
-            // no artificial delay; very cheap frames still honor target FPS.
-            let elapsed = DispatchTime.now().uptimeNanoseconds &- frameStarted
-            let targetInterval = UInt64(1_000_000_000 / max(
-                1, configuration.targetFrameRate))
-            if elapsed < targetInterval {
-                do {
-                    try await Task.sleep(
-                        for: .nanoseconds(Int64(targetInterval - elapsed)))
-                } catch is CancellationError {
-                    break
-                } catch {
-                    break
-                }
             }
 
         case .clipboardText(let text):
@@ -582,8 +581,9 @@ public final class VNCSession {
         diagnostics.serverInit = serverInit
         diagnostics.handshakeCompleteTime = Date()
 
-        // Determine pixel format to use
-        let pixelFormat = configuration.preferredPixelFormat ?? serverInit.pixelFormat
+        // Must match what the transport sent in SetPixelFormat — decoding
+        // with the server's pre-negotiation format would corrupt every rect.
+        let pixelFormat = configuration.effectivePixelFormat
 
         // Create framebuffer and renderer
         let fb = Framebuffer(
@@ -620,10 +620,19 @@ public final class VNCSession {
             }
         }
 
+        // Publish-only throttle: rects are always applied (persistent codec
+        // state) and the transport credit is always returned, but the
+        // full-framebuffer snapshot + image publish is capped at
+        // targetFrameRate. A trailing snapshot guarantees the final state
+        // always renders after a burst.
+        let publishInterval = UInt64(
+            1_000_000_000 / max(1, configuration.targetFrameRate))
         let renderStarted = DispatchTime.now().uptimeNanoseconds
+        let takeSnapshot = renderStarted &- lastImagePublishNanos >= publishInterval
         let result = await withCheckedContinuation { continuation in
             framebufferRenderQueue.async {
-                continuation.resume(returning: renderer.applyBatch(rects))
+                continuation.resume(
+                    returning: renderer.applyBatch(rects, snapshot: takeSnapshot))
             }
         }
         let renderFinished = DispatchTime.now().uptimeNanoseconds
@@ -649,7 +658,22 @@ public final class VNCSession {
            let height = result.resizedHeight {
             applyDesktopResizeMetadata(width: width, height: height)
         }
-        currentImage = result.image
+        if let image = result.image {
+            trailingSnapshotTask?.cancel()
+            trailingSnapshotTask = nil
+            currentImage = image
+            lastImagePublishNanos = DispatchTime.now().uptimeNanoseconds
+        } else {
+            scheduleTrailingSnapshot(interval: publishInterval)
+        }
+        switch result.cursorUpdate {
+        case .shape(let cursor):
+            remoteCursor = cursor
+        case .hidden:
+            remoteCursor = nil
+        case nil:
+            break
+        }
     }
 
     /// Apply one live geometry transition to every consumer of framebuffer
@@ -780,15 +804,18 @@ public final class VNCSession {
                   self.connectionState.isConnected,
                   let event = self.inputQueue.dequeue() {
                 switch event {
-                case .key(let downFlag, let keysym):
-                    try? await transport.sendKeyEvent(
-                        downFlag: downFlag,
-                        key: keysym)
-                case .pointer(let buttonMask, let x, let y):
-                    try? await transport.sendPointerEvent(
-                        buttonMask: buttonMask,
-                        x: x,
-                        y: y)
+                case .key, .pointer:
+                    // Drain the whole run of basic key/pointer messages that
+                    // is already waiting into one socket write; scroll,
+                    // gesture, and clipboard boundaries end the run.
+                    var batch = [Self.batchableInputEvent(event)!]
+                    while batch.count < 64,
+                          let next = self.inputQueue.peek(),
+                          let batchable = Self.batchableInputEvent(next) {
+                        _ = self.inputQueue.dequeue()
+                        batch.append(batchable)
+                    }
+                    try? await transport.sendInputEvents(batch)
                 case .scroll(let event):
                     try? await transport.sendScrollEvent(event)
                 case .gesture(let event):
@@ -800,6 +827,42 @@ public final class VNCSession {
             if self.inputGeneration == generation {
                 self.inputTask = nil
             }
+        }
+    }
+
+    private func scheduleTrailingSnapshot(interval: UInt64) {
+        guard trailingSnapshotTask == nil else { return }
+        let delay = interval &- min(
+            interval, DispatchTime.now().uptimeNanoseconds &- lastImagePublishNanos)
+        trailingSnapshotTask = Task { [weak self] in
+            try? await Task.sleep(for: .nanoseconds(Int64(delay)))
+            guard let self, !Task.isCancelled,
+                  let renderer = self.renderer else { return }
+            let queue = self.framebufferRenderQueue
+            let image = await withCheckedContinuation { continuation in
+                queue.async {
+                    continuation.resume(returning: renderer.snapshot())
+                }
+            }
+            guard !Task.isCancelled else { return }
+            if let image {
+                self.currentImage = image
+                self.lastImagePublishNanos = DispatchTime.now().uptimeNanoseconds
+            }
+            self.trailingSnapshotTask = nil
+        }
+    }
+
+    private static func batchableInputEvent(
+        _ event: SessionInputEvent
+    ) -> ClientInputEvent? {
+        switch event {
+        case .key(let downFlag, let keysym):
+            return .key(downFlag: downFlag, key: keysym)
+        case .pointer(let buttonMask, let x, let y):
+            return .pointer(buttonMask: buttonMask, x: x, y: y)
+        case .scroll, .gesture, .clipboard:
+            return nil
         }
     }
 

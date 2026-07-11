@@ -233,7 +233,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertFalse(effective.contains(.appleH264))
         XCTAssertFalse(effective.contains(.appleMultiVariantScreenshare))
         XCTAssertFalse(effective.contains(.mediaStreamOffer))
-        XCTAssertEqual(Array(effective.prefix(4)), [.zlib, .zrle, .copyRect, .raw])
+        XCTAssertEqual(Array(effective.prefix(4)), [.copyRect, .zrle, .zlib, .raw])
     }
 
     func testQualityModesExposeGUILabels() {

@@ -127,7 +127,10 @@ public struct RemoteDesktopView: View {
             keyboardActive: $keyboardActive,
             framebufferSize: framebufferSize,
             touchHandler: touchHandler,
-            keyboardHandler: keyboardHandler)
+            keyboardHandler: keyboardHandler,
+            // Adaptive mode's video composites the server cursor; only the
+            // classic framebuffer path adopts the remote shape locally.
+            remoteCursor: session.isHighPerformanceMode ? nil : session.remoteCursor)
             .frame(width: viewSize.width, height: viewSize.height)
             .contentShape(Rectangle())
         #else

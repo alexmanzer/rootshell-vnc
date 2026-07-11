@@ -2,6 +2,7 @@
 import SwiftUI
 import UIKit
 import RFBProtocol
+import RFBRendering
 
 /// Transparent UIKit input surface shared by Adaptive and Full Quality modes.
 /// UIKit is used here because SwiftUI gestures do not expose mouse buttons,
@@ -13,6 +14,7 @@ struct RemoteInteractionView: UIViewRepresentable {
     let framebufferSize: CGSize
     let touchHandler: TouchInputHandler
     let keyboardHandler: KeyboardInputHandler
+    let remoteCursor: RemoteCursor?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -36,7 +38,8 @@ struct RemoteInteractionView: UIViewRepresentable {
         uiView.update(
             framebufferSize: framebufferSize,
             viewport: viewport,
-            keyboardActive: keyboardActive)
+            keyboardActive: keyboardActive,
+            remoteCursor: remoteCursor)
     }
 
     @MainActor
@@ -61,6 +64,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private var softwareKeyboardRequested = false
     private var pressedKeysyms: [Int: UInt32] = [:]
     private var lastPointerPoint: (x: UInt16, y: UInt16)?
+    private var remoteCursor: RemoteCursor?
     private var pointerDragActive = false
     private var lastKnownFramebufferPoint: (x: UInt16, y: UInt16)?
     private var lastScrollPoint: (x: UInt16, y: UInt16)?
@@ -167,13 +171,19 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     func update(
         framebufferSize: CGSize,
         viewport: RemoteViewportState,
-        keyboardActive: Bool
+        keyboardActive: Bool,
+        remoteCursor: RemoteCursor?
     ) {
         self.framebufferSize = framebufferSize
         self.viewport = viewport
         self.viewport.clampOffset(
             viewSize: bounds.size,
             framebufferSize: framebufferSize)
+
+        if self.remoteCursor?.image !== remoteCursor?.image {
+            self.remoteCursor = remoteCursor
+            pointerInteraction.invalidate()
+        }
 
         guard keyboardActive != softwareKeyboardRequested else { return }
         softwareKeyboardRequested = keyboardActive
@@ -568,11 +578,28 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         return defaultRegion
     }
 
+    /// Adopt the remote cursor's silhouette so shape changes (I-beam, resize
+    /// arrows, pointing hand) show without a server round trip. The pointer
+    /// itself stays fully local; nil falls back to the system arrow.
     func pointerInteraction(
         _ interaction: UIPointerInteraction,
         styleFor region: UIPointerRegion
     ) -> UIPointerStyle? {
-        nil
+        guard let cursor = remoteCursor,
+              framebufferSize.width > 0,
+              let frame = viewport.displayedFrame(
+                viewSize: bounds.size,
+                framebufferSize: framebufferSize),
+              frame.width > 0 else { return nil }
+
+        // Cursor pixels arrive in framebuffer units; the pointer is drawn in
+        // view points.
+        let scale = frame.width / framebufferSize.width
+        var transform = CGAffineTransform(scaleX: scale, y: scale)
+        guard scale > 0,
+              let scaledPath = cursor.shapePath.copy(using: &transform),
+              !scaledPath.isEmpty else { return nil }
+        return UIPointerStyle(shape: .path(UIBezierPath(cgPath: scaledPath)))
     }
 
     func gestureRecognizer(

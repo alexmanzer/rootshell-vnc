@@ -62,7 +62,7 @@ public struct VNCConfiguration: Sendable {
             case .adaptive:
                 "Low-latency HEVC over UDP for networks that can sustain the video stream."
             case .standard:
-                "Reliable compressed RFB over TCP for constrained networks, VPNs, and non-Mac servers."
+                "Reliable compressed RFB over TCP for constrained networks, VPNs, and non-Mac servers. Uses thousands of colors for lower latency."
             case .fullQuality:
                 "Lossless framebuffer updates with higher bandwidth and CPU use."
             }
@@ -141,6 +141,20 @@ public struct VNCConfiguration: Sendable {
         .milliseconds(1000 / max(1, targetFrameRate))
     }
 
+    /// The pixel format the session negotiates and decodes with.
+    ///
+    /// An explicit ``preferredPixelFormat`` always wins. Otherwise Standard
+    /// mode uses 16-bit "thousands" color: it exists for bandwidth-limited
+    /// links, where halving every payload cuts interactive latency far more
+    /// than full 24-bit color is worth (Screen Sharing's own adaptive
+    /// classic mode makes the same trade). Other modes keep full color.
+    var effectivePixelFormat: PixelFormat {
+        if let preferredPixelFormat {
+            return preferredPixelFormat
+        }
+        return videoQualityMode == .standard ? .rgb555 : .bgra8888
+    }
+
     /// The full list of encodings to advertise to the server, including
     /// pseudo-encodings for desktop resize and high-performance mode.
     var effectiveEncodings: [Encoding] {
@@ -163,20 +177,28 @@ public struct VNCConfiguration: Sendable {
                 }
             }
         } else if videoQualityMode == .standard {
-            // Match Apple's lossless preference order: ordinary Zlib is much
-            // cheaper to encode and decode than tile-wise ZRLE and therefore
-            // has substantially lower interactive latency. ZRLE remains the
-            // bandwidth-efficient portable fallback. Keep CopyRect ahead of
-            // raw so window moves need not resend pixels.
+            // Standard mode exists for bandwidth-limited remote links, where
+            // transfer time — not codec CPU — dominates interactive latency.
+            // ZRLE's palette/RLE tiles compress typical UI content several
+            // times smaller than whole-rect Zlib, so prefer it; Zlib remains
+            // the cheap-CPU fallback. Keep CopyRect ahead of raw so window
+            // moves need not resend pixels.
             let standardEncodings: [Encoding] = [
-                .zlib, .zrle, .copyRect, .raw,
+                .copyRect, .zrle, .zlib, .raw,
             ]
             for encoding in standardEncodings.reversed() {
                 encodings.removeAll { $0 == encoding }
                 encodings.insert(encoding, at: 0)
             }
         } else if videoQualityMode == .fullQuality {
-            for encoding in [Encoding.zrle, .zlib] where !encodings.contains(encoding) {
+            // Full Quality targets fast local networks: bandwidth is
+            // plentiful, so prefer Zlib's cheaper encode/decode over ZRLE's
+            // tighter compression (matches the native binary's [Zlib, ZRLE]).
+            let fullQualityEncodings: [Encoding] = [
+                .copyRect, .zlib, .zrle, .raw,
+            ]
+            for encoding in fullQualityEncodings.reversed() {
+                encodings.removeAll { $0 == encoding }
                 encodings.insert(encoding, at: 0)
             }
         }

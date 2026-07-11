@@ -120,6 +120,22 @@ public struct PixelFormat: Sendable, Equatable {
         blueShift: 0
     )
 
+    /// 16-bit "thousands" color (XRGB1555, little-endian). Halves every
+    /// framebuffer payload relative to 32-bit — the bandwidth/latency trade
+    /// used by Screen Sharing's own adaptive classic mode on slow links.
+    public static let rgb555 = PixelFormat(
+        bitsPerPixel: 16,
+        depth: 15,
+        bigEndian: false,
+        trueColor: true,
+        redMax: 31,
+        greenMax: 31,
+        blueMax: 31,
+        redShift: 10,
+        greenShift: 5,
+        blueShift: 0
+    )
+
     /// 32-bit RGB with 8 bits per channel, big-endian byte order.
     public static let rgb888 = PixelFormat(
         bitsPerPixel: 32,
