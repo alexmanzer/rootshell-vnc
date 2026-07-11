@@ -51,6 +51,17 @@ struct BoundedDatagramFIFO {
         return value
     }
 
+    /// Removes up to `limit` datagrams without an actor/continuation round trip
+    /// for every packet in a burst.
+    mutating func popFirst(upTo limit: Int) -> [PosixUDPDatagram] {
+        guard limit > 0, head < storage.count else { return [] }
+        let end = min(storage.count, head + limit)
+        let values = Array(storage[head..<end])
+        head = end
+        compactIfNeeded()
+        return values
+    }
+
     private mutating func compactIfNeeded() {
         guard head > 0 else { return }
         if head == storage.count {
@@ -251,6 +262,22 @@ public actor PosixUDPChannel {
                 stateLock.unlock()
             }
         }
+    }
+
+    /// Receive one ordered socket burst. The first datagram uses the existing
+    /// waiter path; everything already queued behind it is drained under the
+    /// same lock. Large compound HEVC pictures contain hundreds of RTP packets,
+    /// and crossing two Swift actor boundaries per datagram allowed the
+    /// userspace FIFO to overflow under GUI load.
+    public func receiveDatagramBatch(maxCount: Int = 512) async throws -> [PosixUDPDatagram] {
+        let limit = max(1, maxCount)
+        let first = try await receiveDatagram()
+        guard limit > 1 else { return [first] }
+
+        let remainder = stateLock.withLock {
+            pendingDatagrams.popFirst(upTo: limit - 1)
+        }
+        return [first] + remainder
     }
 
     /// Send a datagram to the connected peer.

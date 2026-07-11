@@ -6,7 +6,7 @@ import Foundation
 /// bandwidth. That feedback loop could never discover spare capacity quickly.
 /// This controller keeps a
 /// capacity estimate separate from observed screen activity. Confirmed loss or
-/// measured receiver queueing multiplicatively reduces the estimate. Recovery
+/// confirmed transport loss multiplicatively reduces the estimate. Recovery
 /// is deliberately utilization-gated: an idle desktop is not evidence that a
 /// link can sustain a higher motion bitrate. RCTL is advisory feedback; this
 /// class does not impose a second congestion controller.
@@ -32,7 +32,6 @@ final class AppleMediaRateController {
         let startupRampInterval: Double
         let cooldown: Double
         let backoffInterval: Double
-        let queueDelayThreshold: Double
         let throughputWindow: Double
         let updateInterval: Double
 
@@ -44,7 +43,10 @@ final class AppleMediaRateController {
             func value(_ key: String, default fallback: Double) -> Double {
                 env[key].flatMap(Double.init) ?? fallback
             }
-            let minimum = value("ROOTSHELL_VNC_RC_MIN_KBPS", default: 4_000) * 1_000
+            let minimum = value(
+                "ROOTSHELL_VNC_RC_MIN_KBPS",
+                default: AppleMediaRateController.nativeScreenMinimumBitrateBps / 1_000
+            ) * 1_000
             let maximum = value(
                 "ROOTSHELL_VNC_RC_MAX_KBPS",
                 default: maximumCapacity / 1_000) * 1_000
@@ -80,11 +82,6 @@ final class AppleMediaRateController {
                     default: 0.5),
                 cooldown: value("ROOTSHELL_VNC_RC_COOLDOWN", default: 5.0),
                 backoffInterval: value("ROOTSHELL_VNC_RC_BACKOFF_INTERVAL", default: 0.25),
-                // One 60 fps frame period of ingress queueing means the viewer
-                // is already rendering stale content and must reduce pressure.
-                queueDelayThreshold: value(
-                    "ROOTSHELL_VNC_RC_QUEUE_DELAY_MS",
-                    default: 1000.0 / 60.0) / 1_000,
                 throughputWindow: value("ROOTSHELL_VNC_RC_TPUT_WINDOW", default: 0.50),
                 updateInterval: value("ROOTSHELL_VNC_RC_UPDATE_INTERVAL", default: 0.05))
         }
@@ -188,8 +185,13 @@ final class AppleMediaRateController {
         let observed = throughputBps(now: now)
         let expected = intervalReceived + intervalLost
         let lossFraction = expected > 0 ? Double(intervalLost) / Double(expected) : 0
-        let queueCongested = intervalMaximumQueueDelay >= config.queueDelayThreshold
-        let congested = confirmedLossPending || lossFraction > 0.01 || queueCongested
+        // Socket-to-actor delay measures local frame-burst processing, not path
+        // congestion. Retina keyframes routinely arrive in hundreds of packets
+        // and create 20–50 ms lossless bursts. Treating each burst as congestion
+        // repeatedly drove 40 Mbps down to the 4 Mbps floor in a few seconds.
+        // Preserve queue delay as a diagnostic, but reduce the sender only for
+        // confirmed RTP loss.
+        let congested = confirmedLossPending || lossFraction > 0.01
         let mayBackoff = lastBackoff.map { now - $0 >= config.backoffInterval } ?? true
 
         if congested, mayBackoff {

@@ -217,6 +217,23 @@ final class AppleMediaFeedbackTests: XCTestCase {
         XCTAssertEqual(controller.owrdSeconds, 0)
     }
 
+    func testRepeatedLossNeverDropsBelowNativeScreenMinimum() {
+        let controller = AppleMediaRateController(maxTargetBps: 40_000_000)
+        _ = controller.update(now: 0)
+        for step in 1...8 {
+            let now = Double(step)
+            controller.onConfirmedLoss(count: 1, now: now)
+            _ = controller.update(now: now)
+        }
+
+        XCTAssertEqual(
+            controller.bandwidthEstimateBps,
+            UInt32(AppleMediaRateController.nativeScreenMinimumBitrateBps))
+        XCTAssertEqual(
+            controller.targetBitrateBps,
+            UInt32(AppleMediaRateController.nativeScreenMinimumBitrateBps))
+    }
+
     func testSparseScreenDoesNotTurnObservedTrafficIntoCapacityCeiling() {
         let controller = AppleMediaRateController(maxTargetBps: 100_000_000)
         _ = controller.update(now: 0)
@@ -260,19 +277,22 @@ final class AppleMediaFeedbackTests: XCTestCase {
         XCTAssertEqual(controller.bandwidthEstimateBps, 33_000_000)
     }
 
-    func testRateControllerBacksOffForReceiverQueueingBeforeLoss() {
+    func testRateControllerDoesNotBackOffForLosslessFrameBurstQueueing() {
         let controller = AppleMediaRateController(maxTargetBps: 40_000_000)
         _ = controller.update(now: 0)
-        controller.onVideoPacket(
-            ssrc: 1,
-            rtpTimestamp: 1,
-            bytes: 1_400,
-            queueDelaySeconds: 0.030,
-            now: 0.1)
-        _ = controller.update(now: 0.1)
+        for interval in 1...20 {
+            let now = Double(interval) * 0.1
+            controller.onVideoPacket(
+                ssrc: 1,
+                rtpTimestamp: UInt32(interval),
+                bytes: 250_000,
+                queueDelaySeconds: 0.044,
+                now: now)
+            _ = controller.update(now: now)
+        }
 
-        XCTAssertEqual(controller.bandwidthEstimateBps, 30_000_000)
-        XCTAssertEqual(controller.peakQueueDelaySeconds, 0.030, accuracy: 0.000_001)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 40_000_000)
+        XCTAssertEqual(controller.peakQueueDelaySeconds, 0.044, accuracy: 0.000_001)
     }
 
     func testRoutePriorCanProbeQuicklyToFullCapacityBeforeCongestion() {

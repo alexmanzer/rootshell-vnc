@@ -575,8 +575,9 @@ public final class VideoStreamManager: @unchecked Sendable {
         let fresh: Bool
         if irapGateEnabled {
             fresh = awaitingIRAP.isEmpty
-            // All SSRCs feed one VideoToolbox reference timeline. A missing
-            // picture poisons that timeline globally, not just its screen band.
+            // Compound tiles share one VCP reference timeline. The server sends
+            // the recovery IDR on the base SSRC even when a sibling lost RTP,
+            // so stop every dependent tile until that global reset arrives.
             awaitingIRAP.formUnion(seenVideoSSRCs)
             if let affectedSSRC { awaitingIRAP.insert(affectedSSRC) }
         } else {
@@ -592,17 +593,16 @@ public final class VideoStreamManager: @unchecked Sendable {
     func shouldDecodeVCL(nalType: UInt8, ssrc: UInt32) -> Bool {
         lock.lock()
         if nalType == 20 {
-            let recoveredGatedSource = irapGateEnabled
-                && awaitingIRAP.remove(ssrc) != nil
-            let remainingGatedSources = awaitingIRAP.count
+            let recoveredCompoundTimeline = irapGateEnabled
+                && !awaitingIRAP.isEmpty
+            awaitingIRAP.removeAll(keepingCapacity: true)
             lossStats.irapsDecoded += 1
-            if awaitingIRAP.isEmpty { lastLossNanos = 0 }
+            lastLossNanos = 0
             lock.unlock()
-            if recoveredGatedSource {
+            if recoveredCompoundTimeline {
                 log.warning(
-                    "Accepted recovery HEVC IDR_N_LP type=20 "
-                        + "ssrc=0x\(String(ssrc, radix: 16)) "
-                        + "remainingGatedSources=\(remainingGatedSources)")
+                    "Accepted compound recovery HEVC IDR_N_LP type=20 "
+                        + "baseSSRC=0x\(String(ssrc, radix: 16))")
             }
             return true
         }
@@ -1136,7 +1136,8 @@ public final class VideoStreamManager: @unchecked Sendable {
         for gap in result.skippedGaps {
             log.warning("Skipping missing compound HEVC DON \(gap.missingDON); "
                 + "next=\(gap.nextDON) buffered=\(gap.bufferedFrameCount)")
-            if lossRecoveryEnabled { _ = markLossLocked(affectedSSRC: nil) }
+            // Apple legitimately omits unchanged tiles. RTP sequence tracking,
+            // not a sparse global DON timeline, is the damage authority.
         }
         return result
     }

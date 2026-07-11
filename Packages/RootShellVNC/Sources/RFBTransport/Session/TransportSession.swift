@@ -264,8 +264,12 @@ public actor TransportSession {
     /// server retire its capture graph mid-startup. Keep only the newest drag
     /// size queued until the current generation proves ready.
     private var appleDisplayReconfigurationGeneration: UInt64?
-    private var appleVirtualDisplayMaximumPixelWidth: UInt32 = 3_840
-    private var appleVirtualDisplayMaximumPixelHeight: UInt32 = 3_840
+    /// Stable virtual-display capability envelope. Changing these maxima in
+    /// the same command that installs a mode makes WindowServer renegotiate the
+    /// backing scale; requests wider than the old 3840 value intermittently
+    /// landed on a 1× surface even though the mode explicitly described 2×.
+    private let appleVirtualDisplayMaximumPixelWidth: UInt32 = 8_192
+    private let appleVirtualDisplayMaximumPixelHeight: UInt32 = 8_192
     /// A staged virtual-display replacement must wait until the initial Apple
     /// media graph emits video. Message 2 only completes control negotiation;
     /// replacing the display before the first RTP packet can retire the
@@ -771,8 +775,9 @@ public actor TransportSession {
 
         self.fbWidth = width
         self.fbHeight = height
-        let initialPixelArea = Int(width) * Int(height)
-        activeAppleMediaTilesPerFrame = initialPixelArea >= 5_000_000 ? 2 : 1
+        activeAppleMediaTilesPerFrame = AppleMediaVideoMode.activeTileCount(
+            pixelWidth: Int(width),
+            pixelHeight: Int(height))
         self.pixelFormat = pf
 
         log.info("ServerInit: \(width)x\(height) '\(name)'")
@@ -1366,21 +1371,14 @@ public actor TransportSession {
             pixelHeight: UInt32(requested.pixelHeight),
             pointWidth: UInt32(requested.pointWidth),
             pointHeight: UInt32(requested.pointHeight))
-        // These are capability maxima, not the active mode or an artificial
-        // resolution limit. Never shrink them during a live resize: doing so
-        // makes WindowServer re-evaluate the existing virtual display and can
-        // select a 1× fallback whose pixels equal the requested point size.
-        appleVirtualDisplayMaximumPixelWidth = max(
-            appleVirtualDisplayMaximumPixelWidth,
-            UInt32(requested.pixelWidth))
-        appleVirtualDisplayMaximumPixelHeight = max(
-            appleVirtualDisplayMaximumPixelHeight,
-            UInt32(requested.pixelHeight))
+        // These are fixed capability maxima, not the active mode or an active
+        // resolution cap. The requested pixel/point pair below selects 2×.
         // Viceroy's virtual encoder emits multiple tiles only above its capture
         // size threshold. Demanding them for a smaller Match Client window
         // completes control negotiation but creates no RTP source at all.
-        let pixelArea = Int(requested.pixelWidth) * Int(requested.pixelHeight)
-        activeAppleMediaTilesPerFrame = pixelArea >= 5_000_000 ? 2 : 1
+        activeAppleMediaTilesPerFrame = AppleMediaVideoMode.activeTileCount(
+            pixelWidth: Int(requested.pixelWidth),
+            pixelHeight: Int(requested.pixelHeight))
         let display = AppleVirtualDisplay(
             name: "Rootshell Virtual Display",
             widthInMillimeters: Float(requested.pointWidth) * millimetersPerPoint,
@@ -2837,10 +2835,9 @@ public actor TransportSession {
         let readTask = Task { [weak self, channel] in
             while !Task.isCancelled {
                 do {
-                    let datagram = try await channel.receiveDatagram()
-                    await self?.handleAppleMediaUDPDatagram(
-                        datagram.data,
-                        arrivalNanos: datagram.arrivalNanos,
+                    let datagrams = try await channel.receiveDatagramBatch()
+                    await self?.handleAppleMediaUDPDatagrams(
+                        datagrams,
                         from: channel)
                 } catch is CancellationError {
                     break
@@ -2851,6 +2848,21 @@ public actor TransportSession {
             }
         }
         udpReadTasks.append(readTask)
+    }
+
+    /// Keep a socket-drain batch on this actor until every packet has been
+    /// authenticated and delivered. This preserves wire order while amortizing
+    /// actor scheduling across the hundreds of RTP fragments in a Retina tile.
+    private func handleAppleMediaUDPDatagrams(
+        _ datagrams: [PosixUDPDatagram],
+        from channel: PosixUDPChannel
+    ) {
+        for datagram in datagrams {
+            handleAppleMediaUDPDatagram(
+                datagram.data,
+                arrivalNanos: datagram.arrivalNanos,
+                from: channel)
+        }
     }
 
     private nonisolated func isLoopbackHost(_ host: String) -> Bool {

@@ -977,6 +977,13 @@ public final class VNCSession {
                           m.isStreamActive else { return }
                     let progress = m.decodeProgress
                     guard progress.streamGeneration == streamGeneration else { return }
+                    // Loss recovery deliberately withholds dependent compound
+                    // pictures until the base IDR. Rebuilding the decoder here
+                    // races the FIR loop and discards every recovery picture.
+                    if m.hasGatedBands {
+                        detector = DecodeOutputStallDetector()
+                        continue
+                    }
                     if detector.observe(
                         submittedFrameCount: progress.submittedFrameCount,
                         deliveredFrameCount: decodedBands.frameCount,

@@ -28,6 +28,20 @@ final class BoundedDatagramFIFOTests: XCTestCase {
         XCTAssertEqual(drain(&fifo), [packet(3), packet(4), packet(5)])
     }
 
+    func testBatchPopPreservesOrderAndLeavesRemainder() {
+        var fifo = BoundedDatagramFIFO(capacity: 10)
+        XCTAssertEqual(fifo.append(contentsOf: (0..<6).map(packet)), 0)
+
+        XCTAssertEqual(
+            fifo.popFirst(upTo: 4).map { Int($0.arrivalNanos) },
+            [0, 1, 2, 3])
+        XCTAssertEqual(fifo.count, 2)
+        XCTAssertEqual(
+            fifo.popFirst(upTo: 99).map { Int($0.arrivalNanos) },
+            [4, 5])
+        XCTAssertTrue(fifo.isEmpty)
+    }
+
     private func drain(_ fifo: inout BoundedDatagramFIFO) -> [PosixUDPDatagram] {
         var result: [PosixUDPDatagram] = []
         while let packet = fifo.popFirst() { result.append(packet) }

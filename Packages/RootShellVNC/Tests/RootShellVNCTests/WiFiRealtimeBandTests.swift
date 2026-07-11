@@ -40,6 +40,9 @@ final class WiFiRealtimeBandTests: XCTestCase {
             CGSize(width: 1197, height: 837),
             CGSize(width: 1283, height: 779),
             CGSize(width: 1024, height: 1366),
+            // Exact wide Retina geometry from the GUI session that eventually
+            // overflowed the per-datagram actor handoff.
+            CGSize(width: 2768, height: 696),
         ]
 
         session.updateRemoteDisplaySize(viewSize: viewSizes[0], displayScale: 2)
@@ -80,6 +83,24 @@ final class WiFiRealtimeBandTests: XCTestCase {
             try await assertContinuesAtomicRendering(
                 session,
                 expectedBandCount: expectedBandCount(for: viewSize))
+        }
+
+        // Opt-in soak at the exact >4K-axis geometry. Check progress throughout
+        // the hold so an initial clean frame followed by a frozen/corrupt tile
+        // cannot pass merely because the final counters are non-zero.
+        let wideHoldSeconds = Double(env["VNC_TEST_WIDE_HOLD_SECONDS"] ?? "0") ?? 0
+        let wideHoldDeadline = Date().addingTimeInterval(wideHoldSeconds)
+        while Date() < wideHoldDeadline {
+            let priorCommit = session.videoBandRenderer.frameCommitCount
+            try await Task.sleep(for: .seconds(min(
+                5,
+                max(0.1, wideHoldDeadline.timeIntervalSinceNow))))
+            XCTAssertGreaterThan(
+                session.videoBandRenderer.frameCommitCount,
+                priorCommit,
+                "Wide Retina multi-tile rendering froze during the soak")
+            XCTAssertEqual(session.videoBandRenderer.renderedBandCount, 2)
+            XCTAssertEqual(session.videoBandRenderer.partialCommitCount, 0)
         }
 
         // Reproduce a real window drag: each update lives longer than the UI
@@ -258,7 +279,9 @@ final class WiFiRealtimeBandTests: XCTestCase {
 
     private func expectedBandCount(for viewSize: CGSize) -> Int {
         guard let size = RemoteDisplaySize.matching(viewSize: viewSize) else { return 1 }
-        return Int(size.pixelWidth) * Int(size.pixelHeight) >= 5_000_000 ? 2 : 1
+        return AppleMediaVideoMode.activeTileCount(
+            pixelWidth: Int(size.pixelWidth),
+            pixelHeight: Int(size.pixelHeight))
     }
 
     private final class BandStats: @unchecked Sendable {

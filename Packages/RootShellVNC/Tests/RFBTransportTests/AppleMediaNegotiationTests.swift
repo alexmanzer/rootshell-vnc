@@ -4,6 +4,22 @@ import XCTest
 @testable import RFBTransport
 
 final class AppleMediaNegotiationTests: XCTestCase {
+    func testRetinaTileCountUsesCaptureAreaThreshold() {
+        XCTAssertEqual(
+            AppleMediaVideoMode.activeTileCount(
+                pixelWidth: 2400, pixelHeight: 1680),
+            1)
+        XCTAssertEqual(
+            AppleMediaVideoMode.activeTileCount(
+                pixelWidth: 2048, pixelHeight: 2736),
+            2)
+        XCTAssertEqual(
+            AppleMediaVideoMode.activeTileCount(
+                pixelWidth: 5536, pixelHeight: 1392),
+            2)
+        XCTAssertEqual(AppleMediaVideoMode.negotiatedTilesPerFrame, 2)
+    }
+
     func testMediaMessageOneAnswerCyclesCreateDistinctGenerations() {
         var tracker = AppleMediaNegotiationGenerationTracker()
 

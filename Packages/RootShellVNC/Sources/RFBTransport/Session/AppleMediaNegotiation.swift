@@ -45,6 +45,13 @@ public enum AppleMediaVideoMode {
     public static var negotiatedTilesPerFrame: UInt64 {
         2
     }
+
+    /// Tile sessions below the encoder's size threshold must remain single
+    /// tile. Larger captures use the server's two horizontal HEVC bands.
+    public static func activeTileCount(pixelWidth: Int, pixelHeight: Int) -> Int {
+        guard pixelWidth > 0, pixelHeight > 0 else { return 1 }
+        return pixelWidth * pixelHeight >= 5_000_000 ? 2 : 1
+    }
 }
 
 /// Portable encoder for the Viceroy v1 media-negotiation message used by
