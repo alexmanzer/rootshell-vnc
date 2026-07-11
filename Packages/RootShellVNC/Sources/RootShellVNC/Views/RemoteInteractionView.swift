@@ -71,16 +71,20 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private var scrollPointAccumulator = ScrollPointAccumulator()
     private var previousScrollTranslation = CGPoint.zero
     private var directScrollPhaseActive = false
+    private var momentumScrollPhaseActive = false
     private weak var activeScrollRecognizer: UIPanGestureRecognizer?
+    private var lastDirectScrollVelocity = CGPoint.zero
+    private var lastDirectScrollVelocityTimestamp: CFTimeInterval = 0
+    private var previousScrollTimestamp: CFTimeInterval = 0
+    private var syntheticMomentumVelocity = CGPoint.zero
+    private var syntheticMomentumLastTimestamp: CFTimeInterval = 0
+    private var momentumDisplayLink: CADisplayLink?
     private let suppressedInputView = UIView(frame: .zero)
     #if DEBUG
     private let inputLog = VNCLogger(category: "InputRouting")
     private var inputLogBudget = 128
     #endif
 
-    /// UIKit scroll events have zero touches, while one-finger direct scrolling
-    /// has one. A single 0...1 recognizer is the supported configuration for
-    /// both without accepting indirect-pointer click drags.
     private lazy var scrollRecognizer = UIPanGestureRecognizer(
         target: self,
         action: #selector(handleNativeScrollState(_:)))
@@ -90,9 +94,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private lazy var viewportPanRecognizer = UIPanGestureRecognizer(
         target: self,
         action: #selector(handleViewportPan(_:)))
-    private lazy var pointerPanRecognizer = UIPanGestureRecognizer(
+    private lazy var pointerDragRecognizer = UILongPressGestureRecognizer(
         target: self,
-        action: #selector(handlePointerPan(_:)))
+        action: #selector(handlePointerDrag(_:)))
     private lazy var tapRecognizer = UITapGestureRecognizer(
         target: self,
         action: #selector(handleTap(_:)))
@@ -290,32 +294,49 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         lastPointerPoint = nil
     }
 
-    /// UIKit exposes both direct pans and `UIEventTypeScroll` through public
-    /// pan recognizers. Translation is already expressed in view points and in
-    /// the same sign as CG scroll deltas, so no guessed multiplier is needed.
+    /// UIKit exposes touch and indirect-pointer scrolling through the same pan
+    /// recognizer, but Catalyst does not consistently expose a deceleration
+    /// phase. Consume its direct translation and always generate the momentum
+    /// tail from the final measured velocity ourselves.
     @objc private func handleNativeScrollState(_ recognizer: UIPanGestureRecognizer) {
         logInputRoute(
             "scroll state=\(recognizer.state.rawValue) "
             + "translation=\(recognizer.translation(in: self))")
         switch recognizer.state {
         case .began:
-            if directScrollPhaseActive {
-                endDirectScrollPhase(.ended)
+            if momentumScrollPhaseActive {
+                endMomentumScrollPhase()
                 finishScrollInteraction()
             }
             activeScrollRecognizer = recognizer
+            lastDirectScrollVelocity = .zero
+            lastDirectScrollVelocityTimestamp = 0
             let translation = recognizer.translation(in: self)
             previousScrollTranslation = translation
+            previousScrollTimestamp = CACurrentMediaTime()
             beginScrollInteractionIfNeeded(
                 using: recognizer,
                 initialTranslation: translation)
         case .changed:
             guard activeScrollRecognizer === recognizer else { return }
             let translation = recognizer.translation(in: self)
+            let now = CACurrentMediaTime()
+            let elapsed = now - previousScrollTimestamp
+            let deltaX = translation.x - previousScrollTranslation.x
+            let deltaY = translation.y - previousScrollTranslation.y
+            let reportedVelocity = recognizer.velocity(in: self)
+            if hypot(reportedVelocity.x, reportedVelocity.y) >= 1 {
+                rememberScrollVelocity(reportedVelocity, at: now)
+            } else if elapsed > 0, elapsed <= 0.1 {
+                rememberScrollVelocity(CGPoint(
+                    x: deltaX / CGFloat(elapsed),
+                    y: deltaY / CGFloat(elapsed)), at: now)
+            }
             let points = scrollPointAccumulator.consume(
-                deltaX: translation.x - previousScrollTranslation.x,
-                deltaY: translation.y - previousScrollTranslation.y)
+                deltaX: deltaX,
+                deltaY: deltaY)
             previousScrollTranslation = translation
+            previousScrollTimestamp = now
             guard points.x != 0 || points.y != 0 else { return }
             sendScrollSample(
                 pointDeltaX: points.x,
@@ -323,12 +344,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 scrollPhase: .changed)
         case .ended:
             guard activeScrollRecognizer === recognizer else { return }
+            rememberScrollVelocity(recognizer.velocity(in: self))
             endDirectScrollPhase(.ended)
-            finishScrollInteraction()
+            if !beginSyntheticMomentumIfNeeded() {
+                finishScrollInteraction()
+            }
         case .cancelled, .failed:
             guard activeScrollRecognizer === recognizer else { return }
-            endDirectScrollPhase(.cancelled)
-            finishScrollInteraction()
+            cancelScrollInteraction()
         default:
             break
         }
@@ -339,6 +362,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         initialTranslation: CGPoint
     ) {
         guard !directScrollPhaseActive else { return }
+        if momentumScrollPhaseActive {
+            endMomentumScrollPhase()
+        }
         directScrollPhaseActive = true
         lastScrollPoint = nil
         scrollPointAccumulator.reset()
@@ -359,6 +385,100 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             momentumPhase: .none)
     }
 
+    private func beginMomentumScrollPhaseIfNeeded() {
+        guard !momentumScrollPhaseActive else { return }
+        endDirectScrollPhase(.ended)
+        momentumScrollPhaseActive = true
+        sendScrollSample(
+            pointDeltaX: 0,
+            pointDeltaY: 0,
+            scrollPhase: .none,
+            momentumPhase: .began)
+    }
+
+    /// Preserve the final public pan velocity and generate a consistent tail
+    /// on every platform instead of depending on UIKit's private scroll phase.
+    @discardableResult
+    private func beginSyntheticMomentumIfNeeded() -> Bool {
+        guard momentumDisplayLink == nil else { return false }
+        guard CACurrentMediaTime() - lastDirectScrollVelocityTimestamp <= 0.15 else {
+            return false
+        }
+        let speed = hypot(lastDirectScrollVelocity.x, lastDirectScrollVelocity.y)
+        guard speed >= 25 else { return false }
+
+        let maximumSpeed: CGFloat = 12_000
+        let scale = min(1, maximumSpeed / speed)
+        syntheticMomentumVelocity = CGPoint(
+            x: lastDirectScrollVelocity.x * scale,
+            y: lastDirectScrollVelocity.y * scale)
+        syntheticMomentumLastTimestamp = 0
+        beginMomentumScrollPhaseIfNeeded()
+
+        let link = CADisplayLink(target: self, selector: #selector(stepSyntheticMomentum(_:)))
+        link.preferredFramesPerSecond = 60
+        link.add(to: .main, forMode: .common)
+        momentumDisplayLink = link
+        logInputRoute(
+            "synthetic momentum velocity=(\(syntheticMomentumVelocity.x),"
+                + "\(syntheticMomentumVelocity.y))")
+        return true
+    }
+
+    private func rememberScrollVelocity(
+        _ velocity: CGPoint,
+        at timestamp: CFTimeInterval = CACurrentMediaTime()
+    ) {
+        // Some platforms report zero from the terminal callback. Retain the
+        // newest meaningful changed-state sample instead of erasing it.
+        guard hypot(velocity.x, velocity.y) >= 1 else { return }
+        lastDirectScrollVelocity = velocity
+        lastDirectScrollVelocityTimestamp = timestamp
+    }
+
+    @objc private func stepSyntheticMomentum(_ displayLink: CADisplayLink) {
+        guard momentumDisplayLink === displayLink,
+              momentumScrollPhaseActive else {
+            stopSyntheticMomentum()
+            return
+        }
+
+        let elapsed: CFTimeInterval
+        if syntheticMomentumLastTimestamp == 0 {
+            elapsed = displayLink.duration
+        } else {
+            elapsed = min(0.05, displayLink.timestamp - syntheticMomentumLastTimestamp)
+        }
+        syntheticMomentumLastTimestamp = displayLink.timestamp
+
+        let points = scrollPointAccumulator.consume(
+            deltaX: syntheticMomentumVelocity.x * elapsed,
+            deltaY: syntheticMomentumVelocity.y * elapsed)
+        if points.x != 0 || points.y != 0 {
+            sendScrollSample(
+                pointDeltaX: points.x,
+                pointDeltaY: points.y,
+                scrollPhase: .none,
+                momentumPhase: .changed)
+        }
+
+        // UIScrollView.DecelerationRate.normal is 0.998 per millisecond.
+        let decay = pow(CGFloat(0.998), CGFloat(elapsed * 1_000))
+        syntheticMomentumVelocity.x *= decay
+        syntheticMomentumVelocity.y *= decay
+        if hypot(syntheticMomentumVelocity.x, syntheticMomentumVelocity.y) < 5 {
+            endMomentumScrollPhase()
+            finishScrollInteraction()
+        }
+    }
+
+    private func stopSyntheticMomentum() {
+        momentumDisplayLink?.invalidate()
+        momentumDisplayLink = nil
+        syntheticMomentumVelocity = .zero
+        syntheticMomentumLastTimestamp = 0
+    }
+
     private func endDirectScrollPhase(_ phase: AppleScrollEvent.Phase) {
         guard directScrollPhaseActive else { return }
         sendScrollSample(
@@ -375,14 +495,23 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         directScrollPhaseActive = false
     }
 
+    private func endMomentumScrollPhase() {
+        guard momentumScrollPhaseActive else { return }
+        stopSyntheticMomentum()
+        sendScrollSample(
+            pointDeltaX: 0,
+            pointDeltaY: 0,
+            scrollPhase: .none,
+            momentumPhase: .ended)
+        momentumScrollPhaseActive = false
+    }
+
     private func cancelScrollInteraction() {
         endDirectScrollPhase(.cancelled)
+        endMomentumScrollPhase()
         finishScrollInteraction()
     }
 
-    /// Native Screen Sharing keeps scroll-wheel coordinates at the actual mouse
-    /// location. A zero-touch UIKit pan's `location(in:)` is a moving gesture
-    /// centroid, so snapshot once and never use it as per-delta pointer motion.
     private func captureScrollPoint(using recognizer: UIPanGestureRecognizer) {
         if let lastKnownFramebufferPoint {
             lastScrollPoint = lastKnownFramebufferPoint
@@ -416,10 +545,13 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     private func finishScrollInteraction() {
-        guard !directScrollPhaseActive else { return }
+        guard !directScrollPhaseActive, !momentumScrollPhaseActive else { return }
         activeScrollRecognizer = nil
         lastScrollPoint = nil
         scrollPointAccumulator.reset()
+        lastDirectScrollVelocity = .zero
+        lastDirectScrollVelocityTimestamp = 0
+        previousScrollTimestamp = 0
         previousScrollTranslation = .zero
     }
 
@@ -447,11 +579,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         viewportPanRecognizer.allowedTouchTypes = directTouchTypes
         viewportPanRecognizer.delegate = self
 
-        pointerPanRecognizer.minimumNumberOfTouches = 1
-        pointerPanRecognizer.maximumNumberOfTouches = 1
-        pointerPanRecognizer.allowedTouchTypes = pointerTypes
-        pointerPanRecognizer.allowedScrollTypesMask = []
-        pointerPanRecognizer.delegate = self
+        // A pan waits for a movement threshold before beginning, which can
+        // move off a narrow scrollbar thumb before remote button-down. Begin
+        // at the exact primary-button location and keep tracking while held.
+        pointerDragRecognizer.minimumPressDuration = 0
+        pointerDragRecognizer.allowableMovement = .greatestFiniteMagnitude
+        pointerDragRecognizer.numberOfTouchesRequired = 1
+        pointerDragRecognizer.allowedTouchTypes = pointerTypes
+        pointerDragRecognizer.delegate = self
 
         tapRecognizer.numberOfTapsRequired = 1
         tapRecognizer.allowedTouchTypes = allPointerTypes
@@ -460,6 +595,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         doubleTapRecognizer.numberOfTapsRequired = 2
         doubleTapRecognizer.allowedTouchTypes = allPointerTypes
         doubleTapRecognizer.delegate = self
+        tapRecognizer.require(toFail: pointerDragRecognizer)
+        doubleTapRecognizer.require(toFail: pointerDragRecognizer)
         tapRecognizer.require(toFail: doubleTapRecognizer)
 
         rightTapRecognizer.numberOfTouchesRequired = 2
@@ -474,7 +611,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             scrollRecognizer,
             pinchRecognizer,
             viewportPanRecognizer,
-            pointerPanRecognizer,
+            pointerDragRecognizer,
             tapRecognizer,
             doubleTapRecognizer,
             rightTapRecognizer,
@@ -507,7 +644,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         onViewportChange?(viewport)
     }
 
-    @objc private func handlePointerPan(_ recognizer: UIPanGestureRecognizer) {
+    @objc private func handlePointerDrag(_ recognizer: UILongPressGestureRecognizer) {
         focusForHardwareKeyboardIfNeeded(recognizer)
         switch recognizer.state {
         case .began, .changed:
@@ -563,6 +700,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         defaultRegion: UIPointerRegion
     ) -> UIPointerRegion? {
         guard !directScrollPhaseActive,
+              !momentumScrollPhaseActive,
               !pointerDragActive,
               scrollRecognizer.state != .began,
               scrollRecognizer.state != .changed,
@@ -621,7 +759,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-        if gestureRecognizer === pointerPanRecognizer,
+        if gestureRecognizer === pointerDragRecognizer,
            !gestureRecognizer.buttonMask.isEmpty {
             return gestureRecognizer.buttonMask.contains(.primary)
         }
