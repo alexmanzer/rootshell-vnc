@@ -233,6 +233,29 @@ public enum MessageWriter: Sendable {
         return data
     }
 
+    /// Serialize `_RFBPostGestureEventScroll` exactly as the native client:
+    /// three big-endian Float32 deltas, natural direction, phase, gesture mask,
+    /// and framebuffer coordinates in a 32-byte type-23 payload.
+    public static func writeAppleGestureScrollEvent(
+        _ event: AppleGestureScrollEvent
+    ) -> Data {
+        var data = Data(count: AppleGestureScrollEvent.wireByteCount)
+        data[0] = AppleGestureScrollEvent.messageType
+        data[1] = 0
+        writeUInt16(AppleGestureScrollEvent.payloadByteCount, into: &data, at: 2)
+        writeUInt16(AppleGestureScrollEvent.inputEventVersion, into: &data, at: 4)
+        writeUInt16(AppleGestureScrollEvent.gestureScrollSubtype, into: &data, at: 6)
+        writeUInt32(event.deltaX.bitPattern, into: &data, at: 8)
+        writeUInt32(event.deltaY.bitPattern, into: &data, at: 12)
+        writeUInt32(event.deltaZ.bitPattern, into: &data, at: 16)
+        writeUInt32(event.naturalScrolling ? 1 : 0, into: &data, at: 20)
+        writeUInt32(event.gesturePhase.rawValue, into: &data, at: 24)
+        writeUInt32(event.gestureMask, into: &data, at: 28)
+        writeUInt16(event.x, into: &data, at: 32)
+        writeUInt16(event.y, into: &data, at: 34)
+        return data
+    }
+
     /// Serialize Apple's client media-stream configuration request.
     ///
     /// Current macOS Screen Sharing sends this `0x21` message after ServerInit

@@ -43,6 +43,7 @@ public struct AppleScrollEvent: Sendable, Equatable {
 
         public static let instantMouser = Flags(rawValue: 1 << 0)
         public static let continuous = Flags(rawValue: 1 << 1)
+        public static let directionInvertedFromDevice = Flags(rawValue: 1 << 2)
     }
 
     public let deltaX: Int16

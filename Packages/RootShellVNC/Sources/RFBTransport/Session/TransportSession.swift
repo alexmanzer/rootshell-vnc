@@ -441,8 +441,19 @@ public actor TransportSession {
     /// ordinary RFB wheel-button events.
     public func sendScrollEvent(_ event: AppleScrollEvent) async throws {
         if supportsApplePreciseInput {
-            try await sendClientPayload(
-                ClientMessage.appleScrollEvent(event).serialize())
+            var payload = ClientMessage.appleScrollEvent(event).serialize()
+            if event.momentumPhase == .none, event.scrollPhase != .none {
+                payload.append(ClientMessage.appleGestureScrollEvent(
+                    AppleGestureScrollEvent(
+                        deltaX: Float(event.pointDeltaX),
+                        deltaY: Float(event.pointDeltaY),
+                        naturalScrolling: true,
+                        gesturePhase: event.scrollPhase,
+                        x: event.x,
+                        y: event.y)
+                ).serialize())
+            }
+            try await sendClientPayload(payload)
             return
         }
 

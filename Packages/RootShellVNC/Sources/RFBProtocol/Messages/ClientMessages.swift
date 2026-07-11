@@ -30,6 +30,9 @@ public enum ClientMessage: Sendable, Equatable {
     /// Apple message type 23: begin/end envelope for a trackpad/touch gesture.
     case appleGestureEvent(AppleGestureEvent)
 
+    /// Apple message type 23/subtype 8: gesture-scroll targeting metadata.
+    case appleGestureScrollEvent(AppleGestureScrollEvent)
+
     /// Apple message type 33: request accelerated media-stream configuration.
     case appleMediaStreamConfiguration
 
@@ -53,6 +56,7 @@ public enum ClientMessage: Sendable, Equatable {
         case .setDesktopSize:              return SetDesktopSizeRequest.messageType
         case .appleScrollEvent:            return AppleScrollEvent.messageType
         case .appleGestureEvent:           return AppleGestureEvent.messageType
+        case .appleGestureScrollEvent:     return AppleGestureScrollEvent.messageType
         case .appleMediaStreamConfiguration: return 0x21
         case .appleMediaStreamRequest:     return 0x12
         case .appleDisplayConfiguration:   return AppleDisplayConfiguration.messageType
@@ -84,6 +88,8 @@ public enum ClientMessage: Sendable, Equatable {
             return MessageWriter.writeAppleScrollEvent(event)
         case .appleGestureEvent(let event):
             return MessageWriter.writeAppleGestureEvent(event)
+        case .appleGestureScrollEvent(let event):
+            return MessageWriter.writeAppleGestureScrollEvent(event)
         case .appleMediaStreamConfiguration:
             return MessageWriter.writeAppleMediaStreamConfiguration()
         case .appleMediaStreamRequest:

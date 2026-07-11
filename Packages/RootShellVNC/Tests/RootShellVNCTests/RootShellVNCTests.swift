@@ -1473,7 +1473,7 @@ final class TouchInputHandlerTests: XCTestCase {
         XCTAssertEqual(event.fixedDeltaX, 6_553)
         XCTAssertEqual(event.fixedDeltaY, -26_214)
         XCTAssertEqual(event.scrollPhase, .changed)
-        XCTAssertEqual(event.flags, [.continuous])
+        XCTAssertEqual(event.flags, [.continuous, .directionInvertedFromDevice])
         XCTAssertEqual(event.x, 20)
         XCTAssertEqual(event.y, 30)
     }

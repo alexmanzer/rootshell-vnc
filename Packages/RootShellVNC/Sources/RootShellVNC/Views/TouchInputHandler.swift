@@ -190,7 +190,7 @@ public struct TouchInputHandler {
             pointDeltaY: pointDeltaY,
             scrollPhase: scrollPhase,
             momentumPhase: momentumPhase,
-            flags: [.continuous],
+            flags: [.continuous, .directionInvertedFromDevice],
             x: x,
             y: y)
 
@@ -225,6 +225,7 @@ public struct TouchInputHandler {
     ) {
         sendGestureEvent?(AppleGestureEvent(kind: kind, x: x, y: y))
     }
+
 
     /// Handle a double-tap at the given framebuffer coordinates.
     ///

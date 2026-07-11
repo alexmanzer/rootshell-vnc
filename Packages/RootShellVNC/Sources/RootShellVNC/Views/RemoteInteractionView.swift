@@ -109,6 +109,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private lazy var longPressRecognizer = UILongPressGestureRecognizer(
         target: self,
         action: #selector(handleLongPress(_:)))
+    private lazy var hoverRecognizer = UIHoverGestureRecognizer(
+        target: self,
+        action: #selector(handleHover(_:)))
     private lazy var pointerInteraction = UIPointerInteraction(delegate: self)
     init(
         touchHandler: TouchInputHandler,
@@ -370,6 +373,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         scrollPointAccumulator.reset()
         captureScrollPoint(using: recognizer)
         if let point = lastScrollPoint {
+            // The Apple scroll record carries coordinates, but remote WebKit
+            // hit-testing still follows the server's current pointer. Sync it
+            // explicitly before the gesture envelope just like a local hover.
+            lastPointerPoint = point
+            touchHandler.handleMove(x: point.x, y: point.y)
             touchHandler.handleGesture(
                 kind: .began,
                 x: point.x,
@@ -513,11 +521,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     private func captureScrollPoint(using recognizer: UIPanGestureRecognizer) {
-        if let lastKnownFramebufferPoint {
-            lastScrollPoint = lastKnownFramebufferPoint
-        } else if let point = framebufferPoint(
-            for: recognizer.location(in: self)) {
+        // For UIEvent.scroll, UIKit's zero-touch pan location is the actual
+        // trackpad pointer position at gesture begin. iPadOS may not deliver
+        // intervening hover callbacks, so a cached hover point can remain at
+        // the last click and route the gesture to the wrong remote view.
+        if let point = framebufferPoint(for: recognizer.location(in: self)) {
             lastScrollPoint = point
+        } else if let lastKnownFramebufferPoint {
+            lastScrollPoint = lastKnownFramebufferPoint
         } else if let center = framebufferPoint(for: CGPoint(
             x: bounds.midX,
             y: bounds.midY)) {
@@ -607,6 +618,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         longPressRecognizer.allowedTouchTypes = directTouchTypes
         longPressRecognizer.delegate = self
 
+        hoverRecognizer.allowedTouchTypes = pointerTypes
+        hoverRecognizer.delegate = self
+
         for recognizer in [
             scrollRecognizer,
             pinchRecognizer,
@@ -616,6 +630,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             doubleTapRecognizer,
             rightTapRecognizer,
             longPressRecognizer,
+            hoverRecognizer,
         ] {
             recognizer.cancelsTouchesInView = false
             addGestureRecognizer(recognizer)
@@ -694,6 +709,21 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         touchHandler.handleRightClick(x: point.x, y: point.y)
     }
 
+    @objc private func handleHover(_ recognizer: UIHoverGestureRecognizer) {
+        guard !directScrollPhaseActive,
+              !momentumScrollPhaseActive,
+              !pointerDragActive,
+              recognizer.state == .began || recognizer.state == .changed,
+              let point = framebufferPoint(
+                for: recognizer.location(in: self)) else { return }
+        guard lastPointerPoint?.x != point.x
+                || lastPointerPoint?.y != point.y else { return }
+        lastPointerPoint = point
+        logInputRoute("hover pos=(\(point.x),\(point.y))")
+        focusForHardwareKeyboard()
+        touchHandler.handleMove(x: point.x, y: point.y)
+    }
+
     func pointerInteraction(
         _ interaction: UIPointerInteraction,
         regionFor request: UIPointerRegionRequest,
@@ -750,9 +780,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             if accepted { logInputRoute("received UIEvent.scroll") }
             return accepted
         case .hover:
-            // Actual pointer movement comes from UIPointerInteraction. Gesture
-            // recognizers never consume Catalyst's pre-scroll hover bursts.
-            return false
+            return gestureRecognizer === hoverRecognizer
         default:
             return true
         }

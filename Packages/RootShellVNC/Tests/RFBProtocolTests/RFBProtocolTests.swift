@@ -958,6 +958,28 @@ final class MessageWriterTests: XCTestCase {
         ]))
     }
 
+    func testWriteAppleGestureScrollEventMatchesNativeSubtypeEightLayout() {
+        let event = AppleGestureScrollEvent(
+            deltaX: 1.5,
+            deltaY: -2.25,
+            deltaZ: 0.5,
+            naturalScrolling: true,
+            gesturePhase: .changed,
+            x: 0xabcd,
+            y: 0x1234)
+
+        XCTAssertEqual(MessageWriter.writeAppleGestureScrollEvent(event), Data([
+            0x17, 0x00, 0x00, 0x20, 0x00, 0x01, 0x00, 0x08,
+            0x3f, 0xc0, 0x00, 0x00,
+            0xc0, 0x10, 0x00, 0x00,
+            0x3f, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x02,
+            0xe0, 0x1c, 0x00, 0x00,
+            0xab, 0xcd, 0x12, 0x34,
+        ]))
+    }
+
     func testAppleScrollPhaseValuesMatchMeasuredCGEventFields() {
         XCTAssertEqual(AppleScrollEvent.Phase.began.rawValue, 1)
         XCTAssertEqual(AppleScrollEvent.Phase.changed.rawValue, 2)
