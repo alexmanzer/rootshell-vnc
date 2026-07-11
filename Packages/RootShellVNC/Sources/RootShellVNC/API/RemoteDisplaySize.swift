@@ -6,62 +6,50 @@ struct RemoteDisplaySize: Sendable, Equatable {
     let pointWidth: UInt16
     let pointHeight: UInt16
 
-    /// Apple's virtual displays top out at 3840×2160 pixels. A literal iPhone
-    /// viewport is too small to be a usable macOS workspace, so first expand it
-    /// to a 1024×600-point minimum while preserving the client aspect ratio.
-    /// HiDPI is capped at 2× to match the native client.
-    static func matching(
-        viewSize: CGSize,
-        displayScale: CGFloat
-    ) -> RemoteDisplaySize? {
+    /// A literal iPhone viewport is too small to be a usable macOS workspace,
+    /// so first expand it to a 1024×600-point minimum while preserving the
+    /// client aspect ratio. Backing density is discrete: Apple recognizes a
+    /// virtual display as HiDPI only when every point is backed by exactly 2×2
+    /// pixels.
+    static func matching(viewSize: CGSize) -> RemoteDisplaySize? {
         guard viewSize.width.isFinite,
               viewSize.height.isFinite,
-              displayScale.isFinite,
               viewSize.width >= 1,
               viewSize.height >= 1 else { return nil }
 
-        let requestedUIScale = min(2, max(1, displayScale))
+        let uiScale = 2
         let workspaceScale = max(
             1,
             1024 / viewSize.width,
             600 / viewSize.height)
-        var pointWidthValue = viewSize.width * workspaceScale
-        var pointHeightValue = viewSize.height * workspaceScale
+        let pointWidthValue = viewSize.width * workspaceScale
+        let pointHeightValue = viewSize.height * workspaceScale
 
-        // Prefer reducing backing density over shrinking the logical macOS
-        // workspace. This is especially important in portrait, where fitting a
-        // 2× framebuffer into 2160 pixels previously turned a requested
-        // 1024-point-wide desktop back into an unusable ~600-point workspace.
-        let fittedUIScale = min(
-            requestedUIScale,
-            3840 / pointWidthValue,
-            2160 / pointHeightValue)
-        let uiScale = max(1, fittedUIScale)
-        if fittedUIScale < 1 {
-            let pointFit = min(
-                1,
-                3840 / pointWidthValue,
-                2160 / pointHeightValue)
-            pointWidthValue *= pointFit
-            pointHeightValue *= pointFit
-        }
-        let pixelWidth = pointWidthValue * uiScale
-        let pixelHeight = pointHeightValue * uiScale
+        // Apple's compound HEVC encoder requires each full-width band on a
+        // 16-pixel codec boundary. Quantize in point space so Match Client can
+        // accept arbitrary window shapes while preserving an exact 2× backing
+        // ratio (8 points × 2 = 16 pixels) instead of silently falling to 1×.
+        let pointAlignment: CGFloat = 8
+        let roundedPointWidth = (pointWidthValue / pointAlignment).rounded()
+            * pointAlignment
+        let roundedPointHeight = (pointHeightValue / pointAlignment).rounded()
+            * pointAlignment
+        let maximumPointDimension = CGFloat(Int(UInt16.max) / uiScale)
+        guard roundedPointWidth <= maximumPointDimension,
+              roundedPointHeight <= maximumPointDimension else { return nil }
 
-        // Video encoders and chroma planes require even dimensions. Rounding
-        // down cannot exceed the server limit and changes aspect negligibly.
-        let evenPixelWidth = max(2, Int(pixelWidth.rounded(.down)) & ~1)
-        let evenPixelHeight = max(2, Int(pixelHeight.rounded(.down)) & ~1)
-        let pointWidth = max(1, Int(pointWidthValue.rounded()))
-        let pointHeight = max(1, Int(pointHeightValue.rounded()))
+        let pointWidth = max(1, Int(roundedPointWidth))
+        let pointHeight = max(1, Int(roundedPointHeight))
+        let pixelWidth = pointWidth * uiScale
+        let pixelHeight = pointHeight * uiScale
 
-        guard evenPixelWidth <= Int(UInt16.max),
-              evenPixelHeight <= Int(UInt16.max),
+        guard pixelWidth <= Int(UInt16.max),
+              pixelHeight <= Int(UInt16.max),
               pointWidth <= Int(UInt16.max),
               pointHeight <= Int(UInt16.max) else { return nil }
         return RemoteDisplaySize(
-            pixelWidth: UInt16(evenPixelWidth),
-            pixelHeight: UInt16(evenPixelHeight),
+            pixelWidth: UInt16(pixelWidth),
+            pixelHeight: UInt16(pixelHeight),
             pointWidth: UInt16(pointWidth),
             pointHeight: UInt16(pointHeight))
     }

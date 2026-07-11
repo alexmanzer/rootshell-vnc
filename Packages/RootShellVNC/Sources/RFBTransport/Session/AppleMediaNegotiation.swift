@@ -33,23 +33,17 @@ struct AppleMediaNegotiationGenerationTracker {
     }
 }
 
-/// Selects the portable Apple screen-video profile.
-///
-/// A one-tile stream is a conventional HEVC reference timeline accepted by
-/// public VideoToolbox on macOS, iOS, and iPadOS. Apple's four-tile stream
-/// requires subframe reference-picture remapping performed by its private VCP
-/// decoder. Keep that mode opt-in until the same semantics are reproduced with
-/// public APIs; advertising it without those semantics decodes one picture and
-/// then stalls on missing references.
+/// Selects Apple's native compound screen-video profile.
 public enum AppleMediaVideoMode {
+    public static var usesTiledHEVC: Bool { true }
+
+    @available(*, deprecated, renamed: "usesTiledHEVC")
     public static var usesExperimentalTiledHEVC: Bool {
-        ProcessInfo.processInfo.environment[
-            "ROOTSHELL_VNC_EXPERIMENTAL_TILED_HEVC"
-        ] == "1"
+        usesTiledHEVC
     }
 
     public static var negotiatedTilesPerFrame: UInt64 {
-        usesExperimentalTiledHEVC ? 4 : 1
+        2
     }
 }
 
@@ -69,8 +63,9 @@ struct AppleMediaNegotiationProfile: Sendable {
     private static let screenAccessNetworkType: UInt64 = 1
     private static let screenVideoTransportType: UInt64 = 1
 
-    /// Viceroy negotiates the minimum of the peers' values. The portable
-    /// default is one; four remains available for bounded diagnostics only.
+    /// Viceroy negotiates the minimum of the peers' values. Four matches the
+    /// native Screen Sharing profile and preserves full-resolution Retina
+    /// capture instead of downscaling into the one-tile encoder budget.
     static var publicDecoderTilesPerFrame: UInt64 {
         AppleMediaVideoMode.negotiatedTilesPerFrame
     }
@@ -147,18 +142,19 @@ struct AppleMediaNegotiationProfile: Sendable {
 
     let aspectRatio: AspectRatio
     let supportsHDR: Bool
+    let tilesPerFrame: UInt64
 
     init(
         framebufferWidth: UInt16,
         framebufferHeight: UInt16,
-        supportsHDR: Bool
+        supportsHDR: Bool,
+        tilesPerFrame: UInt64 = AppleMediaVideoMode.negotiatedTilesPerFrame
     ) {
-        // The dimensions are intentionally accepted as session context but do
-        // not rewrite the native codec capability pair.
-        _ = framebufferWidth
-        _ = framebufferHeight
         self.aspectRatio = .screenCodec
         self.supportsHDR = supportsHDR
+        self.tilesPerFrame = tilesPerFrame
+        _ = framebufferWidth
+        _ = framebufferHeight
     }
 
     /// Create an entire binary-plist negotiator offer. Every session-dependent
@@ -232,7 +228,7 @@ struct AppleMediaNegotiationProfile: Sendable {
         screen.message(field: 3, secondaryScreenPayload())
         screen.varint(
             field: 6,
-            Self.publicDecoderTilesPerFrame)  // tilesPerFrame
+            tilesPerFrame)  // tilesPerFrame
         screen.bool(field: 7, true)           // ltrpEnabled
         screen.varint(field: 8, 63)           // supported pixel-format bitmap
         screen.varint(field: 9, supportsHDR ? 9 : 1) // supported HDR-mode bitmap

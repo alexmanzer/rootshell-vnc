@@ -109,11 +109,10 @@ struct HEVCPresentationTimeline {
 
 /// Manages the accelerated HEVC video stream for high-performance VNC mode.
 ///
-/// Supports the portable one-tile Apple HEVC RTP mode and an opt-in diagnostic
-/// implementation of the native multi-tile transport. The latter round-robins
-/// a DON timeline across several SSRCs, but those sources are not independent
-/// public-VideoToolbox reference chains: Apple's private decoder remaps them
-/// with `NumberOfTiles`, `TileID`, and `TileOrder` metadata.
+/// Supports Apple's native multi-tile transport and the conventional one-tile
+/// fallback. Tiled mode round-robins one DON timeline across several SSRCs;
+/// those sources are one compound reference chain, so samples stay on a shared
+/// decoder and carry `NumberOfTiles`, `TileID`, and `TileOrder` metadata.
 public final class VideoStreamManager: @unchecked Sendable {
 
     /// Delivers a decoded frame and the source SSRC (which screen band it is).
@@ -125,6 +124,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var frameCallback: FrameCallback?
     private var _isActive: Bool = false
     private var usesDecodingOrderNumbers = true
+    private var numberOfTiles = 2
     private var streamID: UInt32 = 0
     private var streamGeneration: UInt64 = 0
     /// AVC negotiation generation inside the still-live RFB stream. Unlike
@@ -270,6 +270,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         width: Int,
         height: Int,
         usesDecodingOrderNumbers: Bool = true,
+        numberOfTiles: Int? = nil,
         frameCallback: @escaping FrameCallback
     ) {
         lock.lock()
@@ -279,6 +280,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         self.fullFrameWidth = width
         self.fullFrameHeight = height
         self.usesDecodingOrderNumbers = usesDecodingOrderNumbers
+        self.numberOfTiles = numberOfTiles ?? (usesDecodingOrderNumbers ? 2 : 1)
         self.frameCallback = frameCallback
         self.presentationTimeline.reset()
         self.submittedFrameCount = 0
@@ -321,7 +323,10 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// generation. The RFB connection, frame callback, geometry, feedback
     /// wiring, and liveness counters remain in place. Calling this on the
     /// session's serial media queue orders it before the new generation's RTP.
-    public func prepareForStreamReconfiguration(mediaGeneration: UInt64) {
+    public func prepareForStreamReconfiguration(
+        mediaGeneration: UInt64,
+        numberOfTiles: Int? = nil
+    ) {
         let retiredDecoder: HEVCDecoder?
 
         lock.lock()
@@ -333,12 +338,15 @@ public final class VideoStreamManager: @unchecked Sendable {
         }
 
         self.mediaGeneration = mediaGeneration
+        self.numberOfTiles = max(1, numberOfTiles ?? self.numberOfTiles)
+        self.usesDecodingOrderNumbers = self.numberOfTiles > 1
         retiredDecoder = decoder
         decoder = makeDecoder(
             streamGeneration: streamGeneration,
             mediaGeneration: mediaGeneration,
             frameCallback: callback)
-        demuxer.reset()
+        demuxer = RTPDemuxer(
+            usesDecodingOrderNumbers: self.usesDecodingOrderNumbers)
         presentationTimeline.reset()
         pendingVPS = nil
         pendingSPS = nil
@@ -453,6 +461,9 @@ public final class VideoStreamManager: @unchecked Sendable {
                 switch nalType {
                 case 32...40: continue
                 default:
+                    let tileMetadata = compoundTileMetadata(
+                        ssrc: accessUnit.ssrc,
+                        don: accessUnit.don)
                     // One DON is one band access unit. Preserve all of its VCL
                     // NALs/slices in a single VideoToolbox sample; submitting
                     // slices separately renders partial pictures.
@@ -472,12 +483,18 @@ public final class VideoStreamManager: @unchecked Sendable {
                         // Preserve it while the media queue rebuilds the public
                         // decoder instead of consuming the only recovery frame.
                         if isDecoderRecoveryPending {
-                            bufferEarlyVCL(nals: nalUnits, ssrc: accessUnit.ssrc)
+                            bufferEarlyVCL(
+                                nals: nalUnits,
+                                ssrc: accessUnit.ssrc,
+                                tileMetadata: tileMetadata)
                         }
                         continue
                     }
                     guard decoderRef.isReady else {
-                        bufferEarlyVCL(nals: nalUnits, ssrc: accessUnit.ssrc)
+                        bufferEarlyVCL(
+                            nals: nalUnits,
+                            ssrc: accessUnit.ssrc,
+                            tileMetadata: tileMetadata)
                         continue
                     }
                     let pts = CMTime(
@@ -486,7 +503,8 @@ public final class VideoStreamManager: @unchecked Sendable {
                     try decoderRef.decode(
                         nalUnits: nalUnits,
                         presentationTime: pts,
-                        frameTag: accessUnit.ssrc)
+                        frameTag: accessUnit.ssrc,
+                        tileMetadata: tileMetadata)
                     recordDecodeSubmission()
                     decodedCount += 1
                 }
@@ -726,13 +744,21 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// VCL NAL units that arrived before the decoder had its parameter sets
     /// (startup burst ordering). Drained the moment the format description is
     /// configured; bounded so a broken stream can't grow it unboundedly.
-    private var earlyVCLBuffer: [(nals: [Data], ssrc: UInt32)] = []
+    private var earlyVCLBuffer: [(
+        nals: [Data],
+        ssrc: UInt32,
+        tileMetadata: HEVCTileMetadata?
+    )] = []
 
-    private func bufferEarlyVCL(nals: [Data], ssrc: UInt32) {
+    private func bufferEarlyVCL(
+        nals: [Data],
+        ssrc: UInt32,
+        tileMetadata: HEVCTileMetadata?
+    ) {
         lock.lock()
         defer { lock.unlock() }
         if earlyVCLBuffer.count < 256 {
-            earlyVCLBuffer.append((nals, ssrc))
+            earlyVCLBuffer.append((nals, ssrc, tileMetadata))
         }
     }
 
@@ -966,7 +992,10 @@ public final class VideoStreamManager: @unchecked Sendable {
 
         for item in buffered {
             guard let decoderRef = decoderForSource(item.ssrc), decoderRef.isReady else {
-                bufferEarlyVCL(nals: item.nals, ssrc: item.ssrc)
+                bufferEarlyVCL(
+                    nals: item.nals,
+                    ssrc: item.ssrc,
+                    tileMetadata: item.tileMetadata)
                 continue
             }
             let pts = CMTime(
@@ -976,7 +1005,8 @@ public final class VideoStreamManager: @unchecked Sendable {
                 try decoderRef.decode(
                     nalUnits: item.nals,
                     presentationTime: pts,
-                    frameTag: item.ssrc)
+                    frameTag: item.ssrc,
+                    tileMetadata: item.tileMetadata)
                 recordDecodeSubmission()
             } catch {
                 log.warning("Failed to decode buffered startup frame: \(error.localizedDescription)")
@@ -1001,6 +1031,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     ) -> HEVCDecoder {
         let orderer = DecodedFrameOrderer(callback: frameCallback)
         return HEVCDecoder(
+            numberOfTiles: numberOfTiles,
             frameCallback: { [weak self] pixelBuffer, pts, frameTag in
                 guard self?.recordDecoderOutput(
                     streamGeneration: streamGeneration,
@@ -1019,6 +1050,31 @@ public final class VideoStreamManager: @unchecked Sendable {
                     status: status,
                     ssrc: frameTag)
             })
+    }
+
+    /// Build the compound-frame metadata Apple normally installs in its VCP
+    /// wrapper. SSRC order is the stable top-to-bottom band identity; DON is
+    /// global, so subtracting the band order yields the frame's decode base.
+    private func compoundTileMetadata(
+        ssrc: UInt32,
+        don: UInt16
+    ) -> HEVCTileMetadata? {
+        lock.lock()
+        guard usesDecodingOrderNumbers else {
+            lock.unlock()
+            return nil
+        }
+        let orderedSources = seenVideoSSRCs.sorted()
+        let tileIndex = orderedSources.firstIndex(of: ssrc)
+        lock.unlock()
+        guard let tileIndex else { return nil }
+
+        let tileID = UInt32(tileIndex)
+        let base = don &- UInt16(truncatingIfNeeded: tileIndex)
+        return HEVCTileMetadata(
+            tileID: tileID,
+            tileOrder: tileID,
+            decodingOrderBase: UInt32(base))
     }
 
     private func logMultiNALAccessUnitIfNeeded(don: UInt16, count: Int) {

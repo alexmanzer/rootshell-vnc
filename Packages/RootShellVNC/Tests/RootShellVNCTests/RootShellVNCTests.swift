@@ -3,7 +3,20 @@ import Foundation
 import CoreVideo
 @testable import RootShellVNC
 import RFBProtocol
-import RFBRendering
+@testable import RFBRendering
+
+final class HEVCTileMetadataTests: XCTestCase {
+    func testNativeVCPAttachmentKeysCarryCompoundFrameIdentity() {
+        let metadata = HEVCTileMetadata(
+            tileID: 2,
+            tileOrder: 2,
+            decodingOrderBase: 120)
+
+        XCTAssertEqual(metadata.sampleAttachments["TileID"], 2)
+        XCTAssertEqual(metadata.sampleAttachments["TileOrder"], 2)
+        XCTAssertEqual(metadata.sampleAttachments["decodingOrderBase"], 120)
+    }
+}
 
 final class StandardFramebufferPipelineTests: XCTestCase {
     func testProductionRendererPreservesZRLEStreamAcrossPresentedBatches() {
@@ -379,44 +392,64 @@ final class RemoteDisplaySizeTests: XCTestCase {
     func testPhoneViewportExpandsToUsableMacWorkspace() {
         XCTAssertEqual(
             RemoteDisplaySize.matching(
-                viewSize: CGSize(width: 852, height: 393),
-                displayScale: 2),
+                viewSize: CGSize(width: 852, height: 393)),
             RemoteDisplaySize(
-                pixelWidth: 2600,
+                pixelWidth: 2608,
                 pixelHeight: 1200,
-                pointWidth: 1301,
+                pointWidth: 1304,
                 pointHeight: 600))
     }
 
     func testIPadViewportProducesTwoTimesHiDPIFramebuffer() {
         XCTAssertEqual(
             RemoteDisplaySize.matching(
-                viewSize: CGSize(width: 1366, height: 1024),
-                displayScale: 2),
+                viewSize: CGSize(width: 1366, height: 1024)),
             RemoteDisplaySize(
-                pixelWidth: 2732,
+                pixelWidth: 2736,
                 pixelHeight: 2048,
-                pointWidth: 1366,
+                pointWidth: 1368,
                 pointHeight: 1024))
     }
 
-    func testScaleIsCappedAtTwoTimes() {
-        XCTAssertEqual(
-            RemoteDisplaySize.matching(
-                viewSize: CGSize(width: 1000, height: 700),
-                displayScale: 3),
-            RemoteDisplaySize(
-                pixelWidth: 2048,
-                pixelHeight: 1432,
-                pointWidth: 1024,
-                pointHeight: 717))
+    @MainActor
+    func testIPadMatchClientRemainsRetinaInEveryQualityMode() {
+        let expected = RemoteDisplaySize(
+            pixelWidth: 2736,
+            pixelHeight: 2048,
+            pointWidth: 1368,
+            pointHeight: 1024)
+
+        for qualityMode in VNCConfiguration.VideoQualityMode.allCases {
+            for reportedScale: CGFloat in [1, 1.5, 2, 3] {
+                let session = VNCSession(configuration: VNCConfiguration(
+                    videoQualityMode: qualityMode,
+                    displaySizingMode: .matchClient))
+                XCTAssertEqual(
+                    session.matchingClientDisplaySize(
+                        viewSize: CGSize(width: 1366, height: 1024),
+                        displayScale: reportedScale),
+                    expected,
+                    "Match Client should remain HiDPI in \(qualityMode) "
+                        + "when the window reports scale \(reportedScale)")
+            }
+        }
     }
 
-    func testLandscapeViewportFitsExactFourKServerLimit() {
+    func testSmallViewportUsesTwoTimesUsableWorkspace() {
         XCTAssertEqual(
             RemoteDisplaySize.matching(
-                viewSize: CGSize(width: 1920, height: 1080),
-                displayScale: 2),
+                viewSize: CGSize(width: 1000, height: 700)),
+            RemoteDisplaySize(
+                pixelWidth: 2048,
+                pixelHeight: 1440,
+                pointWidth: 1024,
+                pointHeight: 720))
+    }
+
+    func testFourKLandscapeViewportIsPreservedExactly() {
+        XCTAssertEqual(
+            RemoteDisplaySize.matching(
+                viewSize: CGSize(width: 1920, height: 1080)),
             RemoteDisplaySize(
                 pixelWidth: 3840,
                 pixelHeight: 2160,
@@ -424,25 +457,49 @@ final class RemoteDisplaySizeTests: XCTestCase {
                 pointHeight: 1080))
     }
 
-    func testPortraitViewportPreservesAspectInsideServerLimit() {
+    func testPortraitViewportIsNotReducedToLandscapeFourKBounds() {
         XCTAssertEqual(
             RemoteDisplaySize.matching(
-                viewSize: CGSize(width: 1024, height: 1366),
-                displayScale: 2),
+                viewSize: CGSize(width: 1024, height: 1366)),
             RemoteDisplaySize(
-                pixelWidth: 1618,
-                pixelHeight: 2160,
+                pixelWidth: 2048,
+                pixelHeight: 2736,
                 pointWidth: 1024,
-                pointHeight: 1366))
+                pointHeight: 1368))
+    }
+
+    func testArbitraryRetinaWindowShapesAlwaysUseExactTwoTimesBacking() throws {
+        let viewSizes = [
+            CGSize(width: 1197, height: 837),
+            CGSize(width: 1024, height: 1366),
+            CGSize(width: 2400, height: 1000),
+            CGSize(width: 744, height: 1133),
+        ]
+
+        for viewSize in viewSizes {
+            let size = try XCTUnwrap(RemoteDisplaySize.matching(
+                viewSize: viewSize))
+            XCTAssertEqual(size.pixelWidth, size.pointWidth * 2)
+            XCTAssertEqual(size.pixelHeight, size.pointHeight * 2)
+        }
+    }
+
+    func testClientViewportLargerThanFourKIsNotArtificiallyCapped() {
+        XCTAssertEqual(
+            RemoteDisplaySize.matching(
+                viewSize: CGSize(width: 2400, height: 1200)),
+            RemoteDisplaySize(
+                pixelWidth: 4800,
+                pixelHeight: 2400,
+                pointWidth: 2400,
+                pointHeight: 1200))
     }
 
     func testInvalidViewportIsIgnored() {
         XCTAssertNil(RemoteDisplaySize.matching(
-            viewSize: CGSize(width: 0, height: 1024),
-            displayScale: 2))
+            viewSize: CGSize(width: 0, height: 1024)))
         XCTAssertNil(RemoteDisplaySize.matching(
-            viewSize: CGSize(width: 1024, height: CGFloat.infinity),
-            displayScale: 2))
+            viewSize: CGSize(width: 1024, height: CGFloat.infinity)))
     }
 }
 
@@ -932,6 +989,31 @@ final class VNCConnectionStateTests: XCTestCase {
 // MARK: - Video Band Geometry Tests
 
 final class VideoBandGeometryTests: XCTestCase {
+
+    @MainActor
+    func testAcceptedMatchClientGeometryUpdatesSessionAndGPUAspectTogether() throws {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .adaptive,
+            displaySizingMode: .matchClient))
+        session.framebufferWidth = 2976
+        session.framebufferHeight = 1860
+        session.videoBandRenderer.setViewBounds(
+            CGRect(x: 0, y: 0, width: 1000, height: 1000))
+        session.videoBandRenderer.setScreenSize(width: 2976, height: 1860)
+        let requested = try XCTUnwrap(RemoteDisplaySize.matching(
+            viewSize: CGSize(width: 1024, height: 1366)))
+
+        session.applyRequestedRemoteDisplayGeometry(requested)
+
+        XCTAssertEqual(session.framebufferWidth, Int(requested.pixelWidth))
+        XCTAssertEqual(session.framebufferHeight, Int(requested.pixelHeight))
+        let frame = session.videoBandRenderer.containerLayer.frame
+        XCTAssertEqual(
+            frame.width / frame.height,
+            CGFloat(requested.pixelWidth) / CGFloat(requested.pixelHeight),
+            accuracy: 0.0001,
+            "The GUI must aspect-fit using the accepted Match Client geometry")
+    }
 
     @MainActor
     func testLiveScreenResizeRecomputesAspectFitContainer() {

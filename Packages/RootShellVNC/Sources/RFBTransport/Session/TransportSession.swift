@@ -89,7 +89,9 @@ public actor TransportSession {
     /// Ordered notification for a fresh AVC media generation. The app installs
     /// this beside the RTP sink so its decoder reset is queued before any RTP
     /// from the new keys/SSRC can overtake it.
-    private var appleMediaGenerationSink: (@Sendable (UInt64) -> Void)?
+    private var appleMediaGenerationSink: (@Sendable (UInt64, Int) -> Void)?
+    private var activeAppleMediaTilesPerFrame = Int(
+        AppleMediaVideoMode.negotiatedTilesPerFrame)
     /// Per-SSRC packet jitter buffer. UDP reordering is repaired here before an
     /// HEVC fragmentation unit reaches the decoder.
     private var appleMediaRTPReorderBuffer = AppleMediaRTPReorderBuffer()
@@ -256,6 +258,13 @@ public actor TransportSession {
     private var standardDesktopLayout: ExtendedDesktopSizePayload?
     private var pendingRemoteDisplaySize: PendingRemoteDisplaySize?
     private var lastSentRemoteDisplaySize: PendingRemoteDisplaySize?
+    private var appleVirtualDisplayMaximumPixelWidth: UInt32 = 3_840
+    private var appleVirtualDisplayMaximumPixelHeight: UInt32 = 3_840
+    /// A staged virtual-display replacement must wait until the initial Apple
+    /// media graph emits video. Message 2 only completes control negotiation;
+    /// replacing the display before the first RTP packet can retire the
+    /// physical capture graph before it has installed a source.
+    private var completedInitialAppleMediaNegotiation = false
     /// Non-wheel pointer buttons currently held, preserved across fallback
     /// wheel press/release pairs just like the native client.
     private var pointerButtonMask: UInt8 = 0
@@ -423,11 +432,15 @@ public actor TransportSession {
         appleMediaVideoSSRCChannels.count
     }
 
+    public var currentAppleMediaTilesPerFrame: Int {
+        activeAppleMediaTilesPerFrame
+    }
+
     /// Install the in-session media-generation boundary callback. This is
     /// separate from connection state: a display resize renegotiates AVC while
     /// the RFB session and its input/control channel remain alive.
     public func setAppleMediaGenerationSink(
-        _ sink: (@Sendable (UInt64) -> Void)?
+        _ sink: (@Sendable (UInt64, Int) -> Void)?
     ) {
         appleMediaGenerationSink = sink
     }
@@ -485,6 +498,13 @@ public actor TransportSession {
         pendingRemoteDisplaySize = requested
         if appleServerCapabilities?.supportsServerCommand(
             AppleServerCapabilities.displayConfigurationCommand) == true {
+            if requestAppleMediaStream,
+               !completedInitialAppleMediaNegotiation {
+                log.info(
+                    "Deferring staged virtual display \(pixelWidth)x\(pixelHeight) "
+                        + "until initial Apple media negotiation completes")
+                return .appleVirtualDisplay
+            }
             try await sendAppleVirtualDisplaySize(requested)
             return .appleVirtualDisplay
         }
@@ -732,6 +752,8 @@ public actor TransportSession {
 
         self.fbWidth = width
         self.fbHeight = height
+        let initialPixelArea = Int(width) * Int(height)
+        activeAppleMediaTilesPerFrame = initialPixelArea >= 5_000_000 ? 2 : 1
         self.pixelFormat = pf
 
         log.info("ServerInit: \(width)x\(height) '\(name)'")
@@ -742,7 +764,8 @@ public actor TransportSession {
         // prevents a constrained remote viewer from first receiving a physical
         // 5K reference frame and only resizing after the video path is already
         // congested.
-        if let pendingRemoteDisplaySize,
+        if !requestAppleMediaStream,
+           let pendingRemoteDisplaySize,
            appleServerCapabilities?.supportsServerCommand(
                AppleServerCapabilities.displayConfigurationCommand) == true {
             try await sendAppleVirtualDisplaySize(pendingRemoteDisplaySize)
@@ -1144,6 +1167,24 @@ public actor TransportSession {
         try await sendAppleEncryptedClientPayload(viewerInfo)
         sentAppleMediaPostAnswerViewerInfo = true
         log.debug("Sent Apple media post-answer viewer info length=\(viewerInfo.count)")
+
+    }
+
+    private func applyStagedVirtualDisplayAfterInitialVideo() async {
+        guard let pendingRemoteDisplaySize,
+              appleServerCapabilities?.supportsServerCommand(
+                AppleServerCapabilities.displayConfigurationCommand) == true else { return }
+        do {
+            log.info(
+                "Initial Apple video source live; applying staged virtual display "
+                    + "\(pendingRemoteDisplaySize.pixelWidth)x"
+                    + "\(pendingRemoteDisplaySize.pixelHeight)")
+            try await sendAppleVirtualDisplaySize(pendingRemoteDisplaySize)
+        } catch {
+            log.error(
+                "Could not apply staged virtual display after initial video: "
+                    + error.localizedDescription)
+        }
     }
 
     private func appleMediaPostAcceptEncodings() -> [Encoding] {
@@ -1286,16 +1327,45 @@ public actor TransportSession {
             pixelHeight: UInt32(requested.pixelHeight),
             pointWidth: UInt32(requested.pointWidth),
             pointHeight: UInt32(requested.pointHeight))
+        // These are capability maxima, not the active mode or an artificial
+        // resolution limit. Never shrink them during a live resize: doing so
+        // makes WindowServer re-evaluate the existing virtual display and can
+        // select a 1× fallback whose pixels equal the requested point size.
+        appleVirtualDisplayMaximumPixelWidth = max(
+            appleVirtualDisplayMaximumPixelWidth,
+            UInt32(requested.pixelWidth))
+        appleVirtualDisplayMaximumPixelHeight = max(
+            appleVirtualDisplayMaximumPixelHeight,
+            UInt32(requested.pixelHeight))
+        // Viceroy's virtual encoder emits multiple tiles only above its capture
+        // size threshold. Demanding them for a smaller Match Client window
+        // completes control negotiation but creates no RTP source at all.
+        let pixelArea = Int(requested.pixelWidth) * Int(requested.pixelHeight)
+        activeAppleMediaTilesPerFrame = pixelArea >= 5_000_000 ? 2 : 1
         let display = AppleVirtualDisplay(
             name: "Rootshell Virtual Display",
             widthInMillimeters: Float(requested.pointWidth) * millimetersPerPoint,
             heightInMillimeters: Float(requested.pointHeight) * millimetersPerPoint,
-            maximumPixelWidth: UInt32(requested.pixelWidth),
-            maximumPixelHeight: UInt32(requested.pixelHeight),
+            maximumPixelWidth: appleVirtualDisplayMaximumPixelWidth,
+            maximumPixelHeight: appleVirtualDisplayMaximumPixelHeight,
             modes: [mode])
         let message = ClientMessage.appleDisplayConfiguration(
             AppleDisplayConfiguration(displays: [display]))
-        try await sendClientPayload(message.serialize())
+        // The Apple media re-offer that follows command 29 is generated from
+        // these session dimensions. ServerInit is not repeated for a virtual
+        // display change, so retaining the physical framebuffer here would
+        // advertise decoder geometry for the retired capture source.
+        let previousWidth = fbWidth
+        let previousHeight = fbHeight
+        fbWidth = requested.pixelWidth
+        fbHeight = requested.pixelHeight
+        do {
+            try await sendClientPayload(message.serialize())
+        } catch {
+            fbWidth = previousWidth
+            fbHeight = previousHeight
+            throw error
+        }
         lastSentRemoteDisplaySize = requested
         pendingRemoteDisplaySize = nil
         log.info(
@@ -2445,7 +2515,8 @@ public actor TransportSession {
         let profile = AppleMediaNegotiationProfile(
             framebufferWidth: fbWidth,
             framebufferHeight: fbHeight,
-            supportsHDR: appleMediaSupportsHDR
+            supportsHDR: appleMediaSupportsHDR,
+            tilesPerFrame: UInt64(activeAppleMediaTilesPerFrame)
         )
         log.debug(
             "Generated Apple media \(mode == 8 ? "audio" : "screen") offer "
@@ -2594,7 +2665,9 @@ public actor TransportSession {
         if transition.isReconfiguration {
             log.info(
                 "Beginning in-session Apple media generation \(transition.generation)")
-            appleMediaGenerationSink?(transition.generation)
+            appleMediaGenerationSink?(
+                transition.generation,
+                activeAppleMediaTilesPerFrame)
         }
     }
 
@@ -3112,6 +3185,14 @@ public actor TransportSession {
         appleMediaVideoSSRCChannels[header.ssrc] = channel
         if isNew {
             log.info("First video RTP for ssrc=0x\(String(header.ssrc, radix: 16))")
+        }
+        let requiredInitialSources = activeAppleMediaTilesPerFrame
+        if !completedInitialAppleMediaNegotiation,
+           appleMediaVideoSSRCChannels.count >= requiredInitialSources {
+            completedInitialAppleMediaNegotiation = true
+            Task { [weak self] in
+                await self?.applyStagedVirtualDisplayAfterInitialVideo()
+            }
         }
 
         let processingNanos = DispatchTime.now().uptimeNanoseconds

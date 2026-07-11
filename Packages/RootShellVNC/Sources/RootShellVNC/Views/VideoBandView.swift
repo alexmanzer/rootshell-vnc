@@ -1,6 +1,7 @@
 import SwiftUI
 import CoreVideo
 import QuartzCore
+import RFBTransport
 
 /// GPU renderer for Apple's high-performance HEVC screen bands.
 ///
@@ -30,6 +31,19 @@ public final class VideoBandLayerRenderer {
     /// at half resolution on a Retina display (blurry, "compressed"); this must
     /// track the screen's scale.
     private var pixelScale: CGFloat = 2
+    private(set) var frameCommitCount: UInt64 = 0
+    private(set) var streamGenerationCount: UInt64 = 0
+    private(set) var lastCommitBandCount = 0
+    private(set) var partialCommitCount: UInt64 = 0
+    private var expectedBandCount = Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
+
+    var renderedBandCount: Int { bandBuffers.count }
+
+    var renderedBandDimensions: [(width: Int, height: Int)] {
+        bandBuffers.values.map {
+            (CVPixelBufferGetWidth($0), CVPixelBufferGetHeight($0))
+        }
+    }
 
     public init() {
         containerLayer.masksToBounds = true
@@ -51,6 +65,10 @@ public final class VideoBandLayerRenderer {
         layout()
     }
 
+    public func configureExpectedBandCount(_ count: Int) {
+        expectedBandCount = max(1, count)
+    }
+
     public func reset() {
         for layer in bandLayers.values { layer.removeFromSuperlayer() }
         bandLayers.removeAll()
@@ -59,7 +77,11 @@ public final class VideoBandLayerRenderer {
         replaceLayersOnNextFrame = false
     }
 
-    public func beginStreamGeneration() {
+    public func beginStreamGeneration(
+        expectedBandCount: Int = Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
+    ) {
+        streamGenerationCount &+= 1
+        self.expectedBandCount = expectedBandCount
         replaceLayersOnNextFrame = true
     }
 
@@ -69,6 +91,11 @@ public final class VideoBandLayerRenderer {
     /// boundary from timing or pixels.
     public func setBands(_ buffers: [UInt32: CVPixelBuffer]) {
         guard !buffers.isEmpty else { return }
+        frameCommitCount &+= 1
+        lastCommitBandCount = buffers.count
+        if buffers.count != expectedBandCount {
+            partialCommitCount &+= 1
+        }
         var needsLayout = false
 
         CATransaction.begin()

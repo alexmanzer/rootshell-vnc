@@ -35,6 +35,29 @@ public enum HEVCDecoderError: Error, Sendable, LocalizedError {
     }
 }
 
+/// Metadata that identifies one band inside Apple's compound HEVC screen
+/// frame. The private VCP wrapper supplies these same keys before handing a
+/// sample to the underlying VideoToolbox decoder.
+public struct HEVCTileMetadata: Sendable, Equatable {
+    public let tileID: UInt32
+    public let tileOrder: UInt32
+    public let decodingOrderBase: UInt32
+
+    public init(tileID: UInt32, tileOrder: UInt32, decodingOrderBase: UInt32) {
+        self.tileID = tileID
+        self.tileOrder = tileOrder
+        self.decodingOrderBase = decodingOrderBase
+    }
+
+    var sampleAttachments: [String: NSNumber] {
+        [
+            "TileID": NSNumber(value: tileID),
+            "TileOrder": NSNumber(value: tileOrder),
+            "decodingOrderBase": NSNumber(value: decodingOrderBase),
+        ]
+    }
+}
+
 /// Decodes HEVC (H.265) NAL units using VideoToolbox hardware decoder.
 public final class HEVCDecoder: @unchecked Sendable {
 
@@ -57,15 +80,18 @@ public final class HEVCDecoder: @unchecked Sendable {
 
     private var decompressionSession: VTDecompressionSession?
     private var formatDescription: CMFormatDescription?
+    private let numberOfTiles: Int
     private let lock = NSLock()
     private var callbackStorage: UnsafeMutablePointer<CallbackBundle>?
 
     // MARK: - Init
 
     public init(
+        numberOfTiles: Int = 1,
         frameCallback: @escaping FrameCallback,
         failureCallback: FailureCallback? = nil
     ) {
+        self.numberOfTiles = max(1, numberOfTiles)
         // Allocate the callback trampoline storage once and keep it alive for
         // the decoder's whole lifetime. VideoToolbox may invoke the output
         // callback asynchronously *after* a session is invalidated (e.g. when a
@@ -228,10 +254,13 @@ public final class HEVCDecoder: @unchecked Sendable {
         outputCallback.decompressionOutputRefCon = callbackStorage.map(UnsafeMutableRawPointer.init)
 
         var session: VTDecompressionSession?
+        let decoderSpecification: CFDictionary? = numberOfTiles > 1
+            ? ["NumberOfTiles": numberOfTiles] as CFDictionary
+            : nil
         let status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             formatDescription: formatDesc,
-            decoderSpecification: nil,
+            decoderSpecification: decoderSpecification,
             imageBufferAttributes: pixelBufferAttributes as CFDictionary,
             outputCallback: &outputCallback,
             decompressionSessionOut: &session
@@ -280,14 +309,28 @@ public final class HEVCDecoder: @unchecked Sendable {
     /// Feed a complete HEVC NAL unit for decoding.
     /// The NAL unit should NOT include the start code prefix (0x00000001).
     /// The decoder will call frameCallback on its internal thread when a frame is ready.
-    public func decode(nalUnit: Data, presentationTime: CMTime, frameTag: UInt32 = 0) throws {
-        try decode(nalUnits: [nalUnit], presentationTime: presentationTime, frameTag: frameTag)
+    public func decode(
+        nalUnit: Data,
+        presentationTime: CMTime,
+        frameTag: UInt32 = 0,
+        tileMetadata: HEVCTileMetadata? = nil
+    ) throws {
+        try decode(
+            nalUnits: [nalUnit],
+            presentationTime: presentationTime,
+            frameTag: frameTag,
+            tileMetadata: tileMetadata)
     }
 
     /// Feed a complete HEVC access unit for decoding. `frameTag` is handed back
     /// verbatim in the frame callback (we use it to carry the source SSRC).
     /// Each NAL unit should NOT include a start code prefix.
-    public func decode(nalUnits: [Data], presentationTime: CMTime, frameTag: UInt32 = 0) throws {
+    public func decode(
+        nalUnits: [Data],
+        presentationTime: CMTime,
+        frameTag: UInt32 = 0,
+        tileMetadata: HEVCTileMetadata? = nil
+    ) throws {
         lock.lock()
         defer { lock.unlock() }
 
@@ -373,6 +416,16 @@ public final class HEVCDecoder: @unchecked Sendable {
 
         guard status == noErr, let sample = sampleBuffer else {
             throw HEVCDecoderError.sampleBufferCreationFailed(status)
+        }
+
+        if let tileMetadata {
+            for (key, value) in tileMetadata.sampleAttachments {
+                CMSetAttachment(
+                    sample,
+                    key: key as CFString,
+                    value: value,
+                    attachmentMode: kCMAttachmentMode_ShouldPropagate)
+            }
         }
 
         // Decode

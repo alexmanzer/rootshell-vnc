@@ -1,36 +1,38 @@
 import XCTest
 @testable import RootShellVNC
 
-final class LatestBandFrameAccumulatorTests: XCTestCase {
-    func testActiveBandDoesNotWaitForStaticBands() {
-        var accumulator = LatestBandFrameAccumulator<String>()
+final class AtomicBandFrameAccumulatorTests: XCTestCase {
+    func testDoesNotPublishPartialCompoundFrame() {
+        var accumulator = AtomicBandFrameAccumulator<String>(expectedSourceCount: 2)
 
         accumulator.submit(source: 10, value: "top")
-        let frame = accumulator.takeAll()
-
-        XCTAssertEqual(frame, [10: "top"])
+        XCTAssertNil(accumulator.takeCompleteFrame())
+        accumulator.submit(source: 11, value: "bottom")
+        XCTAssertEqual(accumulator.takeCompleteFrame(), [10: "top", 11: "bottom"])
     }
 
     func testNewestBandSupersedesOlderValueBeforeDrain() {
-        var accumulator = LatestBandFrameAccumulator<Int>()
+        var accumulator = AtomicBandFrameAccumulator<Int>(expectedSourceCount: 2)
 
         accumulator.submit(source: 1, value: 1)
         accumulator.submit(source: 1, value: 2)
         accumulator.submit(source: 2, value: 3)
-        let frame = accumulator.takeAll()
+        let frame = accumulator.takeCompleteFrame()
 
-        XCTAssertEqual(frame[1], 2)
-        XCTAssertEqual(frame[2], 3)
+        XCTAssertEqual(frame?[1], 2)
+        XCTAssertEqual(frame?[2], 3)
     }
 
-    func testDrainClearsOnlyPreviouslyStagedValues() {
-        var accumulator = LatestBandFrameAccumulator<Int>()
+    func testStaticBandIsRetainedInNextAtomicSnapshot() {
+        var accumulator = AtomicBandFrameAccumulator<Int>(expectedSourceCount: 2)
 
         accumulator.submit(source: 1, value: 1)
-        XCTAssertEqual(accumulator.takeAll(), [1: 1])
-        XCTAssertTrue(accumulator.takeAll().isEmpty)
-
+        XCTAssertNil(accumulator.takeCompleteFrame())
         accumulator.submit(source: 2, value: 2)
-        XCTAssertEqual(accumulator.takeAll(), [2: 2])
+        XCTAssertEqual(accumulator.takeCompleteFrame(), [1: 1, 2: 2])
+        XCTAssertNil(accumulator.takeCompleteFrame())
+
+        accumulator.submit(source: 2, value: 3)
+        XCTAssertEqual(accumulator.takeCompleteFrame(), [1: 1, 2: 3])
     }
 }

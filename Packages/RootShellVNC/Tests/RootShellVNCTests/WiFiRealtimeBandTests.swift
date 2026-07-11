@@ -8,6 +8,7 @@ import AppKit
 import RFBProtocol
 @testable import RFBTransport
 @testable import RFBRendering
+@testable import RootShellVNC
 
 /// Connects to a live server over the network and runs the REAL-TIME media
 /// pipeline exactly like the app (transport → RTP sink → VideoStreamManager →
@@ -18,6 +19,69 @@ import RFBProtocol
 ///   VNC_TEST_HOST=192.168.46.111 VNC_TEST_USERNAME=kknox VNC_TEST_PASSWORD='...' \
 ///   swift test --filter WiFiRealtimeBandTests
 final class WiFiRealtimeBandTests: XCTestCase {
+
+    @MainActor
+    func testMatchClientRetinaSurvivesArbitraryLiveResizes() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let host = env["VNC_TEST_HOST"], !host.isEmpty,
+              let pass = env["VNC_TEST_PASSWORD"], !pass.isEmpty else {
+            throw XCTSkip("Set VNC_TEST_HOST and VNC_TEST_PASSWORD")
+        }
+        let credentials = VNCCredentials(
+            host: host,
+            port: UInt16(env["VNC_TEST_PORT"] ?? "5900") ?? 5900,
+            password: pass,
+            username: env["VNC_TEST_USERNAME"])
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .adaptive,
+            displaySizingMode: .matchClient,
+            enableRemoteAudio: false))
+        let viewSizes = [
+            CGSize(width: 1197, height: 837),
+            CGSize(width: 1283, height: 779),
+            CGSize(width: 1024, height: 1366),
+        ]
+
+        session.updateRemoteDisplaySize(viewSize: viewSizes[0], displayScale: 2)
+        try await session.connect(credentials: credentials)
+        defer { session.disconnect() }
+
+        try await waitForRenderedBands(
+            session,
+            expectedSize: try XCTUnwrap(
+                RemoteDisplaySize.matching(viewSize: viewSizes[0])),
+            expectedBandCount: expectedBandCount(for: viewSizes[0]),
+            afterCommit: 0,
+            timeoutSeconds: 15)
+        XCTAssertTrue(session.isHighPerformanceMode)
+        XCTAssertEqual(
+            session.videoBandRenderer.renderedBandCount,
+            expectedBandCount(for: viewSizes[0]))
+        try await assertContinuesAtomicRendering(
+            session,
+            expectedBandCount: expectedBandCount(for: viewSizes[0]))
+
+        for viewSize in viewSizes.dropFirst() {
+            let priorCommit = session.videoBandRenderer.frameCommitCount
+            let priorGeneration = session.videoBandRenderer.streamGenerationCount
+            session.updateRemoteDisplaySize(viewSize: viewSize, displayScale: 2)
+            try await waitForRenderedBands(
+                session,
+                expectedSize: try XCTUnwrap(
+                    RemoteDisplaySize.matching(viewSize: viewSize)),
+                expectedBandCount: expectedBandCount(for: viewSize),
+                afterCommit: priorCommit,
+                afterGeneration: priorGeneration,
+                timeoutSeconds: 15)
+            XCTAssertEqual(
+                session.videoBandRenderer.renderedBandCount,
+                expectedBandCount(for: viewSize),
+                "Match Client resize to \(viewSize) must render its negotiated Retina tiles")
+            try await assertContinuesAtomicRendering(
+                session,
+                expectedBandCount: expectedBandCount(for: viewSize))
+        }
+    }
 
     func testRealtimeBandHealthOverNetwork() async throws {
         let env = ProcessInfo.processInfo.environment
@@ -36,6 +100,14 @@ final class WiFiRealtimeBandTests: XCTestCase {
         let manager = VideoStreamManager()
         let stats = BandStats()
 
+        if env["VNC_TEST_MATCH_CLIENT"] == "1" {
+            _ = try await session.requestRemoteDisplaySize(
+                pixelWidth: 2400,
+                pixelHeight: 1680,
+                pointWidth: 1200,
+                pointHeight: 840)
+        }
+
         // Optionally dump live-decoded frames over time to see drift accumulate.
         let frameOutDir = env["ROOTSHELL_VNC_FRAME_OUT_DIR"]
         if let d = frameOutDir { try? FileManager.default.createDirectory(atPath: d, withIntermediateDirectories: true) }
@@ -44,6 +116,14 @@ final class WiFiRealtimeBandTests: XCTestCase {
 
         let eventTask = Task {
             for await event in session.events {
+                if env["VNC_TEST_MATCH_CLIENT"] == "1" {
+                    switch event {
+                    case .appleMediaRTPPacket, .udpDatagram, .framebufferUpdate:
+                        break
+                    default:
+                        print("MATCH CLIENT EVENT: \(event)")
+                    }
+                }
                 if case .mediaStreamOffer = event {
                     manager.startStream(streamID: 1, width: 2976, height: 1860) { pixelBuffer, ssrc in
                         stats.record(ssrc: ssrc, green: isGreen(pixelBuffer))
@@ -68,7 +148,7 @@ final class WiFiRealtimeBandTests: XCTestCase {
             }
         }
 
-        try? await session.connect()
+        try await session.connect()
         let waitSeconds = Double(env["VNC_TEST_WAIT_SECONDS"] ?? "8") ?? 8
         try await Task.sleep(for: .seconds(waitSeconds))
         eventTask.cancel()
@@ -76,7 +156,76 @@ final class WiFiRealtimeBandTests: XCTestCase {
         manager.stopStream()
         try await Task.sleep(for: .seconds(0.3))
 
-        stats.report()
+        let snapshot = stats.report()
+        let progress = manager.decodeProgress
+        print(
+            "decode submissions=\(progress.submittedFrameCount) "
+                + "outputs=\(progress.decoderOutputCount) "
+                + "videoSources=\(await session.videoSourceCount) "
+                + "loss=\(manager.lossStatsSnapshot)")
+        XCTAssertGreaterThan(
+            snapshot.totalFrames,
+            0,
+            "The live Adaptive pipeline must decode at least one video frame")
+    }
+
+    @MainActor
+    private func waitForRenderedBands(
+        _ session: VNCSession,
+        expectedSize: RemoteDisplaySize,
+        expectedBandCount: Int,
+        afterCommit: UInt64,
+        afterGeneration: UInt64? = nil,
+        timeoutSeconds: Double
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if session.videoBandRenderer.frameCommitCount > afterCommit,
+               afterGeneration.map({
+                   session.videoBandRenderer.streamGenerationCount > $0
+               }) ?? true,
+               session.videoBandRenderer.renderedBandCount == expectedBandCount,
+               session.framebufferWidth == Int(expectedSize.pixelWidth),
+               session.framebufferHeight == Int(expectedSize.pixelHeight),
+               session.videoBandRenderer.renderedBandDimensions.allSatisfy({
+                   $0.width == Int(expectedSize.pixelWidth)
+               }) {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        XCTFail(
+            "Timed out waiting for Match Client tiles; commits="
+                + "\(session.videoBandRenderer.frameCommitCount) bands="
+                + "\(session.videoBandRenderer.renderedBandCount) generations="
+                + "\(session.videoBandRenderer.streamGenerationCount) media="
+                + "\(session.liveMediaDebugSnapshot) dims="
+                + "\(session.videoBandRenderer.renderedBandDimensions)")
+    }
+
+    @MainActor
+    private func assertContinuesAtomicRendering(
+        _ session: VNCSession,
+        expectedBandCount: Int
+    ) async throws {
+        let priorCommit = session.videoBandRenderer.frameCommitCount
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertGreaterThan(
+            session.videoBandRenderer.frameCommitCount,
+            priorCommit,
+            "Match Client tiles must continue rendering after the first image")
+        XCTAssertEqual(
+            session.videoBandRenderer.lastCommitBandCount,
+            expectedBandCount)
+        XCTAssertEqual(
+            session.videoBandRenderer.partialCommitCount,
+            0,
+            "The Metal/Core Animation handoff must never publish a partial tile set")
+    }
+
+    private func expectedBandCount(for viewSize: CGSize) -> Int {
+        guard let size = RemoteDisplaySize.matching(viewSize: viewSize) else { return 1 }
+        return Int(size.pixelWidth) * Int(size.pixelHeight) >= 5_000_000 ? 2 : 1
     }
 
     private final class BandStats: @unchecked Sendable {
@@ -96,7 +245,7 @@ final class WiFiRealtimeBandTests: XCTestCase {
             total[ssrc, default: 0] += 1
             if isG { green[ssrc, default: 0] += 1 }
         }
-        func report() {
+        func report() -> (totalFrames: Int, greenFrames: Int) {
             lock.lock(); defer { lock.unlock() }
             print("=== REALTIME BAND HEALTH ===")
             print("distinct bands (SSRCs) that produced frames: \(total.count)")
@@ -108,6 +257,7 @@ final class WiFiRealtimeBandTests: XCTestCase {
             let allGreen = green.values.reduce(0, +)
             let allTotal = total.values.reduce(0, +)
             print("TOTAL frames=\(allTotal) green=\(allGreen)")
+            return (allTotal, allGreen)
         }
     }
 }

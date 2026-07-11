@@ -377,20 +377,21 @@ public final class VNCSession {
     /// Debounce viewport/rotation changes and request a matching remote display
     /// when the user selected Match Client. The transport capability-gates both
     /// Apple's virtual-display command and standard RFB SetDesktopSize.
+    func matchingClientDisplaySize(
+        viewSize: CGSize,
+        displayScale _: CGFloat
+    ) -> RemoteDisplaySize? {
+        guard configuration.displaySizingMode == .matchClient else { return nil }
+        return RemoteDisplaySize.matching(viewSize: viewSize)
+    }
+
     public func updateRemoteDisplaySize(
         viewSize: CGSize,
         displayScale: CGFloat
     ) {
-        guard configuration.displaySizingMode == .matchClient,
-              let requested = RemoteDisplaySize.matching(
-                viewSize: viewSize,
-                // Standard RFB must software-decode and snapshot every changed
-                // pixel. A 2× backing store quadruples that work and provides
-                // little benefit once the desktop is scaled into the client
-                // view, so keep the logical workspace but render it at 1×.
-                displayScale: configuration.videoQualityMode == .standard
-                    ? 1
-                    : displayScale) else { return }
+        guard let requested = matchingClientDisplaySize(
+            viewSize: viewSize,
+            displayScale: displayScale) else { return }
 
         // ConnectionView supplies the viewport before connecting; the remote
         // desktop view keeps it current for window changes and device rotation.
@@ -404,7 +405,7 @@ public final class VNCSession {
         remoteDisplayResizeTask?.cancel()
         remoteDisplayResizeTask = Task { [weak self, weak transport] in
             do {
-                try await Task.sleep(for: .milliseconds(300))
+                try await Task.sleep(for: .milliseconds(120))
                 try Task.checkCancellation()
                 guard let self,
                       let transport,
@@ -416,6 +417,14 @@ public final class VNCSession {
                     pixelHeight: requested.pixelHeight,
                     pointWidth: requested.pointWidth,
                     pointHeight: requested.pointHeight)
+                // Command 29 does not reliably produce an RFB DesktopSize
+                // rectangle, and a tiled HEVC SPS describes one band rather
+                // than the complete desktop. Apply the accepted virtual mode
+                // to every GUI geometry consumer immediately; otherwise the
+                // new pixels are aspect-fitted and hit-tested with stale bounds.
+                if disposition == .appleVirtualDisplay {
+                    self.applyRequestedRemoteDisplayGeometry(requested)
+                }
                 self.logger.info(
                     "Client-sized display \(requested.pixelWidth)x"
                         + "\(requested.pixelHeight): \(String(describing: disposition))")
@@ -442,6 +451,15 @@ public final class VNCSession {
     public func getDiagnostics() -> ConnectionDiagnostics {
         diagnostics
     }
+
+    #if DEBUG
+    var liveMediaDebugSnapshot: (submitted: UInt64, outputs: UInt64) {
+        let progress = videoStreamManager?.decodeProgress
+        return (
+            progress?.submittedFrameCount ?? 0,
+            progress?.decoderOutputCount ?? 0)
+    }
+    #endif
 
     // MARK: - Private: Event Processing
 
@@ -668,6 +686,12 @@ public final class VNCSession {
         }
     }
 
+    func applyRequestedRemoteDisplayGeometry(_ requested: RemoteDisplaySize) {
+        applyDesktopResizeMetadata(
+            width: requested.pixelWidth,
+            height: requested.pixelHeight)
+    }
+
     /// Apply the full-frame dimensions carried by the one-tile HEVC format.
     /// Apple's resize path can renegotiate AVC without emitting DesktopSize,
     /// so the public codec format is authoritative for both display layout and
@@ -861,7 +885,10 @@ public final class VNCSession {
 
         let width = framebufferWidth > 0 ? framebufferWidth : Int(offer.width)
         let height = framebufferHeight > 0 ? framebufferHeight : Int(offer.height)
+        let initialTileCount = await transportSession?.currentAppleMediaTilesPerFrame
+            ?? Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
         videoBandRenderer.setScreenSize(width: width, height: height)
+        videoBandRenderer.configureExpectedBandCount(initialTileCount)
 
         let renderer = videoBandRenderer
         // Coalesced main-thread delivery. A Task per decoded frame has no FIFO
@@ -870,7 +897,9 @@ public final class VNCSession {
         // across bands. Instead: stage the newest buffer per band under a lock
         // and drain all staged bands in ONE main-queue hop (FIFO by definition);
         // under main-thread load intermediate frames are simply superseded.
-        let coalescer = BandFrameCoalescer(renderer: renderer)
+        let coalescer = BandFrameCoalescer(
+            renderer: renderer,
+            expectedSourceCount: initialTileCount)
         // Diagnostic tap: with ROOTSHELL_VNC_FRAME_OUT_DIR set, periodically
         // save the EXACT decoded buffers handed to the renderer, so decode
         // output and on-screen result can be compared for the same session.
@@ -895,12 +924,12 @@ public final class VNCSession {
             streamID: offer.streamID,
             width: width,
             height: height,
-            // Match the offer generated by RFBTransport. The public default is
-            // a conventional one-tile stream without DONL; the four-tile path
-            // is an explicit diagnostic experiment until its reference-picture
-            // remapping is reproduced portably.
+            // Match the initial tiled offer generated by RFBTransport. DON
+            // restores the compound frame's global decode order; later media
+            // generations can switch between one and multiple tiles.
             usesDecodingOrderNumbers:
-                AppleMediaVideoMode.usesExperimentalTiledHEVC,
+                initialTileCount > 1,
+            numberOfTiles: initialTileCount,
             frameCallback: callback
         )
 
@@ -1078,11 +1107,14 @@ public final class VNCSession {
             let sinkManager = manager // VideoStreamManager is Sendable
             let sinkAudioPlayer = remoteAudioPlayer
             let generationCoalescer = coalescer
-            await transport.setAppleMediaGenerationSink { generation in
+            await transport.setAppleMediaGenerationSink { generation, numberOfTiles in
                 queue.async {
                     sinkManager.prepareForStreamReconfiguration(
-                        mediaGeneration: generation)
-                    generationCoalescer.beginStreamGeneration(generation)
+                        mediaGeneration: generation,
+                        numberOfTiles: numberOfTiles)
+                    generationCoalescer.beginStreamGeneration(
+                        generation,
+                        expectedSourceCount: numberOfTiles)
                 }
                 // A media generation installs fresh SRTP keys for audio as
                 // well as video. Reset once at that real codec boundary; the
@@ -1294,21 +1326,36 @@ struct DecodeOutputStallDetector {
     }
 }
 
-/// Accumulates the newest decoded value for every source since the last display
-/// drain. Screen bands are independent dirty-region streams: a static band can
-/// legitimately emit fewer frames than a busy band, so no all-band barrier is
-/// valid here.
-struct LatestBandFrameAccumulator<Value> {
-    private var staged: [UInt32: Value] = [:]
+/// Retains a complete compound HEVC surface set. Apple change-gates individual
+/// tiles, so a static tile need not emit alongside a dirty tile; every publish
+/// nevertheless contains the latest surface for every tile and is applied
+/// by the renderer in one transaction.
+struct AtomicBandFrameAccumulator<Value> {
+    let expectedSourceCount: Int
+    private var sources: Set<UInt32> = []
+    private var latest: [UInt32: Value] = [:]
+    private var hasPendingUpdate = false
 
-    mutating func submit(source: UInt32, value: Value) {
-        staged[source] = value
+    init(expectedSourceCount: Int) {
+        self.expectedSourceCount = expectedSourceCount
     }
 
-    mutating func takeAll() -> [UInt32: Value] {
-        let latest = staged
-        staged.removeAll(keepingCapacity: true)
-        return latest
+    mutating func submit(source: UInt32, value: Value) {
+        sources.insert(source)
+        latest[source] = value
+        hasPendingUpdate = true
+    }
+
+    var hasCompleteFrame: Bool {
+        sources.count == expectedSourceCount
+            && sources.allSatisfy { latest[$0] != nil }
+            && hasPendingUpdate
+    }
+
+    mutating func takeCompleteFrame() -> [UInt32: Value]? {
+        guard hasCompleteFrame else { return nil }
+        hasPendingUpdate = false
+        return latest.filter { sources.contains($0.key) }
     }
 }
 
@@ -1318,29 +1365,40 @@ struct LatestBandFrameAccumulator<Value> {
 /// fall behind the decoder.
 final class BandFrameCoalescer: @unchecked Sendable {
     private let lock = NSLock()
-    private var accumulator = LatestBandFrameAccumulator<CVPixelBuffer>()
+    private var accumulator = AtomicBandFrameAccumulator<CVPixelBuffer>(
+        expectedSourceCount: Int(AppleMediaVideoMode.negotiatedTilesPerFrame))
     private var hopScheduled = false
     private var streamGeneration: UInt64 = 0
     private let renderer: VideoBandLayerRenderer
 
-    init(renderer: VideoBandLayerRenderer) {
+    init(
+        renderer: VideoBandLayerRenderer,
+        expectedSourceCount: Int = Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
+    ) {
         self.renderer = renderer
+        accumulator = AtomicBandFrameAccumulator(
+            expectedSourceCount: expectedSourceCount)
     }
 
     /// Drop decoded values staged from the retired media generation and queue
     /// the visual handoff before any subsequently submitted frame can queue its
     /// own main-thread hop. The renderer keeps showing its last committed
     /// surfaces until that first replacement frame exists.
-    func beginStreamGeneration(_ generation: UInt64) {
+    func beginStreamGeneration(
+        _ generation: UInt64,
+        expectedSourceCount: Int
+    ) {
         lock.lock()
         streamGeneration = generation
-        accumulator = LatestBandFrameAccumulator()
+        accumulator = AtomicBandFrameAccumulator<CVPixelBuffer>(
+            expectedSourceCount: expectedSourceCount)
         hopScheduled = false
         lock.unlock()
 
         DispatchQueue.main.async { [renderer] in
             MainActor.assumeIsolated {
-                renderer.beginStreamGeneration()
+                renderer.beginStreamGeneration(
+                    expectedBandCount: expectedSourceCount)
             }
         }
     }
@@ -1348,7 +1406,7 @@ final class BandFrameCoalescer: @unchecked Sendable {
     func submit(ssrc: UInt32, pixelBuffer: CVPixelBuffer) {
         lock.lock()
         accumulator.submit(source: ssrc, value: pixelBuffer)
-        let shouldScheduleHop = !hopScheduled
+        let shouldScheduleHop = accumulator.hasCompleteFrame && !hopScheduled
         let generation = streamGeneration
         if shouldScheduleHop { hopScheduled = true }
         lock.unlock()
@@ -1366,10 +1424,10 @@ final class BandFrameCoalescer: @unchecked Sendable {
                 lock.unlock()
                 return
             }
-            let frames = accumulator.takeAll()
+            let frames = accumulator.takeCompleteFrame()
             hopScheduled = false
             lock.unlock()
-            guard !frames.isEmpty else { return }
+            guard let frames, !frames.isEmpty else { return }
             MainActor.assumeIsolated {
                 renderer.setBands(frames)
             }
