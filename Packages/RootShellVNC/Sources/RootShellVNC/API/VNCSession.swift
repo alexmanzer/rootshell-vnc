@@ -491,11 +491,9 @@ public final class VNCSession {
             handleServerInit(serverInit)
 
         case .framebufferUpdate(let rects):
-            // The transport pipelines the next incremental request at
-            // wire-read time; decoding here and returning the credit below
-            // is the only backpressure. No artificial pacing: on slow links
-            // the cadence is network-bound, on fast links the server's own
-            // change detection paces delivery.
+            // Returning the credit below requests the next incremental frame.
+            // Keeping one update in flight prevents stale reference frames
+            // from queueing while decode/presentation is busy.
             await handleFramebufferUpdate(rects)
 
             do {

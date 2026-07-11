@@ -30,6 +30,17 @@ public final class RFBZlibStreamInflater: @unchecked Sendable {
         }
     }
 
+    /// Reset the persistent dictionary at an encoding-defined stream boundary.
+    /// Tight carries four independent zlib streams and signals resets in the
+    /// low nibble of each rectangle's compression-control byte.
+    public func reset() throws {
+        let status = inflateReset(&stream)
+        guard status == Z_OK else {
+            throw VNCProtocolError.protocolViolation(
+                "Failed to reset zlib inflater (status \(status))")
+        }
+    }
+
     /// Inflate one rectangle's compressed bytes while preserving the stream
     /// dictionary for the next rectangle.
     public func decompress(_ input: Data, maxOutputSize: Int) throws -> Data {

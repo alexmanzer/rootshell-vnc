@@ -53,6 +53,20 @@ final class StandardFramebufferPipelineTests: XCTestCase {
             ]))
     }
 
+    func testAppleControlRectanglesDoNotBecomeRenderingIssues() {
+        let renderer = FramebufferRenderer(
+            framebuffer: Framebuffer(
+                width: 1, height: 1, pixelFormat: .bgra8888),
+            pixelFormat: .bgra8888)
+        let rectangles = [1100, 1101, 1104, 1105].map { value in
+            (FramebufferRect(
+                x: 0, y: 0, width: 0, height: 0,
+                encoding: .unknown(Int32(value))), Data())
+        }
+
+        XCTAssertTrue(renderer.applyBatch(rectangles, snapshot: false).issues.isEmpty)
+    }
+
     private func wirePayload(_ compressed: Data) -> Data {
         let count = UInt32(compressed.count)
         var result = Data([
@@ -227,13 +241,32 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(effective.contains(.zrle))
     }
 
-    func testStandardUsesBestImplementedPortableEncodingProfile() {
+    func testStandardUsesAppleDCTWithPortableFallbackProfile() {
         let config = VNCConfiguration(videoQualityMode: .standard)
         let effective = config.effectiveEncodings
         XCTAssertFalse(effective.contains(.appleH264))
-        XCTAssertFalse(effective.contains(.appleMultiVariantScreenshare))
+        XCTAssertTrue(effective.contains(.appleMultiVariantScreenshare))
         XCTAssertFalse(effective.contains(.mediaStreamOffer))
-        XCTAssertEqual(Array(effective.prefix(4)), [.copyRect, .zrle, .zlib, .raw])
+        XCTAssertEqual(
+            Array(effective.prefix(12)),
+            [
+                .appleMultiVariantScreenshare, .tight, .unknown(-224),
+                .zrle, .zlib, .copyRect,
+                .unknown(1105), .unknown(1101), .unknown(1100), .unknown(1104),
+                .raw, .unknown(-23),
+            ])
+    }
+
+    func testStandardDefaultsToFullColor() {
+        let config = VNCConfiguration(videoQualityMode: .standard)
+        XCTAssertEqual(config.effectivePixelFormat, .bgra8888)
+    }
+
+    func testStandardAllowsExplicitThousandsOfColorsOverride() {
+        let config = VNCConfiguration(
+            preferredPixelFormat: .rgb555,
+            videoQualityMode: .standard)
+        XCTAssertEqual(config.effectivePixelFormat, .rgb555)
     }
 
     func testQualityModesExposeGUILabels() {
@@ -273,6 +306,185 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(
             VNCConfiguration.DisplaySizingMode.matchClient.title,
             "Match Client")
+    }
+}
+
+final class AppleAdaptiveDCTDecoderTests: XCTestCase {
+    func testCommandRunLengthGrammar() throws {
+        // 0 => 1, 1+0011 => 5, 1+1111+00000111 => 24.
+        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0x4f, 0xe0, 0xe0]))
+        XCTAssertEqual(try reader.readCommandRunLength(), 1)
+        XCTAssertEqual(try reader.readCommandRunLength(), 5)
+        XCTAssertEqual(try reader.readCommandRunLength(), 24)
+    }
+
+    func testExtendedCommandRunLengthUsesBase128Groups() throws {
+        // Escape plus 0x81,0x01 encodes 17 + 1 + (1 << 7) = 146.
+        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0xfc, 0x08, 0x08]))
+        XCTAssertEqual(try reader.readCommandRunLength(), 146)
+    }
+
+    func testBitReaderRejectsTruncatedCommand() throws {
+        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0xf8]))
+        XCTAssertThrowsError(try reader.readCommandRunLength())
+    }
+
+    func testSignedDCRiceGrammar() throws {
+        // q=0 zero: 00; q=0 +1: 010; q=0 -1: 011;
+        // q=1 magnitude 3 negative: 10 11.
+        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0x13, 0xb0]))
+        XCTAssertEqual(try reader.readSignedDCRice(), 0)
+        XCTAssertEqual(try reader.readSignedDCRice(), 1)
+        XCTAssertEqual(try reader.readSignedDCRice(), -1)
+        XCTAssertEqual(try reader.readSignedDCRice(), -3)
+    }
+
+    func testYCC20ExpandsSixBitChroma() throws {
+        // Y=0xab, Cb=0x15, Cr=0x2a.
+        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0xab, 0x56, 0xa0]))
+        let color = try reader.readYCC20()
+        XCTAssertEqual(color.y, 0xab)
+        XCTAssertEqual(color.cb, 0x54)
+        XCTAssertEqual(color.cr, 0xa8)
+    }
+
+    func testSmallCoefficientAndZeroRunGrammar() throws {
+        // 10 => +amplitude; 11 => -amplitude; 00 => zero;
+        // 01 0 => EOB.
+        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0xb1, 0x00]))
+        XCTAssertEqual(try reader.readSmallCoefficient(at: 1, amplitude: 8).value, 8)
+        XCTAssertEqual(try reader.readSmallCoefficient(at: 2, amplitude: 8).value, -8)
+        XCTAssertNil(try reader.readSmallCoefficient(at: 3, amplitude: 8).value)
+        XCTAssertEqual(
+            try reader.readSmallCoefficient(at: 4, amplitude: 8).nextIndex,
+            64)
+    }
+
+    func testSmallCoefficientLongZeroRun() throws {
+        // 01 1 11 enters the long form; 111 then 010 adds 6+7+2.
+        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0x7f, 0x40]))
+        let result = try reader.readSmallCoefficient(at: 3, amplitude: 2)
+        XCTAssertEqual(result.nextIndex, 18)
+        XCTAssertNil(result.value)
+    }
+
+    func testType2InstallsBothQuantizationTables() throws {
+        let decoder = AppleAdaptiveDCTDecoder()
+        let luma = Array(UInt8(0)..<64)
+        let chroma = Array(UInt8(64)..<128)
+        var payload = Data([0, 0, 0, 129, 2])
+        payload.append(contentsOf: luma)
+        payload.append(contentsOf: chroma)
+
+        XCTAssertNil(try decoder.ingest(payload))
+        XCTAssertEqual(decoder.lumaQuantization, luma.map(UInt16.init))
+        XCTAssertEqual(decoder.chromaQuantization, chroma.map(UInt16.init))
+    }
+
+    func testCapturedType0HeaderSeparatesCommandAndDataStreams() throws {
+        // Shape of the live 40-byte message captured from macOS encoding 1011.
+        var payload = Data([0, 0, 0, 36, 0, 15, 25, 0, 0, 10])
+        payload.append(contentsOf: [0x54, 0x54, 0x36, 0x80])
+        payload.append(Data(repeating: 0xA5, count: 26))
+
+        let image = try XCTUnwrap(AppleAdaptiveDCTDecoder().ingest(payload))
+        XCTAssertEqual(image.field1, 15)
+        XCTAssertEqual(image.field2, 25)
+        XCTAssertEqual(image.commandBytes, Data([0x54, 0x54, 0x36, 0x80]))
+        XCTAssertEqual(image.dataBytes.count, 26)
+    }
+
+    func testPreviousTileCommandRepeatsAcrossLocalRowBoundary() throws {
+        // Reserved bit, command 0 for one white tile, then command 1 with a
+        // run of three. The third repeated tile starts a new local row.
+        var payload = Data([0, 0, 0, 9, 0, 15, 25, 0, 0, 8])
+        payload.append(contentsOf: [0x01, 0x88, 0x00])
+        let framebuffer = Framebuffer(
+            width: 16, height: 16, pixelFormat: .bgra8888)
+        let rect = FramebufferRect(
+            x: 0, y: 0, width: 16, height: 16,
+            encoding: .appleMultiVariantScreenshare)
+
+        try AppleAdaptiveDCTDecoder().render(
+            rect: rect, payload: payload, to: framebuffer)
+
+        XCTAssertEqual(
+            framebuffer.getPixels(x: 0, y: 0, width: 16, height: 16),
+            Data(repeating: 0xff, count: 16 * 16 * 4))
+    }
+
+    func testSolidReuseUsesIndependentSolidColorCache() throws {
+        let framebuffer = Framebuffer(
+            width: 16, height: 8, pixelFormat: .bgra8888)
+        let rect = FramebufferRect(
+            x: 0, y: 0, width: 16, height: 8,
+            encoding: .appleMultiVariantScreenshare)
+        // Command 4 run=2. Tile 0 subtype 0 defines a white solid color;
+        // tile 1 subtype 1 reuses that independent solid-color cache.
+        let payload = Data([
+            0, 0, 0, 11, 0, 15, 25, 0, 0, 8,
+            0x48, 0x00,
+            0x3f, 0xe0, 0x81,
+        ])
+
+        try AppleAdaptiveDCTDecoder().render(
+            rect: rect, payload: payload, to: framebuffer)
+
+        let white = framebuffer.getPixels(x: 8, y: 0, width: 1, height: 1)
+        XCTAssertEqual(
+            framebuffer.getPixels(x: 0, y: 0, width: 1, height: 1),
+            white)
+        XCTAssertEqual(white[white.startIndex], white[white.startIndex + 1])
+        XCTAssertEqual(white[white.startIndex + 1], white[white.startIndex + 2])
+        XCTAssertGreaterThanOrEqual(white[white.startIndex], 0xfe)
+        var expected = Data(capacity: 8 * 8 * 4)
+        for _ in 0..<(8 * 8) { expected.append(white) }
+        XCTAssertEqual(
+            framebuffer.getPixels(x: 8, y: 0, width: 8, height: 8),
+            expected)
+    }
+
+    func testType1RefinementAndBothCoefficientCacheCommands() throws {
+        let framebuffer = Framebuffer(
+            width: 24, height: 8, pixelFormat: .bgra8888)
+        let decoder = AppleAdaptiveDCTDecoder()
+        func rect(_ x: UInt16) -> FramebufferRect {
+            FramebufferRect(
+                x: x, y: 0, width: 8, height: 8,
+                encoding: .appleMultiVariantScreenshare)
+        }
+
+        // Minimal all-zero type-0 coefficient tile.
+        try decoder.render(
+            rect: rect(0),
+            payload: Data([0, 0, 0, 9, 0, 1, 1, 0, 0, 7, 0x50, 0, 0x10]),
+            to: framebuffer)
+        // Type 1 command 1 refines it and reserves coefficient-cache key 1.
+        var refinement = Data([0, 0, 0, 132, 1, 15, 20, 0x40])
+        refinement.append(Data(repeating: 0, count: 128))
+        try decoder.render(rect: rect(0), payload: refinement, to: framebuffer)
+        // Type-0 command 7 consumes the next implicit cache key.
+        try decoder.render(
+            rect: rect(8),
+            payload: Data([0, 0, 0, 8, 0, 1, 1, 0, 0, 7, 0x70, 0]),
+            to: framebuffer)
+        // Type-0 command 6 names cache key 1 explicitly.
+        try decoder.render(
+            rect: rect(16),
+            payload: Data([0, 0, 0, 9, 0, 1, 1, 0, 0, 7, 0x60, 0, 1]),
+            to: framebuffer)
+
+        let first = framebuffer.getPixels(x: 0, y: 0, width: 8, height: 8)
+        XCTAssertEqual(
+            first.prefix(32),
+            Data([
+                0x00, 0xf7, 0x00, 0xff, 0x54, 0xa8, 0x42, 0xff,
+                0xc3, 0x72, 0x81, 0xff, 0x74, 0x87, 0x78, 0xff,
+                0x6b, 0x94, 0x61, 0xff, 0x84, 0x8b, 0x6a, 0xff,
+                0x7c, 0x86, 0x76, 0xff, 0x85, 0x85, 0x73, 0xff,
+            ]))
+        XCTAssertEqual(first, framebuffer.getPixels(x: 8, y: 0, width: 8, height: 8))
+        XCTAssertEqual(first, framebuffer.getPixels(x: 16, y: 0, width: 8, height: 8))
     }
 }
 

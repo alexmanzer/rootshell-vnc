@@ -39,8 +39,24 @@ let package = Package(
         // MARK: - RFBRendering (VideoToolbox HEVC decode, framebuffer, display)
         .target(
             name: "RFBRendering",
-            dependencies: ["RFBProtocol"],
-            swiftSettings: [.swiftLanguageMode(.v6)]
+            dependencies: ["RFBProtocol", "RFBRenderingC"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                // Adaptive DCT is a bit-level codec with an integer IDCT per
+                // tile. At -Onone a single Retina reference frame can take
+                // several seconds, allowing standard-mode updates to backlog
+                // even on a fast LAN. Keep the rendering package optimized in
+                // app Debug builds while the UI/transport remain debuggable.
+                .unsafeFlags(["-O"], .when(configuration: .debug)),
+            ]
+        ),
+        .target(
+            name: "RFBRenderingC",
+            dependencies: [],
+            publicHeadersPath: "include",
+            cSettings: [
+                .unsafeFlags(["-O3"], .when(configuration: .debug)),
+            ]
         ),
 
         // MARK: - RootShellVNC (public API facade, SwiftUI views, input handling)

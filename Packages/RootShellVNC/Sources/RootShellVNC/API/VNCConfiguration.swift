@@ -62,7 +62,7 @@ public struct VNCConfiguration: Sendable {
             case .adaptive:
                 "Low-latency HEVC over UDP for networks that can sustain the video stream."
             case .standard:
-                "Reliable compressed RFB over TCP for constrained networks, VPNs, and non-Mac servers. Uses thousands of colors for lower latency."
+                "Reliable compressed RFB over TCP for constrained networks, VPNs, and non-Mac servers."
             case .fullQuality:
                 "Lossless framebuffer updates with higher bandwidth and CPU use."
             }
@@ -80,7 +80,7 @@ public struct VNCConfiguration: Sendable {
 
     /// Preferred pixel format to request from the server.
     ///
-    /// When `nil`, the server's default pixel format is used.
+    /// When `nil`, the session requests full-color BGRA8888.
     public var preferredPixelFormat: PixelFormat?
 
     /// Preferred encodings in priority order.
@@ -111,7 +111,7 @@ public struct VNCConfiguration: Sendable {
     /// Create a VNC session configuration.
     ///
     /// - Parameters:
-    ///   - preferredPixelFormat: Pixel format to request, or `nil` for server default.
+    ///   - preferredPixelFormat: Pixel format to request, or `nil` for full-color BGRA8888.
     ///   - preferredEncodings: Encodings in priority order.
     ///   - enableHighPerformanceMode: Whether to enable HEVC when available.
     ///   - targetFrameRate: Desired frame rate for update requests.
@@ -143,16 +143,12 @@ public struct VNCConfiguration: Sendable {
 
     /// The pixel format the session negotiates and decodes with.
     ///
-    /// An explicit ``preferredPixelFormat`` always wins. Otherwise Standard
-    /// mode uses 16-bit "thousands" color: it exists for bandwidth-limited
-    /// links, where halving every payload cuts interactive latency far more
-    /// than full 24-bit color is worth (Screen Sharing's own adaptive
-    /// classic mode makes the same trade). Other modes keep full color.
+    /// An explicit ``preferredPixelFormat`` always wins (pass `.rgb555` for
+    /// 16-bit "thousands" color — measured ~3x smaller ZRLE payloads against
+    /// macOS Screen Sharing when bandwidth, not color, is the constraint).
+    /// The default stays full color in every mode.
     var effectivePixelFormat: PixelFormat {
-        if let preferredPixelFormat {
-            return preferredPixelFormat
-        }
-        return videoQualityMode == .standard ? .rgb555 : .bgra8888
+        preferredPixelFormat ?? .bgra8888
     }
 
     /// The full list of encodings to advertise to the server, including
@@ -177,14 +173,15 @@ public struct VNCConfiguration: Sendable {
                 }
             }
         } else if videoQualityMode == .standard {
-            // Standard mode exists for bandwidth-limited remote links, where
-            // transfer time — not codec CPU — dominates interactive latency.
-            // ZRLE's palette/RLE tiles compress typical UI content several
-            // times smaller than whole-rect Zlib, so prefer it; Zlib remains
-            // the cheap-CPU fallback. Keep CopyRect ahead of raw so window
-            // moves need not resend pixels.
+            // Match Screens 5's Apple-capable classic-RFB ordering. Encoding
+            // 1011 is Apple's low-latency adaptive DCT path; non-Apple servers
+            // ignore it and continue with Tight/ZRLE/Zlib. Full color remains
+            // the default for both the DCT and fallback paths.
             let standardEncodings: [Encoding] = [
-                .copyRect, .zrle, .zlib, .raw,
+                .appleMultiVariantScreenshare, .tight, .unknown(-224),
+                .zrle, .zlib, .copyRect,
+                .unknown(1105), .unknown(1101), .unknown(1100), .unknown(1104),
+                .raw, .unknown(-23),
             ]
             for encoding in standardEncodings.reversed() {
                 encodings.removeAll { $0 == encoding }

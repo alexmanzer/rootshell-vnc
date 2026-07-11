@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import ImageIO
 import RFBProtocol
 
 // MARK: - Rendering Errors
@@ -45,6 +46,8 @@ public final class FramebufferRenderer: @unchecked Sendable {
     private var rawDecoder: RawEncodingRenderer
     private var zlibDecoder: ZlibEncodingRenderer
     private var zrleDecoder: ZRLEEncodingRenderer
+    private var tightDecoder: TightEncodingRenderer
+    private var appleDCTDecoder: AppleAdaptiveDCTDecoder
 
     public init(framebuffer: Framebuffer, pixelFormat: PixelFormat) {
         self.framebuffer = framebuffer
@@ -52,6 +55,8 @@ public final class FramebufferRenderer: @unchecked Sendable {
         self.rawDecoder = RawEncodingRenderer()
         self.zlibDecoder = ZlibEncodingRenderer()
         self.zrleDecoder = ZRLEEncodingRenderer()
+        self.tightDecoder = TightEncodingRenderer()
+        self.appleDCTDecoder = AppleAdaptiveDCTDecoder()
     }
 
     /// Apply a rectangle update to the framebuffer.
@@ -73,6 +78,13 @@ public final class FramebufferRenderer: @unchecked Sendable {
                 rect: rect, data: data,
                 to: framebuffer, pixelFormat: pixelFormat
             )
+        case .tight:
+            try tightDecoder.render(
+                rect: rect, data: data,
+                to: framebuffer, pixelFormat: pixelFormat
+            )
+        case .appleMultiVariantScreenshare:
+            try appleDCTDecoder.render(rect: rect, payload: data, to: framebuffer)
         default:
             throw RenderingError.unsupportedEncoding(rect.encoding)
         }
@@ -125,6 +137,13 @@ public final class FramebufferRenderer: @unchecked Sendable {
                  .mediaStreamOffer, .mediaStreamAnswer:
                 break
 
+            case .unknown(let value)
+                where value == 1100 || value == 1101
+                    || value == 1104 || value == 1105:
+                // Apple Screen Sharing capability/control rectangles are
+                // consumed by TransportSession and carry no framebuffer pixels.
+                break
+
             default:
                 do {
                     try applyRect(rect: rect, data: data)
@@ -164,6 +183,327 @@ public final class FramebufferRenderer: @unchecked Sendable {
     /// Handle desktop resize.
     public func handleDesktopResize(width: UInt16, height: UInt16) {
         framebuffer.resize(width: Int(width), height: Int(height))
+    }
+}
+
+// MARK: - Tight Encoding Renderer
+
+/// Tight is the first classic-RFB encoding advertised by Screens 5. It mixes
+/// four persistent zlib streams with fill, palette, gradient and JPEG
+/// subencodings, which lets a server send photographic/animated areas without
+/// blocking later small UI updates behind a lossless full-screen rectangle.
+final class TightEncodingRenderer {
+    private var inflaters: [RFBZlibStreamInflater?] = (0..<4).map { _ in
+        try? RFBZlibStreamInflater()
+    }
+
+    func render(
+        rect: FramebufferRect,
+        data: Data,
+        to framebuffer: Framebuffer,
+        pixelFormat: PixelFormat
+    ) throws {
+        guard !data.isEmpty else {
+            throw RenderingError.insufficientData(expected: 1, got: 0)
+        }
+        var offset = data.startIndex
+        let control = data[offset]
+        offset += 1
+        for stream in 0..<4 where control & (1 << stream) != 0 {
+            try inflaters[stream]?.reset()
+        }
+
+        let compression = control >> 4
+        let compact = usesCompactPixels(pixelFormat)
+        let tightPixelSize = compact ? 3 : pixelFormat.bytesPerPixel
+        switch compression {
+        case 8:
+            let pixel = try readPixel(
+                data, offset: &offset, size: tightPixelSize,
+                compact: compact)
+            framebuffer.fillRect(
+                x: Int(rect.x), y: Int(rect.y),
+                width: Int(rect.width), height: Int(rect.height),
+                pixel: pixel)
+
+        case 9:
+            let length = try readCompactLength(data, offset: &offset)
+            guard length > 0, offset + length <= data.endIndex else {
+                throw RenderingError.insufficientData(
+                    expected: length, got: data.endIndex - offset)
+            }
+            try renderJPEG(
+                Data(data[offset..<offset + length]), rect: rect,
+                to: framebuffer)
+
+        case 0...7:
+            try renderBasic(
+                compression: compression, rect: rect, data: data,
+                offset: &offset, tightPixelSize: tightPixelSize,
+                compact: compact, to: framebuffer,
+                pixelFormat: pixelFormat)
+
+        default:
+            throw RenderingError.invalidTileData(
+                "Unsupported Tight compression control \(compression)")
+        }
+    }
+
+    private func renderBasic(
+        compression: UInt8,
+        rect: FramebufferRect,
+        data: Data,
+        offset: inout Data.Index,
+        tightPixelSize: Int,
+        compact: Bool,
+        to framebuffer: Framebuffer,
+        pixelFormat: PixelFormat
+    ) throws {
+        var filter: UInt8 = 0
+        if compression & 0x04 != 0 {
+            guard offset < data.endIndex else {
+                throw RenderingError.insufficientData(expected: 1, got: 0)
+            }
+            filter = data[offset]
+            offset += 1
+        }
+
+        let width = Int(rect.width)
+        let height = Int(rect.height)
+        var palette: [Data] = []
+        let uncompressedSize: Int
+        if filter == 1 {
+            guard offset < data.endIndex else {
+                throw RenderingError.insufficientData(expected: 1, got: 0)
+            }
+            let count = Int(data[offset]) + 1
+            offset += 1
+            palette.reserveCapacity(count)
+            for _ in 0..<count {
+                palette.append(try readPixel(
+                    data, offset: &offset, size: tightPixelSize,
+                    compact: compact))
+            }
+            uncompressedSize = count == 2
+                ? ((width + 7) / 8) * height
+                : width * height
+        } else {
+            uncompressedSize = width * height * tightPixelSize
+        }
+
+        let filtered: Data
+        if uncompressedSize < 12 {
+            guard offset + uncompressedSize <= data.endIndex else {
+                throw RenderingError.insufficientData(
+                    expected: uncompressedSize, got: data.endIndex - offset)
+            }
+            filtered = Data(data[offset..<offset + uncompressedSize])
+            offset += uncompressedSize
+        } else {
+            let compressedLength = try readCompactLength(data, offset: &offset)
+            guard offset + compressedLength <= data.endIndex else {
+                throw RenderingError.insufficientData(
+                    expected: compressedLength, got: data.endIndex - offset)
+            }
+            let stream = Int(compression & 0x03)
+            guard let inflater = inflaters[stream] else {
+                throw RenderingError.decompressionFailed(
+                    "Failed to initialize Tight zlib stream \(stream)")
+            }
+            filtered = try inflater.decompress(
+                Data(data[offset..<offset + compressedLength]),
+                maxOutputSize: uncompressedSize)
+            offset += compressedLength
+            guard filtered.count == uncompressedSize else {
+                throw RenderingError.decompressionFailed(
+                    "Tight decoded \(filtered.count) bytes; expected \(uncompressedSize)")
+            }
+        }
+
+        let pixels: Data
+        switch filter {
+        case 0:
+            pixels = compact
+                ? expandCompactRGB(filtered, pixelCount: width * height)
+                : filtered
+        case 1:
+            pixels = try expandPalette(
+                filtered, palette: palette, width: width, height: height,
+                bytesPerPixel: framebuffer.bytesPerPixel)
+        case 2:
+            guard compact else {
+                throw RenderingError.invalidTileData(
+                    "Tight gradient requires 24-bit true color")
+            }
+            pixels = decodeGradient(filtered, width: width, height: height)
+        default:
+            throw RenderingError.invalidTileData(
+                "Unsupported Tight filter \(filter)")
+        }
+
+        framebuffer.update(
+            x: Int(rect.x), y: Int(rect.y), width: width, height: height,
+            data: pixels)
+    }
+
+    private func renderJPEG(
+        _ jpeg: Data,
+        rect: FramebufferRect,
+        to framebuffer: Framebuffer
+    ) throws {
+        guard let source = CGImageSourceCreateWithData(jpeg as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            throw RenderingError.decompressionFailed("Invalid Tight JPEG image")
+        }
+        guard framebuffer.bytesPerPixel == 4 else {
+            throw RenderingError.invalidTileData(
+                "Tight JPEG requires a 32-bit destination")
+        }
+        let width = Int(rect.width)
+        let height = Int(rect.height)
+        var pixels = Data(count: width * height * 4)
+        let created = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let base = bytes.baseAddress,
+                  let context = CGContext(
+                    data: base, width: width, height: height,
+                    bitsPerComponent: 8, bytesPerRow: width * 4,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                        | CGBitmapInfo.byteOrder32Little.rawValue) else { return false }
+            context.translateBy(x: 0, y: CGFloat(height))
+            context.scaleBy(x: 1, y: -1)
+            context.interpolationQuality = .none
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            return true
+        }
+        guard created else {
+            throw RenderingError.decompressionFailed(
+                "Could not create Tight JPEG bitmap")
+        }
+        framebuffer.update(
+            x: Int(rect.x), y: Int(rect.y), width: width, height: height,
+            data: pixels)
+    }
+
+    private func expandPalette(
+        _ indices: Data,
+        palette: [Data],
+        width: Int,
+        height: Int,
+        bytesPerPixel: Int
+    ) throws -> Data {
+        guard !palette.isEmpty else {
+            throw RenderingError.invalidTileData("Empty Tight palette")
+        }
+        var output = Data(capacity: width * height * bytesPerPixel)
+        if palette.count == 2 {
+            let rowBytes = (width + 7) / 8
+            guard indices.count >= rowBytes * height else {
+                throw RenderingError.insufficientData(
+                    expected: rowBytes * height, got: indices.count)
+            }
+            for row in 0..<height {
+                for column in 0..<width {
+                    let byte = indices[row * rowBytes + column / 8]
+                    let index = Int((byte >> (7 - column % 8)) & 1)
+                    output.append(palette[index])
+                }
+            }
+        } else {
+            guard indices.count >= width * height else {
+                throw RenderingError.insufficientData(
+                    expected: width * height, got: indices.count)
+            }
+            for index in indices.prefix(width * height) {
+                let paletteIndex = min(Int(index), palette.count - 1)
+                output.append(palette[paletteIndex])
+            }
+        }
+        return output
+    }
+
+    private func decodeGradient(
+        _ residuals: Data,
+        width: Int,
+        height: Int
+    ) -> Data {
+        var previous = [UInt8](repeating: 0, count: width * 3)
+        var current = [UInt8](repeating: 0, count: width * 3)
+        var output = Data(capacity: width * height * 4)
+        var source = residuals.startIndex
+        for _ in 0..<height {
+            for x in 0..<width {
+                for component in 0..<3 {
+                    let position = x * 3 + component
+                    let left = x == 0 ? 0 : Int(current[position - 3])
+                    let up = Int(previous[position])
+                    let upLeft = x == 0 ? 0 : Int(previous[position - 3])
+                    let estimate = min(max(left + up - upLeft, min(left, up)), max(left, up))
+                    current[position] = UInt8(truncatingIfNeeded:
+                        estimate + Int(residuals[source]))
+                    source += 1
+                }
+                output.append(current[x * 3 + 2]) // B
+                output.append(current[x * 3 + 1]) // G
+                output.append(current[x * 3])     // R
+                output.append(0xFF)
+            }
+            swap(&previous, &current)
+        }
+        return output
+    }
+
+    private func expandCompactRGB(_ data: Data, pixelCount: Int) -> Data {
+        var output = Data(capacity: pixelCount * 4)
+        var offset = data.startIndex
+        for _ in 0..<pixelCount {
+            output.append(data[offset + 2])
+            output.append(data[offset + 1])
+            output.append(data[offset])
+            output.append(0xFF)
+            offset += 3
+        }
+        return output
+    }
+
+    private func readPixel(
+        _ data: Data,
+        offset: inout Data.Index,
+        size: Int,
+        compact: Bool
+    ) throws -> Data {
+        guard offset + size <= data.endIndex else {
+            throw RenderingError.insufficientData(
+                expected: size, got: data.endIndex - offset)
+        }
+        defer { offset += size }
+        if compact {
+            return Data([data[offset + 2], data[offset + 1], data[offset], 0xFF])
+        }
+        return Data(data[offset..<offset + size])
+    }
+
+    private func readCompactLength(
+        _ data: Data,
+        offset: inout Data.Index
+    ) throws -> Int {
+        var value = 0
+        for index in 0..<3 {
+            guard offset < data.endIndex else {
+                throw RenderingError.insufficientData(expected: 1, got: 0)
+            }
+            let byte = data[offset]
+            offset += 1
+            value |= Int(byte & 0x7F) << (7 * index)
+            if byte & 0x80 == 0 { return value }
+        }
+        return value
+    }
+
+    private func usesCompactPixels(_ format: PixelFormat) -> Bool {
+        format.bitsPerPixel == 32 && format.depth == 24 && format.trueColor
+            && format.redMax == 255 && format.greenMax == 255
+            && format.blueMax == 255
     }
 }
 

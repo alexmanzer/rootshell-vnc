@@ -115,8 +115,15 @@ public actor TransportSession {
     /// Set when an update finished reading while the pipeline was full; the
     /// deferred incremental request goes out on the next acknowledgement.
     private var deferredUpdateRequest = false
-    /// One update being decoded plus one queued behind it.
-    private let maxUnacknowledgedUpdates = 2
+    /// Apple may answer the first full request with only DCT quantization and
+    /// capability rectangles. Keep requesting a reference frame until a
+    /// type-0 rectangle actually covers the framebuffer.
+    private var awaitingAppleDCTReferenceFrame = false
+    /// Keep classic RFB strictly request/response: the next request is sent
+    /// only after the current update has decoded and produced its snapshot.
+    /// A queued reference frame can otherwise turn one slow decode into
+    /// seconds of stale pointer response and visible tile catch-up.
+    private let maxUnacknowledgedUpdates = 1
     /// Latched once an Apple media stream offer arrives: media negotiation
     /// switches this channel to encrypted control records, so no further
     /// framebuffer update requests may be sent.
@@ -336,6 +343,8 @@ public actor TransportSession {
         self.username = username
         let configuredEncodings = preferredEncodings ?? ConnectionStateMachine.defaultPreferredEncodings
         self.requestAppleMediaStream = configuredEncodings.contains(.appleH264)
+        self.awaitingAppleDCTReferenceFrame =
+            configuredEncodings.contains(.appleMultiVariantScreenshare)
 
         var cont: AsyncStream<SessionEvent>.Continuation!
         self.events = AsyncStream<SessionEvent> { continuation in
@@ -519,14 +528,14 @@ public actor TransportSession {
     /// framebuffer update. Standard RFB encodings carry persistent codec
     /// state, so updates must not be dropped; this credit return is the
     /// backpressure that bounds the undecoded backlog. The next incremental
-    /// request itself is pipelined at wire-read time in
-    /// handleFramebufferUpdate; only a request deferred by a full pipeline
-    /// is sent from here.
+    /// With a single standard-RFB credit, the next request is deliberately
+    /// deferred until this acknowledgement so stale frames cannot queue.
     public func finishFramebufferUpdate() async throws {
         unacknowledgedUpdates = max(0, unacknowledgedUpdates - 1)
         guard deferredUpdateRequest, !framebufferRequestsSuppressed else { return }
         deferredUpdateRequest = false
-        try await requestFramebufferUpdate(incremental: true)
+        try await requestFramebufferUpdate(
+            incremental: !awaitingAppleDCTReferenceFrame)
     }
 
     /// Request one remote display matching the client viewport. Apple servers
@@ -815,6 +824,8 @@ public actor TransportSession {
 
         self.fbWidth = width
         self.fbHeight = height
+        awaitingAppleDCTReferenceFrame =
+            stateMachine.preferredEncodings.contains(.appleMultiVariantScreenshare)
         activeAppleMediaTilesPerFrame = AppleMediaVideoMode.activeTileCount(
             pixelWidth: Int(width),
             pixelHeight: Int(height))
@@ -946,6 +957,23 @@ public actor TransportSession {
                 fullPayload.append(compressedData)
                 pixelData = fullPayload
 
+            case .tight:
+                pixelData = try await readTightRectanglePayload(rect: rect)
+
+            case .appleMultiVariantScreenshare:
+                // Apple Adaptive DCT (1011) is framed as a big-endian UInt32
+                // byte count followed by one self-typed codec message.
+                let lengthData = try await tcp.read(exactly: 4)
+                let length = Int(lengthData[lengthData.startIndex]) << 24
+                    | Int(lengthData[lengthData.startIndex + 1]) << 16
+                    | Int(lengthData[lengthData.startIndex + 2]) << 8
+                    | Int(lengthData[lengthData.startIndex + 3])
+                var fullPayload = lengthData
+                if length > 0 {
+                    fullPayload.append(try await tcp.read(exactly: length))
+                }
+                pixelData = fullPayload
+
             case .copyRect:
                 // 4 bytes: srcX(2) + srcY(2)
                 pixelData = try await tcp.read(exactly: 4)
@@ -1027,6 +1055,45 @@ public actor TransportSession {
                     pixelData = Data()
                 }
 
+            case .unknown(let value) where value == 1100:
+                // Apple cursor-position notification; coordinates are carried
+                // by the rectangle header.
+                pixelData = Data()
+
+            case .unknown(let value) where value == 1101:
+                // Legacy Apple display layout: 10-byte header followed by
+                // 28 bytes per display. The count is the final UInt16.
+                var payload = try await tcp.read(exactly: 10)
+                let count = Int(payload[payload.startIndex + 8]) << 8
+                    | Int(payload[payload.startIndex + 9])
+                if count > 0 {
+                    payload.append(try await tcp.read(exactly: count * 28))
+                }
+                pixelData = payload
+
+            case .unknown(let value) where value == 1104:
+                // Apple cursor cache record: id + payload byte count.
+                var payload = try await tcp.read(exactly: 8)
+                let length = Int(payload[payload.startIndex + 4]) << 24
+                    | Int(payload[payload.startIndex + 5]) << 16
+                    | Int(payload[payload.startIndex + 6]) << 8
+                    | Int(payload[payload.startIndex + 7])
+                if length > 0 {
+                    payload.append(try await tcp.read(exactly: length))
+                }
+                pixelData = payload
+
+            case .unknown(let value) where value == 1105:
+                // Apple DisplayInfo2: a UInt16 byte count followed by the
+                // complete display-layout structure.
+                var payload = try await tcp.read(exactly: 2)
+                let length = Int(payload[payload.startIndex]) << 8
+                    | Int(payload[payload.startIndex + 1])
+                if length > 0 {
+                    payload.append(try await tcp.read(exactly: length))
+                }
+                pixelData = payload
+
             default:
                 // For encodings we don't specifically handle, log and skip.
                 // Since we only advertise encodings we implement, this path
@@ -1043,6 +1110,18 @@ public actor TransportSession {
 
         if let resize = pendingResize {
             try await acceptFramebufferResize(width: resize.width, height: resize.height)
+        }
+
+        if awaitingAppleDCTReferenceFrame,
+           rectsWithData.contains(where: { rect, payload in
+               rect.encoding == .appleMultiVariantScreenshare
+                   && payload.count > 4
+                   && payload[payload.startIndex + 4] == 0
+                   && rect.x == 0 && rect.y == 0
+                   && rect.width >= fbWidth && rect.height >= fbHeight
+           }) {
+            awaitingAppleDCTReferenceFrame = false
+            log.debug("Received complete Apple DCT reference framebuffer")
         }
 
         let now = DispatchTime.now().uptimeNanoseconds
@@ -1086,6 +1165,85 @@ public actor TransportSession {
             }
             try await executeAction(action)
         }
+    }
+
+    /// Consume one complete Tight rectangle while retaining its compact wire
+    /// framing for the renderer. A wrong byte count here desynchronizes the
+    /// entire RFB stream, so derive the basic-filter payload size exactly as
+    /// specified instead of scanning for the next message boundary.
+    private func readTightRectanglePayload(rect: FramebufferRect) async throws -> Data {
+        let controlData = try await tcp.read(exactly: 1)
+        let control = controlData[controlData.startIndex]
+        let compression = control >> 4
+        var payload = controlData
+        let tightPixelSize = pixelFormat.bitsPerPixel == 32
+            && pixelFormat.depth == 24
+            && pixelFormat.trueColor
+            && pixelFormat.redMax == 255
+            && pixelFormat.greenMax == 255
+            && pixelFormat.blueMax == 255
+            ? 3 : pixelFormat.bytesPerPixel
+
+        switch compression {
+        case 8: // Fill
+            payload.append(try await tcp.read(exactly: tightPixelSize))
+
+        case 9: // JPEG
+            let (lengthBytes, length) = try await readTightCompactLength()
+            payload.append(lengthBytes)
+            if length > 0 { payload.append(try await tcp.read(exactly: length)) }
+
+        case 0...7: // Basic compression, optionally with an explicit filter.
+            var filter: UInt8 = 0
+            if compression & 0x04 != 0 {
+                let filterData = try await tcp.read(exactly: 1)
+                filter = filterData[filterData.startIndex]
+                payload.append(filterData)
+            }
+
+            let width = Int(rect.width)
+            let height = Int(rect.height)
+            let uncompressedSize: Int
+            if filter == 1 {
+                let paletteSizeData = try await tcp.read(exactly: 1)
+                payload.append(paletteSizeData)
+                let paletteSize = Int(paletteSizeData[paletteSizeData.startIndex]) + 1
+                payload.append(try await tcp.read(exactly: paletteSize * tightPixelSize))
+                uncompressedSize = paletteSize == 2
+                    ? ((width + 7) / 8) * height
+                    : width * height
+            } else {
+                uncompressedSize = width * height * tightPixelSize
+            }
+
+            if uncompressedSize < 12 {
+                if uncompressedSize > 0 {
+                    payload.append(try await tcp.read(exactly: uncompressedSize))
+                }
+            } else {
+                let (lengthBytes, length) = try await readTightCompactLength()
+                payload.append(lengthBytes)
+                if length > 0 { payload.append(try await tcp.read(exactly: length)) }
+            }
+
+        default:
+            throw VNCProtocolError.protocolViolation(
+                "Unsupported Tight compression control \(compression)")
+        }
+        return payload
+    }
+
+    private func readTightCompactLength() async throws -> (Data, Int) {
+        var bytes = Data()
+        var value = 0
+        for index in 0..<3 {
+            let byteData = try await tcp.read(exactly: 1)
+            let byte = byteData[byteData.startIndex]
+            bytes.append(byte)
+            value |= Int(byte & 0x7F) << (7 * index)
+            if byte & 0x80 == 0 { return (bytes, value) }
+        }
+        return (bytes, value)
     }
 
     private func handleSetColorMapEntries() async throws {
@@ -1410,6 +1568,9 @@ public actor TransportSession {
         let oldHeight = fbHeight
         fbWidth = width
         fbHeight = height
+        if stateMachine.preferredEncodings.contains(.appleMultiVariantScreenshare) {
+            awaitingAppleDCTReferenceFrame = true
+        }
         log.info("Framebuffer resized \(oldWidth)x\(oldHeight) -> \(width)x\(height)")
 
         guard acceptedAppleMediaStream, sentAppleMediaAutoFrameUpdate else { return }
