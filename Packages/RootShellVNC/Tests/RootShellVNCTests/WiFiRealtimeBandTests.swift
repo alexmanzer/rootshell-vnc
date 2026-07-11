@@ -81,6 +81,38 @@ final class WiFiRealtimeBandTests: XCTestCase {
                 session,
                 expectedBandCount: expectedBandCount(for: viewSize))
         }
+
+        // Reproduce a real window drag: each update lives longer than the UI
+        // debounce, but arrives before the preceding AVC generation is ready.
+        // The transport must send the first command, coalesce the middle one,
+        // and apply only the final size after the first generation is live.
+        let dragSizes = [
+            CGSize(width: 1872, height: 1048),
+            CGSize(width: 1856, height: 872),
+            CGSize(width: 1912, height: 1144),
+        ]
+        let generationBeforeDrag = session.videoBandRenderer.streamGenerationCount
+        let commitBeforeDrag = session.videoBandRenderer.frameCommitCount
+        for size in dragSizes {
+            session.updateRemoteDisplaySize(viewSize: size, displayScale: 2)
+            try await Task.sleep(for: .milliseconds(250))
+        }
+        let finalDragSize = try XCTUnwrap(RemoteDisplaySize.matching(
+            viewSize: try XCTUnwrap(dragSizes.last)))
+        try await waitForRenderedBands(
+            session,
+            expectedSize: finalDragSize,
+            expectedBandCount: expectedBandCount(for: try XCTUnwrap(dragSizes.last)),
+            afterCommit: commitBeforeDrag,
+            afterGeneration: generationBeforeDrag,
+            timeoutSeconds: 20)
+        XCTAssertLessThanOrEqual(
+            session.videoBandRenderer.streamGenerationCount - generationBeforeDrag,
+            2,
+            "A resize burst must coalesce instead of starting one media generation per size")
+        try await assertContinuesAtomicRendering(
+            session,
+            expectedBandCount: expectedBandCount(for: try XCTUnwrap(dragSizes.last)))
     }
 
     func testRealtimeBandHealthOverNetwork() async throws {
@@ -199,7 +231,8 @@ final class WiFiRealtimeBandTests: XCTestCase {
                 + "\(session.videoBandRenderer.frameCommitCount) bands="
                 + "\(session.videoBandRenderer.renderedBandCount) generations="
                 + "\(session.videoBandRenderer.streamGenerationCount) media="
-                + "\(session.liveMediaDebugSnapshot) dims="
+                + "\(session.liveMediaDebugSnapshot) framebuffer="
+                + "\(session.framebufferWidth)x\(session.framebufferHeight) dims="
                 + "\(session.videoBandRenderer.renderedBandDimensions)")
     }
 

@@ -2,6 +2,19 @@ import XCTest
 @testable import RootShellVNC
 
 final class AtomicBandFrameAccumulatorTests: XCTestCase {
+    func testDecodedBandTrackerResetDropsRetiredGenerationSources() {
+        let tracker = DecodedBandTracker()
+        tracker.record(10)
+        tracker.record(11)
+        XCTAssertEqual(tracker.count, 2)
+
+        tracker.reset()
+        tracker.record(20)
+
+        XCTAssertEqual(tracker.count, 1)
+        XCTAssertEqual(tracker.frameCount, 1)
+    }
+
     func testDoesNotPublishPartialCompoundFrame() {
         var accumulator = AtomicBandFrameAccumulator<String>(expectedSourceCount: 2)
 

@@ -589,18 +589,20 @@ public final class VideoStreamManager: @unchecked Sendable {
     /// Whether a VCL NAL should reach the decoder, updating recovery state.
     /// AVConference's VCP wrapper resumes specifically for HEVC NAL type 20
     /// (IDR_N_LP); CRA and dependent pictures remain withheld.
-    private func shouldDecodeVCL(nalType: UInt8, ssrc: UInt32) -> Bool {
+    func shouldDecodeVCL(nalType: UInt8, ssrc: UInt32) -> Bool {
         lock.lock()
         if nalType == 20 {
-            let wasGated = irapGateEnabled && !awaitingIRAP.isEmpty
+            let recoveredGatedSource = irapGateEnabled
+                && awaitingIRAP.remove(ssrc) != nil
+            let remainingGatedSources = awaitingIRAP.count
             lossStats.irapsDecoded += 1
-            awaitingIRAP.removeAll()
-            lastLossNanos = 0
+            if awaitingIRAP.isEmpty { lastLossNanos = 0 }
             lock.unlock()
-            if wasGated {
+            if recoveredGatedSource {
                 log.warning(
                     "Accepted recovery HEVC IDR_N_LP type=20 "
-                        + "ssrc=0x\(String(ssrc, radix: 16))")
+                        + "ssrc=0x\(String(ssrc, radix: 16)) "
+                        + "remainingGatedSources=\(remainingGatedSources)")
             }
             return true
         }
@@ -620,6 +622,15 @@ public final class VideoStreamManager: @unchecked Sendable {
         }
         return false
     }
+
+    #if DEBUG
+    func installCompoundRecoveryGateForTesting(sources: Set<UInt32>) {
+        lock.lock()
+        seenVideoSSRCs = sources
+        _ = markLossLocked(affectedSSRC: nil)
+        lock.unlock()
+    }
+    #endif
 
     /// Rebuild a VideoToolbox session without touching the VNC or media
     /// connection. The caller runs this on the serial media queue, so incoming

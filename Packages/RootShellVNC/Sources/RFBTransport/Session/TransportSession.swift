@@ -90,6 +90,7 @@ public actor TransportSession {
     /// this beside the RTP sink so its decoder reset is queued before any RTP
     /// from the new keys/SSRC can overtake it.
     private var appleMediaGenerationSink: (@Sendable (UInt64, Int) -> Void)?
+    private var appleRemoteDisplaySizeSink: (@Sendable (UInt16, UInt16) -> Void)?
     private var activeAppleMediaTilesPerFrame = Int(
         AppleMediaVideoMode.negotiatedTilesPerFrame)
     /// Per-SSRC packet jitter buffer. UDP reordering is repaired here before an
@@ -258,6 +259,11 @@ public actor TransportSession {
     private var standardDesktopLayout: ExtendedDesktopSizePayload?
     private var pendingRemoteDisplaySize: PendingRemoteDisplaySize?
     private var lastSentRemoteDisplaySize: PendingRemoteDisplaySize?
+    /// Command 29 starts a complete AVC generation. Sending another command
+    /// before every expected RTP source from that generation is live makes the
+    /// server retire its capture graph mid-startup. Keep only the newest drag
+    /// size queued until the current generation proves ready.
+    private var appleDisplayReconfigurationGeneration: UInt64?
     private var appleVirtualDisplayMaximumPixelWidth: UInt32 = 3_840
     private var appleVirtualDisplayMaximumPixelHeight: UInt32 = 3_840
     /// A staged virtual-display replacement must wait until the initial Apple
@@ -445,6 +451,12 @@ public actor TransportSession {
         appleMediaGenerationSink = sink
     }
 
+    public func setAppleRemoteDisplaySizeSink(
+        _ sink: (@Sendable (UInt16, UInt16) -> Void)?
+    ) {
+        appleRemoteDisplaySizeSink = sink
+    }
+
     /// Request a framebuffer update from the server.
     public func requestFramebufferUpdate(incremental: Bool) async throws {
         let msg = ClientMessage.framebufferUpdateRequest(
@@ -505,6 +517,12 @@ public actor TransportSession {
                         + "until initial Apple media negotiation completes")
                 return .appleVirtualDisplay
             }
+            if appleDisplayReconfigurationGeneration != nil {
+                log.info(
+                    "Coalescing virtual display \(pixelWidth)x\(pixelHeight) "
+                        + "while media reconfiguration is in flight")
+                return .appleVirtualDisplay
+            }
             try await sendAppleVirtualDisplaySize(requested)
             return .appleVirtualDisplay
         }
@@ -525,6 +543,7 @@ public actor TransportSession {
         readTask?.cancel()
         readTask = nil
         appleMediaGenerationSink = nil
+        appleRemoteDisplaySizeSink = nil
         await stopAppleMediaUDP()
         tcp.close()
         let actions = stateMachine.handle(event: .userRequestedDisconnect)
@@ -1187,6 +1206,23 @@ public actor TransportSession {
         }
     }
 
+    private func applyQueuedVirtualDisplayAfterMediaReady() async {
+        guard appleDisplayReconfigurationGeneration == nil,
+              let pendingRemoteDisplaySize,
+              pendingRemoteDisplaySize != lastSentRemoteDisplaySize else { return }
+        do {
+            log.info(
+                "Media reconfiguration live; applying coalesced virtual display "
+                    + "\(pendingRemoteDisplaySize.pixelWidth)x"
+                    + "\(pendingRemoteDisplaySize.pixelHeight)")
+            try await sendAppleVirtualDisplaySize(pendingRemoteDisplaySize)
+        } catch {
+            log.error(
+                "Could not apply coalesced virtual display: "
+                    + error.localizedDescription)
+        }
+    }
+
     private func appleMediaPostAcceptEncodings() -> [Encoding] {
         let nativeViewerEncodingRawValues: Set<Int32> = [
             0, 1, 6, 16,
@@ -1310,6 +1346,9 @@ public actor TransportSession {
         try await sendClientPayload(message.serialize())
         lastSentRemoteDisplaySize = requested
         pendingRemoteDisplaySize = nil
+        appleRemoteDisplaySizeSink?(
+            requested.pixelWidth,
+            requested.pixelHeight)
         log.info(
             "Requested standard remote desktop \(requested.pixelWidth)x"
                 + "\(requested.pixelHeight)")
@@ -1359,15 +1398,23 @@ public actor TransportSession {
         let previousHeight = fbHeight
         fbWidth = requested.pixelWidth
         fbHeight = requested.pixelHeight
+        if requestAppleMediaStream, completedInitialAppleMediaNegotiation {
+            appleDisplayReconfigurationGeneration =
+                appleMediaGenerationTracker.generation &+ 1
+        }
         do {
             try await sendClientPayload(message.serialize())
         } catch {
             fbWidth = previousWidth
             fbHeight = previousHeight
+            appleDisplayReconfigurationGeneration = nil
             throw error
         }
         lastSentRemoteDisplaySize = requested
         pendingRemoteDisplaySize = nil
+        appleRemoteDisplaySizeSink?(
+            requested.pixelWidth,
+            requested.pixelHeight)
         log.info(
             "Requested Apple dynamic virtual display \(requested.pixelWidth)x"
                 + "\(requested.pixelHeight) pixels (\(requested.pointWidth)x"
@@ -3192,6 +3239,17 @@ public actor TransportSession {
             completedInitialAppleMediaNegotiation = true
             Task { [weak self] in
                 await self?.applyStagedVirtualDisplayAfterInitialVideo()
+            }
+        }
+        if let awaitedGeneration = appleDisplayReconfigurationGeneration,
+           appleMediaGenerationTracker.generation >= awaitedGeneration,
+           appleMediaVideoSSRCChannels.count >= activeAppleMediaTilesPerFrame {
+            appleDisplayReconfigurationGeneration = nil
+            if let pendingRemoteDisplaySize,
+               pendingRemoteDisplaySize != lastSentRemoteDisplaySize {
+                Task { [weak self] in
+                    await self?.applyQueuedVirtualDisplayAfterMediaReady()
+                }
             }
         }
 

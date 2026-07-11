@@ -10,6 +10,19 @@ import Foundation
 ///   swift test --filter ReorderRecoveryTests
 final class ReorderRecoveryTests: XCTestCase {
 
+    func testCompoundRecoveryWaitsForEveryTileIDR() {
+        let manager = VideoStreamManager()
+        manager.installCompoundRecoveryGateForTesting(sources: [10, 11])
+
+        XCTAssertTrue(manager.shouldDecodeVCL(nalType: 20, ssrc: 10))
+        XCTAssertTrue(manager.hasGatedBands)
+        XCTAssertFalse(manager.shouldDecodeVCL(nalType: 1, ssrc: 11))
+
+        XCTAssertTrue(manager.shouldDecodeVCL(nalType: 20, ssrc: 11))
+        XCTAssertFalse(manager.hasGatedBands)
+        XCTAssertTrue(manager.shouldDecodeVCL(nalType: 1, ssrc: 10))
+    }
+
     func testCapturedCompoundStreamDecodes() throws {
         let env = ProcessInfo.processInfo.environment
         guard let path = env["ROOTSHELL_VNC_DECODED_RTP"],

@@ -417,14 +417,6 @@ public final class VNCSession {
                     pixelHeight: requested.pixelHeight,
                     pointWidth: requested.pointWidth,
                     pointHeight: requested.pointHeight)
-                // Command 29 does not reliably produce an RFB DesktopSize
-                // rectangle, and a tiled HEVC SPS describes one band rather
-                // than the complete desktop. Apply the accepted virtual mode
-                // to every GUI geometry consumer immediately; otherwise the
-                // new pixels are aspect-fitted and hit-tested with stale bounds.
-                if disposition == .appleVirtualDisplay {
-                    self.applyRequestedRemoteDisplayGeometry(requested)
-                }
                 self.logger.info(
                     "Client-sized display \(requested.pixelWidth)x"
                         + "\(requested.pixelHeight): \(String(describing: disposition))")
@@ -1028,6 +1020,7 @@ public final class VNCSession {
 
                     var attempt = 0
                     var hasWaitedForDisplay = false
+                    var unsettledDeferrals = 0
                     while recoveryManager.isStreamActive,
                           recoveryManager.hasGatedBands {
                         // Native names this its no-video-display fail-safe. A
@@ -1043,10 +1036,21 @@ public final class VNCSession {
                         guard !Task.isCancelled,
                               recoveryManager.isStreamActive,
                               recoveryManager.hasGatedBands else { return }
-                        guard await transport.isReadyForVideoKeyframeRecovery() else {
-                            log.info("Deferring FIR while video rate/loss is still unsettled")
-                            continue
+                        if !(await transport.isReadyForVideoKeyframeRecovery()) {
+                            unsettledDeferrals += 1
+                            if unsettledDeferrals < 8 {
+                                log.info("Deferring FIR while video rate/loss is still unsettled")
+                                continue
+                            }
+                            // A busy screen can keep the capacity controller
+                            // unsettled forever while all affected bands remain
+                            // gated. Bound that preference: a possibly costly
+                            // IDR is better than a permanently frozen display.
+                            log.warning(
+                                "Video remains gated after bounded FIR deferral; "
+                                    + "forcing recovery keyframe")
                         }
+                        unsettledDeferrals = 0
                         attempt += 1
                         log.warning("No video displayed after RTP loss; applying native FIR "
                             + "fail-safe (attempt \(attempt))")
@@ -1107,19 +1111,59 @@ public final class VNCSession {
             let sinkManager = manager // VideoStreamManager is Sendable
             let sinkAudioPlayer = remoteAudioPlayer
             let generationCoalescer = coalescer
+            let generationLog = logger
             await transport.setAppleMediaGenerationSink { generation, numberOfTiles in
                 queue.async {
                     sinkManager.prepareForStreamReconfiguration(
                         mediaGeneration: generation,
                         numberOfTiles: numberOfTiles)
+                    decodedBands.reset()
                     generationCoalescer.beginStreamGeneration(
                         generation,
                         expectedSourceCount: numberOfTiles)
+
+                    // The connection-level startup watchdog cannot validate a
+                    // replacement generation: its SSRC set belongs to retired
+                    // media. Require every new tile to decode before declaring
+                    // this generation live, otherwise the atomic renderer can
+                    // retain the old whole-screen frame forever.
+                    Task { [weak transport, weak sinkManager, recoveryCoordinator] in
+                        for attempt in 1...4 {
+                            try? await Task.sleep(for: .seconds(1))
+                            guard let transport,
+                                  let manager = sinkManager,
+                                  manager.isStreamActive,
+                                  manager.currentMediaGeneration == generation else { return }
+                            let decoded = decodedBands.count
+                            if decoded >= numberOfTiles {
+                                if attempt > 1 {
+                                    generationLog.info(
+                                        "Media generation \(generation) ready: "
+                                            + "\(decoded)/\(numberOfTiles) tiles decoded")
+                                }
+                                return
+                            }
+                            let ready = await transport.isReadyForVideoKeyframeRecovery()
+                            guard (ready || attempt == 4),
+                                  await recoveryCoordinator.begin() else { continue }
+                            generationLog.warning(
+                                "Media generation \(generation) has \(decoded)/"
+                                    + "\(numberOfTiles) decoded tiles; requesting FIR "
+                                    + "attempt \(attempt)")
+                            await transport.requestVideoKeyframe()
+                            await recoveryCoordinator.finish()
+                        }
+                    }
                 }
                 // A media generation installs fresh SRTP keys for audio as
                 // well as video. Reset once at that real codec boundary; the
                 // repeated stream-offer path above intentionally does not.
                 sinkAudioPlayer?.reset()
+            }
+            await transport.setAppleRemoteDisplaySizeSink { [weak self] width, height in
+                Task { @MainActor [weak self] in
+                    self?.applyDesktopResizeMetadata(width: width, height: height)
+                }
             }
             await transport.setAppleMediaRTPSink { packet in
                 if AppleRemoteAudioPlayer.canHandleRTPPacket(packet) {
@@ -1263,6 +1307,13 @@ final class DecodedBandTracker: @unchecked Sendable {
         lock.lock()
         ssrcs.insert(ssrc)
         frames &+= 1
+        lock.unlock()
+    }
+
+    func reset() {
+        lock.lock()
+        ssrcs.removeAll(keepingCapacity: true)
+        frames = 0
         lock.unlock()
     }
 
