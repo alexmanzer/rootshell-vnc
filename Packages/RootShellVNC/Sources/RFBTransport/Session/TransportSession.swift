@@ -115,10 +115,14 @@ public actor TransportSession {
     /// Set when an update finished reading while the pipeline was full; the
     /// deferred incremental request goes out on the next acknowledgement.
     private var deferredUpdateRequest = false
-    /// Apple may answer the first full request with only DCT quantization and
-    /// capability rectangles. Keep requesting a reference frame until a
-    /// type-0 rectangle actually covers the framebuffer.
-    private var awaitingAppleDCTReferenceFrame = false
+    /// Standard mode starts with a portable full-frame codec, then enables
+    /// Apple DCT only after that reference image has been presented. This
+    /// avoids exposing the zeroed framebuffer when macOS initially sends only
+    /// DCT quantization/control rectangles.
+    private let appleDCTEncodingsAfterBootstrap: [Encoding]?
+    private var awaitingAppleDCTBootstrapReference: Bool
+    private var pendingAppleDCTBootstrapActivation = false
+    private var appleDCTBootstrapActivated = false
     /// Keep classic RFB strictly request/response: the next request is sent
     /// only after the current update has decoded and produced its snapshot.
     /// A queued reference frame can otherwise turn one slow decode into
@@ -334,17 +338,25 @@ public actor TransportSession {
         // media socket is IPv4-only — so no video arrives. Pin both to 127.0.0.1.
         let resolvedHost = (host == "localhost") ? "127.0.0.1" : host
         self.tcp = TCPConnection(host: resolvedHost, port: port)
+        let configuredEncodings =
+            preferredEncodings ?? ConnectionStateMachine.defaultPreferredEncodings
+        let shouldBootstrapAppleDCT =
+            configuredEncodings.contains(.appleMultiVariantScreenshare)
+                && !configuredEncodings.contains(.appleH264)
+        let initialEncodings = shouldBootstrapAppleDCT
+            ? configuredEncodings.filter { $0 != .appleMultiVariantScreenshare }
+            : configuredEncodings
         self.stateMachine = ConnectionStateMachine(
             preferredPixelFormat: preferredPixelFormat,
-            preferredEncodings: preferredEncodings ?? ConnectionStateMachine.defaultPreferredEncodings
+            preferredEncodings: initialEncodings
         )
         self.host = resolvedHost
         self.password = password
         self.username = username
-        let configuredEncodings = preferredEncodings ?? ConnectionStateMachine.defaultPreferredEncodings
         self.requestAppleMediaStream = configuredEncodings.contains(.appleH264)
-        self.awaitingAppleDCTReferenceFrame =
-            configuredEncodings.contains(.appleMultiVariantScreenshare)
+        self.appleDCTEncodingsAfterBootstrap =
+            shouldBootstrapAppleDCT ? configuredEncodings : nil
+        self.awaitingAppleDCTBootstrapReference = shouldBootstrapAppleDCT
 
         var cont: AsyncStream<SessionEvent>.Continuation!
         self.events = AsyncStream<SessionEvent> { continuation in
@@ -534,8 +546,18 @@ public actor TransportSession {
         unacknowledgedUpdates = max(0, unacknowledgedUpdates - 1)
         guard deferredUpdateRequest, !framebufferRequestsSuppressed else { return }
         deferredUpdateRequest = false
+        if pendingAppleDCTBootstrapActivation,
+           let encodings = appleDCTEncodingsAfterBootstrap {
+            pendingAppleDCTBootstrapActivation = false
+            appleDCTBootstrapActivated = true
+            try await sendClientPayload(
+                ClientMessage.setEncodings(encodings).serialize())
+            log.debug("Enabled Apple DCT after portable reference framebuffer")
+            try await requestFramebufferUpdate(incremental: false)
+            return
+        }
         try await requestFramebufferUpdate(
-            incremental: !awaitingAppleDCTReferenceFrame)
+            incremental: !awaitingAppleDCTBootstrapReference)
     }
 
     /// Request one remote display matching the client viewport. Apple servers
@@ -824,8 +846,6 @@ public actor TransportSession {
 
         self.fbWidth = width
         self.fbHeight = height
-        awaitingAppleDCTReferenceFrame =
-            stateMachine.preferredEncodings.contains(.appleMultiVariantScreenshare)
         activeAppleMediaTilesPerFrame = AppleMediaVideoMode.activeTileCount(
             pixelWidth: Int(width),
             pixelHeight: Int(height))
@@ -1112,16 +1132,16 @@ public actor TransportSession {
             try await acceptFramebufferResize(width: resize.width, height: resize.height)
         }
 
-        if awaitingAppleDCTReferenceFrame,
-           rectsWithData.contains(where: { rect, payload in
-               rect.encoding == .appleMultiVariantScreenshare
-                   && payload.count > 4
-                   && payload[payload.startIndex + 4] == 0
+        if awaitingAppleDCTBootstrapReference,
+           rectsWithData.contains(where: { rect, _ in
+               (rect.encoding == .tight || rect.encoding == .zlib
+                    || rect.encoding == .zrle || rect.encoding == .raw)
                    && rect.x == 0 && rect.y == 0
                    && rect.width >= fbWidth && rect.height >= fbHeight
            }) {
-            awaitingAppleDCTReferenceFrame = false
-            log.debug("Received complete Apple DCT reference framebuffer")
+            awaitingAppleDCTBootstrapReference = false
+            pendingAppleDCTBootstrapActivation = true
+            log.debug("Received portable reference framebuffer for Apple DCT")
         }
 
         let now = DispatchTime.now().uptimeNanoseconds
@@ -1568,8 +1588,8 @@ public actor TransportSession {
         let oldHeight = fbHeight
         fbWidth = width
         fbHeight = height
-        if stateMachine.preferredEncodings.contains(.appleMultiVariantScreenshare) {
-            awaitingAppleDCTReferenceFrame = true
+        if appleDCTEncodingsAfterBootstrap != nil, !appleDCTBootstrapActivated {
+            awaitingAppleDCTBootstrapReference = true
         }
         log.info("Framebuffer resized \(oldWidth)x\(oldHeight) -> \(width)x\(height)")
 
