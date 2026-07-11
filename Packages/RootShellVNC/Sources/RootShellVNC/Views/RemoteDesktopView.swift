@@ -89,9 +89,6 @@ public struct RemoteDesktopView: View {
                 }
             }
         }
-        #if os(iOS)
-        .statusBarHidden()
-        #endif
     }
 
     @ViewBuilder
