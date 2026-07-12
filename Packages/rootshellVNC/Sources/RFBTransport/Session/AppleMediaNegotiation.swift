@@ -43,14 +43,23 @@ public enum AppleMediaVideoMode {
     }
 
     public static var negotiatedTilesPerFrame: UInt64 {
-        2
+        // A/B diagnostic override (Viceroy negotiates min(peer values), so
+        // this can only lower or restore the native four-tile profile).
+        if let override = ProcessInfo.processInfo.environment[
+            "ROOTSHELL_VNC_TILES_PER_FRAME"],
+           let value = UInt64(override), (1...4).contains(value) {
+            return value
+        }
+        return 2
     }
 
     /// Tile sessions below the encoder's size threshold must remain single
-    /// tile. Larger captures use the server's two horizontal HEVC bands.
+    /// tile. Larger captures use the negotiated horizontal HEVC band count.
     public static func activeTileCount(pixelWidth: Int, pixelHeight: Int) -> Int {
         guard pixelWidth > 0, pixelHeight > 0 else { return 1 }
-        return pixelWidth * pixelHeight >= 5_000_000 ? 2 : 1
+        return pixelWidth * pixelHeight >= 5_000_000
+            ? Int(negotiatedTilesPerFrame)
+            : 1
     }
 }
 
