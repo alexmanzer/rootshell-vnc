@@ -96,4 +96,26 @@ final class AppleRemoteAudioPlayerTests: XCTestCase {
         XCTAssertTrue(diagnostics.isRunning)
         XCTAssertFalse(diagnostics.rendererFailed)
     }
+
+    /// An underrun-inflated cushion must decay back to the 100 ms base after
+    /// clean playback, so a transient Wi-Fi glitch cannot permanently leave
+    /// audio a quarter second behind the video on every later restart.
+    func testInflatedCushionDecaysAfterCleanPlayback() throws {
+        let player = try AppleRemoteAudioPlayer()
+        defer { player.stop() }
+
+        player.setPrerollTargetForTesting(
+            AppleRemoteAudioPlayer.maximumPrerollAccessUnitTarget,
+            decayIntervalNanos: 200_000_000)
+
+        streamBursts(60, to: player) // ~4 s of clean 10 ms packets
+
+        let diagnostics = player.diagnosticsSnapshot()
+        XCTAssertTrue(diagnostics.isRunning)
+        XCTAssertEqual(diagnostics.underrunCount, 0)
+        XCTAssertEqual(
+            diagnostics.prerollAccessUnitTarget,
+            AppleRemoteAudioPlayer.basePrerollAccessUnitTarget,
+            "clean playback must decay the cushion back to its base")
+    }
 }

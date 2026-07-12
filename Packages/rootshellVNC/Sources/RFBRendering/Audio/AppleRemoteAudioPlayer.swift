@@ -44,8 +44,19 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     private var lastOrderedSequence: UInt16?
     private var lastOrderedTimestamp: UInt32?
     private var enqueuedAccessUnitCount = 0
-    private var prerollAccessUnitTarget = 10
+    private var prerollAccessUnitTarget =
+        AppleRemoteAudioPlayer.basePrerollAccessUnitTarget
     private var playbackStartHostTime: CMTime?
+    /// Preroll cushion bounds, in 10 ms access units. Underruns grow the
+    /// cushion for resilience; sustained clean playback decays it back so one
+    /// bad Wi-Fi patch does not leave audio a quarter second behind the video
+    /// for the rest of the connection.
+    static let basePrerollAccessUnitTarget = 10
+    static let maximumPrerollAccessUnitTarget = 24
+    private static let prerollGrowthStep = 4
+    /// Clean-playback window required before each 40 ms decay step.
+    private var cushionDecayIntervalNanos: UInt64 = 30_000_000_000
+    private var lastCushionAdjustmentNanos: UInt64 = 0
     private var detectedLossCount: UInt64 = 0
     private var underrunCount: UInt64 = 0
     private var isRunning = false
@@ -138,6 +149,7 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
         let underrunCount: UInt64
         let isRunning: Bool
         let rendererFailed: Bool
+        let prerollAccessUnitTarget: Int
     }
 
     func diagnosticsSnapshot() -> DiagnosticsSnapshot {
@@ -145,7 +157,25 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
             DiagnosticsSnapshot(
                 underrunCount: underrunCount,
                 isRunning: isRunning,
-                rendererFailed: renderer.status == .failed)
+                rendererFailed: renderer.status == .failed,
+                prerollAccessUnitTarget: prerollAccessUnitTarget)
+        }
+    }
+
+    /// Test-only: simulate an underrun-inflated cushion and optionally shrink
+    /// the clean-playback window so decay is observable in test time.
+    func setPrerollTargetForTesting(
+        _ target: Int,
+        decayIntervalNanos: UInt64? = nil
+    ) {
+        queue.sync {
+            prerollAccessUnitTarget = min(
+                max(target, Self.basePrerollAccessUnitTarget),
+                Self.maximumPrerollAccessUnitTarget)
+            if let decayIntervalNanos {
+                cushionDecayIntervalNanos = decayIntervalNanos
+            }
+            lastCushionAdjustmentNanos = DispatchTime.now().uptimeNanoseconds
         }
     }
 
@@ -224,7 +254,10 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
                let renderTime = trustedRenderTime(),
                CMTimeCompare(CMTimeAdd(presentationTime, duration), renderTime) <= 0 {
                 underrunCount &+= 1
-                prerollAccessUnitTarget = min(prerollAccessUnitTarget + 4, 24)
+                prerollAccessUnitTarget = min(
+                    prerollAccessUnitTarget + Self.prerollGrowthStep,
+                    Self.maximumPrerollAccessUnitTarget)
+                lastCushionAdjustmentNanos = DispatchTime.now().uptimeNanoseconds
                 let lateMilliseconds = Int(
                     (CMTimeSubtract(renderTime, presentationTime).seconds * 1000)
                         .rounded())
@@ -282,10 +315,37 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
             playbackStartHostTime = CMClockGetTime(CMClockGetHostTimeClock())
             synchronizer.setRate(1, time: .zero)
             isRunning = true
+            lastCushionAdjustmentNanos = DispatchTime.now().uptimeNanoseconds
             log.info(
                 "Remote audio playback started with "
                     + "\(prerollAccessUnitTarget * 10) ms preroll")
         }
+
+        decayPrerollCushionIfClean()
+    }
+
+    /// Step an underrun-inflated cushion back down after each clean-playback
+    /// window. The narrower cushion takes effect at the next timeline anchor
+    /// (renegotiation, discontinuity, or re-anchored underrun recovery), so
+    /// steady playback is never perturbed — it only stops future restarts from
+    /// inheriting a stale worst-case latency.
+    private func decayPrerollCushionIfClean() {
+        guard isRunning,
+              prerollAccessUnitTarget > Self.basePrerollAccessUnitTarget else {
+            return
+        }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard lastCushionAdjustmentNanos != 0,
+              now &- lastCushionAdjustmentNanos >= cushionDecayIntervalNanos else {
+            return
+        }
+        prerollAccessUnitTarget = max(
+            Self.basePrerollAccessUnitTarget,
+            prerollAccessUnitTarget - Self.prerollGrowthStep)
+        lastCushionAdjustmentNanos = now
+        log.info(
+            "Remote audio cushion decayed to "
+                + "\(prerollAccessUnitTarget * 10) ms after clean playback")
     }
 
     /// The synchronizer's render position, or nil while the reading is
