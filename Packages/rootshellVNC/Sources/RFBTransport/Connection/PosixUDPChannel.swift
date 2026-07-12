@@ -31,6 +31,9 @@ struct BoundedDatagramFIFO {
 
     var count: Int { storage.count - head }
     var isEmpty: Bool { count == 0 }
+    var first: PosixUDPDatagram? {
+        head < storage.count ? storage[head] : nil
+    }
 
     /// Appends datagrams in order and, if the hard memory bound is exceeded,
     /// drops the oldest entries. Returns the number dropped.
@@ -122,6 +125,9 @@ public actor PosixUDPChannel {
         CheckedContinuation<PosixUDPDatagram, Error>
     ] = []
     private nonisolated(unsafe) var lastBacklogLogNanos: UInt64 = 0
+    private nonisolated(unsafe) var backlogHighWater = 0
+    private nonisolated(unsafe) var publishedSinceBacklogLog = 0
+    private nonisolated(unsafe) var droppedSinceBacklogLog = 0
     private nonisolated(unsafe) var lockedClosed = false
     /// Soft cap so a stalled consumer degrades like a kernel buffer overflow
     /// (bounded memory, oldest dropped) instead of growing without bound.
@@ -269,7 +275,7 @@ public actor PosixUDPChannel {
     /// same lock. Large compound HEVC pictures contain hundreds of RTP packets,
     /// and crossing two Swift actor boundaries per datagram allowed the
     /// userspace FIFO to overflow under GUI load.
-    public func receiveDatagramBatch(maxCount: Int = 512) async throws -> [PosixUDPDatagram] {
+    public func receiveDatagramBatch(maxCount: Int = 2048) async throws -> [PosixUDPDatagram] {
         let limit = max(1, maxCount)
         let first = try await receiveDatagram()
         guard limit > 1 else { return [first] }
@@ -361,20 +367,39 @@ public actor PosixUDPChannel {
     private nonisolated func publishBatchInOrder(_ batch: [PosixUDPDatagram]) {
         stateLock.lock()
         let dropped = pendingDatagrams.append(contentsOf: batch)
-        let queued = pendingDatagrams.count
+        let queuedBeforeDelivery = pendingDatagrams.count
+        backlogHighWater = max(backlogHighWater, queuedBeforeDelivery)
+        publishedSinceBacklogLog += batch.count
+        droppedSinceBacklogLog += dropped
         let now = DispatchTime.now().uptimeNanoseconds
-        let shouldLogBacklog = queued >= 512
-            && (lastBacklogLogNanos == 0 || now &- lastBacklogLogNanos >= 1_000_000_000)
-        if shouldLogBacklog { lastBacklogLogNanos = now }
         var resumes: [(CheckedContinuation<PosixUDPDatagram, Error>, PosixUDPDatagram)] = []
         while !receiveWaiters.isEmpty, let datagram = pendingDatagrams.popFirst() {
             resumes.append((receiveWaiters.removeFirst(), datagram))
         }
+        let queued = pendingDatagrams.count
+        let oldestDelayMilliseconds = pendingDatagrams.first.map {
+            now >= $0.arrivalNanos ? (now - $0.arrivalNanos) / 1_000_000 : 0
+        } ?? 0
+        let shouldLogBacklog = (queued >= 512 || droppedSinceBacklogLog > 0)
+            && (lastBacklogLogNanos == 0 || now &- lastBacklogLogNanos >= 1_000_000_000)
+        let diagnosticHighWater = backlogHighWater
+        let diagnosticPublished = publishedSinceBacklogLog
+        let diagnosticDropped = droppedSinceBacklogLog
+        if shouldLogBacklog {
+            lastBacklogLogNanos = now
+            backlogHighWater = queued
+            publishedSinceBacklogLog = 0
+            droppedSinceBacklogLog = 0
+        }
         stateLock.unlock()
         if dropped > 0 {
-            log.error("UDP userspace receive queue overflow; dropped \(dropped) oldest datagrams")
-        } else if shouldLogBacklog {
-            log.warning("UDP userspace receive backlog=\(queued) datagrams")
+            log.error("UDP userspace receive queue overflow; dropped \(dropped) oldest datagrams "
+                + "queued=\(queued) highWater=\(diagnosticHighWater) oldest=\(oldestDelayMilliseconds)ms")
+        }
+        if shouldLogBacklog {
+            log.warning("UDP userspace receive backlog queued=\(queued) "
+                + "highWater=\(diagnosticHighWater) oldest=\(oldestDelayMilliseconds)ms "
+                + "published=\(diagnosticPublished) dropped=\(diagnosticDropped)")
         }
         for (cont, datagram) in resumes {
             cont.resume(returning: datagram)

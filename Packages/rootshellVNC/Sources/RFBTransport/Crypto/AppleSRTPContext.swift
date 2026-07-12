@@ -20,9 +20,9 @@ public final class AppleSRTPContext: @unchecked Sendable {
     private static let masterKeyLength = 32
     private static let masterSaltLength = 14
 
-    private let encryptionKey: Data
-    private let authenticationKey: Data
+    private let authenticationSymmetricKey: SymmetricKey
     private let saltKey: Data
+    private var cryptor: CCCryptorRef?
     private let tagLength = 10
     private let lock = NSLock()
     private var states: [UInt32: SSRCState] = [:]
@@ -36,9 +36,17 @@ public final class AppleSRTPContext: @unchecked Sendable {
 
         let masterKey = Data(mediaKey.prefix(Self.masterKeyLength))
         let masterSalt = Data(mediaKey.dropFirst(Self.masterKeyLength).prefix(Self.masterSaltLength))
-        self.encryptionKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x00, length: Self.masterKeyLength)
-        self.authenticationKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x01, length: 20)
+        let encryptionKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x00, length: Self.masterKeyLength)
+        let authenticationKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x01, length: 20)
+        self.authenticationSymmetricKey = SymmetricKey(data: authenticationKey)
         self.saltKey = try Self.deriveSessionKey(masterKey: masterKey, masterSalt: masterSalt, label: 0x02, length: 14)
+        self.cryptor = try Self.makeCryptor(key: encryptionKey)
+    }
+
+    deinit {
+        if let cryptor {
+            CCCryptorRelease(cryptor)
+        }
     }
 
     public func unprotect(_ packet: Data) throws -> Data {
@@ -70,41 +78,53 @@ public final class AppleSRTPContext: @unchecked Sendable {
             throw VNCProtocolError.protocolViolation("SRTP packet has invalid payload bounds")
         }
 
-        let header = Data(packet[base..<payloadOffset])
-        let encryptedPayload = Data(packet[payloadOffset..<encryptedEnd])
         let packetIndex = (UInt64(roc) << 16) | UInt64(sequence)
-        let payload = try decryptPayload(encryptedPayload, ssrc: ssrc, packetIndex: packetIndex)
+        let rtp = try decryptPacket(
+            packet,
+            payloadOffset: payloadOffset,
+            encryptedEnd: encryptedEnd,
+            ssrc: ssrc,
+            packetIndex: packetIndex)
 
         updateState(&state, sequence: sequence, roc: roc)
         states[ssrc] = state
 
-        var rtp = Data(capacity: header.count + payload.count)
-        rtp.append(header)
-        rtp.append(payload)
         return rtp
     }
 
     private func verifyAuthentication(packet: Data, roc: UInt32) throws {
         let authenticatedEnd = packet.endIndex - tagLength
-        let tag = Data(packet[authenticatedEnd..<packet.endIndex])
-        var input = Data(packet[packet.startIndex..<authenticatedEnd])
-        input.append(UInt8((roc >> 24) & 0xff))
-        input.append(UInt8((roc >> 16) & 0xff))
-        input.append(UInt8((roc >> 8) & 0xff))
-        input.append(UInt8(roc & 0xff))
-
-        let mac = HMAC<Insecure.SHA1>.authenticationCode(
-            for: input,
-            using: SymmetricKey(data: authenticationKey)
-        )
+        var authenticator = HMAC<Insecure.SHA1>(key: authenticationSymmetricKey)
+        authenticator.update(data: packet[packet.startIndex..<authenticatedEnd])
+        var rocBE = roc.bigEndian
+        withUnsafeBytes(of: &rocBE) { bytes in
+            authenticator.update(data: bytes)
+        }
+        let mac = authenticator.finalize()
         let expected = Data(mac.prefix(tagLength))
-        guard expected == tag else {
+        var difference: UInt8 = 0
+        for offset in 0..<tagLength {
+            difference |= expected[expected.startIndex + offset]
+                ^ packet[authenticatedEnd + offset]
+        }
+        guard difference == 0 else {
             throw VNCProtocolError.protocolViolation("SRTP authentication failed")
         }
     }
 
-    private func decryptPayload(_ payload: Data, ssrc: UInt32, packetIndex: UInt64) throws -> Data {
-        guard !payload.isEmpty else { return Data() }
+    private func decryptPacket(
+        _ packet: Data,
+        payloadOffset: Data.Index,
+        encryptedEnd: Data.Index,
+        ssrc: UInt32,
+        packetIndex: UInt64
+    ) throws -> Data {
+        let base = packet.startIndex
+        let headerCount = payloadOffset - base
+        let payloadCount = encryptedEnd - payloadOffset
+        var output = Data(count: encryptedEnd - base)
+        output.replaceSubrange(0..<headerCount, with: packet[base..<payloadOffset])
+        guard payloadCount > 0 else { return output }
 
         // AES-CM is AES-CTR with a big-endian counter whose low 16 bits are the
         // per-block counter. RTP payloads are well under 2^16 blocks, so a
@@ -114,33 +134,49 @@ public final class AppleSRTPContext: @unchecked Sendable {
         // packets per second.
         let iv = counterBlock(ssrc: ssrc, packetIndex: packetIndex, blockCounter: 0)
 
+        guard let cryptor else {
+            throw VNCProtocolError.ioError("AES-CTR context is unavailable")
+        }
+        let resetStatus = iv.withUnsafeBytes { ivPtr in
+            CCCryptorReset(cryptor, ivPtr.baseAddress)
+        }
+        guard resetStatus == kCCSuccess else {
+            throw VNCProtocolError.ioError("AES-CTR reset failed: \(resetStatus)")
+        }
+
+        var moved = 0
+        let updateStatus = output.withUnsafeMutableBytes { outPtr in
+            packet.withUnsafeBytes { inPtr in
+                CCCryptorUpdate(
+                    cryptor,
+                    inPtr.baseAddress?.advanced(by: payloadOffset - base),
+                    payloadCount,
+                    outPtr.baseAddress?.advanced(by: headerCount),
+                    payloadCount,
+                    &moved)
+            }
+        }
+        guard updateStatus == kCCSuccess, moved == payloadCount else {
+            throw VNCProtocolError.ioError("AES-CTR update failed: \(updateStatus)")
+        }
+        return output
+    }
+
+    private static func makeCryptor(key: Data) throws -> CCCryptorRef {
+        let zeroIV = [UInt8](repeating: 0, count: kCCBlockSizeAES128)
         var cryptorRef: CCCryptorRef?
-        let createStatus = iv.withUnsafeBytes { ivPtr in
-            encryptionKey.withUnsafeBytes { keyPtr in
+        let status = zeroIV.withUnsafeBytes { ivPtr in
+            key.withUnsafeBytes { keyPtr in
                 CCCryptorCreateWithMode(
                     CCOperation(kCCEncrypt), CCMode(kCCModeCTR), CCAlgorithm(kCCAlgorithmAES),
-                    CCPadding(ccNoPadding), ivPtr.baseAddress, keyPtr.baseAddress, encryptionKey.count,
+                    CCPadding(ccNoPadding), ivPtr.baseAddress, keyPtr.baseAddress, key.count,
                     nil, 0, 0, CCModeOptions(kCCModeOptionCTR_BE), &cryptorRef)
             }
         }
-        guard createStatus == kCCSuccess, let cryptor = cryptorRef else {
-            throw VNCProtocolError.ioError("AES-CTR init failed: \(createStatus)")
+        guard status == kCCSuccess, let cryptorRef else {
+            throw VNCProtocolError.ioError("AES-CTR init failed: \(status)")
         }
-        defer { CCCryptorRelease(cryptor) }
-
-        var output = Data(count: payload.count)
-        var moved = 0
-        let updateStatus = output.withUnsafeMutableBytes { outPtr in
-            payload.withUnsafeBytes { inPtr in
-                CCCryptorUpdate(cryptor, inPtr.baseAddress, payload.count,
-                                outPtr.baseAddress, outPtr.count, &moved)
-            }
-        }
-        guard updateStatus == kCCSuccess else {
-            throw VNCProtocolError.ioError("AES-CTR update failed: \(updateStatus)")
-        }
-        if moved < output.count { output.removeSubrange(moved..<output.count) }
-        return output
+        return cryptorRef
     }
 
     private func counterBlock(ssrc: UInt32, packetIndex: UInt64, blockCounter: UInt16) -> Data {
@@ -249,10 +285,6 @@ public final class AppleSRTPContext: @unchecked Sendable {
             counter &+= 1
         }
         return Data(output.prefix(length))
-    }
-
-    private func aesEncryptBlock(_ block: Data) throws -> Data {
-        try Self.aesEncrypt(block: block, key: encryptionKey)
     }
 
     private static func aesEncrypt(block: Data, key: Data) throws -> Data {

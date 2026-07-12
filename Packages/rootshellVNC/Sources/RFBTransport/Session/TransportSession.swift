@@ -218,6 +218,9 @@ public actor TransportSession {
     private var appleRCTLLostInterval: Int = 0
     private var appleRCTLBurstLostInterval: Int = 0
     private var appleRCTLLastDiagnosticNanos: UInt64 = 0
+    private var appleMediaIngressPacketsSinceDiagnostic = 0
+    private var appleMediaIngressProcessingNanosSinceDiagnostic: UInt64 = 0
+    private var appleMediaIngressMaximumBatchSinceDiagnostic = 0
     /// Receiver-side capacity estimator used to populate RCTL. Apple's
     /// feedback-only screen receiver sends RCTL by itself.
     private var appleMediaRateController: AppleMediaRateController?
@@ -230,7 +233,7 @@ public actor TransportSession {
         var received: UInt32 = 0
         var expectedPrior: UInt32 = 0
         var receivedPrior: UInt32 = 0
-        var recentSequences: [UInt16] = []
+        var recentSequences = BoundedRTPSequenceHistory(capacity: 256)
         var initialized = false
     }
     private var appleMediaDisplayCount: Int = 1
@@ -2996,6 +2999,9 @@ public actor TransportSession {
         appleRCTLLostInterval = 0
         appleRCTLBurstLostInterval = 0
         appleRCTLLastDiagnosticNanos = 0
+        appleMediaIngressPacketsSinceDiagnostic = 0
+        appleMediaIngressProcessingNanosSinceDiagnostic = 0
+        appleMediaIngressMaximumBatchSinceDiagnostic = 0
         // A display resize installs fresh media keys and SSRCs but does not
         // change the network path. Preserve the capacity learned by generation
         // one; resetting to the route prior here can immediately lose the new
@@ -3156,12 +3162,19 @@ public actor TransportSession {
         _ datagrams: [PosixUDPDatagram],
         from channel: PosixUDPChannel
     ) {
+        let processingStart = DispatchTime.now().uptimeNanoseconds
         for datagram in datagrams {
             handleAppleMediaUDPDatagram(
                 datagram.data,
                 arrivalNanos: datagram.arrivalNanos,
                 from: channel)
         }
+        let processingEnd = DispatchTime.now().uptimeNanoseconds
+        appleMediaIngressPacketsSinceDiagnostic += datagrams.count
+        appleMediaIngressProcessingNanosSinceDiagnostic &+= processingEnd &- processingStart
+        appleMediaIngressMaximumBatchSinceDiagnostic = max(
+            appleMediaIngressMaximumBatchSinceDiagnostic,
+            datagrams.count)
     }
 
     private nonisolated func isLoopbackHost(_ host: String) -> Bool {
@@ -3184,6 +3197,9 @@ public actor TransportSession {
         appleRCTLLostInterval = 0
         appleRCTLBurstLostInterval = 0
         appleRCTLLastDiagnosticNanos = 0
+        appleMediaIngressPacketsSinceDiagnostic = 0
+        appleMediaIngressProcessingNanosSinceDiagnostic = 0
+        appleMediaIngressMaximumBatchSinceDiagnostic = 0
         appleMediaRateController = nil
         appleMediaLastRTPEchoTimestampQ10 = 0
         appleRCTLPreviousRTPTimestamp = nil
@@ -3779,7 +3795,11 @@ public actor TransportSession {
 
         appleMediaRTPReorderFlushTask?.cancel()
         appleMediaRTPReorderScheduledDeadlineNanos = deadline
-        let delay = deadline > nowNanos ? deadline - nowNanos : 0
+        // `nowNanos` is the socket arrival time. When ingress is catching up it
+        // may be far behind the monotonic clock, so an already-expired loss
+        // deadline must fire immediately instead of sleeping another 300 ms.
+        let clockNow = DispatchTime.now().uptimeNanoseconds
+        let delay = deadline > clockNow ? deadline - clockNow : 0
         appleMediaRTPReorderFlushTask = Task { [weak self] in
             try? await Task.sleep(for: .nanoseconds(Int64(min(delay, UInt64(Int64.max)))))
             guard !Task.isCancelled else { return }
@@ -3831,12 +3851,8 @@ public actor TransportSession {
     @discardableResult
     private func updateAppleMediaReceptionStats(ssrc: UInt32, sequence: UInt16) -> Bool {
         var stats = appleMediaReceptionStats[ssrc] ?? AppleMediaReceptionStats()
-        if stats.recentSequences.contains(sequence) {
+        if !stats.recentSequences.insert(sequence) {
             return false
-        }
-        stats.recentSequences.append(sequence)
-        if stats.recentSequences.count > 256 {
-            stats.recentSequences.removeFirst(stats.recentSequences.count - 256)
         }
 
         if !stats.initialized {
@@ -4016,12 +4032,22 @@ public actor TransportSession {
                 (appleMediaRateController?.throughputBps(now: nowSeconds) ?? 0) / 1_000)
             let queuePeakMilliseconds = Int(
                 (appleMediaRateController?.peakQueueDelaySeconds ?? 0) * 1_000)
+            let ingressPackets = appleMediaIngressPacketsSinceDiagnostic
+            let ingressProcessingMilliseconds =
+                appleMediaIngressProcessingNanosSinceDiagnostic / 1_000_000
+            let ingressMaximumBatch = appleMediaIngressMaximumBatchSinceDiagnostic
+            appleMediaIngressPacketsSinceDiagnostic = 0
+            appleMediaIngressProcessingNanosSinceDiagnostic = 0
+            appleMediaIngressMaximumBatchSinceDiagnostic = 0
             log.info(
                 "RCTL bwe=\(bwe)kbps received=\(receivedKbps)kbps "
                     + "echoQ10=\(echo) age=\(age)ms loss=\(lossPercent)% "
                     + "burst=\(burstyLoss) "
                     + "packetCount=\(cumulativeReceivedPacketCount & 0x0fff) "
-                    + "ingressQueuePeak=\(queuePeakMilliseconds)ms")
+                    + "ingressQueuePeak=\(queuePeakMilliseconds)ms "
+                    + "ingressPackets=\(ingressPackets) ingressCPU="
+                    + "\(ingressProcessingMilliseconds)ms maxBatch=\(ingressMaximumBatch) "
+                    + "reorderQueued=\(appleMediaRTPReorderBuffer.queuedPacketCount)")
         }
 
         // AVConference's `VCVideoStreamRateAdaptationFeedbackOnly` passes a

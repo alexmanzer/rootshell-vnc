@@ -1,5 +1,36 @@
 import Foundation
 
+/// Fixed-window duplicate detector with O(1) membership and eviction. RTP
+/// sequence numbers wrap, so entries leave the set in arrival order rather
+/// than being retained for the lifetime of the session.
+struct BoundedRTPSequenceHistory {
+    private let capacity: Int
+    private var order: [UInt16] = []
+    private var head = 0
+    private var members: Set<UInt16> = []
+
+    init(capacity: Int = 256) {
+        precondition(capacity > 0)
+        self.capacity = capacity
+        order.reserveCapacity(capacity * 2)
+        members.reserveCapacity(capacity)
+    }
+
+    mutating func insert(_ sequence: UInt16) -> Bool {
+        guard members.insert(sequence).inserted else { return false }
+        order.append(sequence)
+        if order.count - head > capacity {
+            members.remove(order[head])
+            head += 1
+        }
+        if head >= capacity, head * 2 >= order.count {
+            order.removeFirst(head)
+            head = 0
+        }
+        return true
+    }
+}
+
 /// Ordered handoff between the transport actor and the media decode queue.
 ///
 /// Packets received before the decoder installs its sink stay here instead of
@@ -168,6 +199,10 @@ struct AppleMediaRTPReorderBuffer {
         var interruptionPending = false
         var started = false
         var nextSequence: UInt16?
+        /// Closest packet ahead of `nextSequence` while that sequence is
+        /// missing. Keeping this incrementally avoids an O(buffer size) scan
+        /// for every packet received behind the same hole.
+        var nearestFutureSequence: UInt16?
         var gapDeadlineNanos: UInt64?
         var nextNACKDeadlineNanos: UInt64?
         var pending: [UInt16: BufferedPacket] = [:]
@@ -187,6 +222,9 @@ struct AppleMediaRTPReorderBuffer {
     private let maximumBufferedPacketsPerStream: Int
     private var streams: [UInt32: StreamState] = [:]
     private var nextOrdinal: UInt64 = 0
+    /// Internal diagnostic used by regression tests to ensure loss handling
+    /// scales with sequence holes rather than packets buffered behind them.
+    private(set) var nearestFutureScanCount: UInt64 = 0
 
     init(
         startupHoldNanos: UInt64 = 8_000_000,
@@ -256,6 +294,7 @@ struct AppleMediaRTPReorderBuffer {
                 // distance immediately instead of waiting for impossible NACKs.
                 interruptionGapPacketCount = Int(forward)
                 state.pending.removeAll(keepingCapacity: true)
+                state.nearestFutureSequence = nil
                 state.gapDeadlineNanos = nil
                 state.nextNACKDeadlineNanos = nil
                 state.activeFrameTimestamp = nil
@@ -275,6 +314,18 @@ struct AppleMediaRTPReorderBuffer {
             data: packet,
             arrivalNanos: nowNanos,
             ordinal: nextOrdinal)
+        if state.started, let next = state.nextSequence, sequence != next {
+            let distance = sequence &- next
+            if distance < 0x8000 {
+                if let nearest = state.nearestFutureSequence {
+                    if distance < (nearest &- next) {
+                        state.nearestFutureSequence = sequence
+                    }
+                } else {
+                    state.nearestFutureSequence = sequence
+                }
+            }
+        }
         if let missingPacketCount = interruptionGapPacketCount {
             let frame = estimateDamagedFrame(
                 state: state,
@@ -328,6 +379,7 @@ struct AppleMediaRTPReorderBuffer {
     mutating func reset() {
         streams.removeAll(keepingCapacity: false)
         nextOrdinal = 0
+        nearestFutureScanCount = 0
     }
 
     /// Mark a known application/media interruption. Pending pre-suspension
@@ -337,6 +389,7 @@ struct AppleMediaRTPReorderBuffer {
         for ssrc in Array(streams.keys) {
             guard var state = streams[ssrc] else { continue }
             state.pending.removeAll(keepingCapacity: true)
+            state.nearestFutureSequence = nil
             state.gapDeadlineNanos = nil
             state.nextNACKDeadlineNanos = nil
             state.interruptionPending = true
@@ -352,9 +405,10 @@ struct AppleMediaRTPReorderBuffer {
         }!
         state.started = true
         state.nextSequence = earliest
+        state.nearestFutureSequence = nil
     }
 
-    private func drain(
+    private mutating func drain(
         _ state: inout StreamState,
         ssrc: UInt32,
         nowNanos: UInt64,
@@ -366,6 +420,9 @@ struct AppleMediaRTPReorderBuffer {
 
         while true {
             if let buffered = state.pending.removeValue(forKey: next) {
+                if state.nearestFutureSequence == next {
+                    state.nearestFutureSequence = nil
+                }
                 result.released.append((ssrc, buffered.ordinal, buffered.data))
                 noteReleasedFramePacket(buffered.data, state: &state)
                 next &+= 1
@@ -376,7 +433,18 @@ struct AppleMediaRTPReorderBuffer {
                 continue
             }
 
-            guard let nearest = nearestFutureSequence(to: next, in: state.pending) else {
+            let cachedNearest = state.nearestFutureSequence.flatMap { candidate -> UInt16? in
+                let distance = candidate &- next
+                guard distance != 0, distance < 0x8000,
+                      state.pending[candidate] != nil else { return nil }
+                return candidate
+            }
+            let nearest = cachedNearest ?? nearestFutureSequence(
+                to: next,
+                in: state.pending)
+            state.nearestFutureSequence = nearest
+            guard let nearest else {
+                state.nearestFutureSequence = nil
                 state.gapDeadlineNanos = nil
                 state.nextNACKDeadlineNanos = nil
                 break
@@ -423,11 +491,12 @@ struct AppleMediaRTPReorderBuffer {
         }
     }
 
-    private func nearestFutureSequence(
+    private mutating func nearestFutureSequence(
         to sequence: UInt16,
         in pending: [UInt16: BufferedPacket]
     ) -> UInt16? {
-        pending.keys
+        nearestFutureScanCount &+= 1
+        return pending.keys
             .filter {
                 let distance = $0 &- sequence
                 return distance != 0 && distance < 0x8000

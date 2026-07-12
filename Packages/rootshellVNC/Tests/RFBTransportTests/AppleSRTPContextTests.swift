@@ -36,4 +36,26 @@ final class AppleSRTPContextTests: XCTestCase {
     func testRejectsShortKey() {
         XCTAssertThrowsError(try AppleSRTPContext(mediaKey: Data(count: 30)))
     }
+
+    func testCachedCTRCryptorResetsForEveryPacket() throws {
+        let key = Data(base64Encoded: keyB64)!
+        let packet = Data(base64Encoded: packetB64)!
+        let expected = Data(base64Encoded: expectedB64)!
+        let context = try AppleSRTPContext(mediaKey: key)
+
+        for _ in 0..<128 {
+            XCTAssertEqual(try context.unprotect(packet), expected)
+        }
+    }
+
+    func testAuthenticationRejectsModifiedTagWithCachedContext() throws {
+        let key = Data(base64Encoded: keyB64)!
+        let packet = Data(base64Encoded: packetB64)!
+        let context = try AppleSRTPContext(mediaKey: key)
+        _ = try context.unprotect(packet)
+
+        var modified = packet
+        modified[modified.index(before: modified.endIndex)] ^= 0x01
+        XCTAssertThrowsError(try context.unprotect(modified))
+    }
 }

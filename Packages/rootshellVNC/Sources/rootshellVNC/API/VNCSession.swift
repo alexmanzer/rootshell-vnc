@@ -22,6 +22,50 @@ private actor MediaRecoveryCoordinator {
     }
 }
 
+/// Coalesces the transport's per-packet callback into ordered media-queue
+/// batches. A fullscreen reference picture can contain thousands of RTP
+/// packets; scheduling one Dispatch block for each packet creates avoidable
+/// allocator and queue pressure before the demuxer does any useful work.
+final class OrderedMediaPacketCoalescer: @unchecked Sendable {
+    private let queue: DispatchQueue
+    private let consume: @Sendable ([Data]) -> Void
+    private let lock = NSLock()
+    private var pending: [Data] = []
+    private var drainScheduled = false
+
+    init(queue: DispatchQueue, consume: @escaping @Sendable ([Data]) -> Void) {
+        self.queue = queue
+        self.consume = consume
+    }
+
+    func enqueue(_ packet: Data) {
+        lock.lock()
+        pending.append(packet)
+        let shouldSchedule = !drainScheduled
+        if shouldSchedule { drainScheduled = true }
+        lock.unlock()
+
+        if shouldSchedule {
+            queue.async { [self] in drain() }
+        }
+    }
+
+    private func drain() {
+        while true {
+            lock.lock()
+            guard !pending.isEmpty else {
+                drainScheduled = false
+                lock.unlock()
+                return
+            }
+            let batch = pending
+            pending.removeAll(keepingCapacity: true)
+            lock.unlock()
+            consume(batch)
+        }
+    }
+}
+
 /// Main VNC session observable object for SwiftUI integration.
 ///
 /// `VNCSession` is the primary entry point for consumers of the rootshellVNC
@@ -1210,6 +1254,11 @@ public final class VNCSession {
             let sinkAudioPlayer = remoteAudioPlayer
             let generationCoalescer = coalescer
             let generationLog = logger
+            let videoPacketCoalescer = OrderedMediaPacketCoalescer(queue: queue) { packets in
+                for packet in packets {
+                    sinkManager.feedRTPData(packet)
+                }
+            }
             await transport.setAppleMediaGenerationSink { generation, numberOfTiles in
                 queue.async {
                     sinkManager.prepareForStreamReconfiguration(
@@ -1267,7 +1316,7 @@ public final class VNCSession {
                 if AppleRemoteAudioPlayer.canHandleRTPPacket(packet) {
                     sinkAudioPlayer?.enqueueRTPPacket(packet)
                 } else {
-                    queue.async { sinkManager.feedRTPData(packet) }
+                    videoPacketCoalescer.enqueue(packet)
                 }
             }
         }

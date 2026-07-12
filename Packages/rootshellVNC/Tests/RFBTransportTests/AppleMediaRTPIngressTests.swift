@@ -192,6 +192,58 @@ final class AppleMediaRTPIngressTests: XCTestCase {
         XCTAssertEqual(resumed.gaps.map(\.missingPacketCount), [39_989])
     }
 
+    func testLargeBurstBehindOneHoleDoesNotRescanPendingPackets() {
+        var reorder = AppleMediaRTPReorderBuffer(
+            startupHoldNanos: 8,
+            maximumGapWaitNanos: 1_000_000,
+            nackRetryNanos: 100_000,
+            maximumBufferedPacketsPerStream: 7_000)
+        _ = reorder.insert(
+            packet: numberedPacket(100),
+            ssrc: 7,
+            sequence: 100,
+            nowNanos: 0)
+        XCTAssertEqual(reorder.flushExpired(nowNanos: 8).packets, [numberedPacket(100)])
+        let scansBeforeBurst = reorder.nearestFutureScanCount
+
+        for sequence in UInt16(102)...UInt16(6_101) {
+            let result = reorder.insert(
+                packet: numberedPacket(sequence),
+                ssrc: 7,
+                sequence: sequence,
+                nowNanos: 9)
+            XCTAssertTrue(result.packets.isEmpty)
+            XCTAssertTrue(result.gaps.isEmpty)
+        }
+
+        // One cached nearest-future sequence serves the whole burst. A scan
+        // per packet is the quadratic regression that caused the 5K collapse.
+        XCTAssertLessThanOrEqual(
+            reorder.nearestFutureScanCount - scansBeforeBurst,
+            2)
+
+        let recovered = reorder.insert(
+            packet: numberedPacket(101),
+            ssrc: 7,
+            sequence: 101,
+            nowNanos: 10)
+        XCTAssertEqual(recovered.packets.count, 6_001)
+        XCTAssertEqual(recovered.packets.first, numberedPacket(101))
+        XCTAssertEqual(recovered.packets.last, numberedPacket(6_101))
+        XCTAssertTrue(recovered.gaps.isEmpty)
+    }
+
+    func testBoundedSequenceHistoryEvictsOldestWithoutLosingDuplicateDetection() {
+        var history = BoundedRTPSequenceHistory(capacity: 3)
+        XCTAssertTrue(history.insert(10))
+        XCTAssertTrue(history.insert(11))
+        XCTAssertFalse(history.insert(10))
+        XCTAssertTrue(history.insert(12))
+        XCTAssertTrue(history.insert(13))
+        XCTAssertTrue(history.insert(10), "oldest sequence should be eligible after eviction")
+        XCTAssertFalse(history.insert(13))
+    }
+
     private func makeReorderBuffer() -> AppleMediaRTPReorderBuffer {
         AppleMediaRTPReorderBuffer(
             startupHoldNanos: 8,
@@ -201,6 +253,10 @@ final class AppleMediaRTPIngressTests: XCTestCase {
     }
 
     private func packet(_ value: UInt8) -> Data { Data([value]) }
+
+    private func numberedPacket(_ value: UInt16) -> Data {
+        Data([UInt8(value >> 8), UInt8(value & 0xff)])
+    }
 
     private func rtpPacket(
         sequence: UInt16,
