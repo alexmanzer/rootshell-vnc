@@ -1,7 +1,7 @@
 import Foundation
 import RFBProtocol
 
-/// Public error type for the RootShellVNC framework.
+/// Public error type for the rootshellVNC framework.
 ///
 /// These errors wrap lower-level protocol and transport errors into
 /// a unified error type suitable for presentation to the user.

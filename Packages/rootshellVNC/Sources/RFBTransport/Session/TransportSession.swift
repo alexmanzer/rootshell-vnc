@@ -1679,7 +1679,7 @@ public actor TransportSession {
             pixelWidth: Int(requested.pixelWidth),
             pixelHeight: Int(requested.pixelHeight))
         let display = AppleVirtualDisplay(
-            name: "Rootshell Virtual Display",
+            name: "rootshell Virtual Display",
             widthInMillimeters: Float(requested.pointWidth) * millimetersPerPoint,
             heightInMillimeters: Float(requested.pointHeight) * millimetersPerPoint,
             maximumPixelWidth: appleVirtualDisplayMaximumPixelWidth,

@@ -1,6 +1,6 @@
 import CoreGraphics
 import XCTest
-@testable import RootShellVNC
+@testable import rootshellVNC
 
 final class RemoteViewportStateTests: XCTestCase {
     private let viewSize = CGSize(width: 1000, height: 1000)

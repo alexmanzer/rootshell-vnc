@@ -3,13 +3,13 @@
 import PackageDescription
 
 let package = Package(
-    name: "RootShellVNC",
+    name: "rootshellVNC",
     platforms: [
         .iOS(.v18),
         .macOS(.v15),
     ],
     products: [
-        .library(name: "RootShellVNC", targets: ["RootShellVNC"]),
+        .library(name: "rootshellVNC", targets: ["rootshellVNC"]),
         .library(name: "RFBProtocol", targets: ["RFBProtocol"]),
         .library(name: "RFBTransport", targets: ["RFBTransport"]),
         .library(name: "RFBRendering", targets: ["RFBRendering"]),
@@ -59,9 +59,9 @@ let package = Package(
             ]
         ),
 
-        // MARK: - RootShellVNC (public API facade, SwiftUI views, input handling)
+        // MARK: - rootshellVNC (public API facade, SwiftUI views, input handling)
         .target(
-            name: "RootShellVNC",
+            name: "rootshellVNC",
             dependencies: ["RFBProtocol", "RFBTransport", "RFBRendering"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
@@ -78,8 +78,8 @@ let package = Package(
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(
-            name: "RootShellVNCTests",
-            dependencies: ["RootShellVNC", "RFBProtocol", "RFBTransport", "RFBRendering"],
+            name: "rootshellVNCTests",
+            dependencies: ["rootshellVNC", "RFBProtocol", "RFBTransport", "RFBRendering"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

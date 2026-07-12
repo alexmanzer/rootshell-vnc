@@ -24,7 +24,7 @@ private actor MediaRecoveryCoordinator {
 
 /// Main VNC session observable object for SwiftUI integration.
 ///
-/// `VNCSession` is the primary entry point for consumers of the RootShellVNC
+/// `VNCSession` is the primary entry point for consumers of the rootshellVNC
 /// framework. It manages the connection lifecycle, framebuffer rendering,
 /// and exposes observable state for SwiftUI views.
 ///
@@ -1312,7 +1312,7 @@ final class DiagnosticFrameDumper: @unchecked Sendable {
             guard let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
                 return nil
             }
-            root = caches.appendingPathComponent("RootShellVNC/DecodedFrames", isDirectory: true)
+            root = caches.appendingPathComponent("rootshellVNC/DecodedFrames", isDirectory: true)
             #else
             return nil
             #endif

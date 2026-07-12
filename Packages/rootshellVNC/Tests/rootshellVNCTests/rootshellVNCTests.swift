@@ -1,7 +1,7 @@
 import XCTest
 import Foundation
 import CoreVideo
-@testable import RootShellVNC
+@testable import rootshellVNC
 import RFBProtocol
 @testable import RFBRendering
 

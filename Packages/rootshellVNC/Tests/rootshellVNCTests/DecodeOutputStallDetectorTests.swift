@@ -1,5 +1,5 @@
 import XCTest
-@testable import RootShellVNC
+@testable import rootshellVNC
 
 final class DecodeOutputStallDetectorTests: XCTestCase {
     func testStaticStreamDoesNotLookStalled() {

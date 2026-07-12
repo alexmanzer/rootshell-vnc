@@ -6,7 +6,7 @@
 //
 
 import SwiftUI
-import RootShellVNC
+import rootshellVNC
 
 #if targetEnvironment(macCatalyst)
 import UIKit

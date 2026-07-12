@@ -8,7 +8,7 @@ import AppKit
 import RFBProtocol
 @testable import RFBTransport
 @testable import RFBRendering
-@testable import RootShellVNC
+@testable import rootshellVNC
 
 /// Connects to a live server over the network and runs the REAL-TIME media
 /// pipeline exactly like the app (transport → RTP sink → VideoStreamManager →

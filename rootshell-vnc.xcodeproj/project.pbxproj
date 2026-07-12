@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		47CEC3142F69F34F00C9FCB9 /* RootShellVNC in Frameworks */ = {isa = PBXBuildFile; productRef = AABB00022F69D000005C1D3E /* RootShellVNC */; };
+		47CEC3142F69F34F00C9FCB9 /* rootshellVNC in Frameworks */ = {isa = PBXBuildFile; productRef = AABB00022F69D000005C1D3E /* rootshellVNC */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -56,7 +56,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				47CEC3142F69F34F00C9FCB9 /* RootShellVNC in Frameworks */,
+				47CEC3142F69F34F00C9FCB9 /* rootshellVNC in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -125,7 +125,7 @@
 			);
 			name = "rootshell-vnc";
 			packageProductDependencies = (
-				AABB00022F69D000005C1D3E /* RootShellVNC */,
+				AABB00022F69D000005C1D3E /* rootshellVNC */,
 			);
 			productName = "rootshell-vnc";
 			productReference = 47265FC52F69C6CE005C1D3E /* rootshell-vnc.app */;
@@ -210,7 +210,7 @@
 			mainGroup = 47265FBC2F69C6CE005C1D3E;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				AABB00012F69D000005C1D3E /* XCLocalSwiftPackageReference "Packages/RootShellVNC" */,
+				AABB00012F69D000005C1D3E /* XCLocalSwiftPackageReference "Packages/rootshellVNC" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 47265FC62F69C6CE005C1D3E /* Products */;
@@ -603,16 +603,16 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		AABB00012F69D000005C1D3E /* XCLocalSwiftPackageReference "Packages/RootShellVNC" */ = {
+		AABB00012F69D000005C1D3E /* XCLocalSwiftPackageReference "Packages/rootshellVNC" */ = {
 			isa = XCLocalSwiftPackageReference;
-			relativePath = Packages/RootShellVNC;
+			relativePath = Packages/rootshellVNC;
 		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		AABB00022F69D000005C1D3E /* RootShellVNC */ = {
+		AABB00022F69D000005C1D3E /* rootshellVNC */ = {
 			isa = XCSwiftPackageProductDependency;
-			productName = RootShellVNC;
+			productName = rootshellVNC;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
