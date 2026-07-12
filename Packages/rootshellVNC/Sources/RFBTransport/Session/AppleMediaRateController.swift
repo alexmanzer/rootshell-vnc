@@ -16,7 +16,15 @@ final class AppleMediaRateController {
     /// maxima. Receiver feedback may still report a lower path estimate, so the
     /// controller must not clamp its RCTL value to the media arbitration range.
     static let nativeScreenMinimumBitrateBps: Double = 20_000_000
-    static let nativeScreenMaximumBitrateBps: Double = 40_000_000
+    /// The negotiated low-latency screen tiers include 40 and 60 Mbps maxima.
+    /// The estimator ceiling uses the 60 Mbps tier for every bearer: a flat
+    /// 40 Mbps ceiling starved large virtual displays (a 4288x3072 compound
+    /// stream at 40 Mbps is ~3 bits/px/s under motion — visible pulsing
+    /// macroblocks with zero loss), and modern Wi-Fi frequently outruns wired.
+    /// The bearer sets only the conservative initial prior; the utilization-
+    /// gated ramp and loss backoff decide what a path actually sustains. RCTL's
+    /// UInt16 kbps field keeps everything below 65.5 Mbps representable.
+    static let nativeScreenMaximumBitrateBps: Double = 60_000_000
 
     private struct Config {
         let minimumCapacity: Double

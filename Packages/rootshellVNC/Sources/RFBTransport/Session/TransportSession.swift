@@ -4155,9 +4155,11 @@ public actor TransportSession {
 
     }
 
-    /// Ceiling for the receive-capacity estimator (bps). RCTL serializes kbps
-    /// as UInt16; estimates above that only delay a later loss response because
-    /// several reductions would still encode as the same saturated value.
+    /// Ceiling for the receive-capacity estimator (bps). The bearer only sets
+    /// the initial prior; the ceiling is the 60 Mbps negotiated screen tier on
+    /// every path. RCTL serializes kbps as UInt16; estimates above that only
+    /// delay a later loss response because several reductions would still
+    /// encode as the same saturated value.
     private var appleMediaRateControllerMaxBps: Double {
         AppleMediaRateController.nativeScreenMaximumBitrateBps
     }

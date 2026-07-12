@@ -143,6 +143,33 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertTrue(profile.name.hasSuffix("over private/VPN"))
     }
 
+    func testBearerSetsInitialPriorOnlyWhileCeilingUsesSixtyMbpsTier() {
+        // A large virtual display was pinned at bwe=40000kbps and starved the
+        // encoder (pulsing macroblocks with zero loss). The ceiling is the
+        // 60 Mbps negotiated screen tier on every bearer — modern Wi-Fi often
+        // outruns wired — while the bearer keeps its conservative prior.
+        XCTAssertEqual(
+            AppleMediaRateController.nativeScreenMaximumBitrateBps, 60_000_000)
+
+        let wired = AppleMediaNetworkProfile.detect(
+            from: NetworkPathCharacteristics(
+                interface: .wiredEthernet,
+                usesOtherInterface: false,
+                isExpensive: false,
+                isConstrained: false),
+            remoteHost: "192.168.46.111")
+        XCTAssertEqual(wired.initialCapacityBps, 40_000_000)
+
+        let wifi = AppleMediaNetworkProfile.detect(
+            from: NetworkPathCharacteristics(
+                interface: .wifi,
+                usesOtherInterface: false,
+                isExpensive: false,
+                isConstrained: false),
+            remoteHost: "192.168.46.111")
+        XCTAssertEqual(wifi.initialCapacityBps, 20_000_000)
+    }
+
     func testAudioBlobCarriesAudioSettingsInsteadOfScreenSettings() throws {
         let profile = AppleMediaNegotiationProfile(
             framebufferWidth: 2048,

@@ -38,9 +38,9 @@ final class AppleMediaFeedbackTests: XCTestCase {
             ]))
     }
 
-    func testNativeScreenRateProfileIsTwentyToFortyMegabits() {
+    func testNativeScreenRateProfileIsTwentyToSixtyMegabits() {
         XCTAssertEqual(AppleMediaRateController.nativeScreenMinimumBitrateBps, 20_000_000)
-        XCTAssertEqual(AppleMediaRateController.nativeScreenMaximumBitrateBps, 40_000_000)
+        XCTAssertEqual(AppleMediaRateController.nativeScreenMaximumBitrateBps, 60_000_000)
     }
 
     func testGenericNACKPacksContiguousAndSparseSequenceNumbers() {
