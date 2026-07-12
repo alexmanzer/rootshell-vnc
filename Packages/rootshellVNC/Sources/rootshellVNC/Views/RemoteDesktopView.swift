@@ -9,6 +9,7 @@ public struct RemoteDesktopView: View {
 
     @State private var viewport = RemoteViewportState()
     @State private var keyboardActive = false
+    @State private var confirmPasswordSend = false
 
     #if !canImport(UIKit)
     @State private var lastFallbackMagnification: CGFloat = 1
@@ -17,9 +18,17 @@ public struct RemoteDesktopView: View {
 
     private let touchHandler: TouchInputHandler
     private let keyboardHandler: KeyboardInputHandler
+    private let isFullScreen: Bool
+    private let toggleFullScreen: (() -> Void)?
 
-    public init(session: VNCSession) {
+    public init(
+        session: VNCSession,
+        isFullScreen: Bool = false,
+        toggleFullScreen: (() -> Void)? = nil
+    ) {
         self.session = session
+        self.isFullScreen = isFullScreen
+        self.toggleFullScreen = toggleFullScreen
         self.touchHandler = TouchInputHandler(
             sendPointerEvent: { [session] buttonMask, x, y in
                 session.sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
@@ -61,6 +70,18 @@ public struct RemoteDesktopView: View {
                 viewportControls
             }
             .clipped()
+            .confirmationDialog(
+                "Type the saved password?",
+                isPresented: $confirmPasswordSend,
+                titleVisibility: .visible
+            ) {
+                Button("Type Password and Log In") {
+                    session.sendLoginPassword()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("The password will be typed into the remote computer, followed by Return.")
+            }
             .onChange(of: geometry.size) { _, newSize in
                 viewport.clampOffset(
                     viewSize: newSize,
@@ -149,42 +170,67 @@ public struct RemoteDesktopView: View {
     private var viewportControls: some View {
         VStack {
             Spacer()
-            HStack(spacing: 10) {
+            HStack {
                 Spacer()
-                if !viewport.isIdentity {
-                    controlButton(
-                        title: "Fit Screen",
-                        systemImage: "arrow.down.right.and.arrow.up.left") {
-                            viewport.reset()
-                        }
-                }
-                #if canImport(UIKit)
-                controlButton(
-                    title: keyboardActive ? "Hide Keyboard" : "Show Keyboard",
-                    systemImage: keyboardActive ? "keyboard.chevron.compact.down" : "keyboard") {
+                Menu {
+                    #if canImport(UIKit)
+                    Button {
                         keyboardActive.toggle()
+                    } label: {
+                        Label(
+                            keyboardActive ? "Hide Keyboard" : "Show Keyboard",
+                            systemImage: keyboardActive
+                                ? "keyboard.chevron.compact.down" : "keyboard")
                     }
-                #endif
+                    #endif
+
+                    Button {
+                        viewport.reset()
+                    } label: {
+                        Label("Fit Screen", systemImage: "arrow.down.right.and.arrow.up.left")
+                    }
+                    .disabled(viewport.isIdentity)
+
+                    if let toggleFullScreen {
+                        Button(action: toggleFullScreen) {
+                            Label(
+                                isFullScreen ? "Exit Full Screen" : "Enter Full Screen",
+                                systemImage: isFullScreen
+                                    ? "arrow.down.right.and.arrow.up.left"
+                                    : "arrow.up.left.and.arrow.down.right")
+                        }
+                    }
+
+                    Divider()
+
+                    Button {
+                        confirmPasswordSend = true
+                    } label: {
+                        Label("Type User Password", systemImage: "key.fill")
+                    }
+                    .disabled(!session.canSendLoginPassword)
+
+                    Divider()
+
+                    Button(role: .destructive) {
+                        session.disconnect()
+                    } label: {
+                        Label("Disconnect", systemImage: "xmark.circle")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.body.weight(.bold))
+                        .frame(width: 42, height: 42)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.primary)
+                .accessibilityLabel("Remote Desktop Controls")
+                .help("Remote Desktop Controls")
             }
             .padding(12)
         }
         .allowsHitTesting(true)
-    }
-
-    private func controlButton(
-        title: String,
-        systemImage: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.body.weight(.semibold))
-                .frame(width: 38, height: 38)
-                .background(.ultraThinMaterial, in: Circle())
-        }
-        .buttonStyle(.plain)
-        .foregroundStyle(.primary)
-        .accessibilityLabel(title)
     }
 
     private var placeholderView: some View {

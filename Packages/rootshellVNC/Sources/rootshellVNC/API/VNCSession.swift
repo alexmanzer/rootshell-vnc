@@ -79,6 +79,10 @@ public final class VNCSession {
     // MARK: - Internal
 
     private var transportSession: TransportSession?
+    /// Credentials for the active connection. Kept private so UI code can
+    /// offer credential actions without ever reading or displaying the secret.
+    @ObservationIgnored
+    private var activeCredentials: VNCCredentials?
     private var framebuffer: Framebuffer?
     private var renderer: FramebufferRenderer?
     private var videoStreamManager: VideoStreamManager?
@@ -183,6 +187,7 @@ public final class VNCSession {
 
         invalidateInputQueue()
         connectionState = .connecting
+        activeCredentials = credentials
         lastError = nil
         currentImage = nil
         remoteCursor = nil
@@ -281,6 +286,7 @@ public final class VNCSession {
             }
         }
         transportSession = nil
+        activeCredentials = nil
 
         // Clear rendering state
         framebuffer = nil
@@ -301,6 +307,28 @@ public final class VNCSession {
     }
 
     // MARK: - Input Events
+
+    /// Whether the active connection has a password available for the remote
+    /// login window. The password itself is intentionally never exposed.
+    public var canSendLoginPassword: Bool {
+        connectionState.isConnected && !(activeCredentials?.password.isEmpty ?? true)
+    }
+
+    /// Type the active connection's password and press Return. This mirrors
+    /// the behavior of remote-desktop clients' “Type User Password” action.
+    /// Callers should obtain confirmation before invoking this method.
+    public func sendLoginPassword() {
+        guard canSendLoginPassword, let password = activeCredentials?.password else { return }
+
+        for character in password {
+            let keysym = KeyboardInputHandler.keysymForCharacter(character)
+            guard keysym != 0 else { continue }
+            sendKeyEvent(downFlag: true, key: keysym)
+            sendKeyEvent(downFlag: false, key: keysym)
+        }
+        sendKeyEvent(downFlag: true, key: KeyboardInputHandler.keysymReturn)
+        sendKeyEvent(downFlag: false, key: KeyboardInputHandler.keysymReturn)
+    }
 
     /// Send a key press or release event to the VNC server.
     ///
@@ -757,6 +785,7 @@ public final class VNCSession {
         lastRequestedClientDisplaySize = nil
         invalidateInputQueue()
         transportSession = nil
+        activeCredentials = nil
         videoStreamManager?.stopStream()
         videoStreamManager = nil
         remoteAudioPlayer?.stop()
@@ -779,6 +808,7 @@ public final class VNCSession {
         lastRequestedClientDisplaySize = nil
         invalidateInputQueue()
         transportSession = nil
+        activeCredentials = nil
         remoteAudioPlayer?.stop()
         remoteAudioPlayer = nil
     }

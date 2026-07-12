@@ -15,7 +15,6 @@ import UIKit
 struct ContentView: View {
     @State private var session = VNCSession()
     @State private var isFullScreen = false
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
         Group {
@@ -39,9 +38,21 @@ struct ContentView: View {
         #endif
         .task { await autoConnectIfRequested() }
         .onChange(of: session.connectionState) { _, newState in
+            #if os(iOS) && !targetEnvironment(macCatalyst)
+            // Arm full screen while the connection is still negotiating. That
+            // way the first connected RemoteDesktopView is created directly
+            // in the full-screen hierarchy and can never publish the smaller
+            // NavigationStack geometry as the active client display size.
+            if newState == .connecting || newState.isConnected {
+                enterFullScreen()
+            } else if isFullScreen {
+                exitFullScreen()
+            }
+            #else
             if !newState.isConnected, isFullScreen {
                 exitFullScreen()
             }
+            #endif
         }
         #if targetEnvironment(macCatalyst)
         // Catalyst posts the AppKit window notifications through the default
@@ -80,14 +91,6 @@ struct ContentView: View {
                             .font(.headline)
                     }
                     ToolbarItem(placement: .topBarTrailing) {
-                        Button(action: enterFullScreen) {
-                            Label(
-                                "Enter Full Screen",
-                                systemImage: "arrow.up.left.and.arrow.down.right")
-                        }
-                        .keyboardShortcut("f", modifiers: [.command, .control])
-                    }
-                    ToolbarItem(placement: .topBarTrailing) {
                         Button("Disconnect") {
                             session.disconnect()
                         }
@@ -119,39 +122,17 @@ struct ContentView: View {
     }
 
     private var remoteDesktop: some View {
-        RemoteDesktopView(session: session)
+        RemoteDesktopView(
+            session: session,
+            isFullScreen: isFullScreen,
+            toggleFullScreen: toggleFullScreen)
             .ignoresSafeArea(isFullScreen ? .all : [])
             .persistentSystemOverlays(isFullScreen ? .hidden : .automatic)
-            .overlay(alignment: .topTrailing) {
-                if isFullScreen {
-                    exitFullScreenButton
-                        .safeAreaPadding(.top, 10)
-                        .safeAreaPadding(.trailing, 10)
-                        .transition(.opacity.combined(with: .scale(scale: 0.9)))
-                }
-            }
             .animation(.easeInOut(duration: 0.2), value: isFullScreen)
     }
 
-    private var exitFullScreenButton: some View {
-        Button(action: exitFullScreen) {
-            if horizontalSizeClass == .compact {
-                Image(systemName: "arrow.down.right.and.arrow.up.left")
-                    .frame(width: 42, height: 42)
-            } else {
-                Label("Exit Full Screen", systemImage: "arrow.down.right.and.arrow.up.left")
-                    .padding(.horizontal, 14)
-                    .frame(minHeight: 42)
-            }
-        }
-        .font(.body.weight(.semibold))
-        .foregroundStyle(.primary)
-        .background(.ultraThinMaterial, in: Capsule())
-        .contentShape(Capsule())
-        .buttonStyle(.plain)
-        .keyboardShortcut("f", modifiers: [.command, .control])
-        .accessibilityLabel("Exit Full Screen")
-        .help("Exit Full Screen (⌃⌘F)")
+    private func toggleFullScreen() {
+        isFullScreen ? exitFullScreen() : enterFullScreen()
     }
 
     private func enterFullScreen() {
