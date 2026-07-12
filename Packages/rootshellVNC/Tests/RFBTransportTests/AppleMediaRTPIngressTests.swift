@@ -148,6 +148,49 @@ final class AppleMediaRTPIngressTests: XCTestCase {
         XCTAssertTrue(recovered.retransmissionRequests.isEmpty)
     }
 
+    func testSiblingStreamWaitsBehindRecoverableCompoundGap() {
+        var reorder = makeReorderBuffer()
+        _ = reorder.insert(packet: packet(10), ssrc: 1, sequence: 10, nowNanos: 0)
+        _ = reorder.insert(packet: packet(20), ssrc: 2, sequence: 20, nowNanos: 1)
+        XCTAssertEqual(reorder.flushExpired(nowNanos: 9).packets, [packet(10), packet(20)])
+
+        XCTAssertTrue(
+            reorder.insert(packet: packet(12), ssrc: 1, sequence: 12, nowNanos: 10)
+                .packets.isEmpty)
+        XCTAssertTrue(
+            reorder.insert(packet: packet(21), ssrc: 2, sequence: 21, nowNanos: 11)
+                .packets.isEmpty,
+            "a healthy sibling band must not advance the global HEVC timeline")
+
+        let recovered = reorder.insert(
+            packet: packet(11),
+            ssrc: 1,
+            sequence: 11,
+            nowNanos: 12)
+        XCTAssertEqual(
+            recovered.packets,
+            [packet(11), packet(12), packet(21)],
+            "the repaired band must unblock its missing DON before held siblings")
+        XCTAssertTrue(recovered.gaps.isEmpty)
+    }
+
+    func testConfirmedCompoundGapGatesBeforeHeldSiblingPackets() {
+        var reorder = makeReorderBuffer()
+        _ = reorder.insert(packet: packet(10), ssrc: 1, sequence: 10, nowNanos: 0)
+        _ = reorder.insert(packet: packet(20), ssrc: 2, sequence: 20, nowNanos: 1)
+        _ = reorder.flushExpired(nowNanos: 9)
+
+        _ = reorder.insert(packet: packet(12), ssrc: 1, sequence: 12, nowNanos: 10)
+        _ = reorder.insert(packet: packet(21), ssrc: 2, sequence: 21, nowNanos: 11)
+        let confirmed = reorder.flushExpired(nowNanos: 40)
+
+        XCTAssertEqual(confirmed.gaps, [.init(ssrc: 1, missingPacketCount: 1)])
+        XCTAssertEqual(
+            confirmed.packets,
+            [packet(12), packet(21)],
+            "the sequence jump must gate decoding before sibling packets are released")
+    }
+
     func testSequenceWraparoundAndIndependentSSRCs() {
         var reorder = makeReorderBuffer()
         _ = reorder.insert(packet: packet(1), ssrc: 1, sequence: .max, nowNanos: 0)

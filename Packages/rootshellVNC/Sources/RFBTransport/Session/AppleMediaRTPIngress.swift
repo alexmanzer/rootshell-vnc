@@ -157,11 +157,17 @@ struct AppleMediaRTPReorderBuffer {
 
     struct Result {
         fileprivate var released: [(ssrc: UInt32, arrivalOrdinal: UInt64, data: Data)] = []
+        fileprivate var preorderedPackets: [Data]?
         var gaps: [Gap] = []
         var retransmissionRequests: [RetransmissionRequest] = []
         var duplicateOrLatePacketCount = 0
 
         var packets: [Data] {
+            if let preorderedPackets { return preorderedPackets }
+            return packetsOrderedByArrivalSlots()
+        }
+
+        private func packetsOrderedByArrivalSlots() -> [Data] {
             // Preserve arrival ordering between independent SSRCs, but assign
             // each stream's arrival slots to its sequence-ordered releases.
             // Sorting directly by each packet's original arrival ordinal would
@@ -222,6 +228,11 @@ struct AppleMediaRTPReorderBuffer {
     private let maximumBufferedPacketsPerStream: Int
     private var streams: [UInt32: StreamState] = [:]
     private var nextOrdinal: UInt64 = 0
+    /// Packets from healthy sibling SSRCs wait here while any compound-video
+    /// SSRC has an RTP hole. Letting one band advance while another waits for
+    /// retransmission makes the DON reorderer skip the missing global picture
+    /// and submit dependent HEVC frames before loss recovery can gate them.
+    private var compoundGapHeldPackets: [Data] = []
     /// Internal diagnostic used by regression tests to ensure loss handling
     /// scales with sequence holes rather than packets buffered behind them.
     private(set) var nearestFutureScanCount: UInt64 = 0
@@ -267,7 +278,7 @@ struct AppleMediaRTPReorderBuffer {
         sequence: UInt16,
         nowNanos: UInt64
     ) -> Result {
-        var result = flushExpired(nowNanos: nowNanos)
+        var result = flushExpiredRaw(nowNanos: nowNanos)
         nextOrdinal &+= 1
 
         var state = streams[ssrc] ?? StreamState(
@@ -278,7 +289,7 @@ struct AppleMediaRTPReorderBuffer {
         if state.pending[sequence] != nil {
             result.duplicateOrLatePacketCount += 1
             streams[ssrc] = state
-            return result
+            return finalizeCompoundGapHold(result)
         }
 
         var interruptionGapPacketCount: Int?
@@ -304,7 +315,7 @@ struct AppleMediaRTPReorderBuffer {
             } else if forward >= 0x8000 {
                 result.duplicateOrLatePacketCount += 1
                 streams[ssrc] = state
-                return result
+                return finalizeCompoundGapHold(result)
             }
         }
 
@@ -345,7 +356,7 @@ struct AppleMediaRTPReorderBuffer {
                 forceGap: false,
                 into: &result)
             streams[ssrc] = state
-            return result
+            return finalizeCompoundGapHold(result)
         }
         if state.pending.count >= maximumBufferedPacketsPerStream {
             if !state.started { start(&state) }
@@ -354,10 +365,14 @@ struct AppleMediaRTPReorderBuffer {
             drain(&state, ssrc: ssrc, nowNanos: nowNanos, forceGap: false, into: &result)
         }
         streams[ssrc] = state
-        return result
+        return finalizeCompoundGapHold(result)
     }
 
     mutating func flushExpired(nowNanos: UInt64) -> Result {
+        finalizeCompoundGapHold(flushExpiredRaw(nowNanos: nowNanos))
+    }
+
+    private mutating func flushExpiredRaw(nowNanos: UInt64) -> Result {
         var result = Result()
 
         for ssrc in Array(streams.keys) {
@@ -378,6 +393,7 @@ struct AppleMediaRTPReorderBuffer {
 
     mutating func reset() {
         streams.removeAll(keepingCapacity: false)
+        compoundGapHeldPackets.removeAll(keepingCapacity: false)
         nextOrdinal = 0
         nearestFutureScanCount = 0
     }
@@ -502,6 +518,32 @@ struct AppleMediaRTPReorderBuffer {
                 return distance != 0 && distance < 0x8000
             }
             .min { ($0 &- sequence) < ($1 &- sequence) }
+    }
+
+    /// Keep every band at the same pre-loss decode point while NACK has a
+    /// chance to repair a sequence hole. When repair succeeds, the recovered
+    /// stream is emitted first so its missing DON reaches the decoder before
+    /// sibling pictures accumulated behind it. When loss is confirmed, the
+    /// same ordering makes VideoStreamManager observe and gate the sequence
+    /// jump before any held sibling-band picture can be decoded.
+    private mutating func finalizeCompoundGapHold(_ input: Result) -> Result {
+        let hasPendingGap = streams.values.contains { $0.gapDeadlineNanos != nil }
+        // Normal media never pays for packet materialization or array copies.
+        // The holding path is cold and exists only for an observed RTP hole.
+        guard hasPendingGap || !compoundGapHeldPackets.isEmpty else { return input }
+
+        var result = input
+        let packets = result.packets
+        result.released.removeAll(keepingCapacity: false)
+        if hasPendingGap {
+            compoundGapHeldPackets.append(contentsOf: packets)
+            result.preorderedPackets = []
+            return result
+        }
+
+        result.preorderedPackets = packets + compoundGapHeldPackets
+        compoundGapHeldPackets.removeAll(keepingCapacity: true)
+        return result
     }
 
     private struct RTPFrameBoundary {
