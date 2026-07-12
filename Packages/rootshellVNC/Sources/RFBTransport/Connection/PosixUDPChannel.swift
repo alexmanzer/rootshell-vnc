@@ -275,7 +275,7 @@ public actor PosixUDPChannel {
     /// same lock. Large compound HEVC pictures contain hundreds of RTP packets,
     /// and crossing two Swift actor boundaries per datagram allowed the
     /// userspace FIFO to overflow under GUI load.
-    public func receiveDatagramBatch(maxCount: Int = 2048) async throws -> [PosixUDPDatagram] {
+    public func receiveDatagramBatch(maxCount: Int = 512) async throws -> [PosixUDPDatagram] {
         let limit = max(1, maxCount)
         let first = try await receiveDatagram()
         guard limit > 1 else { return [first] }

@@ -168,9 +168,16 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var lastLossNanos: UInt64 = 0
     /// Kill-switch for A/B testing: ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY=1.
     var lossRecoveryEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY"] != "1"
-    /// Native-equivalent drop-until-IDR gate. The opt-out exists only for
-    /// diagnostics against non-Apple senders.
-    var irapGateEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_IRAP_GATE"] != "1"
+    /// Drop-until-IDR gate. Opt-in only: Apple's high-performance screen stream
+    /// sends exactly one IRAP at startup and never again — recovery is gradual
+    /// intra-refresh inside P-frames, and FIR requests do not produce a new IDR.
+    /// Gating every band until a type-20 IDR decodes therefore freezes the whole
+    /// display until the multi-second decoder-rebuild fail-safe, which under
+    /// motion collapses playback to single-digit fps. The correct behavior is to
+    /// keep decoding through corruption and let intra-refresh heal; enable the
+    /// gate (ROOTSHELL_VNC_ENABLE_IRAP_GATE=1) only for diagnostics or senders
+    /// that actually retransmit an IDR on loss.
+    var irapGateEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_ENABLE_IRAP_GATE"] == "1"
     /// Fired (off-lock) when a fresh loss is detected while no recovery is in
     /// flight. VNCSession wires this to the transport's keyframe request.
     public var onLossDetected: (@Sendable (UInt32?) -> Void)?

@@ -13,6 +13,9 @@ final class ReorderRecoveryTests: XCTestCase {
 
     func testCompoundRecoveryBaseIDRDoesNotReleaseDependentsBeforeDecoderOutput() {
         let manager = VideoStreamManager()
+        // The IRAP gate is opt-in (off by default because Apple's screen stream
+        // never re-sends an IDR); enable it explicitly to exercise the gate.
+        manager.irapGateEnabled = true
         manager.startStream(streamID: 1, width: 1920, height: 1080) { _, _ in }
         defer { manager.stopStream() }
         manager.installCompoundRecoveryGateForTesting(sources: [10, 11])
@@ -31,6 +34,7 @@ final class ReorderRecoveryTests: XCTestCase {
 
     func testRecoveryOrderResetKeepsInFlightRecoveryIDRArmed() {
         let manager = VideoStreamManager()
+        manager.irapGateEnabled = true
         manager.startStream(streamID: 1, width: 1920, height: 1080) { _, _ in }
         defer { manager.stopStream() }
         manager.installCompoundRecoveryGateForTesting(sources: [10, 11])

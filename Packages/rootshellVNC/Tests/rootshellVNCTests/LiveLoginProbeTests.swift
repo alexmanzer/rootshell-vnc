@@ -131,6 +131,9 @@ final class LiveLoginProbeTests: XCTestCase {
         if env["VNC_PROBE_FORCE_RECOVERY"] == "1" {
             let sources = Set(probe.frameCounts().keys)
             probe.note("forcing recovery gate for \(sources.count) live sources")
+            // The IRAP gate is off by default; enable it to exercise the
+            // gate-clear path this probe validates.
+            manager.irapGateEnabled = true
             manager.installCompoundRecoveryGateForTesting(sources: sources)
             await session.requestVideoKeyframe()
             try await Task.sleep(for: .seconds(2))
