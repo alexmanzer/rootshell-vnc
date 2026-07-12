@@ -724,15 +724,36 @@ final class RemoteDisplaySizeTests: XCTestCase {
         }
     }
 
-    func testClientViewportLargerThanFourKIsNotArtificiallyCapped() {
+    /// The server's screen encoder streams at 30 fps above the 4K-UHD pixel
+    /// area (measured live 2026-07-12: 3840x2160 → 60 fps, 3840x2304 and
+    /// 3696x2416 → 30 fps). Oversized client viewports must be fitted into
+    /// that 60 fps tier, preserving aspect ratio and exact 2x backing.
+    func testClientViewportLargerThanUHDIsFittedIntoThe60FPSTier() {
         XCTAssertEqual(
             RemoteDisplaySize.matching(
                 viewSize: CGSize(width: 2400, height: 1200)),
             RemoteDisplaySize(
-                pixelWidth: 4800,
-                pixelHeight: 2400,
-                pointWidth: 2400,
-                pointHeight: 1200))
+                pixelWidth: 4064,
+                pixelHeight: 2032,
+                pointWidth: 2032,
+                pointHeight: 1016))
+    }
+
+    /// The full-screen Catalyst window that originally negotiated a 3696x2416
+    /// virtual display — and halved the server's frame rate — must stay under
+    /// the UHD area while remaining HiDPI and aspect-correct.
+    func testFullScreenCatalystWindowStaysInside60FPSTier() throws {
+        let size = try XCTUnwrap(RemoteDisplaySize.matching(
+            viewSize: CGSize(width: 1848, height: 1208)))
+
+        XCTAssertLessThanOrEqual(
+            Int(size.pixelWidth) * Int(size.pixelHeight), 3840 * 2160)
+        XCTAssertEqual(size.pixelWidth, size.pointWidth * 2)
+        XCTAssertEqual(size.pixelHeight, size.pointHeight * 2)
+        XCTAssertEqual(
+            Double(size.pixelWidth) / Double(size.pixelHeight),
+            1848.0 / 1208.0,
+            accuracy: 0.02)
     }
 
     func testClientViewportIsFittedInsideCompoundHEVCDecodeLimit() {
@@ -740,18 +761,18 @@ final class RemoteDisplaySizeTests: XCTestCase {
             RemoteDisplaySize.matching(
                 viewSize: CGSize(width: 2784, height: 1632)),
             RemoteDisplaySize(
-                pixelWidth: 5120,
-                pixelHeight: 3008,
-                pointWidth: 2560,
-                pointHeight: 1504))
+                pixelWidth: 3760,
+                pixelHeight: 2192,
+                pointWidth: 1880,
+                pointHeight: 1096))
     }
 
     func testDecodeLimitFitAlsoProtectsTallClientWindows() {
         let size = RemoteDisplaySize.matching(
             viewSize: CGSize(width: 1800, height: 3000))
 
-        XCTAssertEqual(size?.pixelWidth, 3072)
-        XCTAssertEqual(size?.pixelHeight, 5120)
+        XCTAssertEqual(size?.pixelWidth, 2224)
+        XCTAssertEqual(size?.pixelHeight, 3712)
         XCTAssertEqual(size?.pixelWidth, size.map { $0.pointWidth * 2 })
         XCTAssertEqual(size?.pixelHeight, size.map { $0.pointHeight * 2 })
     }

@@ -7,6 +7,13 @@ struct RemoteDisplaySize: Sendable, Equatable {
     /// Client inside the largest coded dimension this receiver can sustain.
     private static let maximumDecodedPixelDimension: CGFloat = 5120
 
+    /// The server's screen encoder halves its frame rate above the 4K-UHD
+    /// area tier. Measured live against macOS Screen Sharing (2026-07-12):
+    /// 3840×2160 and below stream at 60 fps; 3840×2304 and 3696×2416 stream
+    /// at 30 fps. A Match Client window larger than UHD must therefore trade
+    /// a few percent of backing resolution for the full 60 fps.
+    private static let maximumSustained60FPSPixelArea: CGFloat = 3840 * 2160
+
     let pixelWidth: UInt16
     let pixelHeight: UInt16
     let pointWidth: UInt16
@@ -43,15 +50,31 @@ struct RemoteDisplaySize: Sendable, Equatable {
         pointWidthValue *= decodeFit
         pointHeightValue *= decodeFit
 
+        // Stay inside the encoder's 60 fps area tier (see
+        // maximumSustained60FPSPixelArea): shrink both axes uniformly so the
+        // negotiated pixel area never crosses into the server's 30 fps mode.
+        let maximumPointArea = maximumSustained60FPSPixelArea
+            / CGFloat(uiScale * uiScale)
+        let fpsFit = min(
+            1,
+            (maximumPointArea / (pointWidthValue * pointHeightValue))
+                .squareRoot())
+        pointWidthValue *= fpsFit
+        pointHeightValue *= fpsFit
+
         // Apple's compound HEVC encoder requires each full-width band on a
         // 16-pixel codec boundary. Quantize in point space so Match Client can
         // accept arbitrary window shapes while preserving an exact 2× backing
         // ratio (8 points × 2 = 16 pixels) instead of silently falling to 1×.
         let pointAlignment: CGFloat = 8
-        let roundedPointWidth = (pointWidthValue / pointAlignment).rounded()
-            * pointAlignment
-        let roundedPointHeight = (pointHeightValue / pointAlignment).rounded()
-            * pointAlignment
+        // When the fps cap engaged, alignment must not round back up across
+        // the area threshold it just enforced.
+        let alignmentRounding: FloatingPointRoundingRule =
+            fpsFit < 1 ? .down : .toNearestOrAwayFromZero
+        let roundedPointWidth = (pointWidthValue / pointAlignment)
+            .rounded(alignmentRounding) * pointAlignment
+        let roundedPointHeight = (pointHeightValue / pointAlignment)
+            .rounded(alignmentRounding) * pointAlignment
         let maximumPointDimension = min(
             CGFloat(Int(UInt16.max) / uiScale),
             maximumDecodedPointDimension)
