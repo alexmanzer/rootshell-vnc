@@ -72,6 +72,8 @@ public struct RemoteDesktopView: View {
                 }
 
                 viewportControls
+
+                recoveryOverlay
             }
             .clipped()
             .confirmationDialog(
@@ -274,6 +276,10 @@ public struct RemoteDesktopView: View {
             case .connected:
                 ProgressView().controlSize(.large)
                 Text("Waiting for framebuffer...").foregroundStyle(.secondary)
+            case .reconnecting(let attempt, _):
+                ProgressView().controlSize(.large)
+                Text("Reconnecting (attempt \(attempt))...")
+                    .foregroundStyle(.secondary)
             case .failed(let reason):
                 Image(systemName: "exclamationmark.triangle")
                     .font(.largeTitle)
@@ -295,6 +301,53 @@ public struct RemoteDesktopView: View {
                     .foregroundStyle(.secondary)
                 Text("No Active Connection").foregroundStyle(.secondary)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var recoveryOverlay: some View {
+        switch session.connectionState {
+        case .reconnecting(let attempt, let delay):
+            VStack(spacing: 10) {
+                ProgressView()
+                Text("Connection interrupted").font(.headline)
+                Text(
+                    delay > 0
+                        ? "Retry \(attempt) starts in about \(Int(ceil(delay))) seconds."
+                        : "Reconnecting now…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Stop Reconnecting", role: .destructive) {
+                    session.disconnect()
+                }
+            }
+            .padding(20)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+            .padding()
+            .accessibilityElement(children: .combine)
+
+        case .failed(let reason):
+            VStack(spacing: 10) {
+                Image(systemName: "wifi.exclamationmark")
+                    .font(.title)
+                Text("Unable to reconnect").font(.headline)
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                HStack {
+                    Button("Try Again") { session.retryConnection() }
+                        .buttonStyle(.borderedProminent)
+                    Button("Disconnect", role: .destructive) { session.disconnect() }
+                        .buttonStyle(.bordered)
+                }
+            }
+            .padding(20)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+            .padding()
+
+        default:
+            EmptyView()
         }
     }
 

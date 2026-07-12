@@ -43,13 +43,13 @@ struct ContentView: View {
             // way the first connected RemoteDesktopView is created directly
             // in the full-screen hierarchy and can never publish the smaller
             // NavigationStack geometry as the active client display size.
-            if newState == .connecting || newState.isConnected {
+            if newState.isConnecting || newState.isConnected {
                 enterFullScreen()
             } else if isFullScreen {
                 exitFullScreen()
             }
             #else
-            if !newState.isConnected, isFullScreen {
+            if !newState.isConnected, !newState.isConnecting, isFullScreen {
                 exitFullScreen()
             }
             #endif
@@ -82,7 +82,7 @@ struct ContentView: View {
                 Text("Connecting...")
                     .foregroundStyle(.secondary)
             }
-        case .connected:
+        case .connected, .reconnecting:
             remoteDesktop
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
@@ -115,7 +115,13 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 Button("Try Again") {
-                    session.connectionState = .idle
+                    session.retryConnection()
+                    // Initial connection failures intentionally discard their
+                    // credentials, so return to the form when there is no
+                    // established session available to retry.
+                    if case .failed = session.connectionState {
+                        session.connectionState = .idle
+                    }
                 }
                 .buttonStyle(.borderedProminent)
             }

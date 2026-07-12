@@ -108,6 +108,9 @@ public struct VNCConfiguration: Sendable {
     /// This is always enabled in DEBUG builds regardless of this setting.
     public var enableProtocolTrace: Bool
 
+    /// Automatic retry behavior after an established TCP connection is lost.
+    public var reconnectionPolicy: VNCReconnectionPolicy
+
     /// Create a VNC session configuration.
     ///
     /// - Parameters:
@@ -124,7 +127,8 @@ public struct VNCConfiguration: Sendable {
         displaySizingMode: DisplaySizingMode = .matchClient,
         enableRemoteAudio: Bool = true,
         targetFrameRate: Int = 30,
-        enableProtocolTrace: Bool = false
+        enableProtocolTrace: Bool = false,
+        reconnectionPolicy: VNCReconnectionPolicy = VNCReconnectionPolicy()
     ) {
         self.preferredPixelFormat = preferredPixelFormat
         self.preferredEncodings = preferredEncodings
@@ -134,6 +138,7 @@ public struct VNCConfiguration: Sendable {
         self.enableRemoteAudio = enableRemoteAudio
         self.targetFrameRate = max(1, min(120, targetFrameRate))
         self.enableProtocolTrace = enableProtocolTrace
+        self.reconnectionPolicy = reconnectionPolicy
     }
 
     /// The interval between frame requests, derived from ``targetFrameRate``.

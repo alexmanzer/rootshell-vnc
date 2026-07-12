@@ -151,6 +151,8 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(config.enableRemoteAudio)
         XCTAssertEqual(config.targetFrameRate, 30)
         XCTAssertFalse(config.enableProtocolTrace)
+        XCTAssertTrue(config.reconnectionPolicy.isEnabled)
+        XCTAssertEqual(config.reconnectionPolicy.maximumAttempts, 8)
     }
 
     func testCustomValues() {
@@ -306,6 +308,32 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(
             VNCConfiguration.DisplaySizingMode.matchClient.title,
             "Match Client")
+    }
+}
+
+final class VNCReconnectionPolicyTests: XCTestCase {
+    func testExponentialBackoffIsCapped() {
+        let policy = VNCReconnectionPolicy(
+            initialDelay: 1,
+            maximumDelay: 10,
+            multiplier: 2,
+            jitter: 0)
+
+        XCTAssertEqual(policy.delay(forAttempt: 1), 1)
+        XCTAssertEqual(policy.delay(forAttempt: 2), 2)
+        XCTAssertEqual(policy.delay(forAttempt: 4), 8)
+        XCTAssertEqual(policy.delay(forAttempt: 8), 10)
+    }
+
+    func testJitterStaysWithinConfiguredBounds() {
+        let policy = VNCReconnectionPolicy(
+            initialDelay: 10,
+            maximumDelay: 30,
+            jitter: 0.2)
+
+        XCTAssertEqual(policy.delay(forAttempt: 1, randomUnit: 0), 8)
+        XCTAssertEqual(policy.delay(forAttempt: 1, randomUnit: 0.5), 10)
+        XCTAssertEqual(policy.delay(forAttempt: 1, randomUnit: 1), 12)
     }
 }
 
@@ -1290,6 +1318,7 @@ final class VNCConnectionStateTests: XCTestCase {
 
         XCTAssertFalse(VNCConnectionState.connecting.canConnect)
         XCTAssertFalse(VNCConnectionState.connected.canConnect)
+        XCTAssertFalse(VNCConnectionState.reconnecting(attempt: 2, delay: 2).canConnect)
         XCTAssertFalse(VNCConnectionState.disconnecting.canConnect)
     }
 
@@ -1297,6 +1326,7 @@ final class VNCConnectionStateTests: XCTestCase {
         XCTAssertTrue(VNCConnectionState.connected.isConnected)
         XCTAssertFalse(VNCConnectionState.idle.isConnected)
         XCTAssertFalse(VNCConnectionState.connecting.isConnected)
+        XCTAssertFalse(VNCConnectionState.reconnecting(attempt: 1, delay: 1).isConnected)
         XCTAssertFalse(VNCConnectionState.disconnecting.isConnected)
         XCTAssertFalse(VNCConnectionState.disconnected.isConnected)
         XCTAssertFalse(VNCConnectionState.failed("err").isConnected)
@@ -1304,6 +1334,7 @@ final class VNCConnectionStateTests: XCTestCase {
 
     func testIsConnecting() {
         XCTAssertTrue(VNCConnectionState.connecting.isConnecting)
+        XCTAssertTrue(VNCConnectionState.reconnecting(attempt: 1, delay: 1).isConnecting)
         XCTAssertFalse(VNCConnectionState.idle.isConnecting)
         XCTAssertFalse(VNCConnectionState.connected.isConnecting)
     }

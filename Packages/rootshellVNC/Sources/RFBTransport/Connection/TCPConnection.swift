@@ -29,6 +29,7 @@ public actor TCPConnection {
     private let host: String
     private let port: UInt16
     private var connected: Bool = false
+    private var disconnectHandler: (@Sendable (VNCProtocolError) -> Void)?
     private let log = VNCLogger(category: "TCPConnection")
 
     /// User-space read buffer. RFB parsing does many tiny field-sized reads
@@ -64,6 +65,8 @@ public actor TCPConnection {
         tcpOptions.noDelay = true
         tcpOptions.enableKeepalive = true
         tcpOptions.keepaliveIdle = 15
+        tcpOptions.keepaliveInterval = 5
+        tcpOptions.keepaliveCount = 3
         tcpOptions.connectionTimeout = 10
         let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.allowLocalEndpointReuse = true
@@ -80,15 +83,18 @@ public actor TCPConnection {
             conn.stateUpdateHandler = { [weak conn] state in
                 switch state {
                 case .ready:
-                    conn?.stateUpdateHandler = nil
                     resumeBox.resume()
                 case .failed(let error):
-                    conn?.stateUpdateHandler = nil
                     conn?.cancel()
-                    resumeBox.resume(throwing: VNCProtocolError.ioError("Connection failed: \(error.localizedDescription)"))
+                    let protocolError = VNCProtocolError.ioError(
+                        "Connection failed: \(error.localizedDescription)")
+                    if !resumeBox.resume(throwing: protocolError) {
+                        Task { await self.notifyUnexpectedDisconnect(protocolError) }
+                    }
                 case .cancelled:
-                    conn?.stateUpdateHandler = nil
-                    resumeBox.resume(throwing: VNCProtocolError.connectionClosed)
+                    if !resumeBox.resume(throwing: VNCProtocolError.connectionClosed) {
+                        Task { await self.notifyUnexpectedDisconnect(.connectionClosed) }
+                    }
                 case .waiting(let error):
                     logger.warning("Connection waiting: \(error.localizedDescription)")
                 default:
@@ -226,6 +232,21 @@ public actor TCPConnection {
     /// Whether the connection is currently established.
     public var isConnected: Bool {
         connected
+    }
+
+    /// Observe terminal Network.framework state transitions after `.ready`.
+    /// Keeping this separate from reads is important on iOS: a connection can
+    /// be failed while the app is suspended before a pending receive callback
+    /// gets an opportunity to report EOF.
+    public func setDisconnectHandler(
+        _ handler: (@Sendable (VNCProtocolError) -> Void)?
+    ) {
+        disconnectHandler = handler
+    }
+
+    private func notifyUnexpectedDisconnect(_ error: VNCProtocolError) {
+        connected = false
+        disconnectHandler?(error)
     }
 
     /// Snapshot the route selected for the actual RFB connection. This is more

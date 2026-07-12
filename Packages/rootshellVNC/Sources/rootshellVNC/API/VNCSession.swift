@@ -185,6 +185,12 @@ public final class VNCSession {
     /// negotiation generation.
     @ObservationIgnored
     private var appliedMediaGeometryGeneration: UInt64 = 0
+    @ObservationIgnored
+    private var reconnectTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var intentionallyDisconnected = false
+    @ObservationIgnored
+    private var hasEstablishedConnection = false
     #if canImport(UIKit)
     @ObservationIgnored
     private var backgroundLifecycleTask: Task<Void, Never>?
@@ -207,6 +213,7 @@ public final class VNCSession {
     }
 
     deinit {
+        reconnectTask?.cancel()
         remoteAudioPlayer?.stop()
         #if canImport(UIKit)
         backgroundLifecycleTask?.cancel()
@@ -230,6 +237,10 @@ public final class VNCSession {
         }
 
         invalidateInputQueue()
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        intentionallyDisconnected = false
+        hasEstablishedConnection = false
         connectionState = .connecting
         activeCredentials = credentials
         lastError = nil
@@ -259,46 +270,29 @@ public final class VNCSession {
             diagnostics.protocolTrace = ProtocolTrace()
         }
 
-        let transport = TransportSession(
-            host: credentials.host,
-            port: credentials.port,
-            password: credentials.password,
-            username: credentials.username,
-            preferredPixelFormat: configuration.effectivePixelFormat,
-            preferredEncodings: configuration.effectiveEncodings,
-            preferFullQualityVideo: configuration.videoQualityMode == .fullQuality
-        )
-        self.transportSession = transport
-
-        // Stage Match Client before the handshake. TransportSession retains the
-        // request until ServerInit advertises the appropriate Apple or standard
-        // resize capability, allowing Apple media setup to use the virtual
-        // display from its first negotiation rather than resizing afterward.
-        if configuration.displaySizingMode == .matchClient,
-           let preparedClientDisplaySize {
-            _ = try await transport.requestRemoteDisplaySize(
-                pixelWidth: preparedClientDisplaySize.pixelWidth,
-                pixelHeight: preparedClientDisplaySize.pixelHeight,
-                pointWidth: preparedClientDisplaySize.pointWidth,
-                pointHeight: preparedClientDisplaySize.pointHeight)
-        }
-
-        // Start processing events before connecting so we don't miss any
-        startEventProcessing(transport: transport)
-
         do {
-            try await transport.connect()
+            try await establishTransport(credentials: credentials)
             logger.info("Connection initiated to \(credentials.host):\(credentials.port)")
         } catch let error as VNCProtocolError {
+            if intentionallyDisconnected {
+                cleanupTransport(clearCredentials: true)
+                connectionState = .disconnected
+                throw CancellationError()
+            }
             connectionState = .failed(error.localizedDescription)
             lastError = error
             diagnostics.lastError = error
-            cleanupTransport()
+            cleanupTransport(clearCredentials: true)
             throw mapProtocolError(error)
         } catch {
+            if intentionallyDisconnected {
+                cleanupTransport(clearCredentials: true)
+                connectionState = .disconnected
+                throw CancellationError()
+            }
             let message = error.localizedDescription
             connectionState = .failed(message)
-            cleanupTransport()
+            cleanupTransport(clearCredentials: true)
             throw VNCError.connectionFailed(message)
         }
     }
@@ -308,10 +302,11 @@ public final class VNCSession {
     /// Cancels all active tasks, closes the transport, and resets the session
     /// state. Safe to call even when not connected.
     public func disconnect() {
-        guard connectionState == .connecting || connectionState == .connected else {
-            return
-        }
+        guard connectionState != .idle && connectionState != .disconnected else { return }
 
+        intentionallyDisconnected = true
+        reconnectTask?.cancel()
+        reconnectTask = nil
         connectionState = .disconnecting
         logger.info("Disconnecting")
 
@@ -348,6 +343,15 @@ public final class VNCSession {
         remoteAudioPlayer = nil
 
         connectionState = .disconnected
+    }
+
+    /// Immediately retry after automatic recovery has exhausted its attempts.
+    public func retryConnection() {
+        guard reconnectTask == nil,
+              activeCredentials != nil,
+              connectionState.canConnect else { return }
+        intentionallyDisconnected = false
+        scheduleReconnect(immediate: true)
     }
 
     // MARK: - Input Events
@@ -546,7 +550,8 @@ public final class VNCSession {
     private func startEventProcessing(transport: TransportSession) {
         eventTask = Task { [weak self] in
             for await event in transport.events {
-                guard let self, !Task.isCancelled else { break }
+                guard let self, !Task.isCancelled,
+                      self.transportSession === transport else { break }
                 await self.handleSessionEvent(event)
             }
         }
@@ -631,6 +636,15 @@ public final class VNCSession {
 
     private func handleStateChanged(_ protocolState: RFBProtocol.ConnectionState) {
         let newState = VNCConnectionState(from: protocolState)
+        // Keep the richer retry state visible while a replacement transport
+        // progresses through its internal handshake states.
+        if reconnectTask != nil {
+            guard newState == .connected else { return }
+        }
+        if hasEstablishedConnection, !intentionallyDisconnected,
+           case .failed = newState {
+            return
+        }
         // Only update if it represents a meaningful change
         // (internal handshake states all map to .connecting)
         if newState != connectionState {
@@ -662,6 +676,8 @@ public final class VNCSession {
         self.framebuffer = fb
         self.renderer = FramebufferRenderer(framebuffer: fb, pixelFormat: pixelFormat)
 
+        hasEstablishedConnection = true
+        lastError = nil
         connectionState = .connected
     }
 
@@ -813,36 +829,26 @@ public final class VNCSession {
         logger.error("Protocol error: \(error.localizedDescription)")
         lastError = error
         diagnostics.lastError = error
-
-        if error == .connectionClosed {
-            handleDisconnected()
-        }
     }
 
     private func handleDisconnected() {
         logger.info("Disconnected")
+        cleanupTransport(clearCredentials: intentionallyDisconnected)
 
-        remoteDisplayResizeTask?.cancel()
-        remoteDisplayResizeTask = nil
-        lastRequestedClientDisplaySize = nil
-        invalidateInputQueue()
-        transportSession = nil
-        activeCredentials = nil
-        videoStreamManager?.stopStream()
-        videoStreamManager = nil
-        remoteAudioPlayer?.stop()
-        remoteAudioPlayer = nil
-
-        if connectionState != .disconnecting {
+        guard !intentionallyDisconnected,
+              hasEstablishedConnection,
+              activeCredentials != nil,
+              configuration.reconnectionPolicy.isEnabled,
+              configuration.reconnectionPolicy.maximumAttempts > 0 else {
             connectionState = .disconnected
-        } else {
-            connectionState = .disconnected
+            return
         }
+        scheduleReconnect()
     }
 
     // MARK: - Private: Helpers
 
-    private func cleanupTransport() {
+    private func cleanupTransport(clearCredentials: Bool) {
         eventTask?.cancel()
         eventTask = nil
         remoteDisplayResizeTask?.cancel()
@@ -850,9 +856,110 @@ public final class VNCSession {
         lastRequestedClientDisplaySize = nil
         invalidateInputQueue()
         transportSession = nil
-        activeCredentials = nil
+        if clearCredentials {
+            activeCredentials = nil
+        }
+        videoStreamManager?.stopStream()
+        videoStreamManager = nil
         remoteAudioPlayer?.stop()
         remoteAudioPlayer = nil
+    }
+
+    private func establishTransport(credentials: VNCCredentials) async throws {
+        let transport = TransportSession(
+            host: credentials.host,
+            port: credentials.port,
+            password: credentials.password,
+            username: credentials.username,
+            preferredPixelFormat: configuration.effectivePixelFormat,
+            preferredEncodings: configuration.effectiveEncodings,
+            preferFullQualityVideo: configuration.videoQualityMode == .fullQuality)
+        transportSession = transport
+
+        if configuration.displaySizingMode == .matchClient,
+           let preparedClientDisplaySize {
+            _ = try await transport.requestRemoteDisplaySize(
+                pixelWidth: preparedClientDisplaySize.pixelWidth,
+                pixelHeight: preparedClientDisplaySize.pixelHeight,
+                pointWidth: preparedClientDisplaySize.pointWidth,
+                pointHeight: preparedClientDisplaySize.pointHeight)
+        }
+
+        startEventProcessing(transport: transport)
+        try await transport.connect()
+    }
+
+    private func scheduleReconnect(immediate: Bool = false) {
+        guard reconnectTask == nil, let credentials = activeCredentials else { return }
+        let policy = configuration.reconnectionPolicy
+        guard policy.maximumAttempts > 0 else {
+            connectionState = .failed("Reconnection is disabled for this session.")
+            return
+        }
+
+        reconnectTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.reconnectTask = nil }
+
+            for attempt in 1...policy.maximumAttempts {
+                guard !Task.isCancelled, !self.intentionallyDisconnected else { return }
+                let delay = immediate && attempt == 1 ? 0 : policy.delay(forAttempt: attempt)
+                self.connectionState = .reconnecting(attempt: attempt, delay: delay)
+                self.logger.warning(
+                    "Connection lost; retry \(attempt)/\(policy.maximumAttempts) in "
+                        + String(format: "%.1f", delay) + "s")
+
+                do {
+                    if delay > 0 {
+                        let nanoseconds = min(
+                            delay * 1_000_000_000,
+                            Double(Int64.max))
+                        try await Task.sleep(
+                            for: .nanoseconds(Int64(nanoseconds)))
+                    }
+                    try Task.checkCancellation()
+                    self.cleanupTransport(clearCredentials: false)
+                    try await self.establishTransport(credentials: credentials)
+                    self.logger.info("Reconnected successfully")
+                    return
+                } catch is CancellationError {
+                    return
+                } catch let error as VNCProtocolError {
+                    self.lastError = error
+                    self.diagnostics.lastError = error
+                    self.logger.warning(
+                        "Reconnect attempt \(attempt) failed: \(error.localizedDescription)")
+                    if let transport = self.transportSession {
+                        await transport.disconnect()
+                    }
+                    if !Self.isRetryableConnectionError(error) {
+                        self.cleanupTransport(clearCredentials: false)
+                        self.connectionState = .failed(error.localizedDescription)
+                        return
+                    }
+                } catch {
+                    self.logger.warning(
+                        "Reconnect attempt \(attempt) failed: \(error.localizedDescription)")
+                    if let transport = self.transportSession {
+                        await transport.disconnect()
+                    }
+                }
+            }
+
+            self.cleanupTransport(clearCredentials: false)
+            self.connectionState = .failed(
+                "Couldn’t reconnect after \(policy.maximumAttempts) attempts. Check the network or server, then try again.")
+        }
+    }
+
+    private static func isRetryableConnectionError(_ error: VNCProtocolError) -> Bool {
+        switch error {
+        case .connectionClosed, .timeout, .ioError, .protocolViolation,
+             .unexpectedMessage:
+            return true
+        case .authenticationFailed, .unsupportedVersion, .unsupportedEncoding:
+            return false
+        }
     }
 
     /// Append input to one ordered, bounded pump. Redundant pointer positions
@@ -980,6 +1087,7 @@ public final class VNCSession {
             await transport.noteAppleMediaInterruption()
         }
     }
+
     #endif
 
     private var isTraceEnabled: Bool {

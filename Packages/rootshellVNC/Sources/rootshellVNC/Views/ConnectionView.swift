@@ -296,6 +296,8 @@ public struct ConnectionView: View {
                     logger.error(
                         "Could not save last connection in Keychain: \(error.localizedDescription, privacy: .public)")
                 }
+            } catch is CancellationError {
+                isConnecting = false
             } catch {
                 errorMessage = error.localizedDescription
                 isConnecting = false

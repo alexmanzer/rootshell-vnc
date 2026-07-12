@@ -115,6 +115,9 @@ public actor TransportSession {
     private var appleMediaRTPReorderFlushTask: Task<Void, Never>?
     private var appleMediaRTPReorderScheduledDeadlineNanos: UInt64?
     private var readTask: Task<Void, Never>?
+    private var handshakeComplete = false
+    private var isDisconnecting = false
+    private var terminalDisconnectHandled = false
     private var framebufferRequestSentNanos: UInt64 = 0
 
     /// Updates yielded to the consumer but not yet acknowledged via
@@ -395,6 +398,13 @@ public actor TransportSession {
     public func connect() async throws {
         log.info("Starting connection")
 
+        isDisconnecting = false
+        terminalDisconnectHandled = false
+        handshakeComplete = false
+        await tcp.setDisconnectHandler { [weak self] error in
+            Task { await self?.handleUnexpectedTCPDisconnect(error) }
+        }
+
         // Transition state machine
         stateMachine.beginConnecting()
         emitState()
@@ -414,6 +424,7 @@ public actor TransportSession {
 
         // Perform handshake
         try await performHandshake()
+        handshakeComplete = true
 
         // Start the message read loop
         readTask = Task { [weak self] in
@@ -647,6 +658,8 @@ public actor TransportSession {
     /// Disconnect from the server.
     public func disconnect() async {
         log.info("Disconnecting")
+        isDisconnecting = true
+        terminalDisconnectHandled = true
         readTask?.cancel()
         readTask = nil
         appleMediaGenerationSink = nil
@@ -956,13 +969,40 @@ public actor TransportSession {
             } catch let error as VNCProtocolError {
                 log.error("Read loop error: \(error.localizedDescription)")
                 continuation?.yield(.error(error))
+                await terminateUnexpectedConnection(error)
                 break
             } catch {
                 log.error("Read loop error: \(error.localizedDescription)")
-                continuation?.yield(.error(.ioError(error.localizedDescription)))
+                let protocolError = VNCProtocolError.ioError(error.localizedDescription)
+                continuation?.yield(.error(protocolError))
+                await terminateUnexpectedConnection(protocolError)
                 break
             }
         }
+    }
+
+    private func handleUnexpectedTCPDisconnect(_ error: VNCProtocolError) async {
+        // During the handshake, the awaited read path owns error propagation
+        // back to connect(). After ServerInit, this state callback is the
+        // authoritative fallback when iOS resumes a suspended failed socket.
+        guard handshakeComplete,
+              !isDisconnecting,
+              !terminalDisconnectHandled else { return }
+        log.error("TCP state reported connection loss: \(error.localizedDescription)")
+        continuation?.yield(.error(error))
+        await terminateUnexpectedConnection(error)
+    }
+
+    private func terminateUnexpectedConnection(_ error: VNCProtocolError) async {
+        guard !isDisconnecting, !terminalDisconnectHandled else { return }
+        terminalDisconnectHandled = true
+        readTask?.cancel()
+        _ = stateMachine.handle(event: .connectionLost(error))
+        emitState()
+        await stopAppleMediaUDP()
+        tcp.close()
+        continuation?.yield(.disconnected)
+        continuation?.finish()
     }
 
     private func handleFramebufferUpdate() async throws {

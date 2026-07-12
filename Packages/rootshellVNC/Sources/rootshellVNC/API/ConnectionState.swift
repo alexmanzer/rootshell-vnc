@@ -8,8 +8,8 @@ import RFBProtocol
 ///
 /// Transitions follow a linear progression:
 /// ```
-/// idle -> connecting -> connected -> disconnecting -> disconnected
-///                   \-> failed
+/// idle -> connecting -> connected -> reconnecting -> connected
+///                   \-> failed          \-> failed
 /// ```
 /// After reaching `disconnected` or `failed`, the session can be reused
 /// by calling ``VNCSession/connect(credentials:)`` again.
@@ -22,6 +22,9 @@ public enum VNCConnectionState: Sendable, Equatable {
 
     /// Successfully connected and receiving framebuffer updates.
     case connected
+
+    /// An established connection was lost and an automatic retry is pending.
+    case reconnecting(attempt: Int, delay: TimeInterval)
 
     /// A disconnect has been requested and is being processed.
     case disconnecting
@@ -39,7 +42,12 @@ public enum VNCConnectionState: Sendable, Equatable {
 
     /// Whether a connection attempt is currently in progress.
     public var isConnecting: Bool {
-        self == .connecting
+        switch self {
+        case .connecting, .reconnecting:
+            return true
+        default:
+            return false
+        }
     }
 
     /// Whether the session is in a terminal state that allows reconnection.
@@ -47,7 +55,7 @@ public enum VNCConnectionState: Sendable, Equatable {
         switch self {
         case .idle, .disconnected, .failed:
             return true
-        case .connecting, .connected, .disconnecting:
+        case .connecting, .connected, .reconnecting, .disconnecting:
             return false
         }
     }
