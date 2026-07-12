@@ -128,6 +128,17 @@ final class LiveLoginProbeTests: XCTestCase {
 
         try await Task.sleep(for: .seconds(6))
 
+        if env["VNC_PROBE_FORCE_RECOVERY"] == "1" {
+            let sources = Set(probe.frameCounts().keys)
+            probe.note("forcing recovery gate for \(sources.count) live sources")
+            manager.installCompoundRecoveryGateForTesting(sources: sources)
+            await session.requestVideoKeyframe()
+            try await Task.sleep(for: .seconds(2))
+            XCTAssertFalse(
+                manager.hasGatedBands,
+                "a decoded live recovery IDR must release the compound gate")
+        }
+
         if doLogin {
             probe.note("typing password remotely to log in")
             // Wake the screen / focus the password field first.

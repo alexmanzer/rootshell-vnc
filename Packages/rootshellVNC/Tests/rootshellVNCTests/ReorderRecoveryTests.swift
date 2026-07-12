@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import CoreMedia
 @testable import RFBRendering
 
 /// Replays a real decrypted-RTP capture through the experimental interleaved
@@ -10,11 +11,20 @@ import Foundation
 ///   swift test --filter ReorderRecoveryTests
 final class ReorderRecoveryTests: XCTestCase {
 
-    func testCompoundRecoveryBaseIDRReleasesEveryTile() {
+    func testCompoundRecoveryBaseIDRDoesNotReleaseDependentsBeforeDecoderOutput() {
         let manager = VideoStreamManager()
+        manager.startStream(streamID: 1, width: 1920, height: 1080) { _, _ in }
+        defer { manager.stopStream() }
         manager.installCompoundRecoveryGateForTesting(sources: [10, 11])
+        let recoveryPTS = CMTime(value: 12_000, timescale: 90_000)
 
         XCTAssertTrue(manager.shouldDecodeVCL(nalType: 20, ssrc: 10))
+        XCTAssertTrue(manager.hasGatedBands)
+        XCTAssertFalse(manager.shouldDecodeVCL(nalType: 1, ssrc: 11))
+
+        XCTAssertTrue(manager.armRecoveryIDRForTesting(presentationTime: recoveryPTS))
+        XCTAssertTrue(manager.completeRecoveryIDROutputForTesting(
+            presentationTime: recoveryPTS))
         XCTAssertFalse(manager.hasGatedBands)
         XCTAssertTrue(manager.shouldDecodeVCL(nalType: 1, ssrc: 11))
     }

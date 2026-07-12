@@ -158,6 +158,10 @@ public final class VideoStreamManager: @unchecked Sendable {
     // poisoned even though later packet assembly is valid.
     private var seenVideoSSRCs: Set<UInt32> = []
     private var awaitingIRAP: Set<UInt32> = []
+    /// Recovery is complete only after VideoToolbox outputs the submitted IDR.
+    /// Clearing the gate when type 20 is merely parsed lets dependent pictures
+    /// poison the old reference chain if that IDR later fails asynchronously.
+    private var pendingRecoveryIDRPresentationTimes: Set<CMTimeValue> = []
     private var lastVideoSeq: [UInt32: UInt16] = [:]
     private var lastVideoPacketArrivalNanos: [UInt32: UInt64] = [:]
     private var mediaInterruptionPendingSSRCs: Set<UInt32> = []
@@ -356,6 +360,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         expectedBandCount = 0
         seenVideoSSRCs.removeAll()
         awaitingIRAP.removeAll()
+        pendingRecoveryIDRPresentationTimes.removeAll()
         lastVideoSeq.removeAll()
         lastVideoPacketArrivalNanos.removeAll()
         mediaInterruptionPendingSSRCs.removeAll()
@@ -500,11 +505,21 @@ public final class VideoStreamManager: @unchecked Sendable {
                     let pts = CMTime(
                         value: nextPresentationTimeValue(),
                         timescale: 90000)
-                    try decoderRef.decode(
-                        nalUnits: nalUnits,
-                        presentationTime: pts,
-                        frameTag: accessUnit.ssrc,
-                        tileMetadata: tileMetadata)
+                    let recoveryIDRArmed = armRecoveryIDRIfNeeded(
+                        nalType: nalType,
+                        presentationTime: pts)
+                    do {
+                        try decoderRef.decode(
+                            nalUnits: nalUnits,
+                            presentationTime: pts,
+                            frameTag: accessUnit.ssrc,
+                            tileMetadata: tileMetadata)
+                    } catch {
+                        if recoveryIDRArmed {
+                            cancelRecoveryIDR(presentationTime: pts)
+                        }
+                        throw error
+                    }
                     recordDecodeSubmission()
                     decodedCount += 1
                 }
@@ -587,21 +602,19 @@ public final class VideoStreamManager: @unchecked Sendable {
         return fresh
     }
 
-    /// Whether a VCL NAL should reach the decoder, updating recovery state.
+    /// Whether a VCL NAL should reach the decoder. A recovery IDR is allowed
+    /// through, but the gate stays latched until VideoToolbox outputs it.
     /// AVConference's VCP wrapper resumes specifically for HEVC NAL type 20
     /// (IDR_N_LP); CRA and dependent pictures remain withheld.
     func shouldDecodeVCL(nalType: UInt8, ssrc: UInt32) -> Bool {
         lock.lock()
         if nalType == 20 {
-            let recoveredCompoundTimeline = irapGateEnabled
-                && !awaitingIRAP.isEmpty
-            awaitingIRAP.removeAll(keepingCapacity: true)
             lossStats.irapsDecoded += 1
-            lastLossNanos = 0
+            let isRecoveryIDR = irapGateEnabled && !awaitingIRAP.isEmpty
             lock.unlock()
-            if recoveredCompoundTimeline {
+            if isRecoveryIDR {
                 log.warning(
-                    "Accepted compound recovery HEVC IDR_N_LP type=20 "
+                    "Submitting compound recovery HEVC IDR_N_LP type=20 "
                         + "baseSSRC=0x\(String(ssrc, radix: 16))")
             }
             return true
@@ -623,11 +636,45 @@ public final class VideoStreamManager: @unchecked Sendable {
         return false
     }
 
+    @discardableResult
+    private func armRecoveryIDRIfNeeded(
+        nalType: UInt8,
+        presentationTime: CMTime
+    ) -> Bool {
+        guard nalType == 20 else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        guard irapGateEnabled, !awaitingIRAP.isEmpty else { return false }
+        pendingRecoveryIDRPresentationTimes.insert(presentationTime.value)
+        return true
+    }
+
+    private func cancelRecoveryIDR(presentationTime: CMTime) {
+        lock.lock()
+        pendingRecoveryIDRPresentationTimes.remove(presentationTime.value)
+        lock.unlock()
+    }
+
     func installCompoundRecoveryGateForTesting(sources: Set<UInt32>) {
         lock.lock()
         seenVideoSSRCs = sources
         _ = markLossLocked(affectedSSRC: nil)
         lock.unlock()
+    }
+
+    func armRecoveryIDRForTesting(presentationTime: CMTime) -> Bool {
+        armRecoveryIDRIfNeeded(nalType: 20, presentationTime: presentationTime)
+    }
+
+    func completeRecoveryIDROutputForTesting(presentationTime: CMTime) -> Bool {
+        lock.lock()
+        let generation = streamGeneration
+        let currentMediaGeneration = mediaGeneration
+        lock.unlock()
+        return recordDecoderOutput(
+            streamGeneration: generation,
+            mediaGeneration: currentMediaGeneration,
+            presentationTime: presentationTime).completedRecovery
     }
 
     /// Rebuild a VideoToolbox session without touching the VNC or media
@@ -659,6 +706,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         donReorderBuffer.reset()
         sequentialAccessUnitAssembler.reset()
         earlyVCLBuffer.removeAll(keepingCapacity: true)
+        pendingRecoveryIDRPresentationTimes.removeAll(keepingCapacity: true)
         lock.unlock()
         log.warning("Reset expected HEVC decoding order while awaiting recovery IDR")
     }
@@ -721,6 +769,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         expectedBandCount = 0
         seenVideoSSRCs.removeAll()
         awaitingIRAP.removeAll()
+        pendingRecoveryIDRPresentationTimes.removeAll()
         lastVideoSeq.removeAll()
         lastVideoPacketArrivalNanos.removeAll()
         mediaInterruptionPendingSSRCs.removeAll()
@@ -781,25 +830,34 @@ public final class VideoStreamManager: @unchecked Sendable {
     @discardableResult
     private func recordDecoderOutput(
         streamGeneration: UInt64,
-        mediaGeneration: UInt64
-    ) -> Bool {
+        mediaGeneration: UInt64,
+        presentationTime: CMTime
+    ) -> (accepted: Bool, completedRecovery: Bool) {
         lock.lock()
         guard streamGeneration == self.streamGeneration,
               mediaGeneration == self.mediaGeneration,
               _isActive else {
             lock.unlock()
-            return false
+            return (false, false)
         }
         decoderOutputCount &+= 1
         lastDecoderOutputNanos = DispatchTime.now().uptimeNanoseconds
+        let completedRecovery = pendingRecoveryIDRPresentationTimes.remove(
+            presentationTime.value) != nil
+        if completedRecovery {
+            pendingRecoveryIDRPresentationTimes.removeAll(keepingCapacity: true)
+            awaitingIRAP.removeAll(keepingCapacity: true)
+            lastLossNanos = 0
+        }
         lock.unlock()
-        return true
+        return (true, completedRecovery)
     }
 
     private func recordDecoderFailure(
         streamGeneration: UInt64,
         mediaGeneration: UInt64,
         status: OSStatus,
+        presentationTime: CMTime,
         ssrc: UInt32
     ) {
         let failure = VideoDecoderFailure(status: status, ssrc: ssrc)
@@ -813,6 +871,7 @@ public final class VideoStreamManager: @unchecked Sendable {
             lock.unlock()
             return
         }
+        pendingRecoveryIDRPresentationTimes.remove(presentationTime.value)
         _ = markLossLocked(affectedSSRC: ssrc)
         callback = onDecoderFailure
         lock.unlock()
@@ -859,6 +918,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         sps = configuredSPS
         pps = configuredPPS
         decoder = nil
+        pendingRecoveryIDRPresentationTimes.removeAll(keepingCapacity: true)
         _ = markLossLocked(affectedSSRC: nil)
         lock.unlock()
 
@@ -1010,6 +1070,13 @@ public final class VideoStreamManager: @unchecked Sendable {
             let pts = CMTime(
                 value: nextPresentationTimeValue(),
                 timescale: 90000)
+            let nalType = item.nals.first.flatMap { nal -> UInt8? in
+                guard nal.count >= 2 else { return nil }
+                return (nal[nal.startIndex] >> 1) & 0x3f
+            }
+            let recoveryIDRArmed = armRecoveryIDRIfNeeded(
+                nalType: nalType ?? .max,
+                presentationTime: pts)
             do {
                 try decoderRef.decode(
                     nalUnits: item.nals,
@@ -1018,6 +1085,9 @@ public final class VideoStreamManager: @unchecked Sendable {
                     tileMetadata: item.tileMetadata)
                 recordDecodeSubmission()
             } catch {
+                if recoveryIDRArmed {
+                    cancelRecoveryIDR(presentationTime: pts)
+                }
                 log.warning("Failed to decode buffered startup frame: \(error.localizedDescription)")
             }
         }
@@ -1042,21 +1112,28 @@ public final class VideoStreamManager: @unchecked Sendable {
         return HEVCDecoder(
             numberOfTiles: numberOfTiles,
             frameCallback: { [weak self] pixelBuffer, pts, frameTag in
-                guard self?.recordDecoderOutput(
+                guard let result = self?.recordDecoderOutput(
                     streamGeneration: streamGeneration,
-                    mediaGeneration: mediaGeneration) == true else {
+                    mediaGeneration: mediaGeneration,
+                    presentationTime: pts),
+                      result.accepted else {
                     return
+                }
+                if result.completedRecovery {
+                    self?.log.warning(
+                        "Completed compound HEVC recovery after decoded IDR output")
                 }
                 orderer.submit(
                     pixelBuffer: pixelBuffer,
                     pts: pts,
                     ssrc: frameTag)
             },
-            failureCallback: { [weak self] status, _, frameTag in
+            failureCallback: { [weak self] status, pts, frameTag in
                 self?.recordDecoderFailure(
                     streamGeneration: streamGeneration,
                     mediaGeneration: mediaGeneration,
                     status: status,
+                    presentationTime: pts,
                     ssrc: frameTag)
             })
     }
