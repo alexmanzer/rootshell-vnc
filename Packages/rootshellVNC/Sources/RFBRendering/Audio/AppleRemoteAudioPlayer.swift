@@ -45,6 +45,7 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     private var lastOrderedTimestamp: UInt32?
     private var enqueuedAccessUnitCount = 0
     private var prerollAccessUnitTarget = 10
+    private var playbackStartHostTime: CMTime?
     private var detectedLossCount: UInt64 = 0
     private var underrunCount: UInt64 = 0
     private var isRunning = false
@@ -132,6 +133,22 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
         }
     }
 
+    /// Test-only synchronous snapshot of playback health.
+    struct DiagnosticsSnapshot {
+        let underrunCount: UInt64
+        let isRunning: Bool
+        let rendererFailed: Bool
+    }
+
+    func diagnosticsSnapshot() -> DiagnosticsSnapshot {
+        queue.sync {
+            DiagnosticsSnapshot(
+                underrunCount: underrunCount,
+                isRunning: isRunning,
+                rendererFailed: renderer.status == .failed)
+        }
+    }
+
     private func processRTPPacket(_ data: Data) {
         do {
             let packet = try AppleRemoteAudioRTPDepacketizer.parse(data)
@@ -184,39 +201,50 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
 
         let base = baseRTPTimestamp ?? packet.timestamp
         if baseRTPTimestamp == nil { baseRTPTimestamp = base }
-        let packetOffset = packet.timestamp &- base
+        var packetOffset = packet.timestamp &- base
 
         for (index, accessUnit) in packet.accessUnits.enumerated() {
             guard !accessUnit.isEmpty else { continue }
-            var frameOffset = Int64(packetOffset)
-                + Int64(index) * AppleRemoteAudioRTPDepacketizer.framesPerAccessUnit
             var presentationTime = CMTime(
-                value: frameOffset,
+                value: Int64(packetOffset)
+                    + Int64(index) * AppleRemoteAudioRTPDepacketizer.framesPerAccessUnit,
                 timescale: AppleRemoteAudioRTPDepacketizer.sampleRate)
             let duration = CMTime(
                 value: AppleRemoteAudioRTPDepacketizer.framesPerAccessUnit,
                 timescale: AppleRemoteAudioRTPDepacketizer.sampleRate)
 
             // Once started, incoming media must remain ahead of the render
-            // clock. If UDP jitter exhausts that lead, a late compressed sample
-            // produces a click and cannot repair the already-rendered gap.
-            // Flush it, increase the adaptive preroll, and establish a fresh
-            // zero-based timeline from this access unit.
-            let renderTime = synchronizer.currentTime()
+            // clock. If UDP jitter exhausts that lead, the renderer has
+            // already emitted silence for the gap; the queue is empty, so
+            // nothing is worth flushing. Slide the RTP timeline forward so
+            // this access unit plays a jitter cushion ahead of "now" and keep
+            // the synchronizer running — a stop/preroll/restart cycle would
+            // only stretch a one-packet glitch into a long dropout.
             if isRunning,
-               renderTime.isValid,
+               let renderTime = trustedRenderTime(),
                CMTimeCompare(CMTimeAdd(presentationTime, duration), renderTime) <= 0 {
                 underrunCount &+= 1
                 prerollAccessUnitTarget = min(prerollAccessUnitTarget + 4, 24)
+                let lateMilliseconds = Int(
+                    (CMTimeSubtract(renderTime, presentationTime).seconds * 1000)
+                        .rounded())
                 log.warning(
-                    "Remote audio underrun (count \(underrunCount)); "
-                        + "rebuffering \(prerollAccessUnitTarget * 10) ms")
-                resetRendererTimeline(flushRenderer: true)
-                baseRTPTimestamp = packet.timestamp
-                frameOffset = Int64(index)
-                    * AppleRemoteAudioRTPDepacketizer.framesPerAccessUnit
+                    "Remote audio underrun (count \(underrunCount), "
+                        + "late \(lateMilliseconds) ms); re-anchoring with "
+                        + "\(prerollAccessUnitTarget * 10) ms cushion")
+                let framesPerAccessUnit =
+                    AppleRemoteAudioRTPDepacketizer.framesPerAccessUnit
+                let resumeFrames = CMTimeConvertScale(
+                    renderTime,
+                    timescale: AppleRemoteAudioRTPDepacketizer.sampleRate,
+                    method: .roundAwayFromZero).value
+                    + Int64(prerollAccessUnitTarget) * framesPerAccessUnit
+                let anchorFrames = max(
+                    resumeFrames - Int64(index) * framesPerAccessUnit, 0)
+                packetOffset = UInt32(truncatingIfNeeded: anchorFrames)
+                baseRTPTimestamp = packet.timestamp &- packetOffset
                 presentationTime = CMTime(
-                    value: frameOffset,
+                    value: Int64(packetOffset) + Int64(index) * framesPerAccessUnit,
                     timescale: AppleRemoteAudioRTPDepacketizer.sampleRate)
             }
             let sampleBuffer = try makeSampleBuffer(
@@ -251,12 +279,36 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
         // ordinary Wi-Fi scheduling bursts; after a measured underrun the
         // target grows in 40 ms steps, capped at 240 ms.
         if !isRunning, enqueuedAccessUnitCount >= prerollAccessUnitTarget {
+            playbackStartHostTime = CMClockGetTime(CMClockGetHostTimeClock())
             synchronizer.setRate(1, time: .zero)
             isRunning = true
             log.info(
                 "Remote audio playback started with "
                     + "\(prerollAccessUnitTarget * 10) ms preroll")
         }
+    }
+
+    /// The synchronizer's render position, or nil while the reading is
+    /// unusable. setRate(_:time:) applies asynchronously, so for a few
+    /// milliseconds after a restart currentTime() still reports the previous
+    /// timeline — seconds ahead of the fresh zero-based one. A reading from
+    /// the current timeline can never exceed the wall-clock elapsed since
+    /// playback started, so anything further ahead is stale. Treating those
+    /// reads as underruns is what previously locked the player in a
+    /// flush/preroll/flush loop after every media renegotiation.
+    private func trustedRenderTime() -> CMTime? {
+        guard let playbackStartHostTime else { return nil }
+        let renderTime = synchronizer.currentTime()
+        guard renderTime.isValid else { return nil }
+        let hostElapsed = CMTimeSubtract(
+            CMClockGetTime(CMClockGetHostTimeClock()), playbackStartHostTime)
+        let tolerance = CMTime(
+            value: CMTimeValue(AppleRemoteAudioRTPDepacketizer.sampleRate / 10),
+            timescale: AppleRemoteAudioRTPDepacketizer.sampleRate)
+        guard CMTimeCompare(renderTime, CMTimeAdd(hostElapsed, tolerance)) <= 0 else {
+            return nil
+        }
+        return renderTime
     }
 
     private func noteOrderedPacket(_ packet: AppleRemoteAudioRTPPacket) {
@@ -364,6 +416,7 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
         synchronizer.setRate(0, time: .invalid)
         if flushRenderer { renderer.flush() }
         baseRTPTimestamp = nil
+        playbackStartHostTime = nil
         enqueuedAccessUnitCount = 0
         isRunning = false
         hasLoggedRendererFailure = false
