@@ -86,9 +86,11 @@ struct ContentView: View {
             remoteDesktop
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
+                    ToolbarItem(placement: .principal) {
                         Text(session.serverName)
                             .font(.headline)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("Disconnect") {
