@@ -334,4 +334,91 @@ final class AppleMediaFeedbackTests: XCTestCase {
         XCTAssertFalse(controller.isReadyForKeyframeRecovery(now: 0.8))
         XCTAssertTrue(controller.isReadyForKeyframeRecovery(now: 1.0))
     }
+
+    func testRecoveryBackoffStepsCapacityDownWithoutDelayingReadiness() {
+        let controller = AppleMediaRateController(maxTargetBps: 40_000_000)
+        _ = controller.update(now: 0)
+        controller.onConfirmedLoss(count: 1, now: 0.1)
+        _ = controller.update(now: 0.1)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 30_000_000)
+
+        XCTAssertTrue(controller.forceRecoveryBackoff(now: 0.5))
+        XCTAssertEqual(controller.bandwidthEstimateBps, 22_500_000)
+        XCTAssertEqual(controller.targetBitrateBps, 22_500_000)
+
+        // The step-down must not refresh the congestion clock: readiness is
+        // still measured from the loss at 0.1, not from the backoff at 0.5.
+        XCTAssertTrue(controller.isReadyForKeyframeRecovery(now: 0.9))
+    }
+
+    func testRecoveryBackoffSharesTheLossBackoffRateLimit() {
+        let controller = AppleMediaRateController(maxTargetBps: 40_000_000)
+        _ = controller.update(now: 0)
+        controller.onConfirmedLoss(count: 1, now: 0.1)
+        _ = controller.update(now: 0.1)
+        XCTAssertEqual(controller.bandwidthEstimateBps, 30_000_000)
+
+        // Within one 0.25 s AIMD window the loss decrease and the recovery
+        // decrease must not compound.
+        XCTAssertFalse(controller.forceRecoveryBackoff(now: 0.2))
+        XCTAssertEqual(controller.bandwidthEstimateBps, 30_000_000)
+        XCTAssertTrue(controller.forceRecoveryBackoff(now: 0.4))
+        XCTAssertEqual(controller.bandwidthEstimateBps, 22_500_000)
+    }
+
+    func testRepeatedRecoveryBackoffClampsAtRecoveryFloor() {
+        let controller = AppleMediaRateController(maxTargetBps: 40_000_000)
+        _ = controller.update(now: 0)
+        for step in 1...8 {
+            _ = controller.forceRecoveryBackoff(now: Double(step))
+        }
+        // Default recovery floor equals the native screen minimum; only an
+        // explicit ROOTSHELL_VNC_RC_RECOVERY_MIN_KBPS may go below it.
+        XCTAssertEqual(
+            controller.bandwidthEstimateBps,
+            UInt32(AppleMediaRateController.nativeScreenMinimumBitrateBps))
+        XCTAssertEqual(controller.recoveryAttemptCount, 8)
+
+        controller.noteRecoveryComplete()
+        XCTAssertEqual(controller.recoveryAttemptCount, 0)
+        XCTAssertEqual(
+            controller.bandwidthEstimateBps,
+            UInt32(AppleMediaRateController.nativeScreenMinimumBitrateBps))
+    }
+
+    func testGatedKeyframeReadinessUsesShortQuietInterval() {
+        let controller = AppleMediaRateController(maxTargetBps: 40_000_000)
+        _ = controller.update(now: 0)
+        controller.onConfirmedLoss(count: 1, now: 0.1)
+        _ = controller.update(now: 0.1)
+
+        // Gated: quiet interval shortens to 0.25 s after the last congestion.
+        XCTAssertFalse(controller.isReadyForKeyframeRecovery(now: 0.3, displayGated: true))
+        XCTAssertTrue(controller.isReadyForKeyframeRecovery(now: 0.36, displayGated: true))
+        // Ungated keeps the conservative 0.75 s window.
+        XCTAssertFalse(controller.isReadyForKeyframeRecovery(now: 0.36))
+        XCTAssertTrue(controller.isReadyForKeyframeRecovery(now: 0.86))
+    }
+
+    func testGatedReadinessVetoedByLocalQueueDelayWithoutCapacityChange() {
+        let controller = AppleMediaRateController(maxTargetBps: 40_000_000)
+        _ = controller.update(now: 0)
+        controller.onVideoPacket(
+            ssrc: 1,
+            rtpTimestamp: 1,
+            bytes: 1_000,
+            queueDelaySeconds: 0.08,
+            now: 0.05)
+        _ = controller.update(now: 0.1)
+
+        // Local ingress backlog defers a gated IDR request but must never
+        // reduce the advertised capacity (the anti-thrash contract).
+        XCTAssertFalse(controller.isReadyForKeyframeRecovery(now: 0.2, displayGated: true))
+        XCTAssertEqual(controller.bandwidthEstimateBps, 40_000_000)
+        XCTAssertTrue(controller.isReadyForKeyframeRecovery(now: 0.2))
+
+        // Once the backlog drains the gated request may proceed.
+        _ = controller.update(now: 0.2)
+        XCTAssertTrue(controller.isReadyForKeyframeRecovery(now: 0.3, displayGated: true))
+    }
 }

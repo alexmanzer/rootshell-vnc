@@ -1248,69 +1248,95 @@ public final class VNCSession {
         // Transport-confirmed RTP loss sends native AFB type-6 feedback before
         // releasing the post-gap packet. If no video is displayed afterwards,
         // AVConference's fail-safe escalates to PSFB FIR and resets expected
-        // decoding order. Mirror that two-stage behavior in the same media
-        // session; repeating one stale AFB forever does not recover the server.
+        // decoding order. A persistent supervisor keyed off the gate state
+        // mirrors that two-stage behavior. It must not be an event-driven
+        // task: markLossLocked only fires onLossDetected for a *fresh* latch,
+        // so a per-event task that exits with the gate still latched could
+        // never be restarted and the display stayed frozen forever.
         if let transport = transportSession {
             let recoveryManager = manager
             let log = logger
             let recoveryQueue = mediaQueue
-            manager.onLossDetected = { [weak transport, weak recoveryManager, recoveryCoordinator] ssrc in
-                guard let transport, let recoveryManager else { return }
-                Task { [transport, recoveryManager, recoveryCoordinator] in
-                    guard await transport.hasObservedVideoLossFeedback(ssrc: ssrc) else {
-                        log.warning("Compressed stream gated without a matching observed RTP loss report")
-                        return
+            let latestLossSSRC = LatestLossSSRC()
+            manager.onLossDetected = { [weak transport, latestLossSSRC] ssrc in
+                latestLossSSRC.record(ssrc)
+                guard let transport else { return }
+                // Diagnostic only. A gate latched by the parse/decode-error
+                // path has no transport loss report; recovery must still run,
+                // so this must never guard the supervisor.
+                Task { [transport] in
+                    if !(await transport.hasObservedVideoLossFeedback(ssrc: ssrc)) {
+                        log.warning("Compressed stream gated without a matching "
+                            + "observed RTP loss report")
                     }
-                    guard await recoveryCoordinator.begin() else { return }
-                    defer {
-                        Task { await recoveryCoordinator.finish() }
-                    }
-
-                    var attempt = 0
-                    var hasWaitedForDisplay = false
-                    var unsettledDeferrals = 0
-                    while recoveryManager.isStreamActive,
-                          recoveryManager.hasGatedBands {
-                        // Native names this its no-video-display fail-safe. A
-                        // two-second display silence gives retransmission and
-                        // the initial AFB time to work without pulsing quality.
-                        // Once that expires, poll capacity promptly: waiting
-                        // another two seconds after every deferred check leaves
-                        // a recovered mobile path black unnecessarily.
-                        try? await Task.sleep(for: hasWaitedForDisplay
-                            ? .milliseconds(250)
-                            : .seconds(2))
-                        hasWaitedForDisplay = true
-                        guard !Task.isCancelled,
-                              recoveryManager.isStreamActive,
-                              recoveryManager.hasGatedBands else { return }
-                        if !(await transport.isReadyForVideoKeyframeRecovery()) {
-                            unsettledDeferrals += 1
-                            if unsettledDeferrals < 8 {
-                                log.info("Deferring FIR while video rate/loss is still unsettled")
-                                continue
-                            }
-                            // A busy screen can keep the capacity controller
-                            // unsettled forever while all affected bands remain
-                            // gated. Bound that preference: a possibly costly
-                            // IDR is better than a permanently frozen display.
-                            log.warning(
-                                "Video remains gated after bounded FIR deferral; "
-                                    + "forcing recovery keyframe")
+                }
+            }
+            Task { [weak transport, weak recoveryManager, recoveryCoordinator, latestLossSSRC] in
+                var escalator = GatedRecoveryEscalator()
+                var episodeActive = false
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    guard let transport,
+                          let m = recoveryManager,
+                          m.isStreamActive else { return }
+                    guard m.decodeProgress.streamGeneration == streamGeneration else { return }
+                    guard m.hasGatedBands else {
+                        // Steady state costs one lock acquisition; skip the
+                        // transport actor hop entirely while healthy.
+                        if episodeActive {
+                            episodeActive = false
+                            escalator = GatedRecoveryEscalator()
+                            await transport.noteVideoRecoveryComplete()
+                            log.info("Recovery gate cleared; capacity restores via normal ramp")
                         }
-                        unsettledDeferrals = 0
-                        attempt += 1
-                        log.warning("No video displayed after RTP loss; applying native FIR "
-                            + "fail-safe (attempt \(attempt))")
+                        continue
+                    }
+                    episodeActive = true
+                    let ready = await transport.isReadyForVideoKeyframeRecovery(displayGated: true)
+                    let action = escalator.observe(
+                        gated: true,
+                        readyForKeyframe: ready,
+                        nowNanos: DispatchTime.now().uptimeNanoseconds)
+                    guard action != .none else { continue }
+                    // A busy coordinator (startup watchdog mid-FIR) is not a
+                    // failure; the uncommitted action is re-offered next tick.
+                    guard await recoveryCoordinator.begin() else { continue }
+                    let actionNanos = DispatchTime.now().uptimeNanoseconds
+                    if action == .rebuildDecoderAndFIR {
+                        escalator.noteDecoderRebuilt(nowNanos: actionNanos)
+                    }
+                    escalator.noteFIRRequested(nowNanos: actionNanos)
+
+                    switch action {
+                    case .backoffThenFIR, .rebuildDecoderAndFIR:
+                        // Step the advertised bitrate down and give the server
+                        // one RCTL interval to apply it, so the retry IDR is
+                        // smaller than the burst that was just shredded.
+                        await transport.applyVideoRecoveryBackoff()
+                        try? await Task.sleep(for: .milliseconds(250))
+                    case .none, .requestFIR:
+                        break
+                    }
+                    if action == .rebuildDecoderAndFIR {
+                        log.warning("Recovery gate persisted through FIR retries; "
+                            + "rebuilding decoder in media session")
                         await withCheckedContinuation { continuation in
                             recoveryQueue.async {
-                                recoveryManager.resetExpectedDecodingOrderForRecovery()
+                                _ = m.recoverDecoderAfterOutputStall()
                                 continuation.resume()
                             }
                         }
-                        await transport.requestVideoKeyframe(ssrc: ssrc)
-                        hasWaitedForDisplay = false
                     }
+                    log.warning("No video displayed after RTP loss; applying native FIR "
+                        + "fail-safe (attempt \(escalator.firAttempts))")
+                    await withCheckedContinuation { continuation in
+                        recoveryQueue.async {
+                            m.resetExpectedDecodingOrderForRecovery()
+                            continuation.resume()
+                        }
+                    }
+                    await transport.requestVideoKeyframe(ssrc: latestLossSSRC.take())
+                    await recoveryCoordinator.finish()
                 }
             }
         } else {
@@ -1627,6 +1653,127 @@ struct DecodeOutputStallDetector {
                 || nowNanos &- lastRecoveryNanos >= recoveryCooldownNanos else { return false }
         lastRecoveryNanos = nowNanos
         return true
+    }
+}
+
+/// Escalation policy for a latched recovery gate. Pure timing state: the
+/// caller performs the actions and commits them via the note methods, so an
+/// action that could not run (busy recovery coordinator) is re-offered on the
+/// next observation instead of being silently consumed.
+///
+/// Ladder: 2 s grace for NACK/AFB retransmission, first FIR when the rate
+/// controller settles (bounded at 4 s — a busy screen may never settle), then
+/// escalating retries that first step the advertised bitrate down, and a
+/// decoder rebuild as last resort. Every threshold is an absolute bound on
+/// gate age; nothing in the ladder can defer recovery indefinitely.
+struct GatedRecoveryEscalator {
+    enum Action: Equatable {
+        case none
+        case requestFIR
+        case backoffThenFIR
+        case rebuildDecoderAndFIR
+    }
+
+    private var gateObservedSinceNanos: UInt64?
+    private var lastFIRNanos: UInt64?
+    private var lastRebuildNanos: UInt64 = 0
+    private(set) var firAttempts = 0
+
+    let graceNanos: UInt64
+    let forcedFirstFIRNanos: UInt64
+    let retryIntervalsNanos: [UInt64]
+    let rebuildGateAgeNanos: UInt64
+    let rebuildAttemptThreshold: Int
+    let rebuildCooldownNanos: UInt64
+
+    init(
+        graceNanos: UInt64 = 2_000_000_000,
+        forcedFirstFIRNanos: UInt64 = 4_000_000_000,
+        retryIntervalsNanos: [UInt64] = [1_500_000_000, 2_000_000_000, 3_000_000_000],
+        rebuildGateAgeNanos: UInt64 = 12_000_000_000,
+        rebuildAttemptThreshold: Int = 5,
+        rebuildCooldownNanos: UInt64 = 10_000_000_000
+    ) {
+        self.graceNanos = graceNanos
+        self.forcedFirstFIRNanos = forcedFirstFIRNanos
+        self.retryIntervalsNanos = retryIntervalsNanos
+        self.rebuildGateAgeNanos = rebuildGateAgeNanos
+        self.rebuildAttemptThreshold = rebuildAttemptThreshold
+        self.rebuildCooldownNanos = rebuildCooldownNanos
+    }
+
+    mutating func observe(gated: Bool, readyForKeyframe: Bool, nowNanos: UInt64) -> Action {
+        guard gated else {
+            gateObservedSinceNanos = nil
+            lastFIRNanos = nil
+            firAttempts = 0
+            return .none
+        }
+        let since: UInt64
+        if let existing = gateObservedSinceNanos {
+            since = existing
+        } else {
+            gateObservedSinceNanos = nowNanos
+            since = nowNanos
+        }
+        let gateAge = nowNanos &- since
+        guard gateAge >= graceNanos else { return .none }
+
+        guard let lastFIRNanos else {
+            // First FIR: prefer waiting for the rate controller to settle,
+            // but a busy screen can stay unsettled forever — bound it.
+            return (readyForKeyframe || gateAge >= forcedFirstFIRNanos)
+                ? .requestFIR
+                : .none
+        }
+        let intervalIndex = min(max(firAttempts - 1, 0), retryIntervalsNanos.count - 1)
+        guard nowNanos &- lastFIRNanos >= retryIntervalsNanos[intervalIndex] else {
+            return .none
+        }
+        if gateAge >= rebuildGateAgeNanos || firAttempts >= rebuildAttemptThreshold,
+           lastRebuildNanos == 0 || nowNanos &- lastRebuildNanos >= rebuildCooldownNanos {
+            return .rebuildDecoderAndFIR
+        }
+        // Retries do not wait for readiness — the bound is the point. The
+        // caller steps the advertised bitrate down first so the retry IDR is
+        // smaller and deliverable while motion continues.
+        return .backoffThenFIR
+    }
+
+    mutating func noteFIRRequested(nowNanos: UInt64) {
+        lastFIRNanos = nowNanos
+        firAttempts += 1
+    }
+
+    /// A rebuild re-enters the retry ladder with a fresh decoder; the FIR
+    /// that accompanies it is counted separately via noteFIRRequested.
+    mutating func noteDecoderRebuilt(nowNanos: UInt64) {
+        lastRebuildNanos = nowNanos
+        firAttempts = 0
+    }
+}
+
+/// Latest loss-affected SSRC handed from the media queue to the recovery
+/// supervisor. The recovery gate is global and the server sends its recovery
+/// IDR on the base SSRC, so the value is advisory: FIR falls back to the base
+/// video channel when no specific SSRC was recorded.
+final class LatestLossSSRC: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt32?
+
+    func record(_ ssrc: UInt32?) {
+        guard let ssrc else { return }
+        lock.lock()
+        value = ssrc
+        lock.unlock()
+    }
+
+    func take() -> UInt32? {
+        lock.lock()
+        defer { lock.unlock() }
+        let taken = value
+        value = nil
+        return taken
     }
 }
 

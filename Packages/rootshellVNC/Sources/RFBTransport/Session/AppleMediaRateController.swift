@@ -34,6 +34,9 @@ final class AppleMediaRateController {
         let backoffInterval: Double
         let throughputWindow: Double
         let updateInterval: Double
+        let recoveryMinimumCapacity: Double
+        let recoveryQuietInterval: Double
+        let recoveryQueueDelayVetoSeconds: Double
 
         static func fromEnvironment(
             maximumCapacity: Double,
@@ -83,7 +86,19 @@ final class AppleMediaRateController {
                 cooldown: value("ROOTSHELL_VNC_RC_COOLDOWN", default: 5.0),
                 backoffInterval: value("ROOTSHELL_VNC_RC_BACKOFF_INTERVAL", default: 0.25),
                 throughputWindow: value("ROOTSHELL_VNC_RC_TPUT_WINDOW", default: 0.50),
-                updateInterval: value("ROOTSHELL_VNC_RC_UPDATE_INTERVAL", default: 0.05))
+                updateInterval: value("ROOTSHELL_VNC_RC_UPDATE_INTERVAL", default: 0.05),
+                // Defaults to the native floor so recovery episodes cannot
+                // advertise a rate the negotiated profile never expects; may be
+                // lowered in the field for paths that cannot sustain 20 Mbps.
+                recoveryMinimumCapacity: min(minimum, value(
+                    "ROOTSHELL_VNC_RC_RECOVERY_MIN_KBPS",
+                    default: minimum / 1_000) * 1_000),
+                recoveryQuietInterval: value(
+                    "ROOTSHELL_VNC_RC_RECOVERY_QUIET",
+                    default: 0.25),
+                recoveryQueueDelayVetoSeconds: value(
+                    "ROOTSHELL_VNC_RC_RECOVERY_QDELAY_VETO_MS",
+                    default: 50) / 1_000)
         }
     }
 
@@ -110,6 +125,8 @@ final class AppleMediaRateController {
     private var intervalMaximumQueueDelay = 0.0
     private(set) var lastMaximumQueueDelaySeconds = 0.0
     private(set) var peakQueueDelaySeconds = 0.0
+    private var recoveryEpisodeActive = false
+    private(set) var recoveryAttemptCount = 0
 
     init(maxTargetBps: Double, initialTargetBps: Double? = nil) {
         config = Config.fromEnvironment(
@@ -228,10 +245,10 @@ final class AppleMediaRateController {
 
         capacityEstimate = min(
             config.maximumCapacity,
-            max(config.minimumCapacity, capacityEstimate))
+            max(effectiveMinimumCapacity, capacityEstimate))
         target = min(
             config.maximumCapacity,
-            max(config.minimumCapacity, capacityEstimate * config.targetUtilization))
+            max(effectiveMinimumCapacity, capacityEstimate * config.targetUtilization))
 
         intervalReceived = 0
         if !confirmedLossPending { intervalLost = 0 }
@@ -243,11 +260,71 @@ final class AppleMediaRateController {
     /// A full intra picture is a large burst. Request it only after the sender
     /// has converged near our advertised receive rate and the path has remained
     /// gap-free long enough for queued traffic to drain.
-    func isReadyForKeyframeRecovery(now: Double) -> Bool {
+    ///
+    /// While every band is gated the display is frozen regardless, so the
+    /// quiet requirement shortens: recovering promptly beats waiting out a
+    /// motion burst that may never pause. The throughput check stays — after a
+    /// recovery backoff it confirms the sender actually applied the lower rate
+    /// before we invite another IDR burst. The queue-delay veto only defers
+    /// (the caller's escalation ladder bounds it in absolute time); it must
+    /// never reduce the estimate itself.
+    func isReadyForKeyframeRecovery(now: Double, displayGated: Bool = false) -> Bool {
         let observed = throughputBps(now: now)
         guard observed <= target * 1.25 else { return false }
+        if displayGated,
+           lastMaximumQueueDelaySeconds > config.recoveryQueueDelayVetoSeconds {
+            return false
+        }
         guard let lastCongestionTime else { return true }
-        return now - lastCongestionTime >= 0.75
+        let quietInterval = displayGated ? config.recoveryQuietInterval : 0.75
+        return now - lastCongestionTime >= quietInterval
+    }
+
+    /// Step the advertised capacity down ahead of a recovery-IDR retry. Loss
+    /// backoff only reacts to packets that were already shredded; a retry IDR
+    /// sent at the same rate that just caused the loss tends to be shredded
+    /// too. One proactive AIMD step makes the retry picture smaller and
+    /// deliverable while motion continues. Returns whether a step was applied.
+    @discardableResult
+    func forceRecoveryBackoff(now: Double) -> Bool {
+        // Share the AIMD rate limit with loss backoff so a confirmed-loss
+        // decrease and a recovery decrease cannot compound within one window.
+        if let lastBackoff, now - lastBackoff < config.backoffInterval {
+            recoveryEpisodeActive = true
+            recoveryAttemptCount += 1
+            return false
+        }
+        recoveryEpisodeActive = true
+        recoveryAttemptCount += 1
+        capacityEstimate = max(
+            effectiveMinimumCapacity,
+            capacityEstimate * config.decreaseFactor)
+        target = min(
+            config.maximumCapacity,
+            max(effectiveMinimumCapacity, capacityEstimate * config.targetUtilization))
+        hasExperiencedCongestion = true
+        lastBackoff = now
+        lastRamp = now
+        cooldownUntil = max(cooldownUntil, now + config.cooldown)
+        // lastCongestionTime is deliberately untouched: the caller is about to
+        // retry recovery and must not push its own readiness out again.
+        return true
+    }
+
+    /// The gate cleared. Capacity is restored only through the normal
+    /// utilization-gated ramp — snapping back to the pre-episode floor would
+    /// recreate the burst that caused the loss.
+    func noteRecoveryComplete() {
+        recoveryEpisodeActive = false
+        recoveryAttemptCount = 0
+    }
+
+    /// The relaxed floor applies only during an active recovery episode; the
+    /// ramp restores the normal floor as soon as capacity climbs back over it.
+    private var effectiveMinimumCapacity: Double {
+        recoveryEpisodeActive || capacityEstimate < config.minimumCapacity
+            ? config.recoveryMinimumCapacity
+            : config.minimumCapacity
     }
 
     private func trimSamples(now: Double) {

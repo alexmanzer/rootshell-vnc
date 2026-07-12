@@ -706,7 +706,11 @@ public final class VideoStreamManager: @unchecked Sendable {
         donReorderBuffer.reset()
         sequentialAccessUnitAssembler.reset()
         earlyVCLBuffer.removeAll(keepingCapacity: true)
-        pendingRecoveryIDRPresentationTimes.removeAll(keepingCapacity: true)
+        // pendingRecoveryIDRPresentationTimes is deliberately preserved: it
+        // tracks IDRs already in flight inside VideoToolbox, not receiver-side
+        // assembly. Unarming them here meant a recovery picture that decoded
+        // moments after a FIR retry could no longer clear the gate, burning a
+        // full extra recovery cycle. Decoder-retirement paths still clear it.
         lock.unlock()
         log.warning("Reset expected HEVC decoding order while awaiting recovery IDR")
     }

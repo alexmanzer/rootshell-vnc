@@ -3788,10 +3788,33 @@ public actor TransportSession {
     /// Whether the receive controller considers the path quiet enough for a
     /// large recovery IDR. Sending FIR while packets are still being lost just
     /// creates another undecodable burst and prolongs the black screen.
-    public func isReadyForVideoKeyframeRecovery() -> Bool {
+    /// `displayGated` relaxes the quiet requirement: with every band gated the
+    /// screen is frozen anyway, so recovery latency dominates the tradeoff.
+    public func isReadyForVideoKeyframeRecovery(displayGated: Bool = false) -> Bool {
         guard let controller = appleMediaRateController else { return true }
         return controller.isReadyForKeyframeRecovery(
-            now: Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000)
+            now: Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000,
+            displayGated: displayGated)
+    }
+
+    /// Proactively step the advertised receive capacity down before retrying a
+    /// recovery IDR, and flush one RCTL packet so the reduced estimate is on
+    /// the wire ahead of the FIR rather than up to 50 ms behind it.
+    public func applyVideoRecoveryBackoff() async {
+        guard rateControlEnabled, let controller = appleMediaRateController else { return }
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        guard controller.forceRecoveryBackoff(now: now) else { return }
+        log.warning(
+            "Recovery backoff before FIR retry: advertising "
+                + "\(controller.bandwidthEstimateBps / 1_000) kbps "
+                + "(attempt \(controller.recoveryAttemptCount))")
+        await sendAppleMediaRCTLFeedback()
+    }
+
+    /// The recovery gate cleared; end the controller's recovery episode so the
+    /// normal floor and utilization-gated ramp resume.
+    public func noteVideoRecoveryComplete() {
+        appleMediaRateController?.noteRecoveryComplete()
     }
 
     /// Ask the server to retransmit missing RTP packets while the per-SSRC
