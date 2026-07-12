@@ -1069,7 +1069,7 @@ public final class VNCSession {
             ) {
                 guard !Task.isCancelled, let self else { return }
                 mediaWasBackgrounded = true
-                noteMediaInterruptionBoundary()
+                noteMediaInterruptionBoundary(requestRefresh: false)
             }
         }
         foregroundLifecycleTask = Task { @MainActor [weak self] in
@@ -1079,19 +1079,34 @@ public final class VNCSession {
                 guard !Task.isCancelled, let self else { return }
                 guard mediaWasBackgrounded else { continue }
                 mediaWasBackgrounded = false
-                noteMediaInterruptionBoundary()
+                noteMediaInterruptionBoundary(requestRefresh: true)
             }
         }
     }
 
-    private func noteMediaInterruptionBoundary() {
+    private func noteMediaInterruptionBoundary(requestRefresh: Bool) {
         guard connectionState.isConnected,
-              isHighPerformanceMode,
               let transport = transportSession else { return }
-        videoStreamManager?.noteMediaInterruption()
-        remoteAudioPlayer?.reset()
+
+        if isHighPerformanceMode {
+            videoStreamManager?.noteMediaInterruption()
+            remoteAudioPlayer?.reset()
+        }
+
         Task { [transport] in
-            await transport.noteAppleMediaInterruption()
+            if self.isHighPerformanceMode {
+                await transport.noteAppleMediaInterruption()
+            }
+            guard requestRefresh else { return }
+
+            // A suspended connection can remain nominally alive while its
+            // receive/media pipeline has stopped making progress. Do not wait
+            // for a new RTP packet to initiate recovery: a static desktop may
+            // not produce one. Explicitly solicit fresh state on foreground.
+            if self.isHighPerformanceMode {
+                await transport.requestVideoKeyframe()
+            }
+            try? await transport.requestFramebufferUpdate(incremental: false)
         }
     }
 

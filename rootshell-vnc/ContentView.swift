@@ -8,13 +8,17 @@
 import SwiftUI
 import rootshellVNC
 
-#if targetEnvironment(macCatalyst)
+#if os(iOS)
 import UIKit
 #endif
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var session = VNCSession()
     @State private var isFullScreen = false
+    #if os(iOS) && !targetEnvironment(macCatalyst)
+    @State private var backgroundTimeExtension = BackgroundTimeExtension()
+    #endif
 
     var body: some View {
         Group {
@@ -37,8 +41,15 @@ struct ContentView: View {
         .statusBarHidden(isFullScreen)
         #endif
         .task { await autoConnectIfRequested() }
+        .onChange(of: scenePhase) { _, newPhase in
+            #if os(iOS) && !targetEnvironment(macCatalyst)
+            updateBackgroundTimeExtension(for: newPhase)
+            #endif
+        }
         .onChange(of: session.connectionState) { _, newState in
             #if os(iOS) && !targetEnvironment(macCatalyst)
+            updateBackgroundTimeExtension(for: scenePhase)
+
             // Arm full screen while the connection is still negotiating. That
             // way the first connected RemoteDesktopView is created directly
             // in the full-screen hierarchy and can never publish the smaller
@@ -70,6 +81,25 @@ struct ContentView: View {
         }
         #endif
     }
+
+    #if os(iOS) && !targetEnvironment(macCatalyst)
+    private func updateBackgroundTimeExtension(for phase: ScenePhase) {
+        let needsConnectionTime = session.connectionState.isConnecting
+            || session.connectionState.isConnected
+
+        // Acquire the assertion as soon as the scene becomes inactive. Waiting
+        // for `.background` leaves a small unprotected window in which active
+        // sockets can already fail and change the session to a disconnected
+        // state, preventing the request from ever being made.
+        if phase != .active, needsConnectionTime {
+            backgroundTimeExtension.begin()
+        } else if phase == .active {
+            // Once acquired, keep the assertion through transient connection
+            // state changes so reconnect work remains eligible to run.
+            backgroundTimeExtension.end()
+        }
+    }
+    #endif
 
     @ViewBuilder
     private var standardContent: some View {
@@ -193,6 +223,39 @@ struct ContentView: View {
         try? await session.connect(credentials: credentials)
     }
 }
+
+#if os(iOS) && !targetEnvironment(macCatalyst)
+/// Owns the finite amount of execution time iOS may grant after the app moves
+/// to the background, giving an active connection a chance to remain alive.
+@MainActor
+private final class BackgroundTimeExtension {
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+
+    func begin() {
+        guard identifier == .invalid else { return }
+
+        identifier = UIApplication.shared.beginBackgroundTask(
+            withName: "Keep VNC connection alive"
+        ) { [weak self] in
+            self?.end()
+        }
+    }
+
+    func end() {
+        guard identifier != .invalid else { return }
+
+        let taskToEnd = identifier
+        identifier = .invalid
+        UIApplication.shared.endBackgroundTask(taskToEnd)
+    }
+
+    deinit {
+        if identifier != .invalid {
+            UIApplication.shared.endBackgroundTask(identifier)
+        }
+    }
+}
+#endif
 
 #Preview {
     ContentView()

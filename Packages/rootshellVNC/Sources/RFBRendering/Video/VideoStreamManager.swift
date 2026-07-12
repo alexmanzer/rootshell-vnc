@@ -529,6 +529,15 @@ public final class VideoStreamManager: @unchecked Sendable {
                             presentationTime: pts,
                             frameTag: accessUnit.ssrc,
                             tileMetadata: tileMetadata)
+                    } catch HEVCDecoderError.decodeFailed(let status) {
+                        if recoveryIDRArmed {
+                            cancelRecoveryIDR(presentationTime: pts)
+                        }
+                        recordSynchronousDecoderFailure(
+                            status: status,
+                            presentationTime: pts,
+                            ssrc: accessUnit.ssrc)
+                        throw HEVCDecoderError.decodeFailed(status)
                     } catch {
                         if recoveryIDRArmed {
                             cancelRecoveryIDR(presentationTime: pts)
@@ -904,6 +913,26 @@ public final class VideoStreamManager: @unchecked Sendable {
         -17694, // kVTVideoDecoderReferenceMissingErr — refs through a lost frame
     ]
     private var nonFatalDecodeFailureCount: UInt64 = 0
+
+    /// `VTDecompressionSessionDecodeFrame` can report a terminal session error
+    /// directly instead of through its output callback. Route that synchronous
+    /// failure through the same latch/rebuild path as asynchronous failures.
+    private func recordSynchronousDecoderFailure(
+        status: OSStatus,
+        presentationTime: CMTime,
+        ssrc: UInt32
+    ) {
+        lock.lock()
+        let generation = streamGeneration
+        let currentMediaGeneration = mediaGeneration
+        lock.unlock()
+        recordDecoderFailure(
+            streamGeneration: generation,
+            mediaGeneration: currentMediaGeneration,
+            status: status,
+            presentationTime: presentationTime,
+            ssrc: ssrc)
+    }
 
     private func recordDecoderFailure(
         streamGeneration: UInt64,
