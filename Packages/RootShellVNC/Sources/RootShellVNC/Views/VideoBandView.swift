@@ -85,10 +85,9 @@ public final class VideoBandLayerRenderer {
         replaceLayersOnNextFrame = true
     }
 
-    /// Push the latest independently updated screen bands in a single Core
-    /// Animation transaction. `BandFrameCoalescer` coalesces only values already
-    /// pending in the same main-thread hop; it never invents a cross-band frame
-    /// boundary from timing or pixels.
+    /// Push a synchronized screen-band set in one Core Animation transaction.
+    /// `BandFrameCoalescer` freezes a set after every active band advances, with
+    /// a short bounded fallback for a genuinely static/change-gated band.
     public func setBands(_ buffers: [UInt32: CVPixelBuffer]) {
         guard !buffers.isEmpty else { return }
         frameCommitCount &+= 1

@@ -1445,15 +1445,18 @@ struct DecodeOutputStallDetector {
     }
 }
 
-/// Retains a complete compound HEVC surface set. Apple change-gates individual
-/// tiles, so a static tile need not emit alongside a dirty tile; every publish
-/// nevertheless contains the latest surface for every tile and is applied
-/// by the renderer in one transaction.
+/// Retains a complete compound HEVC surface set. Moving bands are frozen into
+/// one coherent publish set; Apple change-gates static tiles, so the bounded
+/// fallback may pair a dirty tile with the last displayed static surface.
 struct AtomicBandFrameAccumulator<Value> {
     let expectedSourceCount: Int
     private var sources: Set<UInt32> = []
     private var latest: [UInt32: Value] = [:]
-    private var hasPendingUpdate = false
+    private var pendingSources: Set<UInt32> = []
+    /// Freeze a synchronized surface set as soon as every band has advanced.
+    /// Later decoder callbacks belong to the next set and must not overwrite
+    /// one member of this set before the main thread presents it.
+    private var synchronizedFrame: [UInt32: Value]?
 
     init(expectedSourceCount: Int) {
         self.expectedSourceCount = expectedSourceCount
@@ -1462,33 +1465,62 @@ struct AtomicBandFrameAccumulator<Value> {
     mutating func submit(source: UInt32, value: Value) {
         sources.insert(source)
         latest[source] = value
-        hasPendingUpdate = true
+        pendingSources.insert(source)
+        promoteSynchronizedFrameIfPossible()
     }
 
-    var hasCompleteFrame: Bool {
+    var hasSynchronizedFrame: Bool {
+        synchronizedFrame != nil
+    }
+
+    var hasCompletePendingSnapshot: Bool {
         sources.count == expectedSourceCount
             && sources.allSatisfy { latest[$0] != nil }
-            && hasPendingUpdate
+            && !pendingSources.isEmpty
     }
 
-    mutating func takeCompleteFrame() -> [UInt32: Value]? {
-        guard hasCompleteFrame else { return nil }
-        hasPendingUpdate = false
+    mutating func takeSynchronizedFrame() -> [UInt32: Value]? {
+        guard let frame = synchronizedFrame else { return nil }
+        synchronizedFrame = nil
+        promoteSynchronizedFrameIfPossible()
+        return frame
+    }
+
+    /// Bounded-latency escape hatch for Apple's change-gated tiles. If only a
+    /// dirty band emits, publish it with the retained static bands after the
+    /// coalescing deadline instead of waiting forever.
+    mutating func takeLatestPendingSnapshot() -> [UInt32: Value]? {
+        guard synchronizedFrame == nil, hasCompletePendingSnapshot else {
+            return nil
+        }
+        pendingSources.removeAll(keepingCapacity: true)
         return latest.filter { sources.contains($0.key) }
+    }
+
+    private mutating func promoteSynchronizedFrameIfPossible() {
+        guard synchronizedFrame == nil,
+              sources.count == expectedSourceCount,
+              pendingSources.count == expectedSourceCount else { return }
+        synchronizedFrame = latest.filter { sources.contains($0.key) }
+        pendingSources.removeAll(keepingCapacity: true)
     }
 }
 
-/// Delivers the latest independently decoded screen bands to the main-thread
-/// renderer. One FIFO main-queue hop coalesces bursts across sources; a newer
-/// frame supersedes an older pending frame for the same band, so the UI cannot
-/// fall behind the decoder.
+/// Delivers synchronized decoded screen bands to the main-thread renderer.
+/// Complete moving-band sets use one immediate FIFO main-queue hop. A short
+/// deadline prevents a genuinely static/change-gated band from adding stalls.
 final class BandFrameCoalescer: @unchecked Sendable {
     private let lock = NSLock()
     private var accumulator = AtomicBandFrameAccumulator<CVPixelBuffer>(
         expectedSourceCount: Int(AppleMediaVideoMode.negotiatedTilesPerFrame))
-    private var hopScheduled = false
+    private var immediateHopScheduled = false
+    private var fallbackHopScheduled = false
     private var streamGeneration: UInt64 = 0
     private let renderer: VideoBandLayerRenderer
+    /// Half a 60 Hz refresh and roughly one 120 Hz refresh. Normally every
+    /// moving band arrives first and is presented immediately; this deadline
+    /// applies only when the server suppresses an unchanged band.
+    private let fallbackDelay = DispatchTimeInterval.milliseconds(8)
 
     init(
         renderer: VideoBandLayerRenderer,
@@ -1511,7 +1543,8 @@ final class BandFrameCoalescer: @unchecked Sendable {
         streamGeneration = generation
         accumulator = AtomicBandFrameAccumulator<CVPixelBuffer>(
             expectedSourceCount: expectedSourceCount)
-        hopScheduled = false
+        immediateHopScheduled = false
+        fallbackHopScheduled = false
         lock.unlock()
 
         DispatchQueue.main.async { [renderer] in
@@ -1525,15 +1558,24 @@ final class BandFrameCoalescer: @unchecked Sendable {
     func submit(ssrc: UInt32, pixelBuffer: CVPixelBuffer) {
         lock.lock()
         accumulator.submit(source: ssrc, value: pixelBuffer)
-        let shouldScheduleHop = accumulator.hasCompleteFrame && !hopScheduled
+        let shouldScheduleImmediate = accumulator.hasSynchronizedFrame
+            && !immediateHopScheduled
+        let shouldScheduleFallback = accumulator.hasCompletePendingSnapshot
+            && !fallbackHopScheduled
         let generation = streamGeneration
-        if shouldScheduleHop { hopScheduled = true }
+        if shouldScheduleImmediate { immediateHopScheduled = true }
+        if shouldScheduleFallback { fallbackHopScheduled = true }
         lock.unlock()
 
-        if shouldScheduleHop { scheduleRendererHop(generation: generation) }
+        if shouldScheduleImmediate {
+            scheduleImmediateRendererHop(generation: generation)
+        }
+        if shouldScheduleFallback {
+            scheduleFallbackRendererHop(generation: generation)
+        }
     }
 
-    private func scheduleRendererHop(generation: UInt64) {
+    private func scheduleImmediateRendererHop(generation: UInt64) {
         DispatchQueue.main.async { [self] in
             lock.lock()
             guard generation == streamGeneration else {
@@ -1543,8 +1585,37 @@ final class BandFrameCoalescer: @unchecked Sendable {
                 lock.unlock()
                 return
             }
-            let frames = accumulator.takeCompleteFrame()
-            hopScheduled = false
+            let frames = accumulator.takeSynchronizedFrame()
+            immediateHopScheduled = false
+            let scheduleNext = accumulator.hasSynchronizedFrame
+            if scheduleNext { immediateHopScheduled = true }
+            let scheduleFallback = accumulator.hasCompletePendingSnapshot
+                && !fallbackHopScheduled
+            if scheduleFallback { fallbackHopScheduled = true }
+            lock.unlock()
+            if let frames, !frames.isEmpty {
+                MainActor.assumeIsolated {
+                    renderer.setBands(frames)
+                }
+            }
+            if scheduleNext {
+                scheduleImmediateRendererHop(generation: generation)
+            }
+            if scheduleFallback {
+                scheduleFallbackRendererHop(generation: generation)
+            }
+        }
+    }
+
+    private func scheduleFallbackRendererHop(generation: UInt64) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + fallbackDelay) { [self] in
+            lock.lock()
+            guard generation == streamGeneration else {
+                lock.unlock()
+                return
+            }
+            let frames = accumulator.takeLatestPendingSnapshot()
+            fallbackHopScheduled = false
             lock.unlock()
             guard let frames, !frames.isEmpty else { return }
             MainActor.assumeIsolated {

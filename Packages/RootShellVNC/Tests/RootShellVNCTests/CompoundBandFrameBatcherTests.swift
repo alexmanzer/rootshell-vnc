@@ -19,9 +19,9 @@ final class AtomicBandFrameAccumulatorTests: XCTestCase {
         var accumulator = AtomicBandFrameAccumulator<String>(expectedSourceCount: 2)
 
         accumulator.submit(source: 10, value: "top")
-        XCTAssertNil(accumulator.takeCompleteFrame())
+        XCTAssertNil(accumulator.takeSynchronizedFrame())
         accumulator.submit(source: 11, value: "bottom")
-        XCTAssertEqual(accumulator.takeCompleteFrame(), [10: "top", 11: "bottom"])
+        XCTAssertEqual(accumulator.takeSynchronizedFrame(), [10: "top", 11: "bottom"])
     }
 
     func testNewestBandSupersedesOlderValueBeforeDrain() {
@@ -30,22 +30,43 @@ final class AtomicBandFrameAccumulatorTests: XCTestCase {
         accumulator.submit(source: 1, value: 1)
         accumulator.submit(source: 1, value: 2)
         accumulator.submit(source: 2, value: 3)
-        let frame = accumulator.takeCompleteFrame()
+        let frame = accumulator.takeSynchronizedFrame()
 
         XCTAssertEqual(frame?[1], 2)
         XCTAssertEqual(frame?[2], 3)
     }
 
-    func testStaticBandIsRetainedInNextAtomicSnapshot() {
+    func testSingleDirtyBandWaitsForBoundedFallback() {
         var accumulator = AtomicBandFrameAccumulator<Int>(expectedSourceCount: 2)
 
         accumulator.submit(source: 1, value: 1)
-        XCTAssertNil(accumulator.takeCompleteFrame())
+        XCTAssertNil(accumulator.takeSynchronizedFrame())
         accumulator.submit(source: 2, value: 2)
-        XCTAssertEqual(accumulator.takeCompleteFrame(), [1: 1, 2: 2])
-        XCTAssertNil(accumulator.takeCompleteFrame())
+        XCTAssertEqual(accumulator.takeSynchronizedFrame(), [1: 1, 2: 2])
+        XCTAssertNil(accumulator.takeSynchronizedFrame())
 
         accumulator.submit(source: 2, value: 3)
-        XCTAssertEqual(accumulator.takeCompleteFrame(), [1: 1, 2: 3])
+        XCTAssertNil(accumulator.takeSynchronizedFrame())
+        XCTAssertEqual(
+            accumulator.takeLatestPendingSnapshot(),
+            [1: 1, 2: 3])
+    }
+
+    func testReadyFrameCannotBeTornByNextBandCallback() {
+        var accumulator = AtomicBandFrameAccumulator<Int>(expectedSourceCount: 2)
+
+        accumulator.submit(source: 1, value: 10)
+        accumulator.submit(source: 2, value: 20)
+        accumulator.submit(source: 1, value: 11)
+
+        XCTAssertEqual(
+            accumulator.takeSynchronizedFrame(),
+            [1: 10, 2: 20])
+        XCTAssertNil(accumulator.takeSynchronizedFrame())
+
+        accumulator.submit(source: 2, value: 21)
+        XCTAssertEqual(
+            accumulator.takeSynchronizedFrame(),
+            [1: 11, 2: 21])
     }
 }
