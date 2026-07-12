@@ -1,6 +1,12 @@
 import CoreGraphics
 
 struct RemoteDisplaySize: Sendable, Equatable {
+    /// Apple's compound screen codec can advertise an 8192-pixel virtual
+    /// display, but the public VideoToolbox path rejects full-width bands above
+    /// 5120 pixels asynchronously with kVTVideoDecoderBadDataErr. Keep Match
+    /// Client inside the largest coded dimension this receiver can sustain.
+    private static let maximumDecodedPixelDimension: CGFloat = 5120
+
     let pixelWidth: UInt16
     let pixelHeight: UInt16
     let pointWidth: UInt16
@@ -22,8 +28,20 @@ struct RemoteDisplaySize: Sendable, Equatable {
             1,
             1024 / viewSize.width,
             600 / viewSize.height)
-        let pointWidthValue = viewSize.width * workspaceScale
-        let pointHeightValue = viewSize.height * workspaceScale
+        var pointWidthValue = viewSize.width * workspaceScale
+        var pointHeightValue = viewSize.height * workspaceScale
+
+        // Each HEVC band is full desktop width. Fit both axes together so a
+        // large or unusually shaped window cannot negotiate a coded dimension
+        // that creates a valid VT session but then fails every submitted frame.
+        let maximumDecodedPointDimension = maximumDecodedPixelDimension
+            / CGFloat(uiScale)
+        let decodeFit = min(
+            1,
+            maximumDecodedPointDimension / pointWidthValue,
+            maximumDecodedPointDimension / pointHeightValue)
+        pointWidthValue *= decodeFit
+        pointHeightValue *= decodeFit
 
         // Apple's compound HEVC encoder requires each full-width band on a
         // 16-pixel codec boundary. Quantize in point space so Match Client can
@@ -34,7 +52,9 @@ struct RemoteDisplaySize: Sendable, Equatable {
             * pointAlignment
         let roundedPointHeight = (pointHeightValue / pointAlignment).rounded()
             * pointAlignment
-        let maximumPointDimension = CGFloat(Int(UInt16.max) / uiScale)
+        let maximumPointDimension = min(
+            CGFloat(Int(UInt16.max) / uiScale),
+            maximumDecodedPointDimension)
         guard roundedPointWidth <= maximumPointDimension,
               roundedPointHeight <= maximumPointDimension else { return nil }
 

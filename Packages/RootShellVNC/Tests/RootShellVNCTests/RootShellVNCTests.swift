@@ -707,6 +707,27 @@ final class RemoteDisplaySizeTests: XCTestCase {
                 pointHeight: 1200))
     }
 
+    func testClientViewportIsFittedInsideCompoundHEVCDecodeLimit() {
+        XCTAssertEqual(
+            RemoteDisplaySize.matching(
+                viewSize: CGSize(width: 2784, height: 1632)),
+            RemoteDisplaySize(
+                pixelWidth: 5120,
+                pixelHeight: 3008,
+                pointWidth: 2560,
+                pointHeight: 1504))
+    }
+
+    func testDecodeLimitFitAlsoProtectsTallClientWindows() {
+        let size = RemoteDisplaySize.matching(
+            viewSize: CGSize(width: 1800, height: 3000))
+
+        XCTAssertEqual(size?.pixelWidth, 3072)
+        XCTAssertEqual(size?.pixelHeight, 5120)
+        XCTAssertEqual(size?.pixelWidth, size.map { $0.pointWidth * 2 })
+        XCTAssertEqual(size?.pixelHeight, size.map { $0.pointHeight * 2 })
+    }
+
     func testInvalidViewportIsIgnored() {
         XCTAssertNil(RemoteDisplaySize.matching(
             viewSize: CGSize(width: 0, height: 1024)))
