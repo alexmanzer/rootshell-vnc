@@ -623,14 +623,12 @@ public final class VideoStreamManager: @unchecked Sendable {
         return false
     }
 
-    #if DEBUG
     func installCompoundRecoveryGateForTesting(sources: Set<UInt32>) {
         lock.lock()
         seenVideoSSRCs = sources
         _ = markLossLocked(affectedSSRC: nil)
         lock.unlock()
     }
-    #endif
 
     /// Rebuild a VideoToolbox session without touching the VNC or media
     /// connection. The caller runs this on the serial media queue, so incoming

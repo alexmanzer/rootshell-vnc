@@ -534,14 +534,12 @@ public final class VNCSession {
         diagnostics
     }
 
-    #if DEBUG
     var liveMediaDebugSnapshot: (submitted: UInt64, outputs: UInt64) {
         let progress = videoStreamManager?.decodeProgress
         return (
             progress?.submittedFrameCount ?? 0,
             progress?.decoderOutputCount ?? 0)
     }
-    #endif
 
     // MARK: - Private: Event Processing
 

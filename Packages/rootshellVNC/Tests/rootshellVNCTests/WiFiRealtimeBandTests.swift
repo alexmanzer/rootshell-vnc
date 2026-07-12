@@ -247,14 +247,18 @@ final class WiFiRealtimeBandTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(100))
         }
-        XCTFail(
-            "Timed out waiting for Match Client tiles; commits="
-                + "\(session.videoBandRenderer.frameCommitCount) bands="
-                + "\(session.videoBandRenderer.renderedBandCount) generations="
-                + "\(session.videoBandRenderer.streamGenerationCount) media="
-                + "\(session.liveMediaDebugSnapshot) framebuffer="
-                + "\(session.framebufferWidth)x\(session.framebufferHeight) dims="
-                + "\(session.videoBandRenderer.renderedBandDimensions)")
+        let renderer = session.videoBandRenderer
+        let framebuffer = "\(session.framebufferWidth)x\(session.framebufferHeight)"
+        let commits = "commits=\(renderer.frameCommitCount)"
+        let bands = "bands=\(renderer.renderedBandCount)"
+        let generations = "generations=\(renderer.streamGenerationCount)"
+        let media = "media=\(session.liveMediaDebugSnapshot)"
+        let dimensions = "dims=\(renderer.renderedBandDimensions)"
+        let details = [
+            commits, bands, generations, media,
+            "framebuffer=\(framebuffer)", dimensions,
+        ].joined(separator: " ")
+        XCTFail("Timed out waiting for Match Client tiles; \(details)")
     }
 
     @MainActor

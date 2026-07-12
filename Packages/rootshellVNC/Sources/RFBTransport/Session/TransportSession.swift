@@ -87,6 +87,16 @@ public actor TransportSession {
     private let host: String
     private let password: String
     private let username: String?
+    /// Environment-backed diagnostics and experiment switches are launch-time
+    /// configuration. Materializing ProcessInfo.environment copies and bridges
+    /// the complete process environment, so never do it on the RTP hot path.
+    private nonisolated let runtimeEnvironment: [String: String]
+    private nonisolated let appleMediaDecodedRTPDumpPath: String?
+    private nonisolated let appleMediaDecodedRTPDumpIncludesTimestamps: Bool
+    private nonisolated let appleMediaUDPDatagramDumpPath: String?
+    private nonisolated let appleMediaOutgoingRTCPDumpPath: String?
+    private let rctlEnabled: Bool
+    private let rateControlEnabled: Bool
     private var continuation: AsyncStream<SessionEvent>.Continuation?
     /// Single ordered handoff for all decrypted media RTP. It buffers startup
     /// packets until the decoder sink is ready and drains them atomically, so
@@ -138,7 +148,6 @@ public actor TransportSession {
     private let requestAppleMediaStream: Bool
     /// Legacy direct-transport switch for disabling adaptive rate control. The
     /// public Full Quality mode never enters the lossy media path at all.
-    private let preferFullQualityVideo: Bool
     private var appleMediaNetworkProfile: AppleMediaNetworkProfile = .unknown
     private var sentAppleMediaStreamConfiguration = false
     private var sentAppleMediaServerConfiguration = false
@@ -335,7 +344,16 @@ public actor TransportSession {
         preferredEncodings: [Encoding]? = nil,
         preferFullQualityVideo: Bool = false
     ) {
-        self.preferFullQualityVideo = preferFullQualityVideo
+        let environment = ProcessInfo.processInfo.environment
+        self.runtimeEnvironment = environment
+        self.appleMediaDecodedRTPDumpPath = environment["ROOTSHELL_VNC_DUMP_DECODED_RTP"]
+        self.appleMediaDecodedRTPDumpIncludesTimestamps =
+            environment["ROOTSHELL_VNC_DUMP_RTP_TIMED"] == "1"
+        self.appleMediaUDPDatagramDumpPath = environment["ROOTSHELL_VNC_DUMP_MEDIA_UDP"]
+        self.appleMediaOutgoingRTCPDumpPath = environment["ROOTSHELL_VNC_DUMP_OUTGOING_RTCP"]
+        self.rctlEnabled = environment["ROOTSHELL_VNC_DISABLE_RCTL"] != "1"
+        self.rateControlEnabled = !preferFullQualityVideo
+            && environment["ROOTSHELL_VNC_DISABLE_RATE_CONTROL"] != "1"
         // Force IPv4 for "localhost": it resolves to both ::1 and 127.0.0.1, and
         // if TCP connects over IPv6 the server sends UDP media to ::1 while our
         // media socket is IPv4-only — so no video arrives. Pin both to 127.0.0.1.
@@ -1061,7 +1079,7 @@ public actor TransportSession {
                     // stream we never show — splitting the encode budget and
                     // doubling our real-time decode load. The app renders one
                     // display, so cap to 1 unless explicitly raised.
-                    let maxDisplays = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_MAX_DISPLAYS"]
+                    let maxDisplays = runtimeEnvironment["ROOTSHELL_VNC_MAX_DISPLAYS"]
                         .flatMap(Int.init) ?? 1
                     appleMediaDisplayCount = min(offer.videoStreamDisplayCount ?? 1, max(1, maxDisplays))
                     // ScreenSharing reads bit 1 of byte 0x14 in the native
@@ -1585,7 +1603,7 @@ public actor TransportSession {
         sentAppleMediaAutoFrameUpdate = true
         // The interval is a max-fps cap (0 = uncapped, 16 ≈ 62 fps); frame
         // delivery is change-gated regardless, so it does not affect idle bitrate.
-        let interval = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_AUTOFRAME_INTERVAL_MS"]
+        let interval = runtimeEnvironment["ROOTSHELL_VNC_AUTOFRAME_INTERVAL_MS"]
             .flatMap { Int32($0) } ?? 16
         try await sendAppleEncryptedClientPayload(appleAutoFrameUpdateMessage(intervalMilliseconds: interval))
     }
@@ -1608,7 +1626,7 @@ public actor TransportSession {
         log.info("Framebuffer resized \(oldWidth)x\(oldHeight) -> \(width)x\(height)")
 
         guard acceptedAppleMediaStream, sentAppleMediaAutoFrameUpdate else { return }
-        let interval = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_AUTOFRAME_INTERVAL_MS"]
+        let interval = runtimeEnvironment["ROOTSHELL_VNC_AUTOFRAME_INTERVAL_MS"]
             .flatMap { Int32($0) } ?? 16
         try await sendAppleEncryptedClientPayload(
             appleAutoFrameUpdateMessage(intervalMilliseconds: interval))
@@ -1797,12 +1815,12 @@ public actor TransportSession {
     }
 
     private nonisolated func traceAppleMediaClientPayload(label: String, payload: Data) {
-        guard ProcessInfo.processInfo.environment["ROOTSHELL_VNC_TRACE_APPLE_MEDIA_SEND"] == "1" else { return }
+        guard runtimeEnvironment["ROOTSHELL_VNC_TRACE_APPLE_MEDIA_SEND"] == "1" else { return }
         print("Apple media send: \(label) payloadLength=\(payload.count) prefix=\(hexDump(payload.prefix(96)))")
     }
 
     private nonisolated func traceAppleMediaClientFrame(label: String, payload: Data, framed: Data) {
-        guard ProcessInfo.processInfo.environment["ROOTSHELL_VNC_TRACE_APPLE_MEDIA_SEND"] == "1" else { return }
+        guard runtimeEnvironment["ROOTSHELL_VNC_TRACE_APPLE_MEDIA_SEND"] == "1" else { return }
         print("Apple media send: \(label) payloadLength=\(payload.count) frameLength=\(framed.count) payloadPrefix=\(hexDump(payload.prefix(96))) framePrefix=\(hexDump(framed.prefix(96)))")
     }
 
@@ -2070,7 +2088,7 @@ public actor TransportSession {
     }
 
     private nonisolated func dumpAppleMediaTCPChunkIfRequested(_ chunk: Data) {
-        guard let path = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DUMP_MEDIA_TCP"] else {
+        guard let path = runtimeEnvironment["ROOTSHELL_VNC_DUMP_MEDIA_TCP"] else {
             return
         }
         if FileManager.default.fileExists(atPath: path),
@@ -2084,7 +2102,7 @@ public actor TransportSession {
     }
 
     private nonisolated func dumpAppleMediaPlaintextIfRequested(_ payload: Data) {
-        guard let path = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DUMP_MEDIA_PLAINTEXT"] else {
+        guard let path = runtimeEnvironment["ROOTSHELL_VNC_DUMP_MEDIA_PLAINTEXT"] else {
             return
         }
         if FileManager.default.fileExists(atPath: path),
@@ -2102,7 +2120,7 @@ public actor TransportSession {
     /// split back out. Use to capture the exact server->client media-config
     /// records (0x451/0x455/0x456 and the AVC media message) from a real server.
     private nonisolated func dumpAppleMediaServerRecordIfRequested(_ payload: Data) {
-        guard let path = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DUMP_SERVER_RECORDS"] else {
+        guard let path = runtimeEnvironment["ROOTSHELL_VNC_DUMP_SERVER_RECORDS"] else {
             return
         }
         let framed = appleMediaDumpFrame(direction: 0x53 /* 'S' */, payload: payload)
@@ -2137,7 +2155,7 @@ public actor TransportSession {
     /// to a file, length-framed, so the full bidirectional media negotiation
     /// order can be reconstructed alongside the server-record dump.
     private nonisolated func dumpAppleMediaClientRecordIfRequested(_ payload: Data) {
-        guard let path = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DUMP_CLIENT_RECORDS"] else {
+        guard let path = runtimeEnvironment["ROOTSHELL_VNC_DUMP_CLIENT_RECORDS"] else {
             return
         }
         let framed = appleMediaDumpFrame(direction: 0x43 /* 'C' */, payload: payload)
@@ -2656,7 +2674,7 @@ public actor TransportSession {
     }
 
     private func configuredAppleMediaUDPPort() -> UInt16? {
-        guard let value = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_MEDIA_LOCAL_UDP_PORT"],
+        guard let value = runtimeEnvironment["ROOTSHELL_VNC_MEDIA_LOCAL_UDP_PORT"],
                let port = UInt16(value) else {
             return nil
         }
@@ -2707,7 +2725,7 @@ public actor TransportSession {
 
     private func appleMediaStreamConfiguration(localPort: UInt16) -> Data {
         var data = ClientMessage.appleMediaStreamConfiguration.serialize()
-        guard let offsetValue = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_MEDIA_CONFIG_PORT_OFFSET"],
+        guard let offsetValue = runtimeEnvironment["ROOTSHELL_VNC_MEDIA_CONFIG_PORT_OFFSET"],
               let offset = Int(offsetValue),
               offset >= 0,
               offset + 1 < data.count else {
@@ -2851,7 +2869,7 @@ public actor TransportSession {
         // profile. Full Quality is not another media mode: the native client
         // leaves AVC entirely and requests lossless RFB encodings.
         var negotiatorMode = mode
-        if mode != 8, let override = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_AVC_MODE"]
+        if mode != 8, let override = runtimeEnvironment["ROOTSHELL_VNC_AVC_MODE"]
             .flatMap(Int.init) {
             negotiatorMode = override
         }
@@ -2910,7 +2928,7 @@ public actor TransportSession {
 
     /// Server-offered media ports override, e.g. `ROOTSHELL_VNC_MEDIA_PORTS=5900,5901`.
     private nonisolated func configuredAppleMediaPortOverride() -> [UInt16]? {
-        guard let value = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_MEDIA_PORTS"] else {
+        guard let value = runtimeEnvironment["ROOTSHELL_VNC_MEDIA_PORTS"] else {
             return nil
         }
         let ports = value.split(separator: ",").compactMap { UInt16($0.trimmingCharacters(in: .whitespaces)) }
@@ -3117,7 +3135,7 @@ public actor TransportSession {
         // Ephemeral mode binds a distinct local port and relies on the server
         // latching our source (from the primer) — which gives clean loopback
         // delivery. Toggle with ROOTSHELL_VNC_MEDIA_UDP_EPHEMERAL=1.
-        let ephemeral = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_MEDIA_UDP_EPHEMERAL"] == "1"
+        let ephemeral = runtimeEnvironment["ROOTSHELL_VNC_MEDIA_UDP_EPHEMERAL"] == "1"
         let channel = PosixUDPChannel(
             localPort: ephemeral ? nil : binding.localPort,
             remoteHost: host,
@@ -3133,7 +3151,7 @@ public actor TransportSession {
         // Symmetric RTP: send a zero-length / RTCP primer so the server latches
         // our source endpoint and (on loopback) so the connected 4-tuple is
         // established in both directions. Opt-in for experimentation.
-        if ProcessInfo.processInfo.environment["ROOTSHELL_VNC_MEDIA_UDP_PRIME"] == "1" {
+        if runtimeEnvironment["ROOTSHELL_VNC_MEDIA_UDP_PRIME"] == "1" {
             try? await channel.send(appleMediaUDPPrimer())
         }
 
@@ -3393,7 +3411,7 @@ public actor TransportSession {
     }
 
     private nonisolated func dumpAppleMediaOutgoingRTCPIfRequested(plaintext: Data, protected: Data) {
-        guard let path = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DUMP_OUTGOING_RTCP"] else { return }
+        guard let path = appleMediaOutgoingRTCPDumpPath else { return }
         let line = "RTCP plaintext=\(plaintext.map { String(format: "%02x", $0) }.joined()) "
             + "protected=\(protected.map { String(format: "%02x", $0) }.joined())\n"
         if let data = line.data(using: .utf8) {
@@ -3409,11 +3427,11 @@ public actor TransportSession {
     }
 
     private nonisolated func dumpAppleMediaDecodedRTPIfRequested(_ packet: Data) {
-        guard let path = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DUMP_DECODED_RTP"] else { return }
+        guard let path = appleMediaDecodedRTPDumpPath else { return }
         var framed = Data()
         // Optional 8-byte big-endian nanosecond timestamp prefix for bitrate-over-
         // time analysis (ROOTSHELL_VNC_DUMP_RTP_TIMED=1).
-        if ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DUMP_RTP_TIMED"] == "1" {
+        if appleMediaDecodedRTPDumpIncludesTimestamps {
             let t = DispatchTime.now().uptimeNanoseconds
             for shift in stride(from: 56, through: 0, by: -8) {
                 framed.append(UInt8((t >> UInt64(shift)) & 0xFF))
@@ -3894,8 +3912,8 @@ public actor TransportSession {
 
     private func startAppleRTCPReportLoop() {
         guard appleRTCPReportTask == nil else { return }
+        let testFIR = runtimeEnvironment["ROOTSHELL_VNC_TEST_FIR"] == "1"
         appleRTCPReportTask = Task { [weak self] in
-            let testFIR = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_TEST_FIR"] == "1"
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 if Task.isCancelled { return }
@@ -3990,7 +4008,7 @@ public actor TransportSession {
             ? Double(appleMediaRateController?.bandwidthEstimateBps
                 ?? UInt32(appleMediaRateControllerMaxBps)) / 1_000
             : 65_535
-        let bweKbps = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_RCTL_BWE_KBPS"]
+        let bweKbps = runtimeEnvironment["ROOTSHELL_VNC_RCTL_BWE_KBPS"]
             .flatMap(Double.init) ?? estimatedKbps
         let bwe = UInt16(min(65_535, max(0, bweKbps.rounded())))
 
@@ -4072,15 +4090,6 @@ public actor TransportSession {
             }
         }
 
-    }
-
-    private var rctlEnabled: Bool {
-        ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_RCTL"] != "1"
-    }
-
-    private var rateControlEnabled: Bool {
-        !preferFullQualityVideo
-            && ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_RATE_CONTROL"] != "1"
     }
 
     /// Ceiling for the receive-capacity estimator (bps). RCTL serializes kbps
@@ -4181,7 +4190,7 @@ public actor TransportSession {
     }
 
     private nonisolated func dumpAppleMediaSRTPKeysIfRequested(_ keys: [Data]) {
-        guard let path = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DUMP_SRTP_KEYS"] else { return }
+        guard let path = runtimeEnvironment["ROOTSHELL_VNC_DUMP_SRTP_KEYS"] else { return }
         var blob = Data()
         for key in keys {
             blob.append(UInt8(key.count))
@@ -4191,7 +4200,7 @@ public actor TransportSession {
     }
 
     private nonisolated func dumpAppleMediaUDPDatagramIfRequested(_ datagram: Data) {
-        guard let path = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DUMP_MEDIA_UDP"] else { return }
+        guard let path = appleMediaUDPDatagramDumpPath else { return }
         var framed = Data()
         framed.append(UInt8((datagram.count >> 8) & 0xFF))
         framed.append(UInt8(datagram.count & 0xFF))
