@@ -792,6 +792,38 @@ final class KeyboardInputHandlerTests: XCTestCase {
             0x63)
     }
 
+    @MainActor
+    func testCommandTapProducesCompleteRemoteChord() async throws {
+        var transitions: [HardwareKeyboardTransition] = []
+        let handler = KeyboardInputHandler { downFlag, keysym in
+            transitions.append(HardwareKeyboardTransition(
+                downFlag: downFlag,
+                keysym: keysym))
+        }
+
+        handler.handleCommandTap("h")
+
+        XCTAssertEqual(transitions, [
+            HardwareKeyboardTransition(
+                downFlag: true,
+                keysym: KeyboardInputHandler.keysymSuperL),
+            HardwareKeyboardTransition(downFlag: true, keysym: 0x68),
+        ])
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(transitions, [
+            HardwareKeyboardTransition(
+                downFlag: true,
+                keysym: KeyboardInputHandler.keysymSuperL),
+            HardwareKeyboardTransition(downFlag: true, keysym: 0x68),
+            HardwareKeyboardTransition(downFlag: false, keysym: 0x68),
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymSuperL),
+        ])
+    }
+
     func testFunctionKeyConstants() {
         XCTAssertEqual(KeyboardInputHandler.keysymF1, 0xFFBE)
         XCTAssertEqual(KeyboardInputHandler.keysymF2, 0xFFBF)

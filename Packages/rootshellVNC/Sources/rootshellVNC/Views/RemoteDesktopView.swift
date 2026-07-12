@@ -201,6 +201,19 @@ public struct RemoteDesktopView: View {
                             systemImage: keyboardCapture.isCaptured
                                 ? "keyboard.badge.ellipsis" : "keyboard")
                     }
+
+                    Menu {
+                        Button("Command-H") {
+                            keyboardHandler.handleCommandTap("h")
+                        }
+                        Button("Command-M") {
+                            keyboardHandler.handleCommandTap("m")
+                        }
+                    } label: {
+                        Label(
+                            "Send Command Shortcut",
+                            systemImage: "command")
+                    }
                     #endif
 
                     Button {

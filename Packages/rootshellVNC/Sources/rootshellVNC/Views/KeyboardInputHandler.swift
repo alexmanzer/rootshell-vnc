@@ -129,6 +129,21 @@ public struct KeyboardInputHandler {
         sendKeyEvent(downFlag, keysym)
     }
 
+    /// Send an atomic Command/Super shortcut. Touch controls use this when
+    /// iPadOS reserves the equivalent physical Command chord for itself.
+    public func handleCommandTap(_ character: Character) {
+        let keysym = Self.keysymForCharacter(character)
+        guard keysym != 0 else { return }
+        sendKeyEvent(true, Self.keysymSuperL)
+        sendKeyEvent(true, keysym)
+        let release = sendKeyEvent
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(75))
+            release(false, keysym)
+            release(false, Self.keysymSuperL)
+        }
+    }
+
     // MARK: - Keysym Conversion
 
     /// Convert a SwiftUI `KeyEquivalent` to an X11 keysym value.

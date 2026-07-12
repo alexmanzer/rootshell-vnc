@@ -88,6 +88,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private var syntheticMomentumLastTimestamp: CFTimeInterval = 0
     private var momentumDisplayLink: CADisplayLink?
     private let suppressedInputView = UIView(frame: .zero)
+    #if !targetEnvironment(macCatalyst)
+    private var consumedRemoteAliasUsages: Set<UInt32> = []
+    #endif
     #if DEBUG
     private let inputLog = VNCLogger(category: "InputRouting")
     private var inputLogBudget = 128
@@ -350,6 +353,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 continue
             }
             let usage = UInt32(key.keyCode.rawValue)
+            #if !targetEnvironment(macCatalyst)
+            if handleRemoteSystemAlias(key: key, usage: usage) {
+                continue
+            }
+            #endif
             // Control/Command are represented by separate RFB modifier events.
             // UIKit may put an ASCII control byte in `characters` for those
             // chords, so use the printable layout result instead.
@@ -562,6 +570,30 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
     }
 
+    private func handleRemoteSystemAlias(
+        key: UIKey,
+        usage: UInt32
+    ) -> Bool {
+        let flags = key.modifierFlags.intersection([
+            .control, .alternate, .shift, .command,
+        ])
+        guard flags == [.control, .alternate],
+              let character = key.charactersIgnoringModifiers.lowercased().first,
+              character == "h" || character == "m" else { return false }
+
+        // Control and Option may have reached RFB before the target key. End
+        // those modifier states, consume the local alias key through key-up,
+        // then send an atomic plain remote Command-H/M chord.
+        _ = hardwareKeyboard.release(usage: 0xE0)
+        _ = hardwareKeyboard.release(usage: 0xE4)
+        _ = hardwareKeyboard.release(usage: 0xE2)
+        _ = hardwareKeyboard.release(usage: 0xE6)
+        if consumedRemoteAliasUsages.insert(usage).inserted {
+            keyboardHandler.handleCommandTap(character)
+        }
+        return true
+    }
+
     private func ensureLeftModifier(
         _ enabled: Bool,
         usage: UInt32,
@@ -603,6 +635,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        #if !targetEnvironment(macCatalyst)
+        consumedRemoteAliasUsages.removeAll()
+        #endif
         releaseAllPressedKeys()
         super.pressesCancelled(presses, with: event)
     }
@@ -615,6 +650,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 continue
             }
             let usage = UInt32(key.keyCode.rawValue)
+            #if !targetEnvironment(macCatalyst)
+            if consumedRemoteAliasUsages.remove(usage) != nil {
+                continue
+            }
+            #endif
             guard hardwareKeyboard.release(usage: usage) else {
                 unhandled.insert(press)
                 continue
