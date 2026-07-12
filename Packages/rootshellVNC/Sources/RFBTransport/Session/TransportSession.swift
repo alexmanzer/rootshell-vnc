@@ -3599,6 +3599,25 @@ public actor TransportSession {
             ?? appleMediaFeedbackRoutes.first
     }
 
+    /// Test-only deterministic loss injection
+    /// (`ROOTSHELL_VNC_TEST_DROP_VIDEO_AFTER_PACKETS=N` or `N:K`): after N
+    /// accepted video packets, drop the next K (default 1), upstream of all
+    /// reception bookkeeping, so the full native recovery chain runs as for
+    /// real loss. A single dropped packet is healed silently by RTP
+    /// retransmission; a burst defeats RTX and exercises confirmed-loss
+    /// feedback plus keyframe recovery.
+    private lazy var testVideoPacketDropCountdown: Int = {
+        guard let spec = runtimeEnvironment[
+            "ROOTSHELL_VNC_TEST_DROP_VIDEO_AFTER_PACKETS"] else { return Int.min }
+        let parts = spec.split(separator: ":")
+        if parts.count == 2, let after = Int(parts[0]), let burst = Int(parts[1]) {
+            testVideoPacketDropBurst = max(1, burst)
+            return after
+        }
+        return Int(spec) ?? Int.min
+    }()
+    private var testVideoPacketDropBurst = 1
+
     /// Accept one decrypted RTP packet. Video packets pass through the bounded
     /// per-SSRC jitter buffer; non-video media can be delivered immediately.
     private func acceptAppleMediaRTPPacket(
@@ -3611,6 +3630,19 @@ public actor TransportSession {
         guard header.payloadType == 100 else {
             emitAppleMediaRTPPacket(packet)
             return
+        }
+        if testVideoPacketDropCountdown != Int.min {
+            if testVideoPacketDropCountdown > 0 {
+                testVideoPacketDropCountdown -= 1
+            } else {
+                testVideoPacketDropBurst -= 1
+                if testVideoPacketDropBurst <= 0 {
+                    testVideoPacketDropCountdown = Int.min
+                }
+                log.warning("TEST loss injection: dropping video RTP packet pre-ingress "
+                    + "(remaining burst \(max(0, testVideoPacketDropBurst)))")
+                return
+            }
         }
 
         let isNew = appleMediaVideoSSRCChannels[header.ssrc] == nil

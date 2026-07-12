@@ -86,3 +86,52 @@ final class ReorderRecoveryTests: XCTestCase {
         func increment() { lock.lock(); count += 1; lock.unlock() }
     }
 }
+
+/// Classifies asynchronous VideoToolbox failures. Frame-level errors after
+/// packet loss (bad data, missing reference) must NOT trigger a session
+/// rebuild: this stream never sends another IDR, so a rebuilt session fails
+/// every dependent picture and the display freezes in a rebuild/FIR loop.
+/// The mature session keeps its other references and heals via intra refresh.
+final class DecoderFailureClassificationTests: XCTestCase {
+
+    private func makeActiveManager(
+        onFailure: @escaping @Sendable (VideoDecoderFailure) -> Void
+    ) -> VideoStreamManager {
+        let manager = VideoStreamManager()
+        manager.startStream(streamID: 1, width: 2976, height: 1860) { _, _ in }
+        manager.onDecoderFailure = onFailure
+        return manager
+    }
+
+    func testMissingReferenceAndBadDataAreNonFatal() {
+        let fired = expectation(description: "no rebuild callback")
+        fired.isInverted = true
+        let manager = makeActiveManager { _ in fired.fulfill() }
+        defer { manager.stopStream() }
+
+        manager.simulateDecoderFailureForTesting(status: -12909, ssrc: 7) // bad data
+        manager.simulateDecoderFailureForTesting(status: -17694, ssrc: 7) // missing ref
+        for _ in 0..<128 { // sustained post-loss error burst
+            manager.simulateDecoderFailureForTesting(status: -17694, ssrc: 8)
+        }
+
+        wait(for: [fired], timeout: 0.3)
+        XCTAssertFalse(
+            manager.hasLatchedDecoderFailure,
+            "frame-level statuses must keep the session; intra refresh heals them")
+    }
+
+    func testUnknownStatusStillLatchesAndRequestsRebuild() {
+        let fired = expectation(description: "rebuild callback")
+        let manager = makeActiveManager { failure in
+            XCTAssertEqual(failure.status, -12903)
+            fired.fulfill()
+        }
+        defer { manager.stopStream() }
+
+        manager.simulateDecoderFailureForTesting(status: -12903, ssrc: 7)
+
+        wait(for: [fired], timeout: 1.0)
+        XCTAssertTrue(manager.hasLatchedDecoderFailure)
+    }
+}

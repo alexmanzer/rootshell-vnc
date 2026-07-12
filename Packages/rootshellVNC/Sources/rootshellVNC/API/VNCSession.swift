@@ -475,8 +475,15 @@ public final class VNCSession {
         viewSize: CGSize,
         displayScale _: CGFloat
     ) -> RemoteDisplaySize? {
-        guard configuration.displaySizingMode == .matchClient else { return nil }
-        return RemoteDisplaySize.matching(viewSize: viewSize)
+        guard configuration.displaySizingMode == .matchClient,
+              ProcessInfo.processInfo.environment[
+                "ROOTSHELL_VNC_DISABLE_MATCH_CLIENT"] != "1" else { return nil }
+        let size = RemoteDisplaySize.matching(viewSize: viewSize)
+        if RenderCommitStats.shared != nil, let size {
+            print("DISPLAYREQ pixels=\(size.pixelWidth)x\(size.pixelHeight) "
+                + "points=\(size.pointWidth)x\(size.pointHeight)")
+        }
+        return size
     }
 
     public func updateRemoteDisplaySize(
@@ -1261,10 +1268,14 @@ public final class VNCSession {
             manager.onLossDetected = { [weak transport, latestLossSSRC] ssrc in
                 latestLossSSRC.record(ssrc)
                 guard let transport else { return }
-                // Diagnostic only. A gate latched by the parse/decode-error
-                // path has no transport loss report; recovery must still run,
-                // so this must never guard the supervisor.
                 Task { [transport] in
+                    // By the time the demuxer sees a sequence gap, transport
+                    // retransmission has already failed. The server answers a
+                    // keyframe request with a recovery IDR_N_LP + parameter
+                    // sets (verified live 2026-07-12), which the surviving
+                    // decoder session picks up directly — no rebuild needed.
+                    // The transport rate-limits repeated requests.
+                    await transport.requestVideoKeyframe(ssrc: ssrc)
                     if !(await transport.hasObservedVideoLossFeedback(ssrc: ssrc)) {
                         log.warning("Compressed stream gated without a matching "
                             + "observed RTP loss report")
@@ -1351,12 +1362,29 @@ public final class VNCSession {
             let recoveryManager = manager
             manager.onDecoderFailure = { [weak transport, weak recoveryManager] failure in
                 guard let transport, let recoveryManager else { return }
-                Task { [transport, recoveryManager] in
-                    recoveryQueue.async { [transport, recoveryManager] in
-                        guard recoveryManager.recoverDecoderInSession() else { return }
-                        Task { [transport] in
-                            await transport.requestVideoKeyframe(ssrc: failure.ssrc)
+                // The rebuild is paced by VideoStreamManager's cooldown: a
+                // session rebuilt mid-reference-loss fails every dependent
+                // picture until intra refresh completes, so hammering rebuilds
+                // per failure churned 30+ VT sessions a second. Retry on a
+                // timer instead until either the rebuild lands or the latch
+                // clears with the stream still healthy.
+                Task { [weak transport, weak recoveryManager] in
+                    for attempt in 1...8 {
+                        guard let transport,
+                              let recoveryManager,
+                              recoveryManager.isStreamActive,
+                              recoveryManager.hasLatchedDecoderFailure else { return }
+                        let rebuilt = await withCheckedContinuation { continuation in
+                            recoveryQueue.async {
+                                continuation.resume(
+                                    returning: recoveryManager.recoverDecoderInSession())
+                            }
                         }
+                        if rebuilt {
+                            await transport.requestVideoKeyframe(ssrc: failure.ssrc)
+                            return
+                        }
+                        try? await Task.sleep(for: .milliseconds(150 * attempt))
                     }
                 }
             }
@@ -1387,8 +1415,16 @@ public final class VNCSession {
             let generationCoalescer = coalescer
             let generationLog = logger
             let videoPacketCoalescer = OrderedMediaPacketCoalescer(queue: queue) { packets in
-                for packet in packets {
-                    sinkManager.feedRTPData(packet)
+                if let stats = RenderCommitStats.shared {
+                    for packet in packets {
+                        stats.noteVideoPacket(bytes: packet.count)
+                        let result = sinkManager.feedRTPData(packet)
+                        stats.noteSubmittedAccessUnits(result.decodedNALUnitCount)
+                    }
+                } else {
+                    for packet in packets {
+                        sinkManager.feedRTPData(packet)
+                    }
                 }
             }
             await transport.setAppleMediaGenerationSink { generation, numberOfTiles in
@@ -1838,6 +1874,104 @@ struct AtomicBandFrameAccumulator<Value> {
     }
 }
 
+/// Env-gated (`ROOTSHELL_VNC_RENDER_STATS=1`) per-second render-path telemetry.
+/// Prints decoded-frame arrivals, commit counts by path, main-thread hop
+/// latency, and `setBands` duration — the GUI-only stretch of the pipeline
+/// that headless probes cannot observe.
+final class RenderCommitStats: @unchecked Sendable {
+    static let shared: RenderCommitStats? =
+        ProcessInfo.processInfo.environment["ROOTSHELL_VNC_RENDER_STATS"] == "1"
+            ? RenderCommitStats()
+            : nil
+
+    private let lock = NSLock()
+    private var framesIn = 0
+    private var immediateCommits = 0
+    private var fallbackCommits = 0
+    private var committedBands = 0
+    private var hopLatenciesNanos: [UInt64] = []
+    private var setBandsDurationsNanos: [UInt64] = []
+    private var videoPackets = 0
+    private var videoBytes = 0
+    private var submittedAccessUnits = 0
+    private var tick = 0
+    private let timer: DispatchSourceTimer
+
+    private init() {
+        timer = DispatchSource.makeTimerSource(
+            queue: DispatchQueue(label: "com.rootshell.vnc.render-stats"))
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in self?.emit() }
+        timer.resume()
+    }
+
+    func noteFrameIn() {
+        lock.lock(); framesIn += 1; lock.unlock()
+    }
+
+    func noteVideoPacket(bytes: Int) {
+        lock.lock(); videoPackets += 1; videoBytes += bytes; lock.unlock()
+    }
+
+    func noteSubmittedAccessUnits(_ count: Int) {
+        guard count > 0 else { return }
+        lock.lock(); submittedAccessUnits += count; lock.unlock()
+    }
+
+    func noteCommit(
+        immediate: Bool,
+        bandCount: Int,
+        hopLatencyNanos: UInt64,
+        setBandsNanos: UInt64
+    ) {
+        lock.lock()
+        if immediate { immediateCommits += 1 } else { fallbackCommits += 1 }
+        committedBands += bandCount
+        if hopLatenciesNanos.count < 4096 { hopLatenciesNanos.append(hopLatencyNanos) }
+        if setBandsDurationsNanos.count < 4096 { setBandsDurationsNanos.append(setBandsNanos) }
+        lock.unlock()
+    }
+
+    private func emit() {
+        lock.lock()
+        tick += 1
+        let t = tick
+        let frames = framesIn
+        let immediate = immediateCommits
+        let fallback = fallbackCommits
+        let bands = committedBands
+        let hops = hopLatenciesNanos.sorted()
+        let durations = setBandsDurationsNanos.sorted()
+        let packets = videoPackets
+        let kilobytes = videoBytes / 1024
+        let submitted = submittedAccessUnits
+        framesIn = 0
+        immediateCommits = 0
+        fallbackCommits = 0
+        committedBands = 0
+        videoPackets = 0
+        videoBytes = 0
+        submittedAccessUnits = 0
+        hopLatenciesNanos.removeAll(keepingCapacity: true)
+        setBandsDurationsNanos.removeAll(keepingCapacity: true)
+        lock.unlock()
+
+        func ms(_ sorted: [UInt64], _ p: Double) -> Double {
+            guard !sorted.isEmpty else { return 0 }
+            let idx = min(sorted.count - 1, Int(Double(sorted.count) * p))
+            return Double(sorted[idx]) / 1_000_000
+        }
+        print(String(
+            format: "RSTAT t=%03d pkts=%d kB=%d sub=%d in=%d commits=%d (imm=%d fb=%d) bands=%d "
+                + "hop p50=%.1fms p95=%.1fms max=%.1fms "
+                + "setBands p50=%.2fms max=%.2fms",
+            t, packets, kilobytes, submitted,
+            frames, immediate + fallback, immediate, fallback, bands,
+            ms(hops, 0.5), ms(hops, 0.95), ms(hops, 1.0),
+            ms(durations, 0.5), ms(durations, 1.0)))
+    }
+}
+
 /// Delivers synchronized decoded screen bands to the main-thread renderer.
 /// Complete moving-band sets use one immediate FIFO main-queue hop. A short
 /// deadline prevents a genuinely static/change-gated band from adding stalls.
@@ -1888,6 +2022,7 @@ final class BandFrameCoalescer: @unchecked Sendable {
     }
 
     func submit(ssrc: UInt32, pixelBuffer: CVPixelBuffer) {
+        RenderCommitStats.shared?.noteFrameIn()
         lock.lock()
         accumulator.submit(source: ssrc, value: pixelBuffer)
         let shouldScheduleImmediate = accumulator.hasSynchronizedFrame
@@ -1908,7 +2043,9 @@ final class BandFrameCoalescer: @unchecked Sendable {
     }
 
     private func scheduleImmediateRendererHop(generation: UInt64) {
+        let scheduledNanos = DispatchTime.now().uptimeNanoseconds
         DispatchQueue.main.async { [self] in
+            let hopLatency = DispatchTime.now().uptimeNanoseconds &- scheduledNanos
             lock.lock()
             guard generation == streamGeneration else {
                 // This hop was queued by the retired media generation. Its
@@ -1926,9 +2063,15 @@ final class BandFrameCoalescer: @unchecked Sendable {
             if scheduleFallback { fallbackHopScheduled = true }
             lock.unlock()
             if let frames, !frames.isEmpty {
+                let started = DispatchTime.now().uptimeNanoseconds
                 MainActor.assumeIsolated {
                     renderer.setBands(frames)
                 }
+                RenderCommitStats.shared?.noteCommit(
+                    immediate: true,
+                    bandCount: frames.count,
+                    hopLatencyNanos: hopLatency,
+                    setBandsNanos: DispatchTime.now().uptimeNanoseconds &- started)
             }
             if scheduleNext {
                 scheduleImmediateRendererHop(generation: generation)
@@ -1940,7 +2083,11 @@ final class BandFrameCoalescer: @unchecked Sendable {
     }
 
     private func scheduleFallbackRendererHop(generation: UInt64) {
+        let deadlineNanos = DispatchTime.now().uptimeNanoseconds
+            &+ UInt64(8_000_000)
         DispatchQueue.main.asyncAfter(deadline: .now() + fallbackDelay) { [self] in
+            let now = DispatchTime.now().uptimeNanoseconds
+            let hopLatency = now > deadlineNanos ? now &- deadlineNanos : 0
             lock.lock()
             guard generation == streamGeneration else {
                 lock.unlock()
@@ -1950,9 +2097,15 @@ final class BandFrameCoalescer: @unchecked Sendable {
             fallbackHopScheduled = false
             lock.unlock()
             guard let frames, !frames.isEmpty else { return }
+            let started = DispatchTime.now().uptimeNanoseconds
             MainActor.assumeIsolated {
                 renderer.setBands(frames)
             }
+            RenderCommitStats.shared?.noteCommit(
+                immediate: false,
+                bandCount: frames.count,
+                hopLatencyNanos: hopLatency,
+                setBandsNanos: DispatchTime.now().uptimeNanoseconds &- started)
         }
     }
 }

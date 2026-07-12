@@ -146,6 +146,13 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var pendingSPS: Data?
     private var pendingPPS: Data?
     private var decoderFailureLatch = VideoDecoderFailureLatch()
+    /// Apple's screen stream never sends another IDR, so a session rebuilt
+    /// right after reference loss fails every dependent picture until the
+    /// gradual intra refresh completes (~1 s). Without pacing, that turned one
+    /// lost packet into 30+ session rebuilds per second. The cooldown keeps
+    /// the poisoned window quiet; the session owner re-attempts on a timer.
+    private var lastDecoderRebuildNanos: UInt64 = 0
+    private let decoderRebuildCooldownNanos: UInt64 = 250_000_000
     private let log = VNCLogger(category: "VideoStream")
 
     // MARK: - Loss detection & recovery
@@ -168,15 +175,14 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var lastLossNanos: UInt64 = 0
     /// Kill-switch for A/B testing: ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY=1.
     var lossRecoveryEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY"] != "1"
-    /// Drop-until-IDR gate. Opt-in only: Apple's high-performance screen stream
-    /// sends exactly one IRAP at startup and never again — recovery is gradual
-    /// intra-refresh inside P-frames, and FIR requests do not produce a new IDR.
-    /// Gating every band until a type-20 IDR decodes therefore freezes the whole
-    /// display until the multi-second decoder-rebuild fail-safe, which under
-    /// motion collapses playback to single-digit fps. The correct behavior is to
-    /// keep decoding through corruption and let intra-refresh heal; enable the
-    /// gate (ROOTSHELL_VNC_ENABLE_IRAP_GATE=1) only for diagnostics or senders
-    /// that actually retransmit an IDR on loss.
+    /// Drop-until-IDR gate. Opt-in only. Measured live 2026-07-12: the server
+    /// DOES answer a keyframe request with a recovery IDR_N_LP plus fresh
+    /// parameter sets (~300 ms round trip), so the correct loss behavior is to
+    /// keep the mature session, skip the frames VideoToolbox rejects, request
+    /// a keyframe, and let the IDR re-anchor decode. Gating every band until
+    /// that IDR decodes only lengthens the freeze, and under motion collapses
+    /// playback; enable the gate (ROOTSHELL_VNC_ENABLE_IRAP_GATE=1) only for
+    /// diagnostics.
     var irapGateEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_ENABLE_IRAP_GATE"] == "1"
     /// Fired (off-lock) when a fresh loss is detected while no recovery is in
     /// flight. VNCSession wires this to the transport's keyframe request.
@@ -363,6 +369,8 @@ public final class VideoStreamManager: @unchecked Sendable {
         pendingSPS = nil
         pendingPPS = nil
         decoderFailureLatch.reset()
+        lastDecoderRebuildNanos = 0
+        nonFatalDecodeFailureCount = 0
         codedBandHeight = 0
         expectedBandCount = 0
         seenVideoSSRCs.removeAll()
@@ -662,6 +670,21 @@ public final class VideoStreamManager: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Test-only: route a status through the async-failure classifier exactly
+    /// as the VideoToolbox output callback would.
+    func simulateDecoderFailureForTesting(status: OSStatus, ssrc: UInt32) {
+        lock.lock()
+        let generation = streamGeneration
+        let media = mediaGeneration
+        lock.unlock()
+        recordDecoderFailure(
+            streamGeneration: generation,
+            mediaGeneration: media,
+            status: status,
+            presentationTime: CMTime(value: 0, timescale: 90000),
+            ssrc: ssrc)
+    }
+
     func installCompoundRecoveryGateForTesting(sources: Set<UInt32>) {
         lock.lock()
         seenVideoSSRCs = sources
@@ -773,6 +796,8 @@ public final class VideoStreamManager: @unchecked Sendable {
         pendingSPS = nil
         pendingPPS = nil
         decoderFailureLatch.reset()
+        lastDecoderRebuildNanos = 0
+        nonFatalDecodeFailureCount = 0
         fullFrameWidth = 0
         fullFrameHeight = 0
         mediaGeneration = 0
@@ -864,6 +889,22 @@ public final class VideoStreamManager: @unchecked Sendable {
         return (true, completedRecovery)
     }
 
+    /// Frame-level VideoToolbox failures that must NOT invalidate the session.
+    /// Apple's screen stream sends exactly one IRAP at startup and never again:
+    /// a session rebuilt after reference loss holds no references at all, so
+    /// every dependent picture fails (-17694) until a full intra-refresh sweep
+    /// happens to align with a rebuild — in practice a frozen display and an
+    /// endless rebuild/FIR loop. The mature session, by contrast, is missing
+    /// only the lost picture; skipping the failed frame and continuing lets
+    /// the server's gradual intra refresh heal the corruption in under a
+    /// second. A decoder that stops producing output entirely is still caught
+    /// by the decode-output stall watchdog, which rebuilds on its own cadence.
+    private static let nonFatalDecodeStatuses: Set<OSStatus> = [
+        -12909, // kVTVideoDecoderBadDataErr — the damaged picture itself
+        -17694, // kVTVideoDecoderReferenceMissingErr — refs through a lost frame
+    ]
+    private var nonFatalDecodeFailureCount: UInt64 = 0
+
     private func recordDecoderFailure(
         streamGeneration: UInt64,
         mediaGeneration: UInt64,
@@ -871,6 +912,27 @@ public final class VideoStreamManager: @unchecked Sendable {
         presentationTime: CMTime,
         ssrc: UInt32
     ) {
+        if Self.nonFatalDecodeStatuses.contains(status) {
+            lock.lock()
+            guard streamGeneration == self.streamGeneration,
+                  mediaGeneration == self.mediaGeneration,
+                  _isActive else {
+                lock.unlock()
+                return
+            }
+            nonFatalDecodeFailureCount &+= 1
+            let count = nonFatalDecodeFailureCount
+            pendingRecoveryIDRPresentationTimes.remove(presentationTime.value)
+            lock.unlock()
+            if count == 1 || count.isMultiple(of: 64) {
+                log.warning(
+                    "Skipped frame after non-fatal VideoToolbox status=\(status) "
+                        + "ssrc=0x\(String(ssrc, radix: 16)) count=\(count); "
+                        + "keeping session for intra-refresh recovery")
+            }
+            return
+        }
+
         let failure = VideoDecoderFailure(status: status, ssrc: ssrc)
         let callback: (@Sendable (VideoDecoderFailure) -> Void)?
 
@@ -899,6 +961,13 @@ public final class VideoStreamManager: @unchecked Sendable {
         return decoderFailureLatch.hasFailed
     }
 
+    /// True while an asynchronous VideoToolbox failure is latched and the
+    /// decoder has not yet been rebuilt. The session owner polls this to
+    /// re-attempt a rebuild that was deferred by the rebuild cooldown.
+    public var hasLatchedDecoderFailure: Bool {
+        isDecoderRecoveryPending
+    }
+
     private func rebuildDecoderInSession(requireLatchedFailure: Bool) -> Bool {
         let oldDecoder: HEVCDecoder
         let replacement: HEVCDecoder
@@ -918,6 +987,13 @@ public final class VideoStreamManager: @unchecked Sendable {
             lock.unlock()
             return false
         }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard lastDecoderRebuildNanos == 0
+                || now &- lastDecoderRebuildNanos >= decoderRebuildCooldownNanos else {
+            lock.unlock()
+            return false
+        }
+        lastDecoderRebuildNanos = now
         generation = streamGeneration
         currentMediaGeneration = mediaGeneration
         oldDecoder = currentDecoder
