@@ -10,6 +10,7 @@ public struct RemoteDesktopView: View {
     @State private var viewport = RemoteViewportState()
     @State private var keyboardActive = false
     @State private var confirmPasswordSend = false
+    @State private var keyboardCapture: VNCKeyboardCapture
 
     #if !canImport(UIKit)
     @State private var lastFallbackMagnification: CGFloat = 1
@@ -23,10 +24,13 @@ public struct RemoteDesktopView: View {
 
     public init(
         session: VNCSession,
+        keyboardCapture: VNCKeyboardCapture? = nil,
         isFullScreen: Bool = false,
         toggleFullScreen: (() -> Void)? = nil
     ) {
         self.session = session
+        self._keyboardCapture = State(
+            initialValue: keyboardCapture ?? VNCKeyboardCapture())
         self.isFullScreen = isFullScreen
         self.toggleFullScreen = toggleFullScreen
         self.touchHandler = TouchInputHandler(
@@ -146,6 +150,7 @@ public struct RemoteDesktopView: View {
             framebufferSize: framebufferSize,
             touchHandler: touchHandler,
             keyboardHandler: keyboardHandler,
+            keyboardCapture: keyboardCapture,
             // Adaptive mode's video composites the server cursor; only the
             // classic framebuffer path adopts the remote shape locally.
             remoteCursor: session.isHighPerformanceMode ? nil : session.remoteCursor)
@@ -175,12 +180,26 @@ public struct RemoteDesktopView: View {
                 Menu {
                     #if canImport(UIKit)
                     Button {
+                        keyboardCapture.capture()
                         keyboardActive.toggle()
                     } label: {
                         Label(
                             keyboardActive ? "Hide Keyboard" : "Show Keyboard",
                             systemImage: keyboardActive
                                 ? "keyboard.chevron.compact.down" : "keyboard")
+                    }
+
+                    Button {
+                        keyboardCapture.toggle()
+                        if !keyboardCapture.isCaptured {
+                            keyboardActive = false
+                        }
+                    } label: {
+                        Label(
+                            keyboardCapture.isCaptured
+                                ? "Release Keyboard Capture" : "Capture Keyboard",
+                            systemImage: keyboardCapture.isCaptured
+                                ? "keyboard.badge.ellipsis" : "keyboard")
                     }
                     #endif
 

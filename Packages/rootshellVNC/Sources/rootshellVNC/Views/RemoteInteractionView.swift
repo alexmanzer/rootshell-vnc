@@ -3,6 +3,9 @@ import SwiftUI
 import UIKit
 import RFBProtocol
 import RFBRendering
+#if targetEnvironment(macCatalyst)
+import GameController
+#endif
 
 /// Transparent UIKit input surface shared by Adaptive and Full Quality modes.
 /// UIKit is used here because SwiftUI gestures do not expose mouse buttons,
@@ -14,6 +17,7 @@ struct RemoteInteractionView: UIViewRepresentable {
     let framebufferSize: CGSize
     let touchHandler: TouchInputHandler
     let keyboardHandler: KeyboardInputHandler
+    let keyboardCapture: VNCKeyboardCapture
     let remoteCursor: RemoteCursor?
 
     func makeCoordinator() -> Coordinator {
@@ -23,7 +27,8 @@ struct RemoteInteractionView: UIViewRepresentable {
     func makeUIView(context: Context) -> RemoteInputUIView {
         let view = RemoteInputUIView(
             touchHandler: touchHandler,
-            keyboardHandler: keyboardHandler)
+            keyboardHandler: keyboardHandler,
+            keyboardCapture: keyboardCapture)
         view.onViewportChange = { [weak coordinator = context.coordinator] state in
             coordinator?.parent.viewport = state
         }
@@ -39,6 +44,7 @@ struct RemoteInteractionView: UIViewRepresentable {
             framebufferSize: framebufferSize,
             viewport: viewport,
             keyboardActive: keyboardActive,
+            keyboardCaptured: keyboardCapture.isCaptured,
             remoteCursor: remoteCursor)
     }
 
@@ -59,10 +65,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
     private let touchHandler: TouchInputHandler
     private let keyboardHandler: KeyboardInputHandler
+    private let keyboardCapture: VNCKeyboardCapture
+    private lazy var hardwareKeyboard = HardwareKeyboardController(
+        keyboardHandler: keyboardHandler)
     private var framebufferSize: CGSize = .zero
     private var viewport = RemoteViewportState()
     private var softwareKeyboardRequested = false
-    private var pressedKeysyms: [Int: UInt32] = [:]
     private var lastPointerPoint: (x: UInt16, y: UInt16)?
     private var remoteCursor: RemoteCursor?
     private var pointerDragActive = false
@@ -113,23 +121,127 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         target: self,
         action: #selector(handleHover(_:)))
     private lazy var pointerInteraction = UIPointerInteraction(delegate: self)
+
+    #if targetEnvironment(macCatalyst)
+    override var keyCommands: [UIKeyCommand]? {
+        keyboardCapture.isCaptured ? remoteControlKeyCommands : nil
+    }
+
+    private lazy var remoteControlKeyCommands: [UIKeyCommand] = {
+        var commands: [UIKeyCommand] = []
+        let inputs = "abcdefghijklmnopqrstuvwxyz0123456789 -=[]\\;',./`"
+        for input in inputs {
+            for modifiers: UIKeyModifierFlags in [.control, [.control, .shift]] {
+                let command = UIKeyCommand(
+                    input: String(input),
+                    modifierFlags: modifiers,
+                    action: #selector(handleControlKeyCommand(_:)))
+                command.wantsPriorityOverSystemBehavior = true
+                commands.append(command)
+            }
+        }
+        for input in [
+            UIKeyCommand.inputUpArrow,
+            UIKeyCommand.inputDownArrow,
+            UIKeyCommand.inputLeftArrow,
+            UIKeyCommand.inputRightArrow,
+        ] {
+            let command = UIKeyCommand(
+                input: input,
+                modifierFlags: .control,
+                action: #selector(handleControlKeyCommand(_:)))
+            command.wantsPriorityOverSystemBehavior = true
+            commands.append(command)
+        }
+        return commands
+    }()
+    #else
+    override var keyCommands: [UIKeyCommand]? {
+        keyboardCapture.isCaptured ? remoteCommandKeyCommands : nil
+    }
+
+    private lazy var remoteCommandKeyCommands: [UIKeyCommand] = {
+        var commands: [UIKeyCommand] = []
+        let inputs = "abcdefghijklmnopqrstuvwxyz0123456789 -=[]\\;',./`"
+        let modifierVariants: [UIKeyModifierFlags] = [
+            .command,
+            [.command, .shift],
+            [.command, .alternate],
+            [.command, .control],
+            [.command, .shift, .alternate],
+            [.command, .shift, .control],
+            [.command, .alternate, .control],
+            [.command, .shift, .alternate, .control],
+        ]
+
+        // Declare iPadOS app-management shortcuts first. Command-H (Home) and
+        // Command-M (Minimize) otherwise compete with system behavior before
+        // UIKit delivers ordinary presses to the remote input view.
+        for input in ["h", "m"] {
+            commands.append(makeRemoteCommand(input: input, modifiers: .command))
+        }
+
+        for input in inputs {
+            for modifiers in modifierVariants {
+                // Avoid duplicate declarations for the explicit commands above.
+                if modifiers == .command && (input == "h" || input == "m") {
+                    continue
+                }
+                commands.append(makeRemoteCommand(
+                    input: String(input),
+                    modifiers: modifiers))
+            }
+        }
+        return commands
+    }()
+
+    private func makeRemoteCommand(
+        input: String,
+        modifiers: UIKeyModifierFlags
+    ) -> UIKeyCommand {
+        let command = UIKeyCommand(
+            input: input,
+            modifierFlags: modifiers,
+            action: #selector(handleRemoteCommandKey(_:)))
+        command.wantsPriorityOverSystemBehavior = true
+        command.allowsAutomaticLocalization = false
+        return command
+    }
+    #endif
+
     init(
         touchHandler: TouchInputHandler,
-        keyboardHandler: KeyboardInputHandler
+        keyboardHandler: KeyboardInputHandler,
+        keyboardCapture: VNCKeyboardCapture
     ) {
         self.touchHandler = touchHandler
         self.keyboardHandler = keyboardHandler
+        self.keyboardCapture = keyboardCapture
         super.init(frame: .zero)
         backgroundColor = .clear
         isMultipleTouchEnabled = true
         accessibilityLabel = "Remote desktop input"
         configureRecognizers()
         addInteraction(pointerInteraction)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationWillResignActive),
+            name: UIApplication.willResignActiveNotification,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidResignKey),
+            name: UIWindow.didResignKeyNotification,
+            object: nil)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     override var canBecomeFirstResponder: Bool { true }
@@ -179,6 +291,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         framebufferSize: CGSize,
         viewport: RemoteViewportState,
         keyboardActive: Bool,
+        keyboardCaptured: Bool,
         remoteCursor: RemoteCursor?
     ) {
         self.framebufferSize = framebufferSize
@@ -192,13 +305,13 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             pointerInteraction.invalidate()
         }
 
-        guard keyboardActive != softwareKeyboardRequested else { return }
+        let keyboardModeChanged = keyboardActive != softwareKeyboardRequested
         softwareKeyboardRequested = keyboardActive
-        if keyboardActive {
+        if keyboardCaptured {
             if !isFirstResponder { becomeFirstResponder() }
-            reloadInputViews()
-        } else if isFirstResponder {
-            resignFirstResponder()
+            if keyboardModeChanged { reloadInputViews() }
+        } else {
+            hardwareKeyboard.releaseAll()
         }
     }
 
@@ -226,30 +339,261 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        guard keyboardCapture.isCaptured else {
+            super.pressesBegan(presses, with: event)
+            return
+        }
         var unhandled: Set<UIPress> = []
         for press in presses {
             guard let key = press.key else {
                 unhandled.insert(press)
                 continue
             }
-            let usage = Int(key.keyCode.rawValue)
-            // UIKey.characters is the text produced by the active keyboard
-            // layout after Shift/Option are applied (for example, "!" instead
-            // of "1"). charactersIgnoringModifiers loses that information.
+            let usage = UInt32(key.keyCode.rawValue)
+            // Control/Command are represented by separate RFB modifier events.
+            // UIKit may put an ASCII control byte in `characters` for those
+            // chords, so use the printable layout result instead.
+            let characters = KeyboardInputHandler.hardwareCharacters(
+                characters: key.characters,
+                charactersIgnoringModifiers: key.charactersIgnoringModifiers,
+                controlOrCommandDown: !key.modifierFlags
+                    .intersection([.control, .command]).isEmpty)
             let keysym = KeyboardInputHandler.keysymForHIDUsage(
-                UInt32(usage),
-                characters: key.characters)
+                usage,
+                characters: characters)
             guard keysym != 0 else {
                 unhandled.insert(press)
                 continue
             }
-            pressedKeysyms[usage] = keysym
-            keyboardHandler.handleKeysym(downFlag: true, keysym: keysym)
+            _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
         }
         if !unhandled.isEmpty {
             super.pressesBegan(unhandled, with: event)
         }
     }
+
+    /// Responder-chain probe used by a containing rootshell window to suppress
+    /// its own menu shortcuts while the remote desktop owns the keyboard.
+    @objc func claimRootshellKeyboardShortcut(_ sender: Any?) {
+        #if targetEnvironment(macCatalyst)
+        guard keyboardCapture.isCaptured,
+              let command = sender as? UIKeyCommand else { return }
+        forwardClaimedHostShortcut(command)
+        #endif
+    }
+
+    /// Command-Shift-M reaches this through the containing app's existing menu
+    /// action and remains available even after capture has been released.
+    @objc func toggleVNCKeyboardCapture(_ sender: Any?) {
+        keyboardCapture.toggle()
+        if !keyboardCapture.isCaptured {
+            softwareKeyboardRequested = false
+            onKeyboardActiveChange?(false)
+            releaseAllPressedKeys()
+            reloadInputViews()
+        } else {
+            becomeFirstResponder()
+        }
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(claimRootshellKeyboardShortcut(_:)) {
+            return keyboardCapture.isCaptured
+        }
+        if action == #selector(toggleVNCKeyboardCapture(_:)) {
+            return true
+        }
+        return super.canPerformAction(action, withSender: sender)
+    }
+
+    #if targetEnvironment(macCatalyst)
+    @objc private func handleControlKeyCommand(_ command: UIKeyCommand) {
+        guard keyboardCapture.isCaptured else { return }
+        ensureModifierKeys(for: command.modifierFlags)
+
+        let usage: UInt32?
+        if command.input == UIKeyCommand.inputUpArrow {
+            usage = 0x52
+        } else if command.input == UIKeyCommand.inputDownArrow {
+            usage = 0x51
+        } else if command.input == UIKeyCommand.inputLeftArrow {
+            usage = 0x50
+        } else if command.input == UIKeyCommand.inputRightArrow {
+            usage = 0x4F
+        } else if let character = command.input?.lowercased().first {
+            usage = Self.controlCommandHIDUsages[character]
+        } else {
+            usage = nil
+        }
+        guard let usage else { return }
+        let characters = command.input ?? ""
+        let keysym = KeyboardInputHandler.keysymForHIDUsage(
+            usage,
+            characters: characters)
+        _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
+    }
+
+    private func forwardClaimedHostShortcut(_ command: UIKeyCommand) {
+        ensureModifierKeys(for: command.modifierFlags)
+        guard let input = command.input,
+              let usage = Self.hidUsage(forCommandInput: input) else { return }
+        let keysym = KeyboardInputHandler.keysymForHIDUsage(
+            usage,
+            characters: input)
+        _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
+    }
+
+    private func ensureModifierKeys(for flags: UIKeyModifierFlags) {
+        let input = GCKeyboard.coalesced?.keyboardInput
+        ensureModifier(
+            enabled: flags.contains(.control),
+            leftUsage: 0xE0,
+            rightUsage: 0xE4,
+            rightPressed: input?.button(forKeyCode: .rightControl)?.isPressed == true,
+            leftKeysym: KeyboardInputHandler.keysymControlL,
+            rightKeysym: KeyboardInputHandler.keysymControlR)
+        ensureModifier(
+            enabled: flags.contains(.shift),
+            leftUsage: 0xE1,
+            rightUsage: 0xE5,
+            rightPressed: input?.button(forKeyCode: .rightShift)?.isPressed == true,
+            leftKeysym: KeyboardInputHandler.keysymShiftL,
+            rightKeysym: KeyboardInputHandler.keysymShiftR)
+        ensureModifier(
+            enabled: flags.contains(.alternate),
+            leftUsage: 0xE2,
+            rightUsage: 0xE6,
+            rightPressed: input?.button(forKeyCode: .rightAlt)?.isPressed == true,
+            leftKeysym: KeyboardInputHandler.keysymAltL,
+            rightKeysym: KeyboardInputHandler.keysymAltR)
+        ensureModifier(
+            enabled: flags.contains(.command),
+            leftUsage: 0xE3,
+            rightUsage: 0xE7,
+            rightPressed: input?.button(forKeyCode: .rightGUI)?.isPressed == true,
+            leftKeysym: KeyboardInputHandler.keysymSuperL,
+            rightKeysym: KeyboardInputHandler.keysymSuperR)
+    }
+
+    private func ensureModifier(
+        enabled: Bool,
+        leftUsage: UInt32,
+        rightUsage: UInt32,
+        rightPressed: Bool,
+        leftKeysym: UInt32,
+        rightKeysym: UInt32
+    ) {
+        guard enabled,
+              !hardwareKeyboard.contains(usage: leftUsage),
+              !hardwareKeyboard.contains(usage: rightUsage) else { return }
+        _ = hardwareKeyboard.press(
+            usage: rightPressed ? rightUsage : leftUsage,
+            keysym: rightPressed ? rightKeysym : leftKeysym)
+    }
+
+    private static func hidUsage(forCommandInput input: String) -> UInt32? {
+        switch input {
+        case UIKeyCommand.inputUpArrow: return 0x52
+        case UIKeyCommand.inputDownArrow: return 0x51
+        case UIKeyCommand.inputLeftArrow: return 0x50
+        case UIKeyCommand.inputRightArrow: return 0x4F
+        case UIKeyCommand.inputHome: return 0x4A
+        case UIKeyCommand.inputEnd: return 0x4D
+        case UIKeyCommand.inputPageUp: return 0x4B
+        case UIKeyCommand.inputPageDown: return 0x4E
+        case UIKeyCommand.inputEscape: return 0x29
+        case "\r": return 0x28
+        case "\t": return 0x2B
+        default:
+            guard let character = input.lowercased().first else { return nil }
+            return controlCommandHIDUsages[character]
+        }
+    }
+
+    private static let controlCommandHIDUsages: [Character: UInt32] = {
+        var result: [Character: UInt32] = [:]
+        for (offset, character) in "abcdefghijklmnopqrstuvwxyz".enumerated() {
+            result[character] = UInt32(0x04 + offset)
+        }
+        for (offset, character) in "1234567890".enumerated() {
+            result[character] = UInt32(0x1E + offset)
+        }
+        result[" "] = 0x2C
+        result["-"] = 0x2D
+        result["="] = 0x2E
+        result["/"] = 0x38
+        result["\\"] = 0x31
+        result["["] = 0x2F
+        result["]"] = 0x30
+        result[";"] = 0x33
+        result["'"] = 0x34
+        result[","] = 0x36
+        result["."] = 0x37
+        result["`"] = 0x35
+        return result
+    }()
+    #else
+    @objc private func handleRemoteCommandKey(_ command: UIKeyCommand) {
+        guard keyboardCapture.isCaptured,
+              let input = command.input,
+              let character = input.lowercased().first,
+              let usage = Self.remoteCommandHIDUsages[character] else { return }
+
+        ensureLeftModifier(
+            command.modifierFlags.contains(.control),
+            usage: 0xE0,
+            keysym: KeyboardInputHandler.keysymControlL)
+        ensureLeftModifier(
+            command.modifierFlags.contains(.shift),
+            usage: 0xE1,
+            keysym: KeyboardInputHandler.keysymShiftL)
+        ensureLeftModifier(
+            command.modifierFlags.contains(.alternate),
+            usage: 0xE2,
+            keysym: KeyboardInputHandler.keysymAltL)
+        ensureLeftModifier(
+            command.modifierFlags.contains(.command),
+            usage: 0xE3,
+            keysym: KeyboardInputHandler.keysymSuperL)
+
+        let keysym = KeyboardInputHandler.keysymForHIDUsage(
+            usage,
+            characters: input)
+        _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
+    }
+
+    private func ensureLeftModifier(
+        _ enabled: Bool,
+        usage: UInt32,
+        keysym: UInt32
+    ) {
+        guard enabled, !hardwareKeyboard.contains(usage: usage) else { return }
+        _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
+    }
+
+    private static let remoteCommandHIDUsages: [Character: UInt32] = {
+        var result: [Character: UInt32] = [:]
+        for (offset, character) in "abcdefghijklmnopqrstuvwxyz".enumerated() {
+            result[character] = UInt32(0x04 + offset)
+        }
+        for (offset, character) in "1234567890".enumerated() {
+            result[character] = UInt32(0x1E + offset)
+        }
+        result[" "] = 0x2C
+        result["-"] = 0x2D
+        result["="] = 0x2E
+        result["["] = 0x2F
+        result["]"] = 0x30
+        result["\\"] = 0x31
+        result[";"] = 0x33
+        result["'"] = 0x34
+        result["`"] = 0x35
+        result[","] = 0x36
+        result["."] = 0x37
+        result["/"] = 0x38
+        return result
+    }()
+    #endif
 
     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
         let unhandled = releaseHardwarePresses(presses)
@@ -259,10 +603,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        let unhandled = releaseHardwarePresses(presses)
-        if !unhandled.isEmpty {
-            super.pressesCancelled(unhandled, with: event)
-        }
+        releaseAllPressedKeys()
+        super.pressesCancelled(presses, with: event)
     }
 
     private func releaseHardwarePresses(_ presses: Set<UIPress>) -> Set<UIPress> {
@@ -272,21 +614,26 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 unhandled.insert(press)
                 continue
             }
-            let usage = Int(key.keyCode.rawValue)
-            guard let keysym = pressedKeysyms.removeValue(forKey: usage) else {
+            let usage = UInt32(key.keyCode.rawValue)
+            guard hardwareKeyboard.release(usage: usage) else {
                 unhandled.insert(press)
                 continue
             }
-            keyboardHandler.handleKeysym(downFlag: false, keysym: keysym)
         }
         return unhandled
     }
 
     private func releaseAllPressedKeys() {
-        for keysym in pressedKeysyms.values {
-            keyboardHandler.handleKeysym(downFlag: false, keysym: keysym)
-        }
-        pressedKeysyms.removeAll()
+        hardwareKeyboard.releaseAll()
+    }
+
+    @objc private func applicationWillResignActive() {
+        releaseAllPressedKeys()
+    }
+
+    @objc private func windowDidResignKey(_ notification: Notification) {
+        guard notification.object as AnyObject? === window else { return }
+        releaseAllPressedKeys()
     }
 
     private func releasePointerDrag() {
@@ -836,6 +1183,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     private func focusForHardwareKeyboard() {
+        keyboardCapture.capture()
         guard !isFirstResponder else { return }
         softwareKeyboardRequested = false
         becomeFirstResponder()
@@ -843,7 +1191,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
     private func dismissKeyboard() {
         softwareKeyboardRequested = false
-        resignFirstResponder()
+        reloadInputViews()
         onKeyboardActiveChange?(false)
     }
 }

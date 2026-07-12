@@ -42,6 +42,10 @@ public struct KeyboardInputHandler {
     public nonisolated static let keysymPageDown:   UInt32 = 0xFF56
     public nonisolated static let keysymEnd:        UInt32 = 0xFF57
     public nonisolated static let keysymInsert:     UInt32 = 0xFF63
+    public nonisolated static let keysymPause:      UInt32 = 0xFF13
+    public nonisolated static let keysymScrollLock: UInt32 = 0xFF14
+    public nonisolated static let keysymPrint:      UInt32 = 0xFF61
+    public nonisolated static let keysymNumLock:    UInt32 = 0xFF7F
 
     // Function keys
     public nonisolated static let keysymF1:         UInt32 = 0xFFBE
@@ -197,12 +201,12 @@ public struct KeyboardInputHandler {
         return codePoint
     }
 
-    /// Convert a function key number (1-12) to its X11 keysym.
+    /// Convert a function key number (1-24) to its X11 keysym.
     ///
     /// - Parameter number: The function key number (1-12).
     /// - Returns: The corresponding keysym, or 0 if the number is out of range.
     public nonisolated static func keysymForFunctionKey(_ number: Int) -> UInt32 {
-        guard number >= 1 && number <= 12 else { return 0 }
+        guard number >= 1 && number <= 24 else { return 0 }
         return keysymF1 + UInt32(number - 1)
     }
 
@@ -220,6 +224,9 @@ public struct KeyboardInputHandler {
         case 0x2B: return keysymTab
         case 0x39: return keysymCapsLock
         case 0x3A...0x45: return keysymF1 + usage - 0x3A
+        case 0x46: return keysymPrint
+        case 0x47: return keysymScrollLock
+        case 0x48: return keysymPause
         case 0x49: return keysymInsert
         case 0x4A: return keysymHome
         case 0x4B: return keysymPageUp
@@ -230,6 +237,9 @@ public struct KeyboardInputHandler {
         case 0x50: return keysymLeft
         case 0x51: return keysymDown
         case 0x52: return keysymUp
+        case 0x53: return keysymNumLock
+        case 0x58: return keysymReturn
+        case 0x68...0x73: return keysymF1 + 12 + usage - 0x68
         case 0xE0: return keysymControlL
         case 0xE1: return keysymShiftL
         case 0xE2: return keysymAltL
@@ -242,5 +252,22 @@ public struct KeyboardInputHandler {
             guard let character = characters.first else { return 0 }
             return keysymForCharacter(character)
         }
+    }
+
+    /// Choose text for a physical key without turning Control chords into
+    /// ASCII control bytes. RFB represents modifiers as independent key
+    /// transitions, so Control-C must use the `c` keysym rather than 0x03.
+    public nonisolated static func hardwareCharacters(
+        characters: String,
+        charactersIgnoringModifiers: String,
+        controlOrCommandDown: Bool
+    ) -> String {
+        guard controlOrCommandDown else { return characters }
+        if let scalar = charactersIgnoringModifiers.unicodeScalars.first,
+           scalar.value >= 0x20,
+           scalar.value != 0x7F {
+            return charactersIgnoringModifiers
+        }
+        return characters
     }
 }

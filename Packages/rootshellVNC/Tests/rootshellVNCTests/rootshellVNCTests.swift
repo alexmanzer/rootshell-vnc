@@ -780,6 +780,18 @@ final class KeyboardInputHandlerTests: XCTestCase {
             0x21)
     }
 
+    func testControlChordUsesPrintableKeysymInsteadOfControlByte() {
+        let characters = KeyboardInputHandler.hardwareCharacters(
+            characters: "\u{03}",
+            charactersIgnoringModifiers: "c",
+            controlOrCommandDown: true)
+
+        XCTAssertEqual(characters, "c")
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x06, characters: characters),
+            0x63)
+    }
+
     func testFunctionKeyConstants() {
         XCTAssertEqual(KeyboardInputHandler.keysymF1, 0xFFBE)
         XCTAssertEqual(KeyboardInputHandler.keysymF2, 0xFFBF)
@@ -868,7 +880,10 @@ final class KeyboardInputHandlerTests: XCTestCase {
 
     func testKeysymForFunctionKeyOutOfRange() {
         XCTAssertEqual(KeyboardInputHandler.keysymForFunctionKey(0), 0)
-        XCTAssertEqual(KeyboardInputHandler.keysymForFunctionKey(13), 0)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForFunctionKey(24),
+            KeyboardInputHandler.keysymF1 + 23)
+        XCTAssertEqual(KeyboardInputHandler.keysymForFunctionKey(25), 0)
         XCTAssertEqual(KeyboardInputHandler.keysymForFunctionKey(-1), 0)
     }
 
@@ -878,6 +893,76 @@ final class KeyboardInputHandlerTests: XCTestCase {
             let expected = KeyboardInputHandler.keysymF1 + UInt32(i - 1)
             XCTAssertEqual(KeyboardInputHandler.keysymForFunctionKey(i), expected)
         }
+    }
+}
+
+final class HardwareKeyboardStateTests: XCTestCase {
+    func testControlCProducesModifierAndPrintableKeysymTransitions() {
+        var state = HardwareKeyboardState()
+        let transitions = [
+            state.press(
+                usage: 0xE0,
+                keysym: KeyboardInputHandler.keysymControlL),
+            state.press(usage: 0x06, keysym: 0x63),
+            state.release(usage: 0x06),
+            state.release(usage: 0xE0),
+        ].compactMap { $0 }
+
+        XCTAssertEqual(transitions, [
+            HardwareKeyboardTransition(
+                downFlag: true,
+                keysym: KeyboardInputHandler.keysymControlL),
+            HardwareKeyboardTransition(downFlag: true, keysym: 0x63),
+            HardwareKeyboardTransition(downFlag: false, keysym: 0x63),
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymControlL),
+        ])
+    }
+
+    func testPressRepeatAndReleaseRetainPressTimeKeysym() {
+        var state = HardwareKeyboardState()
+
+        XCTAssertEqual(
+            state.press(usage: 0x04, keysym: 0x41),
+            HardwareKeyboardTransition(downFlag: true, keysym: 0x41))
+        XCTAssertNil(state.press(usage: 0x04, keysym: 0x61))
+        XCTAssertEqual(
+            state.repeatedPress(usage: 0x04),
+            HardwareKeyboardTransition(downFlag: true, keysym: 0x41))
+        XCTAssertEqual(
+            state.release(usage: 0x04),
+            HardwareKeyboardTransition(downFlag: false, keysym: 0x41))
+        XCTAssertNil(state.release(usage: 0x04))
+    }
+
+    func testReleaseAllUsesReversePressOrderAndOnlyReleasesOnce() {
+        var state = HardwareKeyboardState()
+        _ = state.press(usage: 0xE0, keysym: KeyboardInputHandler.keysymControlL)
+        _ = state.press(usage: 0x06, keysym: 0x63)
+
+        XCTAssertEqual(state.releaseAll(), [
+            HardwareKeyboardTransition(downFlag: false, keysym: 0x63),
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymControlL),
+        ])
+        XCTAssertTrue(state.releaseAll().isEmpty)
+    }
+
+    func testFunctionKeysThroughF24AndAdditionalHIDKeys() {
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x68, characters: ""),
+            KeyboardInputHandler.keysymForFunctionKey(13))
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x73, characters: ""),
+            KeyboardInputHandler.keysymForFunctionKey(24))
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x58, characters: ""),
+            KeyboardInputHandler.keysymReturn)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x53, characters: ""),
+            KeyboardInputHandler.keysymNumLock)
     }
 }
 

@@ -39,16 +39,6 @@
 			path = "rootshell-vnc";
 			sourceTree = "<group>";
 		};
-		47265FD52F69C6CF005C1D3E /* rootshell-vncTests */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = "rootshell-vncTests";
-			sourceTree = "<group>";
-		};
-		47265FDF2F69C6CF005C1D3E /* rootshell-vncUITests */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = "rootshell-vncUITests";
-			sourceTree = "<group>";
-		};
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -82,8 +72,6 @@
 			children = (
 				AABB00032F69D000005C1D3E /* Packages */,
 				47265FC72F69C6CE005C1D3E /* rootshell-vnc */,
-				47265FD52F69C6CF005C1D3E /* rootshell-vncTests */,
-				47265FDF2F69C6CF005C1D3E /* rootshell-vncUITests */,
 				47265FC62F69C6CE005C1D3E /* Products */,
 			);
 			sourceTree = "<group>";
@@ -144,9 +132,6 @@
 			dependencies = (
 				47265FD42F69C6CF005C1D3E /* PBXTargetDependency */,
 			);
-			fileSystemSynchronizedGroups = (
-				47265FD52F69C6CF005C1D3E /* rootshell-vncTests */,
-			);
 			name = "rootshell-vncTests";
 			packageProductDependencies = (
 			);
@@ -166,9 +151,6 @@
 			);
 			dependencies = (
 				47265FDE2F69C6CF005C1D3E /* PBXTargetDependency */,
-			);
-			fileSystemSynchronizedGroups = (
-				47265FDF2F69C6CF005C1D3E /* rootshell-vncUITests */,
 			);
 			name = "rootshell-vncUITests";
 			packageProductDependencies = (
