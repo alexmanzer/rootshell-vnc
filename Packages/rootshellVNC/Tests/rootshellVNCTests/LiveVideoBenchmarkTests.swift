@@ -53,9 +53,11 @@ final class LiveVideoBenchmarkTests: XCTestCase {
             bench.note("LOSS detected ssrc=\(ssrc.map { String($0 & 0xffff) } ?? "nil"); requesting keyframe")
             guard let session else { return }
             Task {
-                for _ in 0..<4 {
+                for attempt in 1...30 {
+                    let ready = await session.isReadyForVideoKeyframeRecovery()
+                    bench.note("keyframe request attempt \(attempt) ready=\(ready)")
                     await session.requestVideoKeyframe(ssrc: ssrc)
-                    try? await Task.sleep(for: .milliseconds(400))
+                    try? await Task.sleep(for: .seconds(1))
                 }
             }
         }
@@ -141,6 +143,18 @@ final class LiveVideoBenchmarkTests: XCTestCase {
         // phase only extends the observation window around the drop.
         if env["ROOTSHELL_VNC_TEST_DROP_VIDEO_AFTER_PACKETS"] != nil {
             bench.beginPhase("loss-inject")
+            try await Task.sleep(for: .seconds(12))
+        }
+
+        // Bootstrap-recovery experiment: the media-stream request acts as a
+        // stop while a stream is live, so send it twice — stop, then solicit
+        // a fresh offer — and observe whether a new IRAP bootstraps decode.
+        if env["VNC_BENCH_MEDIA_RESTART"] == "1" {
+            bench.beginPhase("media-restart")
+            await session.restartAppleMediaStream()
+            try await Task.sleep(for: .seconds(3))
+            bench.note(">>> second media stream request")
+            await session.restartAppleMediaStream()
             try await Task.sleep(for: .seconds(12))
         }
 
