@@ -129,18 +129,35 @@ public struct KeyboardInputHandler {
         sendKeyEvent(downFlag, keysym)
     }
 
-    /// Send an atomic Command/Super shortcut. Touch controls use this when
-    /// iPadOS reserves the equivalent physical Command chord for itself.
+    /// Send an atomic remote command chord. The command menu and its hardware
+    /// aliases both use this path so local shortcut modifiers never leak to
+    /// the remote computer.
+    func handleRemoteCommand(_ command: RemoteCommand) {
+        handleChord(command.remoteChord)
+    }
+
+    /// Send an atomic Command/Super shortcut. Kept for clients and the iPad
+    /// Control-Option-H/M compatibility aliases, since iPadOS reserves the
+    /// corresponding physical Command chords for app management.
     public func handleCommandTap(_ character: Character) {
-        let keysym = Self.keysymForCharacter(character)
-        guard keysym != 0 else { return }
-        sendKeyEvent(true, Self.keysymSuperL)
-        sendKeyEvent(true, keysym)
+        handleChord(RemoteKeyChord(
+            modifiers: [Self.keysymSuperL],
+            key: Self.keysymForCharacter(character)))
+    }
+
+    private func handleChord(_ chord: RemoteKeyChord) {
+        guard chord.key != 0 else { return }
+        for modifier in chord.modifiers {
+            sendKeyEvent(true, modifier)
+        }
+        sendKeyEvent(true, chord.key)
         let release = sendKeyEvent
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(75))
-            release(false, keysym)
-            release(false, Self.keysymSuperL)
+            release(false, chord.key)
+            for modifier in chord.modifiers.reversed() {
+                release(false, modifier)
+            }
         }
     }
 

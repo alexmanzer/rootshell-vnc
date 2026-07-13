@@ -981,7 +981,85 @@ final class KeyboardInputHandlerTests: XCTestCase {
     }
 
     @MainActor
-    func testCommandTapProducesCompleteRemoteChord() async throws {
+    func testStandardRemoteCommandAliasesMatchScreensDefaults() {
+        let expected: [RemoteCommand: RemoteCommandShortcut] = [
+            .missionControl: RemoteCommandShortcut(
+                input: .upArrow, modifiers: [.control, .option]),
+            .applicationWindows: RemoteCommandShortcut(
+                input: .downArrow, modifiers: [.control, .option]),
+            .moveLeftASpace: RemoteCommandShortcut(
+                input: .leftArrow, modifiers: [.control, .option]),
+            .moveRightASpace: RemoteCommandShortcut(
+                input: .rightArrow, modifiers: [.control, .option]),
+            .forceQuit: RemoteCommandShortcut(
+                input: .escape, modifiers: [.control, .option]),
+            .lockScreen: RemoteCommandShortcut(
+                input: .character("q"), modifiers: [.control, .option]),
+            .logOutUser: RemoteCommandShortcut(
+                input: .character("q"), modifiers: [.option, .shift]),
+            .controlAltDelete: RemoteCommandShortcut(
+                input: .delete, modifiers: [.control, .option]),
+            .backslash: RemoteCommandShortcut(
+                input: .character("7"), modifiers: [.control, .shift]),
+            .insert: RemoteCommandShortcut(
+                input: .character("8"), modifiers: [.control, .shift]),
+        ]
+
+        XCTAssertEqual(RemoteCommand.allCases.count, expected.count)
+        for command in RemoteCommand.allCases {
+            XCTAssertEqual(command.shortcut, expected[command])
+        }
+    }
+
+    @MainActor
+    func testRemoteCommandProducesCompleteChordInReverseReleaseOrder() async throws {
+        var transitions: [HardwareKeyboardTransition] = []
+        let handler = KeyboardInputHandler { downFlag, keysym in
+            transitions.append(HardwareKeyboardTransition(
+                downFlag: downFlag,
+                keysym: keysym))
+        }
+
+        handler.handleRemoteCommand(.forceQuit)
+
+        XCTAssertEqual(transitions, [
+            HardwareKeyboardTransition(
+                downFlag: true,
+                keysym: KeyboardInputHandler.keysymSuperL),
+            HardwareKeyboardTransition(
+                downFlag: true,
+                keysym: KeyboardInputHandler.keysymAltL),
+            HardwareKeyboardTransition(
+                downFlag: true,
+                keysym: KeyboardInputHandler.keysymEscape),
+        ])
+
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertEqual(transitions, [
+            HardwareKeyboardTransition(
+                downFlag: true,
+                keysym: KeyboardInputHandler.keysymSuperL),
+            HardwareKeyboardTransition(
+                downFlag: true,
+                keysym: KeyboardInputHandler.keysymAltL),
+            HardwareKeyboardTransition(
+                downFlag: true,
+                keysym: KeyboardInputHandler.keysymEscape),
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymEscape),
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymAltL),
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymSuperL),
+        ])
+    }
+
+    @MainActor
+    func testCommandTapCompatibilityPathStillSendsCommandChord() async throws {
         var transitions: [HardwareKeyboardTransition] = []
         let handler = KeyboardInputHandler { downFlag, keysym in
             transitions.append(HardwareKeyboardTransition(
@@ -990,14 +1068,6 @@ final class KeyboardInputHandlerTests: XCTestCase {
         }
 
         handler.handleCommandTap("h")
-
-        XCTAssertEqual(transitions, [
-            HardwareKeyboardTransition(
-                downFlag: true,
-                keysym: KeyboardInputHandler.keysymSuperL),
-            HardwareKeyboardTransition(downFlag: true, keysym: 0x68),
-        ])
-
         try await Task.sleep(for: .milliseconds(100))
 
         XCTAssertEqual(transitions, [

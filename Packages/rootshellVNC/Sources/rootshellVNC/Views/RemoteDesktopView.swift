@@ -152,6 +152,10 @@ public struct RemoteDesktopView: View {
             keyboardHandler: keyboardHandler,
             keyboardCapture: keyboardCapture,
             framebufferOrigin: framebufferOrigin,
+            requestPasswordSend: requestPasswordSend,
+            requestDictation: requestDictation,
+            toggleFullScreen: toggleFullScreen,
+            disconnect: { session.disconnect() },
             // Adaptive mode's video composites the server cursor; only the
             // classic framebuffer path adopts the remote shape locally.
             remoteCursor: session.isHighPerformanceMode ? nil : session.remoteCursor)
@@ -206,15 +210,35 @@ public struct RemoteDesktopView: View {
                     }
 
                     Menu {
-                        Button("Command-H") {
-                            keyboardHandler.handleCommandTap("h")
+                        Section("Mac Specific") {
+                            ForEach(RemoteCommand.macSpecific) { command in
+                                Button(command.title) {
+                                    keyboardHandler.handleRemoteCommand(command)
+                                }
+                            }
                         }
-                        Button("Command-M") {
-                            keyboardHandler.handleCommandTap("m")
+
+                        Section("Other Commands") {
+                            Button("Dictate") {
+                                requestDictation()
+                            }
+
+                            ForEach(RemoteCommand.otherCommands) { command in
+                                Button(command.title) {
+                                    keyboardHandler.handleRemoteCommand(command)
+                                }
+                            }
+
+                            Button("Command-H") {
+                                keyboardHandler.handleCommandTap("h")
+                            }
+                            Button("Command-M") {
+                                keyboardHandler.handleCommandTap("m")
+                            }
                         }
                     } label: {
                         Label(
-                            "Send Command Shortcut",
+                            "Commands",
                             systemImage: "command")
                     }
                     #endif
@@ -239,7 +263,7 @@ public struct RemoteDesktopView: View {
                     Divider()
 
                     Button {
-                        confirmPasswordSend = true
+                        requestPasswordSend()
                     } label: {
                         Label("Type User Password", systemImage: "key.fill")
                     }
@@ -250,7 +274,7 @@ public struct RemoteDesktopView: View {
                     Button(role: .destructive) {
                         session.disconnect()
                     } label: {
-                        Label("Disconnect", systemImage: "xmark.circle")
+                        Label("Close Connection", systemImage: "xmark.circle")
                     }
                 } label: {
                     Image(systemName: "ellipsis")
@@ -266,6 +290,16 @@ public struct RemoteDesktopView: View {
             .padding(12)
         }
         .allowsHitTesting(true)
+    }
+
+    private func requestPasswordSend() {
+        guard session.canSendLoginPassword else { return }
+        confirmPasswordSend = true
+    }
+
+    private func requestDictation() {
+        keyboardCapture.capture()
+        keyboardActive = true
     }
 
     private var placeholderView: some View {
