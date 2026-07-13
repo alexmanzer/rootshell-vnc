@@ -1,5 +1,27 @@
 import SwiftUI
 import RFBProtocol
+#if canImport(UIKit)
+import UIKit
+
+private struct DockedKeyboardViewportMetrics: Equatable {
+    var containerSize: CGSize = .zero
+    var keyboardInset: CGFloat = 0
+
+    var availableSize: CGSize {
+        CGSize(
+            width: containerSize.width,
+            height: max(0, containerSize.height - keyboardInset))
+    }
+
+    func isApproximatelyEqual(
+        to other: DockedKeyboardViewportMetrics
+    ) -> Bool {
+        abs(containerSize.width - other.containerSize.width) <= 0.5
+            && abs(containerSize.height - other.containerSize.height) <= 0.5
+            && abs(keyboardInset - other.keyboardInset) <= 0.5
+    }
+}
+#endif
 
 /// Displays the remote desktop and provides one input/viewport layer for both
 /// Adaptive video and Full Quality framebuffer rendering.
@@ -11,6 +33,10 @@ public struct RemoteDesktopView: View {
     @State private var keyboardActive = false
     @State private var confirmPasswordSend = false
     @State private var keyboardCapture: VNCKeyboardCapture
+    #if canImport(UIKit)
+    @State private var keyboardViewportMetrics = DockedKeyboardViewportMetrics()
+    @State private var hardwareKeyboardAttached = false
+    #endif
 
     #if !canImport(UIKit)
     @State private var lastFallbackMagnification: CGFloat = 1
@@ -50,72 +76,107 @@ public struct RemoteDesktopView: View {
     }
 
     public var body: some View {
-        GeometryReader { geometry in
-            let framebufferSize = session.presentedFramebufferSize
-            let framebufferOrigin = session.presentedFramebufferRegion?.origin ?? .zero
+        VStack(spacing: 0) {
+            GeometryReader { geometry in
+                let framebufferSize = session.presentedFramebufferSize
+                let framebufferOrigin = session.presentedFramebufferRegion?.origin ?? .zero
 
-            ZStack {
-                Color.black
-                    .ignoresSafeArea()
+                ZStack {
+                    Color.black
+                        .ignoresSafeArea()
 
-                desktopContent(in: geometry.size)
-                    .scaleEffect(viewport.scale)
-                    .offset(viewport.offset)
+                    desktopContent(in: geometry.size)
+                        .scaleEffect(viewport.scale)
+                        .offset(viewport.offset)
 
-                if session.connectionState.isConnected,
-                   framebufferSize.width > 0,
-                   framebufferSize.height > 0 {
-                    interactionLayer(
+                    if session.connectionState.isConnected,
+                       framebufferSize.width > 0,
+                       framebufferSize.height > 0 {
+                        interactionLayer(
+                            viewSize: geometry.size,
+                            framebufferSize: framebufferSize,
+                            framebufferOrigin: framebufferOrigin)
+                    }
+
+                    viewportControls
+
+                    recoveryOverlay
+                }
+                .clipped()
+                .confirmationDialog(
+                    "Type the saved password?",
+                    isPresented: $confirmPasswordSend,
+                    titleVisibility: .visible
+                ) {
+                    Button("Type Password and Log In") {
+                        session.sendLoginPassword()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("The password will be typed into the remote computer, followed by Return.")
+                }
+                .onChange(of: geometry.size) { _, newSize in
+                    viewport.clampOffset(
+                        viewSize: newSize,
+                        framebufferSize: framebufferSize)
+                    #if !canImport(UIKit)
+                    updateRemoteDisplaySize(for: newSize)
+                    #endif
+                }
+                .onChange(of: framebufferSize) { _, newSize in
+                    viewport.clampOffset(
                         viewSize: geometry.size,
-                        framebufferSize: framebufferSize,
-                        framebufferOrigin: framebufferOrigin)
+                        framebufferSize: newSize)
                 }
-
-                viewportControls
-
-                recoveryOverlay
-            }
-            .clipped()
-            .confirmationDialog(
-                "Type the saved password?",
-                isPresented: $confirmPasswordSend,
-                titleVisibility: .visible
-            ) {
-                Button("Type Password and Log In") {
-                    session.sendLoginPassword()
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("The password will be typed into the remote computer, followed by Return.")
-            }
-            .onChange(of: geometry.size) { _, newSize in
-                viewport.clampOffset(
-                    viewSize: newSize,
-                    framebufferSize: framebufferSize)
-                updateRemoteDisplaySize(for: newSize)
-            }
-            .onChange(of: framebufferSize) { _, newSize in
-                viewport.clampOffset(
-                    viewSize: geometry.size,
-                    framebufferSize: newSize)
-            }
-            .onAppear {
-                updateRemoteDisplaySize(for: geometry.size)
-            }
-            .onChange(of: displayScale) { _, _ in
-                updateRemoteDisplaySize(for: geometry.size)
-            }
-            .onChange(of: session.connectionState) { _, newState in
-                if newState.isConnected {
+                .onAppear {
+                    #if !canImport(UIKit)
                     updateRemoteDisplaySize(for: geometry.size)
+                    #endif
                 }
-            }
-            .onChange(of: session.configuration.displaySizingMode) { _, mode in
-                if mode == .matchClient {
+                .onChange(of: displayScale) { _, _ in
+                    #if canImport(UIKit)
+                    updateRemoteDisplaySizeFromMeasuredContainer()
+                    #else
                     updateRemoteDisplaySize(for: geometry.size)
+                    #endif
+                }
+                .onChange(of: session.connectionState) { _, newState in
+                    if newState.isConnected {
+                        #if canImport(UIKit)
+                        updateRemoteDisplaySizeFromMeasuredContainer()
+                        #else
+                        updateRemoteDisplaySize(for: geometry.size)
+                        #endif
+                    }
+                }
+                .onChange(of: session.configuration.displaySizingMode) { _, mode in
+                    if mode == .matchClient {
+                        #if canImport(UIKit)
+                        updateRemoteDisplaySizeFromMeasuredContainer()
+                        #else
+                        updateRemoteDisplaySize(for: geometry.size)
+                        #endif
+                    }
                 }
             }
+
+            #if canImport(UIKit)
+            Color.clear
+                .frame(height: keyboardViewportMetrics.keyboardInset)
+                .accessibilityHidden(true)
+            #endif
         }
+        #if canImport(UIKit)
+        .background {
+            DockedKeyboardInsetReader(metrics: $keyboardViewportMetrics)
+        }
+        // UIKit's layout guide distinguishes a bottom-docked keyboard from
+        // floating and split keyboards; SwiftUI's safe area does not.
+        .ignoresSafeArea(.keyboard)
+        .onChange(of: keyboardViewportMetrics) { _, _ in
+            updateRemoteDisplaySizeFromMeasuredContainer()
+        }
+        #endif
     }
 
     @ViewBuilder
@@ -147,6 +208,7 @@ public struct RemoteDesktopView: View {
         RemoteInteractionView(
             viewport: $viewport,
             keyboardActive: $keyboardActive,
+            hardwareKeyboardAttached: $hardwareKeyboardAttached,
             framebufferSize: framebufferSize,
             touchHandler: touchHandler,
             keyboardHandler: keyboardHandler,
@@ -186,14 +248,16 @@ public struct RemoteDesktopView: View {
                 Spacer()
                 Menu {
                     #if canImport(UIKit)
-                    Button {
-                        keyboardCapture.capture()
-                        keyboardActive.toggle()
-                    } label: {
-                        Label(
-                            keyboardActive ? "Hide Keyboard" : "Show Keyboard",
-                            systemImage: keyboardActive
-                                ? "keyboard.chevron.compact.down" : "keyboard")
+                    if !hardwareKeyboardAttached {
+                        Button {
+                            keyboardCapture.capture()
+                            keyboardActive.toggle()
+                        } label: {
+                            Label(
+                                keyboardActive ? "Hide Keyboard" : "Show Keyboard",
+                                systemImage: keyboardActive
+                                    ? "keyboard.chevron.compact.down" : "keyboard")
+                        }
                     }
 
                     Button {
@@ -392,6 +456,14 @@ public struct RemoteDesktopView: View {
             displayScale: displayScale)
     }
 
+    #if canImport(UIKit)
+    private func updateRemoteDisplaySizeFromMeasuredContainer() {
+        let size = keyboardViewportMetrics.availableSize
+        guard size.width > 0, size.height > 0 else { return }
+        updateRemoteDisplaySize(for: size)
+    }
+    #endif
+
     #if !canImport(UIKit)
     private func fallbackTapGesture(
         viewSize: CGSize,
@@ -474,6 +546,155 @@ public struct RemoteDesktopView: View {
     }
     #endif
 }
+
+#if canImport(UIKit)
+/// Reports only the space occupied by a keyboard docked to the bottom edge.
+/// UIKit collapses this guide for floating, split, and detached keyboards.
+private struct DockedKeyboardInsetReader: UIViewRepresentable {
+    @Binding var metrics: DockedKeyboardViewportMetrics
+
+    func makeUIView(context: Context) -> DockedKeyboardInsetView {
+        let view = DockedKeyboardInsetView()
+        view.onMetricsChange = { newMetrics in
+            context.coordinator.setMetrics(newMetrics)
+        }
+        return view
+    }
+
+    func updateUIView(
+        _ uiView: DockedKeyboardInsetView,
+        context: Context
+    ) {
+        context.coordinator.parent = self
+        uiView.setNeedsLayout()
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(parent: self)
+    }
+
+    @MainActor
+    final class Coordinator {
+        var parent: DockedKeyboardInsetReader
+
+        init(parent: DockedKeyboardInsetReader) {
+            self.parent = parent
+        }
+
+        func setMetrics(_ metrics: DockedKeyboardViewportMetrics) {
+            guard !parent.metrics.isApproximatelyEqual(to: metrics) else { return }
+            parent.metrics = metrics
+        }
+    }
+}
+
+@MainActor
+private final class DockedKeyboardInsetView: UIView {
+    var onMetricsChange: ((DockedKeyboardViewportMetrics) -> Void)?
+    private var lastReportedMetrics: DockedKeyboardViewportMetrics?
+    private let keyboardTopProbe = UIView(frame: .zero)
+    private var keyboardTransitionInProgress = false
+    private var metricsPublishGeneration: UInt = 0
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+
+        // The default is already false, but make the intended floating and
+        // split-keyboard behavior explicit.
+        keyboardLayoutGuide.followsUndockedKeyboard = false
+        if #available(iOS 17.0, *) {
+            // An absent or detached keyboard should report zero rather than
+            // the device's bottom safe-area inset.
+            keyboardLayoutGuide.usesBottomSafeArea = false
+        }
+
+        keyboardTopProbe.isHidden = true
+        keyboardTopProbe.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(keyboardTopProbe)
+        NSLayoutConstraint.activate([
+            keyboardTopProbe.topAnchor.constraint(
+                equalTo: keyboardLayoutGuide.topAnchor),
+            keyboardTopProbe.leadingAnchor.constraint(equalTo: leadingAnchor),
+            keyboardTopProbe.widthAnchor.constraint(equalToConstant: 0),
+            keyboardTopProbe.heightAnchor.constraint(equalToConstant: 0),
+        ])
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(keyboardFrameWillChange),
+            name: UIResponder.keyboardWillChangeFrameNotification,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(keyboardFrameDidChange),
+            name: UIResponder.keyboardDidChangeFrameNotification,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(keyboardDidHide),
+            name: UIResponder.keyboardDidHideNotification,
+            object: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+
+        if !keyboardTransitionInProgress {
+            publishCurrentMetrics()
+        }
+    }
+
+    @objc private func keyboardFrameWillChange() {
+        keyboardTransitionInProgress = true
+    }
+
+    @objc private func keyboardFrameDidChange() {
+        keyboardTransitionInProgress = false
+        setNeedsLayout()
+        layoutIfNeeded()
+        publishCurrentMetrics()
+    }
+
+    @objc private func keyboardDidHide() {
+        keyboardTransitionInProgress = false
+        publishMetrics(keyboardInset: 0)
+    }
+
+    private func publishCurrentMetrics() {
+        let inset = max(0, bounds.maxY - keyboardTopProbe.frame.minY)
+        publishMetrics(keyboardInset: inset)
+    }
+
+    private func publishMetrics(keyboardInset: CGFloat) {
+        let metrics = DockedKeyboardViewportMetrics(
+            containerSize: bounds.size,
+            keyboardInset: keyboardInset)
+        guard lastReportedMetrics?.isApproximatelyEqual(to: metrics) != true else {
+            return
+        }
+        lastReportedMetrics = metrics
+        metricsPublishGeneration &+= 1
+        let generation = metricsPublishGeneration
+
+        // Avoid publishing SwiftUI state during a UIKit layout pass.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.metricsPublishGeneration == generation else { return }
+            self.onMetricsChange?(metrics)
+        }
+    }
+}
+#endif
 
 /// Owns the hot standard-framebuffer observation so publishing a new image
 /// does not invalidate the parent view that owns the HUD Menu.

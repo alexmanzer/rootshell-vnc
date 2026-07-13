@@ -164,7 +164,10 @@ struct ContentView: View {
             session: session,
             isFullScreen: isFullScreen,
             toggleFullScreen: toggleFullScreen)
-            .ignoresSafeArea(isFullScreen ? .all : [])
+            // RemoteDesktopView applies its own dock-aware keyboard inset.
+            // Ignore the system regions here so SwiftUI does not reserve a
+            // full keyboard-sized area for a detached iPad keyboard.
+            .ignoresSafeArea(isFullScreen ? .all : .keyboard)
             .persistentSystemOverlays(isFullScreen ? .hidden : .automatic)
             .animation(.easeInOut(duration: 0.2), value: isFullScreen)
     }

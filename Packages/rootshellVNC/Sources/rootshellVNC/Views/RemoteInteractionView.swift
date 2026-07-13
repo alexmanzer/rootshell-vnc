@@ -3,9 +3,7 @@ import SwiftUI
 import UIKit
 import RFBProtocol
 import RFBRendering
-#if targetEnvironment(macCatalyst)
 import GameController
-#endif
 
 /// Transparent UIKit input surface shared by Adaptive and Full Quality modes.
 /// UIKit is used here because SwiftUI gestures do not expose mouse buttons,
@@ -13,6 +11,7 @@ import GameController
 struct RemoteInteractionView: UIViewRepresentable {
     @Binding var viewport: RemoteViewportState
     @Binding var keyboardActive: Bool
+    @Binding var hardwareKeyboardAttached: Bool
 
     let framebufferSize: CGSize
     let touchHandler: TouchInputHandler
@@ -43,6 +42,17 @@ struct RemoteInteractionView: UIViewRepresentable {
         }
         view.onKeyboardActiveChange = { [weak coordinator = context.coordinator] active in
             coordinator?.parent.keyboardActive = active
+        }
+        view.onHardwareKeyboardAttachedChange = {
+            [weak coordinator = context.coordinator] attached in
+            guard let coordinator else { return }
+            coordinator.parent.hardwareKeyboardAttached = attached
+            if attached {
+                coordinator.parent.keyboardActive = false
+            }
+        }
+        DispatchQueue.main.async { [weak view] in
+            view?.publishHardwareKeyboardAvailability()
         }
         return view
     }
@@ -76,6 +86,7 @@ struct RemoteInteractionView: UIViewRepresentable {
 final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPointerInteractionDelegate {
     var onViewportChange: ((RemoteViewportState) -> Void)?
     var onKeyboardActiveChange: ((Bool) -> Void)?
+    var onHardwareKeyboardAttachedChange: ((Bool) -> Void)?
 
     private let touchHandler: TouchInputHandler
     private let keyboardHandler: KeyboardInputHandler
@@ -108,9 +119,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private var momentumDisplayLink: CADisplayLink?
     private let suppressedInputView = UIView(frame: .zero)
     private var consumedRemoteAliasUsages: Set<UInt32> = []
-    #if targetEnvironment(macCatalyst)
     private weak var monitoredCatalystKeyboardInput: GCKeyboardInput?
-    #endif
     #if DEBUG
     private let inputLog = VNCLogger(category: "InputRouting")
     private var inputLogBudget = 128
@@ -348,12 +357,27 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             selector: #selector(windowDidResignKey),
             name: UIWindow.didResignKeyNotification,
             object: nil)
-        #if targetEnvironment(macCatalyst)
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(catalystKeyboardDidConnect(_:)),
+            selector: #selector(softwareKeyboardWillHide),
+            name: UIResponder.keyboardWillHideNotification,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(softwareKeyboardDidHide),
+            name: UIResponder.keyboardDidHideNotification,
+            object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(hardwareKeyboardDidConnect(_:)),
             name: .GCKeyboardDidConnect,
             object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(hardwareKeyboardDidDisconnect(_:)),
+            name: .GCKeyboardDidDisconnect,
+            object: nil)
+        #if targetEnvironment(macCatalyst)
         configureCatalystKeyboardMonitor(for: GCKeyboard.coalesced)
         #endif
     }
@@ -365,6 +389,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+    }
+
+    func publishHardwareKeyboardAvailability() {
+        onHardwareKeyboardAttachedChange?(GCKeyboard.coalesced != nil)
     }
 
     override var canBecomeFirstResponder: Bool { true }
@@ -390,25 +418,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         softwareKeyboardRequested ? nil : suppressedInputView
     }
 
-    override var inputAccessoryView: UIView? {
-        softwareKeyboardRequested ? keyboardAccessory : nil
-    }
-
     var hasText: Bool { true }
-
-    private lazy var keyboardAccessory: UIToolbar = {
-        let toolbar = UIToolbar()
-        toolbar.items = [
-            UIBarButtonItem(systemItem: .flexibleSpace),
-            UIBarButtonItem(
-                title: "Done",
-                primaryAction: UIAction { [weak self] _ in
-                    self?.dismissKeyboard()
-                })
-        ]
-        toolbar.sizeToFit()
-        return toolbar
-    }()
 
     func update(
         framebufferSize: CGSize,
@@ -656,12 +666,29 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             || signature == ("q", [.alternate, .command])
     }
 
-    #if targetEnvironment(macCatalyst)
-    @objc private func catalystKeyboardDidConnect(_ notification: Notification) {
+    @objc private func hardwareKeyboardDidConnect(_ notification: Notification) {
+        onHardwareKeyboardAttachedChange?(true)
+        #if targetEnvironment(macCatalyst)
         configureCatalystKeyboardMonitor(
             for: notification.object as? GCKeyboard ?? GCKeyboard.coalesced)
+        #endif
     }
 
+    @objc private func hardwareKeyboardDidDisconnect(_ notification: Notification) {
+        // GameController may post before `coalesced` drops the disconnected
+        // instance. Read it on the next main-loop turn so multiple connected
+        // keyboards are handled correctly too.
+        DispatchQueue.main.async { [weak self] in
+            self?.publishHardwareKeyboardAvailability()
+        }
+        #if targetEnvironment(macCatalyst)
+        if GCKeyboard.coalesced == nil {
+            configureCatalystKeyboardMonitor(for: nil)
+        }
+        #endif
+    }
+
+    #if targetEnvironment(macCatalyst)
     /// UIKit can translate Control-M into Return before delivering it to a
     /// Catalyst responder. GameController exposes the underlying physical key
     /// independently, so use it as a narrow fallback for the Command-H/M
@@ -1554,6 +1581,18 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private func dismissKeyboard() {
         softwareKeyboardRequested = false
         reloadInputViews()
+        onKeyboardActiveChange?(false)
+    }
+
+    @objc private func softwareKeyboardWillHide() {
+        guard softwareKeyboardRequested else { return }
+        softwareKeyboardRequested = false
+        onKeyboardActiveChange?(false)
+    }
+
+    @objc private func softwareKeyboardDidHide() {
+        guard softwareKeyboardRequested else { return }
+        softwareKeyboardRequested = false
         onKeyboardActiveChange?(false)
     }
 }
