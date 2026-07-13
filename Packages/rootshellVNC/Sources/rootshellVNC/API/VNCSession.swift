@@ -872,6 +872,35 @@ public final class VNCSession {
         remoteAudioPlayer = nil
     }
 
+    /// Escalation of last resort for a video bootstrap that never produced a
+    /// decoded frame: some servers never re-send an IRAP for FIR, so a
+    /// startup burst damaged by packet loss leaves the stream permanently
+    /// dead. Only a fresh connection renegotiates media. (Deliberately no
+    /// capacity reduction on retry: the server ignores our advertised rate
+    /// during bootstrap, and a lowered controller origin destabilizes large
+    /// framebuffers — measured 2026-07-12.)
+    private func noteMediaBootstrapHealthy() {
+        // Bootstrap health currently needs no state; kept as the single hook
+        // point for future per-connection learning.
+    }
+
+    private func forceMediaBootstrapReconnect(reason: String) {
+        guard connectionState.isConnected,
+              reconnectTask == nil,
+              activeCredentials != nil,
+              configuration.reconnectionPolicy.isEnabled,
+              configuration.reconnectionPolicy.maximumAttempts > 0 else {
+            logger.error(
+                "Video bootstrap failed (\(reason)) but automatic reconnection "
+                    + "is unavailable; leaving the session as-is")
+            return
+        }
+        logger.error("Video bootstrap failed (\(reason)); reconnecting")
+        let transport = transportSession
+        Task { await transport?.disconnect() }
+        scheduleReconnect(immediate: true)
+    }
+
     private func establishTransport(credentials: VNCCredentials) async throws {
         let transport = TransportSession(
             host: credentials.host,
@@ -1191,26 +1220,32 @@ public final class VNCSession {
         let streamGeneration = manager.decodeProgress.streamGeneration
         let recoveryCoordinator = MediaRecoveryCoordinator()
 
-        // Startup liveness watchdog. Recovery remains in the negotiated media
-        // protocol: request a fresh intra picture instead of dirtying the
-        // framebuffer or restarting the VNC connection.
+        // Startup liveness watchdog. Recovery stays in the negotiated media
+        // protocol first (FIR for a fresh intra picture); if the bootstrap is
+        // still dead after the retries — some servers never answer FIR with
+        // an IRAP, so a damaged startup burst is unrecoverable in-session —
+        // escalate to a reconnect with a reduced initial capacity.
         if let transport = transportSession {
             let watchdogManager = manager
             let log = logger
-            Task { [weak transport, weak watchdogManager, recoveryCoordinator] in
+            Task { [weak self, weak transport, weak watchdogManager, recoveryCoordinator] in
                 var firAttempts = 0
-                for _ in 1...20 where firAttempts < 3 {
+                var lastStatus = (decoded: 0, sources: 0)
+                for tick in 1...14 {
                     try? await Task.sleep(for: .seconds(1))
                     guard let transport, let m = watchdogManager, m.isStreamActive else { return }
                     let sources = await transport.videoSourceCount
                     let decoded = decodedBands.count
+                    lastStatus = (decoded, sources)
                     if sources > 0 && decoded >= sources {
                         if firAttempts > 0 {
                             log.info("Dead-band watchdog: recovered, \(decoded)/\(sources) bands decoding")
                         }
+                        self?.noteMediaBootstrapHealthy()
                         return
                     }
-                    guard await transport.isReadyForVideoKeyframeRecovery(),
+                    guard firAttempts < 3,
+                          await transport.isReadyForVideoKeyframeRecovery() || tick >= 6,
                           await recoveryCoordinator.begin() else {
                         continue
                     }
@@ -1220,6 +1255,12 @@ public final class VNCSession {
                     await transport.requestVideoKeyframe()
                     await recoveryCoordinator.finish()
                 }
+                guard let self,
+                      let m = watchdogManager, m.isStreamActive,
+                      m.decodeProgress.streamGeneration == streamGeneration else { return }
+                self.forceMediaBootstrapReconnect(
+                    reason: "\(lastStatus.decoded)/\(lastStatus.sources) bands decoding "
+                        + "after \(firAttempts) FIR attempts")
             }
         }
 
@@ -1457,8 +1498,8 @@ public final class VNCSession {
                     // media. Require every new tile to decode before declaring
                     // this generation live, otherwise the atomic renderer can
                     // retain the old whole-screen frame forever.
-                    Task { [weak transport, weak sinkManager, recoveryCoordinator] in
-                        for attempt in 1...4 {
+                    Task { [weak self, weak transport, weak sinkManager, recoveryCoordinator] in
+                        for attempt in 1...8 {
                             try? await Task.sleep(for: .seconds(1))
                             guard let transport,
                                   let manager = sinkManager,
@@ -1471,10 +1512,13 @@ public final class VNCSession {
                                         "Media generation \(generation) ready: "
                                             + "\(decoded)/\(numberOfTiles) tiles decoded")
                                 }
+                                await MainActor.run { [weak self] in
+                                    self?.noteMediaBootstrapHealthy()
+                                }
                                 return
                             }
                             let ready = await transport.isReadyForVideoKeyframeRecovery()
-                            guard (ready || attempt == 4),
+                            guard (ready || attempt >= 4),
                                   await recoveryCoordinator.begin() else { continue }
                             generationLog.warning(
                                 "Media generation \(generation) has \(decoded)/"
@@ -1482,6 +1526,19 @@ public final class VNCSession {
                                     + "attempt \(attempt)")
                             await transport.requestVideoKeyframe()
                             await recoveryCoordinator.finish()
+                        }
+                        // Still dead after the FIR ladder: this generation's
+                        // bootstrap was lost and the server will not replace
+                        // it in-session. Reconnect with a gentler burst.
+                        guard let manager = sinkManager,
+                              manager.isStreamActive,
+                              manager.currentMediaGeneration == generation else { return }
+                        let decoded = decodedBands.count
+                        guard decoded < numberOfTiles else { return }
+                        await MainActor.run { [weak self] in
+                            self?.forceMediaBootstrapReconnect(
+                                reason: "generation \(generation): \(decoded)/"
+                                    + "\(numberOfTiles) tiles decoding")
                         }
                     }
                 }

@@ -152,6 +152,12 @@ public actor TransportSession {
     /// Legacy direct-transport switch for disabling adaptive rate control. The
     /// public Full Quality mode never enters the lossy media path at all.
     private var appleMediaNetworkProfile: AppleMediaNetworkProfile = .unknown
+    // NOTE (2026-07-12): do NOT scale the initial advertised capacity by
+    // framebuffer area. The server ignores the RCTL estimate while sending its
+    // bootstrap IRAP (measured: advertising 4 Mbps vs 60 Mbps produced an
+    // identical startup burst), but the reduced value still leaks into
+    // keyframe-recovery readiness and the ramp origin — at 5K it slowed and
+    // destabilized the bootstrap the scaling was meant to protect.
     private var sentAppleMediaStreamConfiguration = false
     private var sentAppleMediaServerConfiguration = false
     private var sentAppleMediaPostAcceptEncodings = false
@@ -2788,6 +2794,20 @@ public actor TransportSession {
         log.debug("Sent Apple media stream configuration and request udpPort=\(mediaUDPPort)")
     }
 
+    /// Ask the server to restart the Apple media stream. Every stream offer
+    /// bootstraps a fresh generation with parameter sets and an IRAP, so this
+    /// is the recovery of last resort when the initial bootstrap was damaged
+    /// on a server that never re-sends an IDR for FIR.
+    public func restartAppleMediaStream() async {
+        guard sentAppleMediaStreamConfiguration else { return }
+        do {
+            try await tcp.send(ClientMessage.appleMediaStreamRequest.serialize())
+            log.warning("Re-requested Apple media stream (bootstrap recovery)")
+        } catch {
+            log.error("Could not re-request Apple media stream: \(error.localizedDescription)")
+        }
+    }
+
     private func sendAppleMediaServerConfigurationIfNeeded() async throws {
         guard !sentAppleMediaServerConfiguration else { return }
 
@@ -3027,6 +3047,8 @@ public actor TransportSession {
         appleMediaRTPReorderFlushTask = nil
         appleMediaRTPReorderScheduledDeadlineNanos = nil
         appleMediaRTPReorderBuffer.reset()
+        appleMediaLastVideoIngestNanos = 0
+        appleMediaLastVideoReleaseNanos = 0
         pendingAppleMediaRTPStream = nil
         confirmedAppleMediaRTPStream = nil
 
@@ -3609,6 +3631,10 @@ public actor TransportSession {
     private lazy var testVideoPacketDropCountdown: Int = {
         guard let spec = runtimeEnvironment[
             "ROOTSHELL_VNC_TEST_DROP_VIDEO_AFTER_PACKETS"] else { return Int.min }
+        // One injection per process: a recovery reconnect must not be
+        // re-damaged, or the recovery loop under test could never converge.
+        guard !Self.testVideoPacketDropConsumed else { return Int.min }
+        Self.testVideoPacketDropConsumed = true
         let parts = spec.split(separator: ":")
         if parts.count == 2, let after = Int(parts[0]), let burst = Int(parts[1]) {
             testVideoPacketDropBurst = max(1, burst)
@@ -3617,6 +3643,7 @@ public actor TransportSession {
         return Int(spec) ?? Int.min
     }()
     private var testVideoPacketDropBurst = 1
+    private nonisolated(unsafe) static var testVideoPacketDropConsumed = false
 
     /// Accept one decrypted RTP packet. Video packets pass through the bounded
     /// per-SSRC jitter buffer; non-video media can be delivered immediately.
@@ -3707,6 +3734,13 @@ public actor TransportSession {
             }
         }
 
+        let ingestClockNanos = DispatchTime.now().uptimeNanoseconds
+        appleMediaLastVideoIngestNanos = ingestClockNanos
+        if appleMediaLastVideoReleaseNanos == 0 {
+            // Arm the dead-man from first ingest so a from-birth stall (never
+            // a single released packet) is also detected.
+            appleMediaLastVideoReleaseNanos = ingestClockNanos
+        }
         let result = appleMediaRTPReorderBuffer.insert(
             packet: packet,
             ssrc: header.ssrc,
@@ -3769,7 +3803,11 @@ public actor TransportSession {
             }
         }
 
-        for packet in result.packets {
+        let packets = result.packets
+        if !packets.isEmpty {
+            appleMediaLastVideoReleaseNanos = DispatchTime.now().uptimeNanoseconds
+        }
+        for packet in packets {
             emitAppleMediaRTPPacket(packet)
         }
     }
@@ -4036,9 +4074,37 @@ public actor TransportSession {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(50))
                 if Task.isCancelled { return }
+                await self?.recoverWedgedAppleMediaReorderBufferIfNeeded()
                 await self?.sendAppleMediaRCTLFeedback()
             }
         }
+    }
+
+    /// Timestamps for the video release dead-man below.
+    private var appleMediaLastVideoIngestNanos: UInt64 = 0
+    private var appleMediaLastVideoReleaseNanos: UInt64 = 0
+
+    /// Dead-man for a wedged jitter buffer: video RTP is being ingested but
+    /// nothing has been released downstream for well over the maximum gap
+    /// wait. Observed live (2026-07-12) after a confirmed loss landed inside
+    /// a media renegotiation window: every subsequent packet was swallowed and
+    /// the display stayed black while audio continued. Resetting the buffer
+    /// re-anchors sequence tracking; the resulting jump surfaces as a normal
+    /// loss and heals through keyframe recovery.
+    private func recoverWedgedAppleMediaReorderBufferIfNeeded() {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard appleMediaLastVideoIngestNanos != 0,
+              now &- appleMediaLastVideoIngestNanos < 500_000_000,
+              appleMediaLastVideoReleaseNanos != 0,
+              now &- appleMediaLastVideoReleaseNanos > 1_500_000_000 else { return }
+        log.error(
+            "Video jitter buffer stalled (ingest live, no release for >1.5 s, "
+                + "\(appleMediaRTPReorderBuffer.queuedPacketCount) queued); resetting")
+        appleMediaRTPReorderFlushTask?.cancel()
+        appleMediaRTPReorderFlushTask = nil
+        appleMediaRTPReorderScheduledDeadlineNanos = nil
+        appleMediaRTPReorderBuffer.reset()
+        appleMediaLastVideoReleaseNanos = now
     }
 
     /// Mirror feedback-only AVConference's RTP receive accounting. It updates
