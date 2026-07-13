@@ -179,6 +179,53 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(config.enableProtocolTrace)
     }
 
+    func testStandardModesRejectMatchClientSizing() {
+        for qualityMode in [
+            VNCConfiguration.VideoQualityMode.standard,
+            .fullQuality,
+        ] {
+            var config = VNCConfiguration(
+                videoQualityMode: qualityMode,
+                displaySizingMode: .matchClient)
+            XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
+
+            config.displaySizingMode = .matchClient
+            XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
+
+            config.displayMode = .twoVirtualDisplays
+            XCTAssertEqual(config.displayMode, .oneDisplay)
+            XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
+
+            let virtualDisplayConfig = VNCConfiguration(
+                videoQualityMode: qualityMode,
+                displayMode: .twoVirtualDisplays)
+            XCTAssertEqual(virtualDisplayConfig.displayMode, .oneDisplay)
+            XCTAssertEqual(virtualDisplayConfig.displaySizingMode, .remoteDisplay)
+        }
+
+        var config = VNCConfiguration(displaySizingMode: .matchClient)
+        config.videoQualityMode = .standard
+        XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
+    }
+
+    func testRemoteAudioIsEffectiveOnlyInHighPerformanceMatchClientMode() {
+        var config = VNCConfiguration(
+            videoQualityMode: .adaptive,
+            displaySizingMode: .matchClient,
+            enableRemoteAudio: true)
+        XCTAssertTrue(config.supportsRemoteAudio)
+        XCTAssertTrue(config.effectiveRemoteAudioEnabled)
+
+        config.displaySizingMode = .remoteDisplay
+        XCTAssertFalse(config.supportsRemoteAudio)
+        XCTAssertFalse(config.effectiveRemoteAudioEnabled)
+
+        config.videoQualityMode = .standard
+        config.enableRemoteAudio = true
+        XCTAssertFalse(config.supportsRemoteAudio)
+        XCTAssertFalse(config.effectiveRemoteAudioEnabled)
+    }
+
     func testDisplayCountClamping() {
         XCTAssertEqual(VNCConfiguration(displayCount: 0).displayCount, 1)
         XCTAssertEqual(VNCConfiguration(displayCount: 3).displayCount, 2)
@@ -316,7 +363,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(
             VNCConfiguration.VideoQualityMode.allCases,
             [.adaptive, .standard, .fullQuality])
-        XCTAssertEqual(VNCConfiguration.VideoQualityMode.adaptive.title, "Adaptive")
+        XCTAssertEqual(VNCConfiguration.VideoQualityMode.adaptive.title, "High Performance")
         XCTAssertEqual(VNCConfiguration.VideoQualityMode.standard.title, "Standard")
         XCTAssertEqual(VNCConfiguration.VideoQualityMode.fullQuality.title, "Full Quality")
     }
@@ -746,26 +793,24 @@ final class RemoteDisplaySizeTests: XCTestCase {
     }
 
     @MainActor
-    func testIPadMatchClientRemainsRetinaInEveryQualityMode() {
+    func testIPadMatchClientRemainsRetinaInHighPerformanceMode() {
         let expected = RemoteDisplaySize(
             pixelWidth: 2736,
             pixelHeight: 2048,
             pointWidth: 1368,
             pointHeight: 1024)
 
-        for qualityMode in VNCConfiguration.VideoQualityMode.allCases {
-            for reportedScale: CGFloat in [1, 1.5, 2, 3] {
-                let session = VNCSession(configuration: VNCConfiguration(
-                    videoQualityMode: qualityMode,
-                    displaySizingMode: .matchClient))
-                XCTAssertEqual(
-                    session.matchingClientDisplaySize(
-                        viewSize: CGSize(width: 1366, height: 1024),
-                        displayScale: reportedScale),
-                    expected,
-                    "Match Client should remain HiDPI in \(qualityMode) "
-                        + "when the window reports scale \(reportedScale)")
-            }
+        for reportedScale: CGFloat in [1, 1.5, 2, 3] {
+            let session = VNCSession(configuration: VNCConfiguration(
+                videoQualityMode: .adaptive,
+                displaySizingMode: .matchClient))
+            XCTAssertEqual(
+                session.matchingClientDisplaySize(
+                    viewSize: CGSize(width: 1366, height: 1024),
+                    displayScale: reportedScale),
+                expected,
+                "Match Client should remain HiDPI when the window reports "
+                    + "scale \(reportedScale)")
         }
     }
 

@@ -1420,7 +1420,7 @@ public final class VNCSession {
         videoBandRenderer.reset()
         secondaryVideoBandRenderer.reset()
 
-        if configuration.enableRemoteAudio {
+        if configuration.effectiveRemoteAudioEnabled {
             if remoteAudioPlayer == nil {
                 do {
                     remoteAudioPlayer = try AppleRemoteAudioPlayer()

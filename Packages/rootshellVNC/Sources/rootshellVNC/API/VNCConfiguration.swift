@@ -65,7 +65,7 @@ public struct VNCConfiguration: Sendable {
             case .allDisplaysCombined:
                 "Show the remote Mac's physical displays in one combined desktop, matching Apple Screen Sharing."
             case .twoVirtualDisplays:
-                "Ask a capable Mac for two client-sized virtual displays with independent Adaptive video streams."
+                "Ask a capable Mac for two client-sized virtual displays with independent High Performance video streams."
             }
         }
 
@@ -74,25 +74,25 @@ public struct VNCConfiguration: Sendable {
         }
     }
 
-    /// High-performance video quality profile, mirroring the native client's
-    /// Quality setting.
+    /// Backing profile for the native client's connection mode and its
+    /// Standard-mode quality setting.
     public enum VideoQualityMode: String, Sendable, Equatable, CaseIterable, Identifiable {
-        /// "Adapt quality to network conditions" — the server may lower bitrate
-        /// and drop resolution/quality on static regions under pressure.
+        /// Apple's High Performance connection mode. The server may lower
+        /// bitrate and resolution under network pressure.
         case adaptive
-        /// Portable lossless RFB over the ordered TCP channel. This avoids the
-        /// Apple HEVC/UDP media floor on constrained or UDP-hostile paths while
-        /// retaining compressed updates and CopyRect acceleration.
+        /// Apple's Standard connection mode with Adaptive quality selected.
+        /// This uses the ordered TCP channel and avoids the HEVC/UDP media
+        /// floor on constrained or UDP-hostile paths.
         case standard
-        /// "Show the screen at full quality" — mirrors Screen Sharing mode 4
-        /// by using lossless Zlib/ZRLE instead of lossy AVConference video.
+        /// Apple's Standard connection mode with Full Quality selected, using
+        /// lossless Zlib/ZRLE instead of adaptive DCT or HEVC video.
         case fullQuality
 
         public var id: Self { self }
 
         public var title: String {
             switch self {
-            case .adaptive: "Adaptive"
+            case .adaptive: "High Performance"
             case .standard: "Standard"
             case .fullQuality: "Full Quality"
             }
@@ -110,12 +110,24 @@ public struct VNCConfiguration: Sendable {
         }
     }
 
-    /// Which high-performance video quality profile to offer the server.
-    public var videoQualityMode: VideoQualityMode
+    /// The backing connection-mode and quality profile to offer the server.
+    public var videoQualityMode: VideoQualityMode {
+        didSet {
+            if videoQualityMode != .adaptive,
+               displaySizingMode == .matchClient {
+                displaySizingMode = .remoteDisplay
+            }
+        }
+    }
 
     /// Whether a capable server should render at the client viewport size.
     public var displaySizingMode: DisplaySizingMode {
         didSet {
+            if videoQualityMode != .adaptive,
+               displaySizingMode == .matchClient {
+                displaySizingMode = .remoteDisplay
+                return
+            }
             guard oldValue != displaySizingMode else { return }
             if displaySizingMode == .matchClient,
                displayMode == .allDisplaysCombined {
@@ -135,7 +147,11 @@ public struct VNCConfiguration: Sendable {
             case .allDisplaysCombined:
                 displaySizingMode = .remoteDisplay
             case .twoVirtualDisplays:
-                displaySizingMode = .matchClient
+                if videoQualityMode == .adaptive {
+                    displaySizingMode = .matchClient
+                } else {
+                    displayMode = .oneDisplay
+                }
             case .oneDisplay:
                 break
             }
@@ -145,7 +161,7 @@ public struct VNCConfiguration: Sendable {
     /// Compatibility display-count spelling for the native display topology.
     ///
     /// `1` selects one display and `2` selects Apple's combined physical-
-    /// display desktop in both Standard and Adaptive modes. Use
+    /// display desktop in both Standard and High Performance modes. Use
     /// ``displayMode`` to request an explicit topology. Values are clamped to
     /// `1...2`.
     public var displayCount: Int {
@@ -160,6 +176,17 @@ public struct VNCConfiguration: Sendable {
 
     /// Whether negotiated remote system audio should play on this device.
     public var enableRemoteAudio: Bool
+
+    /// Whether the selected connection and sizing modes can carry remote
+    /// system audio.
+    var supportsRemoteAudio: Bool {
+        videoQualityMode == .adaptive && displaySizingMode == .matchClient
+    }
+
+    /// Whether remote system audio should be negotiated for this session.
+    var effectiveRemoteAudioEnabled: Bool {
+        supportsRemoteAudio && enableRemoteAudio
+    }
 
     /// Preferred pixel format to request from the server.
     ///
@@ -219,14 +246,21 @@ public struct VNCConfiguration: Sendable {
         self.preferredEncodings = preferredEncodings
         self.enableHighPerformanceMode = enableHighPerformanceMode
         self.videoQualityMode = videoQualityMode
-        let resolvedDisplayMode = displayMode ?? (
+        let requestedDisplayMode = displayMode ?? (
             Self.clampedDisplayCount(displayCount) == 1
                 ? .oneDisplay
                 : .allDisplaysCombined)
+        let resolvedDisplayMode = if videoQualityMode != .adaptive,
+                                     requestedDisplayMode == .twoVirtualDisplays {
+            DisplayMode.oneDisplay
+        } else {
+            requestedDisplayMode
+        }
         self.displaySizingMode = switch resolvedDisplayMode {
         case .allDisplaysCombined: .remoteDisplay
         case .twoVirtualDisplays: .matchClient
-        case .oneDisplay: displaySizingMode
+        case .oneDisplay:
+            videoQualityMode == .adaptive ? displaySizingMode : .remoteDisplay
         }
         self.displayMode = resolvedDisplayMode
         self.enableRemoteAudio = enableRemoteAudio

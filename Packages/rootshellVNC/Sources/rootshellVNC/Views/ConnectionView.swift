@@ -2,6 +2,20 @@ import SwiftUI
 import RFBProtocol
 import os
 
+private enum AppConnectionMode: String, CaseIterable, Identifiable {
+    case highPerformance = "High Performance"
+    case standard = "Standard"
+
+    var id: Self { self }
+}
+
+private enum StandardQuality: String, CaseIterable, Identifiable {
+    case adaptive = "Adaptive"
+    case fullQuality = "Full Quality"
+
+    var id: Self { self }
+}
+
 /// A form view for entering VNC server connection details and initiating a connection.
 ///
 /// On successful connection, the view navigates to a ``RemoteDesktopView``
@@ -47,9 +61,11 @@ public struct ConnectionView: View {
             Form {
                 serverSection
                 authenticationSection
-                audioSection
                 qualitySection
                 displaySizingSection
+                if session.configuration.supportsRemoteAudio {
+                    audioSection
+                }
                 statusSection
                 connectSection
             }
@@ -186,14 +202,21 @@ public struct ConnectionView: View {
 
     private var qualitySection: some View {
         Section("Display Quality") {
-            Picker("Quality", selection: $session.configuration.videoQualityMode) {
-                ForEach(VNCConfiguration.VideoQualityMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
+            Picker("Connection Mode", selection: connectionMode) {
+                ForEach(AppConnectionMode.allCases) { mode in
+                    Text(mode.rawValue).tag(mode)
                 }
             }
-            // Three descriptive modes do not fit reliably in an iPhone-width
-            // segmented control; the menu preserves their complete labels.
             .pickerStyle(.menu)
+
+            if connectionMode.wrappedValue == .standard {
+                Picker("Quality", selection: standardQuality) {
+                    ForEach(StandardQuality.allCases) { quality in
+                        Text(quality.rawValue).tag(quality)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
 
             Text(session.configuration.videoQualityMode.explanation)
                 .font(.caption)
@@ -201,9 +224,40 @@ public struct ConnectionView: View {
         }
     }
 
+    private var connectionMode: Binding<AppConnectionMode> {
+        Binding {
+            session.configuration.videoQualityMode == .adaptive
+                ? .highPerformance
+                : .standard
+        } set: { mode in
+            switch mode {
+            case .highPerformance:
+                session.configuration.videoQualityMode = .adaptive
+            case .standard:
+                if session.configuration.videoQualityMode == .adaptive {
+                    session.configuration.videoQualityMode = .standard
+                }
+            }
+        }
+    }
+
+    private var standardQuality: Binding<StandardQuality> {
+        Binding {
+            session.configuration.videoQualityMode == .fullQuality
+                ? .fullQuality
+                : .adaptive
+        } set: { quality in
+            session.configuration.videoQualityMode = switch quality {
+            case .adaptive: .standard
+            case .fullQuality: .fullQuality
+            }
+        }
+    }
+
     private var displaySizingSection: some View {
         Section("Remote Display Size") {
-            if session.configuration.displaySizingMode == .matchClient {
+            if connectionMode.wrappedValue == .highPerformance,
+               session.configuration.displaySizingMode == .matchClient {
                 LabeledContent("Display Mode", value: "One Virtual Display")
                 Text("Match Client currently creates one client-sized virtual display.")
                     .font(.caption)
@@ -222,23 +276,15 @@ public struct ConnectionView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Picker("Sizing", selection: $session.configuration.displaySizingMode) {
-                ForEach(VNCConfiguration.DisplaySizingMode.allCases) { mode in
-                    Text(mode.title).tag(mode)
+            if connectionMode.wrappedValue == .highPerformance {
+                Picker("Sizing", selection: $session.configuration.displaySizingMode) {
+                    ForEach(VNCConfiguration.DisplaySizingMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
                 }
-            }
-            .pickerStyle(.segmented)
+                .pickerStyle(.segmented)
 
-            Text(session.configuration.displaySizingMode.explanation)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            if session.configuration.displaySizingMode == .matchClient,
-               session.configuration.videoQualityMode != .adaptive {
-                Text(
-                    "Apple servers support Match Client only in Adaptive mode. "
-                        + "Standard VNC servers may still resize when they advertise "
-                        + "ExtendedDesktopSize support.")
+                Text(session.configuration.displaySizingMode.explanation)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
