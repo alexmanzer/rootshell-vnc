@@ -37,6 +37,105 @@ func normalizedSelectedDisplayRegion(
     return selected.offsetBy(dx: -all.minX, dy: -all.minY)
 }
 
+/// Tracks the portions of Apple DCT type-0 base images that have not yet been
+/// covered by type-1 refinement rectangles. A large base is commonly followed
+/// by many horizontal bands, not one refinement message.
+struct AppleDCTRefinementTracker {
+    private(set) var uncoveredRegions: [CGRect] = []
+
+    var isAwaitingRefinement: Bool { !uncoveredRegions.isEmpty }
+
+    mutating func reset() {
+        uncoveredRegions.removeAll(keepingCapacity: true)
+    }
+
+    @discardableResult
+    mutating func ingest(
+        _ rects: [(FramebufferRect, Data)]
+    ) -> Bool {
+        for (rect, payload) in rects {
+            let region = CGRect(
+                x: Int(rect.x), y: Int(rect.y),
+                width: Int(rect.width), height: Int(rect.height))
+            guard !region.isEmpty else { continue }
+
+            if rect.encoding == .appleMultiVariantScreenshare,
+               payload.count >= 5 {
+                switch payload[payload.startIndex + 4] {
+                case 0: markBase(region)
+                case 1: markRefined(region)
+                default: break
+                }
+                continue
+            }
+
+            switch rect.encoding {
+            case .raw, .zlib, .zrle, .tight, .copyRect:
+                // A portable pixel rectangle supersedes any coarse DCT pixels
+                // in the same region and needs no progressive refinement.
+                markRefined(region)
+            case .desktopSize, .extendedDesktopSize:
+                reset()
+            default:
+                break
+            }
+        }
+        return isAwaitingRefinement
+    }
+
+    private mutating func markBase(_ region: CGRect) {
+        // A newer base replaces any older pending pixels in its area.
+        uncoveredRegions = uncoveredRegions.flatMap {
+            Self.subtract(region, from: $0)
+        }
+        uncoveredRegions.append(region)
+    }
+
+    private mutating func markRefined(_ region: CGRect) {
+        uncoveredRegions = uncoveredRegions.flatMap {
+            Self.subtract(region, from: $0)
+        }
+    }
+
+    private static func subtract(
+        _ coverage: CGRect,
+        from source: CGRect
+    ) -> [CGRect] {
+        let intersection = source.intersection(coverage)
+        guard !intersection.isNull, !intersection.isEmpty else {
+            return [source]
+        }
+        guard intersection != source else { return [] }
+
+        var remainder: [CGRect] = []
+        if source.minY < intersection.minY {
+            remainder.append(CGRect(
+                x: source.minX, y: source.minY,
+                width: source.width,
+                height: intersection.minY - source.minY))
+        }
+        if intersection.maxY < source.maxY {
+            remainder.append(CGRect(
+                x: source.minX, y: intersection.maxY,
+                width: source.width,
+                height: source.maxY - intersection.maxY))
+        }
+        if source.minX < intersection.minX {
+            remainder.append(CGRect(
+                x: source.minX, y: intersection.minY,
+                width: intersection.minX - source.minX,
+                height: intersection.height))
+        }
+        if intersection.maxX < source.maxX {
+            remainder.append(CGRect(
+                x: intersection.maxX, y: intersection.minY,
+                width: source.maxX - intersection.maxX,
+                height: intersection.height))
+        }
+        return remainder
+    }
+}
+
 /// Coalesces the transport's per-packet callback into ordered media-queue
 /// batches. A fullscreen reference picture can contain thousands of RTP
 /// packets; scheduling one Dispatch block for each packet creates avoidable
@@ -233,6 +332,8 @@ public final class VNCSession {
     private var lastImagePublishNanos: UInt64 = 0
     @ObservationIgnored
     private var trailingSnapshotTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var dctRefinementTracker = AppleDCTRefinementTracker()
     /// Rejects late geometry callbacks from a decoder retired by a newer AVC
     /// negotiation generation.
     @ObservationIgnored
@@ -305,6 +406,7 @@ public final class VNCSession {
         remoteDisplayRegionOrder = []
         trailingSnapshotTask?.cancel()
         trailingSnapshotTask = nil
+        dctRefinementTracker.reset()
         lastImagePublishNanos = 0
         remoteDisplayResizeTask?.cancel()
         remoteDisplayResizeTask = nil
@@ -396,6 +498,7 @@ public final class VNCSession {
         remoteDisplayRegionOrder = []
         trailingSnapshotTask?.cancel()
         trailingSnapshotTask = nil
+        dctRefinementTracker.reset()
         lastImagePublishNanos = 0
         videoBandRenderer.reset()
         secondaryVideoBandRenderer.reset()
@@ -909,7 +1012,13 @@ public final class VNCSession {
         let publishInterval = UInt64(
             1_000_000_000 / max(1, configuration.targetFrameRate))
         let renderStarted = DispatchTime.now().uptimeNanoseconds
-        let takeSnapshot = renderStarted &- lastImagePublishNanos >= publishInterval
+        let publishDue = renderStarted &- lastImagePublishNanos >= publishInterval
+        let wasAwaitingDCTRefinement =
+            dctRefinementTracker.isAwaitingRefinement
+        let awaitsDCTRefinement = dctRefinementTracker.ingest(rects)
+        let completedDCTRefinement =
+            wasAwaitingDCTRefinement && !awaitsDCTRefinement
+        let takeSnapshot = publishDue && !awaitsDCTRefinement
         let result = await withCheckedContinuation { continuation in
             framebufferRenderQueue.async {
                 continuation.resume(
@@ -945,7 +1054,17 @@ public final class VNCSession {
             currentImage = image
             lastImagePublishNanos = DispatchTime.now().uptimeNanoseconds
         } else {
-            scheduleTrailingSnapshot(interval: publishInterval)
+            if awaitsDCTRefinement || completedDCTRefinement {
+                // Pending bases replace cadence-only snapshots so they cannot
+                // publish coarse pixels. Completion replaces the longer
+                // safety timeout with the ordinary presentation cadence.
+                trailingSnapshotTask?.cancel()
+                trailingSnapshotTask = nil
+            }
+            scheduleTrailingSnapshot(
+                interval: publishInterval,
+                minimumDelay: awaitsDCTRefinement ? 50_000_000 : 0,
+                resetsDCTRefinement: awaitsDCTRefinement)
         }
         switch result.cursorUpdate {
         case .shape(let cursor):
@@ -1307,10 +1426,16 @@ public final class VNCSession {
         }
     }
 
-    private func scheduleTrailingSnapshot(interval: UInt64) {
+    private func scheduleTrailingSnapshot(
+        interval: UInt64,
+        minimumDelay: UInt64 = 0,
+        resetsDCTRefinement: Bool = false
+    ) {
         guard trailingSnapshotTask == nil else { return }
-        let delay = interval &- min(
-            interval, DispatchTime.now().uptimeNanoseconds &- lastImagePublishNanos)
+        let cadenceDelay = interval &- min(
+            interval,
+            DispatchTime.now().uptimeNanoseconds &- lastImagePublishNanos)
+        let delay = max(cadenceDelay, minimumDelay)
         trailingSnapshotTask = Task { [weak self] in
             try? await Task.sleep(for: .nanoseconds(Int64(delay)))
             guard let self, !Task.isCancelled,
@@ -1325,6 +1450,9 @@ public final class VNCSession {
             if let image {
                 self.currentImage = image
                 self.lastImagePublishNanos = DispatchTime.now().uptimeNanoseconds
+                if resetsDCTRefinement {
+                    self.dctRefinementTracker.reset()
+                }
             }
             self.trailingSnapshotTask = nil
         }

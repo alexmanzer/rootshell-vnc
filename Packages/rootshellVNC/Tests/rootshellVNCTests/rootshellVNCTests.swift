@@ -19,6 +19,46 @@ final class HEVCTileMetadataTests: XCTestCase {
 }
 
 final class StandardFramebufferPipelineTests: XCTestCase {
+    func testAppleDCTBaseWaitsForEveryRefinementBand() {
+        var tracker = AppleDCTRefinementTracker()
+        XCTAssertTrue(tracker.ingest([
+            dctRect(x: 752, y: 320, width: 3136, height: 2000, type: 0),
+        ]))
+
+        for y in stride(from: 320, to: 2240, by: 160) {
+            XCTAssertTrue(tracker.ingest([
+                dctRect(x: 752, y: y, width: 3136, height: 160, type: 1),
+            ]))
+        }
+        XCTAssertFalse(tracker.ingest([
+            dctRect(x: 752, y: 2240, width: 3136, height: 80, type: 1),
+        ]))
+    }
+
+    func testPortableRectangleCompletesPendingDCTRegion() {
+        var tracker = AppleDCTRefinementTracker()
+        XCTAssertTrue(tracker.ingest([
+            dctRect(x: 0, y: 0, width: 16, height: 16, type: 0),
+        ]))
+        let raw = FramebufferRect(
+            x: 0, y: 0, width: 16, height: 16, encoding: .raw)
+        XCTAssertFalse(tracker.ingest([(raw, Data())]))
+    }
+
+    func testNewOverlappingBaseReplacesOlderPendingRegion() {
+        var tracker = AppleDCTRefinementTracker()
+        XCTAssertTrue(tracker.ingest([
+            dctRect(x: 0, y: 0, width: 16, height: 16, type: 0),
+            dctRect(x: 0, y: 0, width: 16, height: 16, type: 0),
+        ]))
+        XCTAssertEqual(tracker.uncoveredRegions, [
+            CGRect(x: 0, y: 0, width: 16, height: 16),
+        ])
+        XCTAssertFalse(tracker.ingest([
+            dctRect(x: 0, y: 0, width: 16, height: 16, type: 1),
+        ]))
+    }
+
     func testProductionRendererPreservesZRLEStreamAcrossPresentedBatches() {
         let framebuffer = Framebuffer(
             width: 2,
@@ -77,6 +117,20 @@ final class StandardFramebufferPipelineTests: XCTestCase {
         ])
         result.append(compressed)
         return result
+    }
+
+    private func dctRect(
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int,
+        type: UInt8
+    ) -> (FramebufferRect, Data) {
+        (FramebufferRect(
+            x: UInt16(x), y: UInt16(y),
+            width: UInt16(width), height: UInt16(height),
+            encoding: .appleMultiVariantScreenshare),
+         Data([0, 0, 0, 1, type]))
     }
 }
 
