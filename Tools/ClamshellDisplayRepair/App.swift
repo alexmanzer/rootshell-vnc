@@ -29,10 +29,6 @@ private final class RepairModel: ObservableObject {
         run("--repair")
     }
 
-    func enableBuiltInDisplay() {
-        run("--enable-built-in")
-    }
-
     private func run(_ argument: String) {
         guard !isRunning else { return }
         isRunning = true
@@ -118,15 +114,13 @@ private struct RepairView: View {
             HStack {
                 Button("Refresh") { model.refresh() }
                 Spacer()
-                Button("Re-enable Built-in") { model.enableBuiltInDisplay() }
-                    .help("Recovery control for the current login session")
                 Button("Repair Closed-Lid Display") { model.repair() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
             }
             .disabled(model.isRunning)
 
-            Text("Repair runs only when the lid is closed, an external display is active, and the built-in display is incorrectly active. It applies only to the current login session.")
+            Text("Repair runs only when the lid is closed, an external display is active, and the built-in display is incorrectly active. Its temporary display override ends before success is reported.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

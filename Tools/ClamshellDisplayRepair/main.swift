@@ -26,6 +26,7 @@ private enum RepairError: LocalizedError {
     case noExternalDisplay
     case lidIsOpen
     case noStrandedBuiltInDisplay
+    case temporaryPulseFailed(String)
     case repairDidNotTakeEffect
 
     var errorDescription: String? {
@@ -38,15 +39,13 @@ private enum RepairError: LocalizedError {
             return "The lid is open; this does not look like the clamshell Screen Sharing bug."
         case .noStrandedBuiltInDisplay:
             return "The built-in display is not active, so there is nothing to repair."
+        case let .temporaryPulseFailed(message):
+            return "The temporary display pulse failed: \(message)"
         case .repairDidNotTakeEffect:
-            return "macOS accepted the display transaction, but the built-in display is still active."
+            return "The temporary pulse ended, but the closed built-in display is still active."
         }
     }
 }
-
-private let repairDefaults = UserDefaults(
-    suiteName: "com.rootshell.ClamshellDisplayRepair")!
-private let disabledDisplayIDsKey = "DisabledBuiltInDisplayIDs"
 
 private func onlineDisplays() throws -> [DisplayState] {
     var count: UInt32 = 0
@@ -101,7 +100,7 @@ private func printStatus(_ displays: [DisplayState], lidClosed: Bool?) {
     }
 }
 
-private func setEnabled(_ enabled: Bool, displays: [CGDirectDisplayID]) throws {
+private func temporarilyDisable(displays: [CGDirectDisplayID]) throws {
     var configuration: CGDisplayConfigRef?
     var result = CGBeginDisplayConfiguration(&configuration)
     guard result == .success else {
@@ -116,20 +115,25 @@ private func setEnabled(_ enabled: Bool, displays: [CGDirectDisplayID]) throws {
     }
 
     for display in displays {
-        result = CGSConfigureDisplayEnabled(configuration, display, enabled)
+        result = CGSConfigureDisplayEnabled(configuration, display, false)
         guard result == .success else {
             throw RepairError.coreGraphics(operation: "Changing display \(display)", code: result)
         }
     }
 
-    result = CGCompleteDisplayConfiguration(configuration, .forSession)
+    // This is the central safety property: the disable exists only while this
+    // short-lived child process is alive. macOS automatically reverts it if
+    // the process exits or crashes. The pulse gives clamshell policy a real
+    // display-topology transition to react to without leaving a session-wide
+    // override behind.
+    result = CGCompleteDisplayConfiguration(configuration, .forAppOnly)
     guard result == .success else {
         throw RepairError.coreGraphics(operation: "Applying display repair", code: result)
     }
     completed = true
 }
 
-private func repair() throws {
+private func strandedBuiltInDisplays() throws -> [CGDirectDisplayID] {
     let displays = try onlineDisplays()
     guard displays.contains(where: { $0.isActive && !$0.isBuiltIn }) else {
         throw RepairError.noExternalDisplay
@@ -138,38 +142,59 @@ private func repair() throws {
 
     let stranded = displays.filter { $0.isActive && $0.isBuiltIn }.map(\.id)
     guard !stranded.isEmpty else { throw RepairError.noStrandedBuiltInDisplay }
-    try setEnabled(false, displays: stranded)
-
-    let repaired = try onlineDisplays()
-    guard !repaired.contains(where: { $0.isActive && $0.isBuiltIn }) else {
-        throw RepairError.repairDidNotTakeEffect
-    }
-    repairDefaults.set(stranded.map(Int.init), forKey: disabledDisplayIDsKey)
-    print("Repair succeeded. The closed built-in display is no longer active.")
-    printStatus(repaired, lidClosed: clamshellState())
+    return stranded
 }
 
-private func enableBuiltInDisplays() throws {
-    let onlineBuiltIns = try onlineDisplays().filter(\.isBuiltIn).map(\.id)
-    let rememberedBuiltIns = (repairDefaults.array(forKey: disabledDisplayIDsKey) as? [NSNumber])?
-        .map { CGDirectDisplayID($0.uint32Value) } ?? []
-    // CoreGraphics normally allocates small IDs to local displays. This
-    // fallback also makes recovery possible after an older build performed a
-    // repair without remembering the ID. Invalid IDs return -1, not 1.
-    let discoverableBuiltIns = (1...32)
-        .map(CGDirectDisplayID.init)
-        .filter { CGDisplayIsBuiltin($0) == 1 }
-    let builtIns = Array(Set(
-        onlineBuiltIns + rememberedBuiltIns + discoverableBuiltIns))
-        .filter { CGDisplayIsBuiltin($0) == 1 }
-    guard !builtIns.isEmpty else {
-        print("No built-in display was found.")
-        return
+private func runTemporaryPulseChild() throws {
+    let stranded = try strandedBuiltInDisplays()
+    try temporarilyDisable(displays: stranded)
+
+    let temporaryState = try onlineDisplays()
+    guard !temporaryState.contains(where: { $0.isActive && $0.isBuiltIn }) else {
+        throw RepairError.repairDidNotTakeEffect
     }
-    try setEnabled(true, displays: builtIns)
-    repairDefaults.removeObject(forKey: disabledDisplayIDsKey)
-    print("Enabled the built-in display for this login session.")
-    printStatus(try onlineDisplays(), lidClosed: clamshellState())
+    Thread.sleep(forTimeInterval: 0.5)
+    // Do not explicitly enable the panel. Exiting this child removes the
+    // application-scoped configuration atomically and safely.
+}
+
+private func repair() throws {
+    _ = try strandedBuiltInDisplays()
+
+    let process = Process()
+    process.executableURL = URL(
+        fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+    process.arguments = ["--temporary-pulse-child"]
+    process.standardOutput = FileHandle.nullDevice
+    let errorPipe = Pipe()
+    process.standardError = errorPipe
+
+    do {
+        try process.run()
+        process.waitUntilExit()
+    } catch {
+        throw RepairError.temporaryPulseFailed(error.localizedDescription)
+    }
+
+    let childError = String(
+        decoding: errorPipe.fileHandleForReading.readDataToEndOfFile(),
+        as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard process.terminationStatus == 0 else {
+        throw RepairError.temporaryPulseFailed(
+            childError.isEmpty ? "child exited with status \(process.terminationStatus)" : childError)
+    }
+
+    // This check runs only after the child has exited, so its app-scoped
+    // disable no longer exists. One external display here means macOS's own
+    // clamshell policy adopted the correct topology.
+    Thread.sleep(forTimeInterval: 0.25)
+    let repaired = try onlineDisplays()
+    guard repaired.contains(where: { $0.isActive && !$0.isBuiltIn }),
+          !repaired.contains(where: { $0.isActive && $0.isBuiltIn }) else {
+        throw RepairError.repairDidNotTakeEffect
+    }
+    print("Repair succeeded. The temporary override has ended and the closed built-in display remains inactive.")
+    printStatus(repaired, lidClosed: clamshellState())
 }
 
 do {
@@ -178,10 +203,10 @@ do {
         printStatus(try onlineDisplays(), lidClosed: clamshellState())
     case "--repair":
         try repair()
-    case "--enable-built-in":
-        try enableBuiltInDisplays()
+    case "--temporary-pulse-child":
+        try runTemporaryPulseChild()
     default:
-        print("Usage: ClamshellDisplayRepair [--status | --repair | --enable-built-in]")
+        print("Usage: ClamshellDisplayRepair [--status | --repair]")
         exit(64)
     }
 } catch {
