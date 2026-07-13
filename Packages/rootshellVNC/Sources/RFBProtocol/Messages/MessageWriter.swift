@@ -98,6 +98,32 @@ public enum MessageWriter: Sendable {
         return data
     }
 
+    /// Serialize Apple's AutoFrameBufferUpdate message (type 9).
+    ///
+    /// This 16-byte layout is used by native Apple-compatible clients: type,
+    /// padding, one region, a signed millisecond pacing
+    /// interval, then the subscribed rectangle. Unlike ordinary type-3
+    /// requests, the server continues sending change-gated updates and uses
+    /// socket delivery time to adapt DCT quality to available bandwidth.
+    public static func writeAppleAutoFramebufferUpdate(
+        intervalMilliseconds: Int32,
+        x: UInt16,
+        y: UInt16,
+        width: UInt16,
+        height: UInt16
+    ) -> Data {
+        var data = Data(count: 16)
+        data[0] = 9
+        data[1] = 0
+        writeUInt16(1, into: &data, at: 2)
+        writeInt32(intervalMilliseconds, into: &data, at: 4)
+        writeUInt16(x, into: &data, at: 8)
+        writeUInt16(y, into: &data, at: 10)
+        writeUInt16(width, into: &data, at: 12)
+        writeUInt16(height, into: &data, at: 14)
+        return data
+    }
+
     /// Serialize standard RFB `SetDesktopSize` (message 251).
     public static func writeSetDesktopSize(_ request: SetDesktopSizeRequest) -> Data {
         let totalSize = SetDesktopSizeRequest.headerWireSize

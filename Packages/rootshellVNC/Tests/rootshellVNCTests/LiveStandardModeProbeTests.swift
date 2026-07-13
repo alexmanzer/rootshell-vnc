@@ -2,6 +2,7 @@ import XCTest
 import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
+import Darwin
 @testable import RFBProtocol
 @testable import RFBTransport
 @testable import RFBRendering
@@ -92,6 +93,22 @@ final class LiveStandardModeProbeTests: XCTestCase {
         let port = UInt16(env["VNC_TEST_PORT"] ?? "5900") ?? 5900
         let motionSeconds = Int(env["VNC_PROBE_SECONDS"] ?? "12") ?? 12
         let outDir = env["ROOTSHELL_VNC_FRAME_OUT_DIR"]
+        var bandwidthProxy: LiveBandwidthProxy?
+        let connectionHost: String
+        let connectionPort: UInt16
+        if let kbps = Int(env["VNC_PROBE_BANDWIDTH_KBPS"] ?? ""), kbps > 0 {
+            let proxy = try LiveBandwidthProxy(
+                remoteHost: host, remotePort: port,
+                downstreamBytesPerSecond: max(1, kbps * 1_000 / 8))
+            bandwidthProxy = proxy
+            connectionHost = "127.0.0.1"
+            connectionPort = proxy.localPort
+            print("PROBE downstream limit=\(kbps)kbps port=\(proxy.localPort)")
+        } else {
+            connectionHost = host
+            connectionPort = port
+        }
+        defer { bandwidthProxy?.stop() }
 
         // Mirror VNCConfiguration(videoQualityMode: .standard).effectiveEncodings.
         // VNC_PROBE_ENCODING=zlib/zrle selects a lossless A/B comparison.
@@ -99,8 +116,8 @@ final class LiveStandardModeProbeTests: XCTestCase {
         let preferred: [Encoding]
         switch encoding {
         case "dct":
-            // Screens 5 VNCKit effective Apple-capable ordering, including
-            // LastRect and its four Screen Sharing capability encodings.
+            // Native Apple-capable ordering, including LastRect and the four
+            // capability encodings required by the adaptive protocol.
             preferred = [
                 .appleMultiVariantScreenshare, .tight, .unknown(-224),
                 .zrle, .zlib, .copyRect,
@@ -117,7 +134,7 @@ final class LiveStandardModeProbeTests: XCTestCase {
         let pixelFormat: PixelFormat =
             env["VNC_PROBE_DEPTH"] == "16" ? .rgb555 : .bgra8888
         let session = TransportSession(
-            host: host, port: port, password: pass, username: user,
+            host: connectionHost, port: connectionPort, password: pass, username: user,
             preferredPixelFormat: pixelFormat,
             preferredEncodings: encodings)
 
@@ -262,6 +279,13 @@ final class LiveStandardModeProbeTests: XCTestCase {
         print("PROBE \(idleSummary)")
         await stats.reset()
 
+        if let kbps = Int(env["VNC_PROBE_BANDWIDTH_AFTER_KBPS"] ?? ""),
+           kbps > 0, let bandwidthProxy {
+            bandwidthProxy.setDownstreamBytesPerSecond(
+                max(1, kbps * 1_000 / 8))
+            print("PROBE downstream limit changed to \(kbps)kbps")
+        }
+
         if env["VNC_PROBE_LOGIN"] == "1" {
             // Opt-in only: focus loginwindow, submit the supplied test
             // credential, and capture the high-motion desktop transition.
@@ -317,9 +341,12 @@ final class LiveStandardModeProbeTests: XCTestCase {
                 let capture = await stats.dctCapturePayload()
                 try? capture.write(to: URL(
                     fileURLWithPath: outDir + "/adaptive_dct_capture.bin"))
+                rendererBox.dumpPNG(to: outDir + "/standard_probe_final.png")
             }
+            let issues = await stats.issues
             eventTask.cancel()
             await session.disconnect()
+            XCTAssertTrue(issues.isEmpty, "decode issues (desync canary): \(issues.prefix(5))")
             return
         }
 
@@ -361,6 +388,197 @@ final class LiveStandardModeProbeTests: XCTestCase {
         await session.disconnect()
 
         XCTAssertTrue(issues.isEmpty, "decode issues (desync canary): \(issues.prefix(5))")
+    }
+}
+
+/// Single-connection loopback proxy used only by the opt-in live probe. The
+/// downstream relay reads in small chunks and does not read the next chunk
+/// until its byte budget is available, so TCP backpressure reaches the remote
+/// encoder instead of accumulating a large user-space queue.
+private final class LiveBandwidthProxy: @unchecked Sendable {
+    let localPort: UInt16
+
+    private let remoteHost: String
+    private let remotePort: UInt16
+    private var downstreamBytesPerSecond: Int
+    private let lock = NSLock()
+    private var listenerFD: Int32
+    private var clientFD: Int32 = -1
+    private var serverFD: Int32 = -1
+    private var stopped = false
+
+    init(
+        remoteHost: String,
+        remotePort: UInt16,
+        downstreamBytesPerSecond: Int
+    ) throws {
+        self.remoteHost = remoteHost
+        self.remotePort = remotePort
+        self.downstreamBytesPerSecond = downstreamBytesPerSecond
+
+        let listener = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard listener >= 0 else { throw Self.posixError("socket") }
+        listenerFD = listener
+
+        var reuse: Int32 = 1
+        _ = setsockopt(
+            listener, SOL_SOCKET, SO_REUSEADDR,
+            &reuse, socklen_t(MemoryLayout.size(ofValue: reuse)))
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bindResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0, Darwin.listen(listener, 1) == 0 else {
+            let error = Self.posixError("bind/listen")
+            Darwin.close(listener)
+            throw error
+        }
+        var bound = sockaddr_in()
+        var boundLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let nameResult = withUnsafeMutablePointer(to: &bound) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getsockname(listener, $0, &boundLength)
+            }
+        }
+        guard nameResult == 0 else {
+            let error = Self.posixError("getsockname")
+            Darwin.close(listener)
+            throw error
+        }
+        localPort = UInt16(bigEndian: bound.sin_port)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.acceptAndRelay()
+        }
+    }
+
+    deinit { stop() }
+
+    func setDownstreamBytesPerSecond(_ value: Int) {
+        lock.withLock {
+            downstreamBytesPerSecond = max(1, value)
+        }
+    }
+
+    func stop() {
+        let descriptors: (Int32, Int32, Int32)? = lock.withLock {
+            guard !stopped else { return nil }
+            stopped = true
+            let result = (listenerFD, clientFD, serverFD)
+            listenerFD = -1
+            clientFD = -1
+            serverFD = -1
+            return result
+        }
+        guard let descriptors else { return }
+        for descriptor in [descriptors.0, descriptors.1, descriptors.2]
+            where descriptor >= 0 {
+            Darwin.shutdown(descriptor, SHUT_RDWR)
+            Darwin.close(descriptor)
+        }
+    }
+
+    private func acceptAndRelay() {
+        let accepted = Darwin.accept(listenerFD, nil, nil)
+        guard accepted >= 0 else { return }
+        let upstream = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard upstream >= 0 else {
+            Darwin.close(accepted)
+            return
+        }
+        var receiveBuffer: Int32 = 8 * 1_024
+        _ = setsockopt(
+            upstream, SOL_SOCKET, SO_RCVBUF,
+            &receiveBuffer, socklen_t(MemoryLayout.size(ofValue: receiveBuffer)))
+        var remote = sockaddr_in()
+        remote.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        remote.sin_family = sa_family_t(AF_INET)
+        remote.sin_port = remotePort.bigEndian
+        guard inet_pton(AF_INET, remoteHost, &remote.sin_addr) == 1 else {
+            Darwin.close(accepted)
+            Darwin.close(upstream)
+            return
+        }
+        let connected = withUnsafePointer(to: &remote) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(upstream, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard connected == 0 else {
+            Darwin.close(accepted)
+            Darwin.close(upstream)
+            return
+        }
+        let shouldRelay = lock.withLock {
+            guard !stopped else { return false }
+            clientFD = accepted
+            serverFD = upstream
+            return true
+        }
+        guard shouldRelay else {
+            Darwin.close(accepted)
+            Darwin.close(upstream)
+            return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.relay(from: accepted, to: upstream, usesDownstreamLimit: false)
+        }
+        relay(
+            from: upstream, to: accepted,
+            usesDownstreamLimit: true)
+    }
+
+    private func relay(
+        from source: Int32, to destination: Int32,
+        usesDownstreamLimit: Bool
+    ) {
+        var buffer = [UInt8](repeating: 0, count: 4 * 1_024)
+        var nextReadNanos = DispatchTime.now().uptimeNanoseconds
+        while true {
+            let bytesPerSecond: Int? = usesDownstreamLimit
+                ? lock.withLock { downstreamBytesPerSecond }
+                : nil
+            if bytesPerSecond != nil {
+                let now = DispatchTime.now().uptimeNanoseconds
+                if nextReadNanos > now {
+                    let delay = nextReadNanos - now
+                    usleep(useconds_t(min(delay / 1_000, UInt64(UInt32.max))))
+                }
+            }
+            let count = Darwin.recv(source, &buffer, buffer.count, 0)
+            guard count > 0 else { break }
+            var sent = 0
+            while sent < count {
+                let written = buffer.withUnsafeBytes { raw in
+                    Darwin.send(
+                        destination, raw.baseAddress!.advanced(by: sent),
+                        count - sent, 0)
+                }
+                guard written > 0 else { stop(); return }
+                sent += written
+            }
+            if let bytesPerSecond {
+                let duration = UInt64(count) * 1_000_000_000
+                    / UInt64(bytesPerSecond)
+                nextReadNanos = max(
+                    nextReadNanos, DispatchTime.now().uptimeNanoseconds) + duration
+            }
+        }
+        stop()
+    }
+
+    private static func posixError(_ operation: String) -> NSError {
+        NSError(
+            domain: NSPOSIXErrorDomain, code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey:
+                "\(operation) failed: \(String(cString: strerror(errno)))"])
     }
 }
 

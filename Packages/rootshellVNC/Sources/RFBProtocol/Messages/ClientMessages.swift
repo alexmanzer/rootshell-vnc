@@ -21,6 +21,17 @@ public enum ClientMessage: Sendable, Equatable {
     /// Message type 6: The client's clipboard text has changed.
     case clientCutText(String)
 
+    /// Apple message type 9: subscribe to change-gated framebuffer updates.
+    ///
+    /// `intervalMilliseconds` is the server-side frame pacing interval. Apple
+    /// uses -1 to disable and positive millisecond values to cap delivery.
+    case appleAutoFramebufferUpdate(
+        intervalMilliseconds: Int32,
+        x: UInt16,
+        y: UInt16,
+        width: UInt16,
+        height: UInt16)
+
     /// Standard message type 251: request a new framebuffer/screen layout.
     case setDesktopSize(SetDesktopSizeRequest)
 
@@ -53,6 +64,7 @@ public enum ClientMessage: Sendable, Equatable {
         case .keyEvent:                    return 4
         case .pointerEvent:                return 5
         case .clientCutText:               return 6
+        case .appleAutoFramebufferUpdate:  return 9
         case .setDesktopSize:              return SetDesktopSizeRequest.messageType
         case .appleScrollEvent:            return AppleScrollEvent.messageType
         case .appleGestureEvent:           return AppleGestureEvent.messageType
@@ -82,6 +94,10 @@ public enum ClientMessage: Sendable, Equatable {
             return MessageWriter.writePointerEvent(buttonMask: mask, x: x, y: y)
         case .clientCutText(let text):
             return MessageWriter.writeClientCutText(text)
+        case .appleAutoFramebufferUpdate(let interval, let x, let y, let width, let height):
+            return MessageWriter.writeAppleAutoFramebufferUpdate(
+                intervalMilliseconds: interval,
+                x: x, y: y, width: width, height: height)
         case .setDesktopSize(let request):
             return MessageWriter.writeSetDesktopSize(request)
         case .appleScrollEvent(let event):

@@ -514,6 +514,40 @@ final class AppleAdaptiveDCTDecoderTests: XCTestCase {
         XCTAssertEqual(first, framebuffer.getPixels(x: 8, y: 0, width: 8, height: 8))
         XCTAssertEqual(first, framebuffer.getPixels(x: 16, y: 0, width: 8, height: 8))
     }
+
+    func testReusedType0TilePreservesMapForLaterRefinement() throws {
+        let framebuffer = Framebuffer(
+            width: 24, height: 8, pixelFormat: .bgra8888)
+        let decoder = AppleAdaptiveDCTDecoder()
+
+        // Command 5 run=2. The first tile defines a nonzero Y AC coefficient;
+        // the second tile reuses the complete preceding coefficient map.
+        try decoder.render(
+            rect: FramebufferRect(
+                x: 0, y: 0, width: 16, height: 8,
+                encoding: .appleMultiVariantScreenshare),
+            payload: Data([
+                0, 0, 0, 11, 0, 1, 1, 0, 0, 8,
+                0x58, 0x00, 0x00, 0x22, 0x80,
+            ]),
+            to: framebuffer)
+
+        // Refine the reused tile, then draw the resulting implicit cache key
+        // into the third tile. Parsing stays aligned only if the reused tile's
+        // nonzero AC map was retained.
+        try decoder.render(
+            rect: FramebufferRect(
+                x: 8, y: 0, width: 16, height: 8,
+                encoding: .appleMultiVariantScreenshare),
+            payload: Data([
+                0, 0, 0, 6, 1, 0, 0, 0x41, 0x03, 0x80,
+            ]),
+            to: framebuffer)
+
+        XCTAssertEqual(
+            framebuffer.getPixels(x: 8, y: 0, width: 8, height: 8),
+            framebuffer.getPixels(x: 16, y: 0, width: 8, height: 8))
+    }
 }
 
 // MARK: - Apple Remote Audio Tests

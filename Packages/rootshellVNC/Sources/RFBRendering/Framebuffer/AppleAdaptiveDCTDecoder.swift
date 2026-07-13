@@ -170,7 +170,6 @@ final class AppleAdaptiveDCTDecoder {
     private var tileCoefficients: [Int16] = []
     private var tileQuality: [UInt8] = []
     private var tileMaps: [Int8] = []
-    private var tileHasRefinedMap: [Bool] = []
     private var tileChromaCounts: [(cb: UInt8, cr: UInt8)] = []
     private var coefficientCache: [Int: CachedTile] = [:]
     private var cacheWriteIndex = 0
@@ -265,7 +264,7 @@ final class AppleAdaptiveDCTDecoder {
 
         var commands = BitReader(message.commandBytes)
         var data = BitReader(message.dataBytes)
-        // VNCKit seeds its MSB reader from byte zero, shifts once, and starts
+        // The native decoder seeds its MSB reader from byte zero, shifts once, and starts
         // command decoding with seven live bits. The first bit is reserved.
         _ = try commands.readBits(1)
         let tilesWide = (Int(rect.width) + 7) / 8
@@ -273,6 +272,7 @@ final class AppleAdaptiveDCTDecoder {
         let tileCount = tilesWide * tilesHigh
         var tileNumber = 0
         var predictor = [Int16](repeating: 0, count: 192)
+        var predictorMap = [Int8](repeating: 0, count: 99)
         var predictorQuality = 0
         var lastDCTPixels = [UInt32](repeating: 0, count: 64)
         var hasLastDCTPixels = false
@@ -289,13 +289,11 @@ final class AppleAdaptiveDCTDecoder {
                     let globalTileX = pixelX / 8
                     let globalTileY = pixelY / 8
                     let globalIndex = globalTileY * ((framebufferWidth + 7) / 8) + globalTileX
-
                     switch command {
                     case 0:
                         try renderSolidTile(
                             0xffff_ffff, x: pixelX, y: pixelY, base: base,
                             width: width, height: height, bytesPerRow: bytesPerRow)
-                        clearTileState(globalIndex)
 
                     case 1:
                         guard tileNumber > 0 else {
@@ -311,16 +309,11 @@ final class AppleAdaptiveDCTDecoder {
                         let sourceLocalY = sourceNumber / tilesWide
                         let sourcePixelX = Int(rect.x) + sourceLocalX * 8
                         let sourcePixelY = Int(rect.y) + sourceLocalY * 8
-                        let sourceGlobalX = sourcePixelX / 8
-                        let sourceGlobalY = sourcePixelY / 8
-                        let sourceGlobalIndex = sourceGlobalY
-                            * ((framebufferWidth + 7) / 8) + sourceGlobalX
                         copyTile(
                             fromX: sourcePixelX, fromY: sourcePixelY,
                             toX: pixelX, toY: pixelY,
                             base: base, width: width, height: height,
                             bytesPerRow: bytesPerRow)
-                        copyTileState(from: sourceGlobalIndex, to: globalIndex)
 
                     case 2:
                         guard pixelY >= 8 else {
@@ -333,16 +326,12 @@ final class AppleAdaptiveDCTDecoder {
                             toX: pixelX, toY: pixelY,
                             base: base, width: width, height: height,
                             bytesPerRow: bytesPerRow)
-                        copyTileState(
-                            from: globalIndex - ((framebufferWidth + 7) / 8),
-                            to: globalIndex)
 
                     case 3:
                         try renderTwoColorTile(
                             reader: &data, first: 0xffff_ffff, second: 0x0000_0000,
                             x: pixelX, y: pixelY, base: base, width: width,
                             height: height, bytesPerRow: bytesPerRow)
-                        clearTileState(globalIndex)
 
                     case 4:
                         let subtype = Int(try data.readBits(2))
@@ -379,18 +368,20 @@ final class AppleAdaptiveDCTDecoder {
                                 x: pixelX, y: pixelY, base: base, width: width,
                                 height: height, bytesPerRow: bytesPerRow)
                         }
-                        clearTileState(globalIndex)
-
                     case 5:
                         let coefficients: DecodedTile
+                        var coefficientMap: [Int8]
                         let reusesPrevious = try data.readBits(1) != 0
                         if reusesPrevious {
                             coefficients = DecodedTile(
                                 values: predictor, quality: predictorQuality)
+                            coefficientMap = predictorMap
                         } else {
+                            coefficientMap = [Int8](repeating: 0, count: 99)
                             do {
                                 coefficients = try decodeNewTile(
                                     reader: &data, predictor: &predictor,
+                                    map: &coefficientMap,
                                     lowCutoff: Int(message.field1),
                                     highCutoff: Int(message.field2))
                                 predictorQuality = coefficients.quality
@@ -399,9 +390,12 @@ final class AppleAdaptiveDCTDecoder {
                                     "DCT tile \(tileNumber) command 5 failed at data bit "
                                         + "\(data.bitOffset): \(error.localizedDescription)")
                             }
+                            predictorMap = coefficientMap
                         }
                         store(coefficients, quality: coefficients.quality, at: globalIndex)
-                        tileHasRefinedMap[globalIndex] = false
+                        storeBaseMap(
+                            coefficientMap, quality: coefficients.quality,
+                            cbCount: 1, crCount: 1, at: globalIndex)
                         if drawPixels {
                             if !reusesPrevious || !hasLastDCTPixels {
                                 decodeDCTTile(
@@ -418,12 +412,9 @@ final class AppleAdaptiveDCTDecoder {
                         if command == 6 {
                             cacheIndex = Int(try data.readBits(16))
                         } else {
-                            cacheReadIndex = nextCacheIndex(after: cacheReadIndex)
-                            cacheIndex = cacheReadIndex
+                            cacheIndex = nextCacheIndex(after: cacheReadIndex)
                         }
                         let cached = try cachedTile(at: cacheIndex)
-                        store(cached.decoded, quality: cached.quality, at: globalIndex)
-                        storeMap(cached, at: globalIndex)
                         if drawPixels {
                             decodeDCTTile(cached.decoded.values, into: &lastDCTPixels)
                             hasLastDCTPixels = true
@@ -448,43 +439,10 @@ final class AppleAdaptiveDCTDecoder {
         tileCoefficients = [Int16](repeating: 0, count: count * 192)
         tileQuality = [UInt8](repeating: 0, count: count)
         tileMaps = [Int8](repeating: 0, count: count * 99)
-        tileHasRefinedMap = [Bool](repeating: false, count: count)
         tileChromaCounts = Array(repeating: (0, 0), count: count)
         coefficientCache.removeAll(keepingCapacity: true)
         cacheWriteIndex = 0
         cacheReadIndex = 0
-    }
-
-    private func clearTileState(_ index: Int) {
-        guard tileQuality.indices.contains(index) else { return }
-        tileQuality[index] = 0
-        tileHasRefinedMap[index] = false
-        tileChromaCounts[index] = (0, 0)
-        let start = index * 192
-        tileCoefficients.replaceSubrange(start..<(start + 192), with: repeatElement(0, count: 192))
-        let mapStart = index * 99
-        tileMaps.replaceSubrange(mapStart..<(mapStart + 99), with: repeatElement(0, count: 99))
-    }
-
-    private func copyTileState(from source: Int, to destination: Int) {
-        guard tileQuality.indices.contains(source), tileQuality.indices.contains(destination) else {
-            return
-        }
-        tileQuality[destination] = tileQuality[source]
-        tileHasRefinedMap[destination] = tileHasRefinedMap[source]
-        tileChromaCounts[destination] = tileChromaCounts[source]
-        let sourceStart = source * 192
-        let destinationStart = destination * 192
-        let copy = Array(tileCoefficients[sourceStart..<(sourceStart + 192)])
-        tileCoefficients.replaceSubrange(
-            destinationStart..<(destinationStart + 192), with: copy)
-        if tileHasRefinedMap[source] {
-            let sourceMapStart = source * 99
-            let destinationMapStart = destination * 99
-            let mapCopy = Array(tileMaps[sourceMapStart..<(sourceMapStart + 99)])
-            tileMaps.replaceSubrange(
-                destinationMapStart..<(destinationMapStart + 99), with: mapCopy)
-        }
     }
 
     private func store(_ decoded: DecodedTile, quality: Int, at index: Int) {
@@ -507,20 +465,28 @@ final class AppleAdaptiveDCTDecoder {
         let crCount: UInt8
     }
 
-    private func storeMap(_ cached: CachedTile, at index: Int) {
-        guard tileQuality.indices.contains(index), cached.map.count == 99 else { return }
+    private func storeBaseMap(
+        _ map: [Int8], quality: Int, cbCount: UInt8, crCount: UInt8,
+        at index: Int
+    ) {
+        guard tileQuality.indices.contains(index), map.count == 99 else { return }
         let start = index * 99
-        tileMaps.replaceSubrange(start..<(start + 99), with: cached.map)
-        tileHasRefinedMap[index] = true
-        tileChromaCounts[index] = (cached.cbCount, cached.crCount)
+        tileMaps.replaceSubrange(start..<(start + 99), with: map)
+        tileQuality[index] = UInt8(clamping: quality)
+        tileChromaCounts[index] = (cbCount, crCount)
     }
 
     private func cachedTile(at index: Int) throws -> CachedTile {
-        guard index > 0, index < 65_000, let cached = coefficientCache[index] else {
+        guard index > 0, index < 65_000 else {
             throw AppleAdaptiveDCTError.malformed(
-                "DCT references unavailable coefficient-cache tile \(index)")
+                "DCT coefficient-cache tile \(index) is outside the valid range")
         }
-        return cached
+        cacheReadIndex = index
+        if let cached = coefficientCache[index] { return cached }
+        let map = [Int8](repeating: 0, count: 99)
+        return CachedTile(
+            decoded: decodedTile(from: map, quality: 0), map: map,
+            quality: 0, cbCount: 0, crCount: 0)
     }
 
     private func nextCacheIndex(after index: Int) -> Int {
@@ -581,18 +547,20 @@ final class AppleAdaptiveDCTDecoder {
                 case 3:
                     let cacheIndex: Int
                     if try bits.readBits(1) != 0 {
-                        cacheReadIndex = nextCacheIndex(after: cacheReadIndex)
-                        cacheIndex = cacheReadIndex
+                        cacheIndex = nextCacheIndex(after: cacheReadIndex)
                     } else {
                         cacheIndex = Int(try bits.readBits(16))
+                    }
+                    guard cacheIndex > 0, cacheIndex < 65_000 else {
+                        throw AppleAdaptiveDCTError.malformed(
+                            "DCT refinement tile \(globalIndex) read invalid cache key "
+                                + "\(cacheIndex) at bit \(bits.bitOffset)")
                     }
                     cached = try cachedTile(at: cacheIndex)
                 default:
                     cached = nil
                 }
                 guard let cached else { continue }
-                store(cached.decoded, quality: cached.quality, at: globalIndex)
-                storeMap(cached, at: globalIndex)
                 if drawPixels {
                     decodeDCTTile(cached.decoded.values, into: &pixels)
                     renderPixelTile(
@@ -610,16 +578,13 @@ final class AppleAdaptiveDCTDecoder {
         let mapStart = index * 99
         let old: [Int8]
         let chromaCounts: (cb: UInt8, cr: UInt8)
-        if tileHasRefinedMap[index] {
-            old = Array(tileMaps[mapStart..<(mapStart + 99)])
-            chromaCounts = tileChromaCounts[index]
-        } else {
-            old = mapFromCoefficientState(at: index)
-            chromaCounts = (1, 1)
-        }
+        old = Array(tileMaps[mapStart..<(mapStart + 99)])
+        chromaCounts = tileChromaCounts[index]
         guard chromaCounts.cb == 1, chromaCounts.cr == 1 else {
             throw AppleAdaptiveDCTError.malformed(
-                "DCT refinement requires single-coefficient chroma predictors")
+                "DCT refinement tile \(index) at bit \(reader.bitOffset) requires "
+                    + "single-coefficient chroma predictors; found "
+                    + "Cb=\(chromaCounts.cb), Cr=\(chromaCounts.cr)")
         }
         var map = [Int8](repeating: 0, count: 99)
         map[0] = old[0]
@@ -707,21 +672,10 @@ final class AppleAdaptiveDCTDecoder {
         return DecodedTile(values: values, quality: quality)
     }
 
-    private func mapFromCoefficientState(at index: Int) -> [Int8] {
-        var map = [Int8](repeating: 0, count: 99)
-        let start = index * 192
-        for coefficient in 0..<64 {
-            map[coefficient] = Int8(clamping:
-                tileCoefficients[start + Self.zigzag[coefficient]])
-        }
-        map[64] = Int8(clamping: tileCoefficients[start + 64])
-        map[84] = Int8(clamping: tileCoefficients[start + 128])
-        return map
-    }
-
     private func decodeNewTile(
         reader: inout BitReader,
         predictor: inout [Int16],
+        map: inout [Int8],
         lowCutoff: Int,
         highCutoff: Int
     ) throws -> DecodedTile {
@@ -738,6 +692,9 @@ final class AppleAdaptiveDCTDecoder {
                 (halfTowardZero(predictor[128]) - (try reader.readSignedDCRice())) * 2)
         }
         values[0] = Int16(clamping: Int(predictor[0]) - (try reader.readSignedDCRice()))
+        map[0] = Int8(truncatingIfNeeded: values[0])
+        map[64] = Int8(truncatingIfNeeded: values[64])
+        map[84] = Int8(truncatingIfNeeded: values[128])
 
         var coefficient = 1
         while coefficient < 64 {
@@ -752,6 +709,7 @@ final class AppleAdaptiveDCTDecoder {
                     at: coefficient, amplitude: amplitude)
                 if let value = result.value {
                     values[Self.zigzag[coefficient]] = Int16(clamping: value)
+                    map[coefficient] = Int8(truncatingIfNeeded: value)
                 }
                 coefficient = result.nextIndex
                 continue
@@ -765,7 +723,9 @@ final class AppleAdaptiveDCTDecoder {
             } else {
                 shift = coefficient < cutoff ? 1 : 3
             }
-            values[Self.zigzag[coefficient]] = Int16(clamping: raw << shift)
+            let stored = Int8(truncatingIfNeeded: raw << shift)
+            map[coefficient] = stored
+            values[Self.zigzag[coefficient]] = Int16(stored)
             coefficient += 1
         }
         predictor = values
@@ -907,7 +867,6 @@ final class AppleAdaptiveDCTDecoder {
                 return
             }
             coefficient += zeroRun
-            guard coefficient <= maximum else { return }
             var amplitude = Int(try reader.readBits(amplitudeBits))
             let midpoint = 1 << (amplitudeBits - 1)
             if amplitude < midpoint {
@@ -952,7 +911,7 @@ final class AppleAdaptiveDCTDecoder {
         }
     }
 
-    /// Integer DCT_ISLOW used by stb_image. VNCKit wraps the same routine;
+    /// Integer DCT_ISLOW used by stb_image. The native decoder wraps the same routine;
     /// retaining its shifts and biases makes scalar and SIMD output identical.
     private func inverseDCT(
         _ coefficients: [Int16], offset: Int, quantization: [UInt16]
@@ -1051,7 +1010,7 @@ final class AppleAdaptiveDCTDecoder {
 
     // The refinement stream uses the standard JPEG luminance AC table.
     // These canonical counts/values are equivalent to the 13-node lookup
-    // table embedded in Apple's and Screens' Adaptive DCT decoders.
+    // table embedded in compatible Adaptive DCT decoders.
     private static let luminanceACCodeCounts = [
         0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125,
     ]
@@ -1079,7 +1038,7 @@ final class AppleAdaptiveDCTDecoder {
         0xf9, 0xfa,
     ]
 
-    /// JPEG-derived defaults embedded in both Apple's and Screens' decoder.
+    /// JPEG-derived defaults embedded in the native decoder.
     private static let defaultLuma: [UInt8] = [
         16, 11, 11, 14, 24, 22, 24, 33,
         11, 12, 11, 11, 26, 18, 19, 23,

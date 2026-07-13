@@ -188,7 +188,7 @@ public final class FramebufferRenderer: @unchecked Sendable {
 
 // MARK: - Tight Encoding Renderer
 
-/// Tight is the first classic-RFB encoding advertised by Screens 5. It mixes
+/// Tight is the first portable classic-RFB fallback. It mixes
 /// four persistent zlib streams with fill, palette, gradient and JPEG
 /// subencodings, which lets a server send photographic/animated areas without
 /// blocking later small UI updates behind a lossless full-screen rectangle.

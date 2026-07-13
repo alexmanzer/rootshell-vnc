@@ -128,18 +128,21 @@ public actor TransportSession {
     /// Set when an update finished reading while the pipeline was full; the
     /// deferred incremental request goes out on the next acknowledgement.
     private var deferredUpdateRequest = false
-    /// Standard mode starts with a portable full-frame codec, then enables
-    /// Apple DCT only after that reference image has been presented. This
-    /// avoids exposing the zeroed framebuffer when macOS initially sends only
-    /// DCT quantization/control rectangles.
-    private let appleDCTEncodingsAfterBootstrap: [Encoding]?
-    private var awaitingAppleDCTBootstrapReference: Bool
-    private var pendingAppleDCTBootstrapActivation = false
-    private var appleDCTBootstrapActivated = false
-    /// Keep classic RFB strictly request/response: the next request is sent
-    /// only after the current update has decoded and produced its snapshot.
-    /// A queued reference frame can otherwise turn one slow decode into
-    /// seconds of stale pointer response and visible tile catch-up.
+    /// Whether this connection negotiated Apple's adaptive DCT encoding.
+    private let appleDCTRequested: Bool
+    private let appleClassicAutoUpdateRequested: Bool
+    /// A control-only quantization update commonly precedes the initial DCT
+    /// image. Keep requesting a complete reference until that image arrives;
+    /// refinements and cache references are only valid after this boundary.
+    private var awaitingAppleDCTInitialReference: Bool
+    private var pendingAppleDCTAutoUpdateActivation = false
+    private var appleDCTAutoUpdateActive = false
+    private var appleDCTAutoUpdateRefreshTask: Task<Void, Never>?
+    /// Auto-update delivery still retains exactly one decode credit. Pausing
+    /// socket reads at this boundary applies TCP backpressure to the encoder,
+    /// which both bounds stale-frame latency and gives the server an honest
+    /// bandwidth signal for its DCT quality controller.
+    private var framebufferCreditWaiter: CheckedContinuation<Void, Never>?
     private let maxUnacknowledgedUpdates = 1
     /// Latched once an Apple media stream offer arrives: media negotiation
     /// switches this channel to encrypted control records, so no further
@@ -370,23 +373,24 @@ public actor TransportSession {
         self.tcp = TCPConnection(host: resolvedHost, port: port)
         let configuredEncodings =
             preferredEncodings ?? ConnectionStateMachine.defaultPreferredEncodings
-        let shouldBootstrapAppleDCT =
+        let shouldUseAppleDCT =
             configuredEncodings.contains(.appleMultiVariantScreenshare)
                 && !configuredEncodings.contains(.appleH264)
-        let initialEncodings = shouldBootstrapAppleDCT
-            ? configuredEncodings.filter { $0 != .appleMultiVariantScreenshare }
-            : configuredEncodings
+        let shouldUseAppleClassicAutoUpdate =
+            !configuredEncodings.contains(.appleH264)
+                && configuredEncodings.contains(.unknown(1105))
+                && configuredEncodings.contains(.unknown(1104))
         self.stateMachine = ConnectionStateMachine(
             preferredPixelFormat: preferredPixelFormat,
-            preferredEncodings: initialEncodings
+            preferredEncodings: configuredEncodings
         )
         self.host = resolvedHost
         self.password = password
         self.username = username
         self.requestAppleMediaStream = configuredEncodings.contains(.appleH264)
-        self.appleDCTEncodingsAfterBootstrap =
-            shouldBootstrapAppleDCT ? configuredEncodings : nil
-        self.awaitingAppleDCTBootstrapReference = shouldBootstrapAppleDCT
+        self.appleDCTRequested = shouldUseAppleDCT
+        self.appleClassicAutoUpdateRequested = shouldUseAppleClassicAutoUpdate
+        self.awaitingAppleDCTInitialReference = shouldUseAppleDCT
 
         var cont: AsyncStream<SessionEvent>.Continuation!
         self.events = AsyncStream<SessionEvent> { continuation in
@@ -575,6 +579,14 @@ public actor TransportSession {
 
     /// Request a framebuffer update from the server.
     public func requestFramebufferUpdate(incremental: Bool) async throws {
+        if appleDCTAutoUpdateActive {
+            // A type-3 request competes with the active type-9 subscription and
+            // can make the server enqueue a second reference frame. Renewing
+            // the subscription requests current geometry without creating a
+            // parallel polling loop.
+            try await sendAppleDCTAutoFrameUpdate()
+            return
+        }
         let msg = ClientMessage.framebufferUpdateRequest(
             incremental: incremental,
             x: 0, y: 0,
@@ -588,25 +600,39 @@ public actor TransportSession {
     /// Acknowledge that the consumer finished decoding and presenting one
     /// framebuffer update. Standard RFB encodings carry persistent codec
     /// state, so updates must not be dropped; this credit return is the
-    /// backpressure that bounds the undecoded backlog. The next incremental
-    /// With a single standard-RFB credit, the next request is deliberately
+    /// backpressure that bounds the undecoded backlog. With a single
+    /// standard-RFB credit, the next request is deliberately
     /// deferred until this acknowledgement so stale frames cannot queue.
     public func finishFramebufferUpdate() async throws {
         unacknowledgedUpdates = max(0, unacknowledgedUpdates - 1)
-        guard deferredUpdateRequest, !framebufferRequestsSuppressed else { return }
-        deferredUpdateRequest = false
-        if pendingAppleDCTBootstrapActivation,
-           let encodings = appleDCTEncodingsAfterBootstrap {
-            pendingAppleDCTBootstrapActivation = false
-            appleDCTBootstrapActivated = true
-            try await sendClientPayload(
-                ClientMessage.setEncodings(encodings).serialize())
-            log.debug("Enabled Apple DCT after portable reference framebuffer")
+        defer { resumeFramebufferCreditWaiterIfPossible() }
+
+        if pendingAppleDCTAutoUpdateActivation {
+            pendingAppleDCTAutoUpdateActivation = false
+            appleDCTAutoUpdateActive = true
+            deferredUpdateRequest = false
+            try await sendAppleDCTAutoFrameUpdate()
+            startAppleDCTAutoUpdateRefreshTask()
+            log.info("Enabled Apple DCT adaptive auto updates")
+            return
+        }
+
+        if appleDCTAutoUpdateActive {
+            deferredUpdateRequest = false
+            return
+        }
+
+        if appleDCTRequested,
+           awaitingAppleDCTInitialReference,
+           stateMachine.negotiatedVersion?.isApple == true {
+            deferredUpdateRequest = false
             try await requestFramebufferUpdate(incremental: false)
             return
         }
-        try await requestFramebufferUpdate(
-            incremental: !awaitingAppleDCTBootstrapReference)
+
+        guard deferredUpdateRequest, !framebufferRequestsSuppressed else { return }
+        deferredUpdateRequest = false
+        try await requestFramebufferUpdate(incremental: true)
     }
 
     /// Request one remote display matching the client viewport. Apple servers
@@ -668,6 +694,10 @@ public actor TransportSession {
         terminalDisconnectHandled = true
         readTask?.cancel()
         readTask = nil
+        appleDCTAutoUpdateRefreshTask?.cancel()
+        appleDCTAutoUpdateRefreshTask = nil
+        framebufferCreditWaiter?.resume()
+        framebufferCreditWaiter = nil
         appleMediaGenerationSink = nil
         appleRemoteDisplaySizeSink = nil
         await stopAppleMediaUDP()
@@ -1003,6 +1033,10 @@ public actor TransportSession {
         guard !isDisconnecting, !terminalDisconnectHandled else { return }
         terminalDisconnectHandled = true
         readTask?.cancel()
+        appleDCTAutoUpdateRefreshTask?.cancel()
+        appleDCTAutoUpdateRefreshTask = nil
+        framebufferCreditWaiter?.resume()
+        framebufferCreditWaiter = nil
         _ = stateMachine.handle(event: .connectionLost(error))
         emitState()
         await stopAppleMediaUDP()
@@ -1210,16 +1244,34 @@ public actor TransportSession {
             try await acceptFramebufferResize(width: resize.width, height: resize.height)
         }
 
-        if awaitingAppleDCTBootstrapReference,
-           rectsWithData.contains(where: { rect, _ in
+        let receivedPortableFullFrame = rectsWithData.contains(where: { rect, _ in
                (rect.encoding == .tight || rect.encoding == .zlib
                     || rect.encoding == .zrle || rect.encoding == .raw)
                    && rect.x == 0 && rect.y == 0
                    && rect.width >= fbWidth && rect.height >= fbHeight
+           })
+        if appleClassicAutoUpdateRequested,
+                  !appleDCTRequested,
+                  stateMachine.negotiatedVersion?.isApple == true,
+                  !appleDCTAutoUpdateActive,
+                  receivedPortableFullFrame {
+            pendingAppleDCTAutoUpdateActivation = true
+            log.debug("Received initial portable framebuffer for adaptive updates")
+        }
+
+        if appleDCTRequested,
+           stateMachine.negotiatedVersion?.isApple == true,
+           !appleDCTAutoUpdateActive,
+           rectsWithData.contains(where: { rect, payload in
+               rect.encoding == .appleMultiVariantScreenshare
+                   && payload.count >= 5
+                   && payload[payload.startIndex + 4] == 0
+                   && rect.x == 0 && rect.y == 0
+                   && rect.width >= fbWidth && rect.height >= fbHeight
            }) {
-            awaitingAppleDCTBootstrapReference = false
-            pendingAppleDCTBootstrapActivation = true
-            log.debug("Received portable reference framebuffer for Apple DCT")
+            awaitingAppleDCTInitialReference = false
+            pendingAppleDCTAutoUpdateActivation = true
+            log.debug("Received complete initial Apple DCT reference image")
         }
 
         let now = DispatchTime.now().uptimeNanoseconds
@@ -1262,6 +1314,10 @@ public actor TransportSession {
                 continue
             }
             try await executeAction(action)
+        }
+
+        if appleDCTAutoUpdateActive || pendingAppleDCTAutoUpdateActivation {
+            await waitForFramebufferCreditIfNeeded()
         }
     }
 
@@ -1654,6 +1710,63 @@ public actor TransportSession {
         try await sendAppleEncryptedClientPayload(appleAutoFrameUpdateMessage(intervalMilliseconds: interval))
     }
 
+    private func sendAppleDCTAutoFrameUpdate() async throws {
+        guard appleClassicAutoUpdateRequested,
+              stateMachine.negotiatedVersion?.isApple == true else { return }
+        try await sendClientPayload(
+            appleAutoFrameUpdateMessage(
+                intervalMilliseconds: 0))
+        framebufferRequestSentNanos = DispatchTime.now().uptimeNanoseconds
+    }
+
+    private func startAppleDCTAutoUpdateRefreshTask() {
+        guard appleDCTAutoUpdateRefreshTask == nil else { return }
+        appleDCTAutoUpdateRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(10))
+                    guard !Task.isCancelled, let self else { return }
+                    try await self.refreshAppleDCTAutoUpdate()
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard let self else { return }
+                    await self.logAppleDCTAutoUpdateRefreshFailure(error)
+                }
+            }
+        }
+    }
+
+    private func refreshAppleDCTAutoUpdate() async throws {
+        guard appleDCTAutoUpdateActive, !isDisconnecting else { return }
+        try await sendAppleDCTAutoFrameUpdate()
+    }
+
+    private func logAppleDCTAutoUpdateRefreshFailure(_ error: Error) {
+        log.warning(
+            "Failed to renew Apple DCT auto updates: "
+                + error.localizedDescription)
+    }
+
+    private func waitForFramebufferCreditIfNeeded() async {
+        guard unacknowledgedUpdates >= maxUnacknowledgedUpdates else { return }
+        await withCheckedContinuation { continuation in
+            if unacknowledgedUpdates < maxUnacknowledgedUpdates {
+                continuation.resume()
+            } else {
+                precondition(framebufferCreditWaiter == nil)
+                framebufferCreditWaiter = continuation
+            }
+        }
+    }
+
+    private func resumeFramebufferCreditWaiterIfPossible() {
+        guard unacknowledgedUpdates < maxUnacknowledgedUpdates,
+              let waiter = framebufferCreditWaiter else { return }
+        framebufferCreditWaiter = nil
+        waiter.resume()
+    }
+
     /// Commit server-announced geometry before any subsequent update request.
     /// An active Apple media subscription carries explicit capture bounds, so
     /// resend that same understood control message with the new dimensions;
@@ -1666,10 +1779,12 @@ public actor TransportSession {
         let oldHeight = fbHeight
         fbWidth = width
         fbHeight = height
-        if appleDCTEncodingsAfterBootstrap != nil, !appleDCTBootstrapActivated {
-            awaitingAppleDCTBootstrapReference = true
-        }
         log.info("Framebuffer resized \(oldWidth)x\(oldHeight) -> \(width)x\(height)")
+
+        if appleDCTAutoUpdateActive {
+            try await sendAppleDCTAutoFrameUpdate()
+            log.debug("Updated Apple DCT frame subscription to \(width)x\(height)")
+        }
 
         guard acceptedAppleMediaStream, sentAppleMediaAutoFrameUpdate else { return }
         let interval = runtimeEnvironment["ROOTSHELL_VNC_AUTOFRAME_INTERVAL_MS"]
@@ -1680,15 +1795,10 @@ public actor TransportSession {
     }
 
     private func appleAutoFrameUpdateMessage(intervalMilliseconds: Int32) -> Data {
-        var data = Data(count: 16)
-        data[0] = 0x09
-        writeUInt16BE(1, into: &data, at: 2)
-        writeUInt32BE(UInt32(bitPattern: intervalMilliseconds), into: &data, at: 4)
-        writeUInt16BE(0, into: &data, at: 8)
-        writeUInt16BE(0, into: &data, at: 10)
-        writeUInt16BE(fbWidth, into: &data, at: 12)
-        writeUInt16BE(fbHeight, into: &data, at: 14)
-        return data
+        ClientMessage.appleAutoFramebufferUpdate(
+            intervalMilliseconds: intervalMilliseconds,
+            x: 0, y: 0,
+            width: fbWidth, height: fbHeight).serialize()
     }
 
     private func noteStandardDesktopSizeSupport(

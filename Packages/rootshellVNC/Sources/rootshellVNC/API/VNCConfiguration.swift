@@ -178,10 +178,8 @@ public struct VNCConfiguration: Sendable {
                 }
             }
         } else if videoQualityMode == .standard {
-            // Match Screens 5's Apple-capable classic-RFB ordering. Encoding
-            // 1011 is Apple's low-latency adaptive DCT path; non-Apple servers
-            // ignore it and continue with Tight/ZRLE/Zlib. Full color remains
-            // the default for both the DCT and fallback paths.
+            // Prefer Apple's low-latency adaptive DCT path with portable
+            // full-color fallbacks for servers that do not support it.
             let standardEncodings: [Encoding] = [
                 .appleMultiVariantScreenshare, .tight, .unknown(-224),
                 .zrle, .zlib, .copyRect,

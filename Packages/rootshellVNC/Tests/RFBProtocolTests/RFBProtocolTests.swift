@@ -791,6 +791,33 @@ final class MessageWriterTests: XCTestCase {
         XCTAssertEqual(data[1], 0) // incremental = false
     }
 
+    // MARK: - Apple AutoFrameBufferUpdate (type 9)
+
+    func testWriteAppleAutoFramebufferUpdate() {
+        let data = MessageWriter.writeAppleAutoFramebufferUpdate(
+            intervalMilliseconds: 33,
+            x: 0, y: 0, width: 2976, height: 1860)
+
+        XCTAssertEqual(data, Data([
+            0x09, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x21,
+            0x00, 0x00, 0x00, 0x00,
+            0x0b, 0xa0, 0x07, 0x44,
+        ]))
+    }
+
+    func testWriteAppleAutoFramebufferUpdateDisableSentinel() {
+        let data = ClientMessage.appleAutoFramebufferUpdate(
+            intervalMilliseconds: -1,
+            x: 1, y: 2, width: 3, height: 4).serialize()
+
+        XCTAssertEqual(data[0], 9)
+        XCTAssertEqual(Data(data[4..<8]), Data([0xff, 0xff, 0xff, 0xff]))
+        XCTAssertEqual(Data(data[8..<16]), Data([
+            0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04,
+        ]))
+    }
+
     // MARK: - KeyEvent (type 4)
 
     func testWriteKeyEventDown() {
