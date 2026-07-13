@@ -148,6 +148,8 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(config.enableHighPerformanceMode)
         XCTAssertEqual(config.videoQualityMode, .adaptive)
         XCTAssertEqual(config.displaySizingMode, .matchClient)
+        XCTAssertEqual(config.displayMode, .oneDisplay)
+        XCTAssertEqual(config.displayCount, 1)
         XCTAssertTrue(config.enableRemoteAudio)
         XCTAssertEqual(config.targetFrameRate, 30)
         XCTAssertFalse(config.enableProtocolTrace)
@@ -161,6 +163,7 @@ final class VNCConfigurationTests: XCTestCase {
             preferredEncodings: [.raw, .zrle],
             enableHighPerformanceMode: false,
             displaySizingMode: .remoteDisplay,
+            displayCount: 2,
             enableRemoteAudio: false,
             targetFrameRate: 60,
             enableProtocolTrace: true
@@ -169,9 +172,47 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(config.preferredEncodings, [.raw, .zrle])
         XCTAssertFalse(config.enableHighPerformanceMode)
         XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
+        XCTAssertEqual(config.displayMode, .allDisplaysCombined)
+        XCTAssertEqual(config.displayCount, 2)
         XCTAssertFalse(config.enableRemoteAudio)
         XCTAssertEqual(config.targetFrameRate, 60)
         XCTAssertTrue(config.enableProtocolTrace)
+    }
+
+    func testDisplayCountClamping() {
+        XCTAssertEqual(VNCConfiguration(displayCount: 0).displayCount, 1)
+        XCTAssertEqual(VNCConfiguration(displayCount: 3).displayCount, 2)
+
+        var config = VNCConfiguration()
+        config.displayCount = 99
+        XCTAssertEqual(config.displayCount, 2)
+        config.displayCount = -1
+        XCTAssertEqual(config.displayCount, 1)
+    }
+
+    func testCompatibilityDisplayCountTwoAlwaysMeansCombined() {
+        var config = VNCConfiguration(
+            displaySizingMode: .matchClient,
+            displayCount: 2)
+        XCTAssertEqual(config.displayMode, .allDisplaysCombined)
+        XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
+
+        config.displaySizingMode = .matchClient
+        XCTAssertEqual(config.displayMode, .oneDisplay)
+        XCTAssertEqual(config.displayCount, 1)
+
+        config.displayCount = 2
+        XCTAssertEqual(config.displayMode, .allDisplaysCombined)
+        XCTAssertEqual(config.displaySizingMode, .remoteDisplay)
+    }
+
+    func testExplicitDisplayModeTakesPrecedenceOverCompatibilityCount() {
+        let config = VNCConfiguration(
+            displaySizingMode: .remoteDisplay,
+            displayCount: 1,
+            displayMode: .allDisplaysCombined)
+        XCTAssertEqual(config.displayMode, .allDisplaysCombined)
+        XCTAssertEqual(config.displayCount, 2)
     }
 
     func testTargetFrameRateClamping() {
@@ -308,6 +349,25 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(
             VNCConfiguration.DisplaySizingMode.matchClient.title,
             "Match Client")
+    }
+}
+
+final class DisplayPresentationTests: XCTestCase {
+    private let displays = [
+        CGRect(x: -1920, y: 0, width: 1920, height: 1080),
+        CGRect(x: 0, y: 0, width: 2560, height: 1440),
+    ]
+
+    func testOneDisplayCropsStandardFramebufferToFirstScreen() {
+        XCTAssertEqual(
+            normalizedSelectedDisplayRegion(displays, displayCount: 1),
+            CGRect(x: 0, y: 0, width: 1920, height: 1080))
+    }
+
+    func testTwoDisplaysPresentCompleteStandardFramebuffer() {
+        XCTAssertEqual(
+            normalizedSelectedDisplayRegion(displays, displayCount: 2),
+            CGRect(x: 0, y: 0, width: 4480, height: 1440))
     }
 }
 

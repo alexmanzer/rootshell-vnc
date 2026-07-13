@@ -76,6 +76,9 @@ public struct ConnectionView: View {
                         .onChange(of: session.configuration.videoQualityMode) { _, _ in
                             prepareRemoteDisplaySize(geometry.size)
                         }
+                        .onChange(of: session.configuration.displayMode) { _, _ in
+                            prepareRemoteDisplaySize(geometry.size)
+                        }
                 }
             }
             .navigationTitle("Connect to VNC Server")
@@ -200,6 +203,25 @@ public struct ConnectionView: View {
 
     private var displaySizingSection: some View {
         Section("Remote Display Size") {
+            if session.configuration.displaySizingMode == .matchClient {
+                LabeledContent("Display Mode", value: "One Virtual Display")
+                Text("Match Client currently creates one client-sized virtual display.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Picker("Display Mode", selection: $session.configuration.displayMode) {
+                    Text(VNCConfiguration.DisplayMode.oneDisplay.title)
+                        .tag(VNCConfiguration.DisplayMode.oneDisplay)
+                    Text(VNCConfiguration.DisplayMode.allDisplaysCombined.title)
+                        .tag(VNCConfiguration.DisplayMode.allDisplaysCombined)
+                }
+                .pickerStyle(.menu)
+
+                Text(session.configuration.displayMode.explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Picker("Sizing", selection: $session.configuration.displaySizingMode) {
                 ForEach(VNCConfiguration.DisplaySizingMode.allCases) { mode in
                     Text(mode.title).tag(mode)

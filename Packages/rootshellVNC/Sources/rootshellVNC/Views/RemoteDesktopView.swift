@@ -51,9 +51,8 @@ public struct RemoteDesktopView: View {
 
     public var body: some View {
         GeometryReader { geometry in
-            let framebufferSize = CGSize(
-                width: CGFloat(session.framebufferWidth),
-                height: CGFloat(session.framebufferHeight))
+            let framebufferSize = session.presentedFramebufferSize
+            let framebufferOrigin = session.presentedFramebufferRegion?.origin ?? .zero
 
             ZStack {
                 Color.black
@@ -68,7 +67,8 @@ public struct RemoteDesktopView: View {
                    framebufferSize.height > 0 {
                     interactionLayer(
                         viewSize: geometry.size,
-                        framebufferSize: framebufferSize)
+                        framebufferSize: framebufferSize,
+                        framebufferOrigin: framebufferOrigin)
                 }
 
                 viewportControls
@@ -122,20 +122,17 @@ public struct RemoteDesktopView: View {
     private func desktopContent(in viewSize: CGSize) -> some View {
         if session.isHighPerformanceMode {
             #if canImport(UIKit)
-            VideoBandView(renderer: session.videoBandRenderer)
+            AdaptiveDisplayView(
+                primaryRenderer: session.videoBandRenderer,
+                secondaryRenderer: session.secondaryVideoBandRenderer,
+                displayRegions: session.presentedVideoDisplayRegions)
                 .frame(width: viewSize.width, height: viewSize.height)
             #else
             placeholderView
                 .frame(width: viewSize.width, height: viewSize.height)
             #endif
-        } else if let image = session.currentImage {
-            Image(decorative: image, scale: 1)
-                .interpolation(.high)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: viewSize.width, height: viewSize.height)
         } else {
-            placeholderView
+            StandardFramebufferContent(session: session)
                 .frame(width: viewSize.width, height: viewSize.height)
         }
     }
@@ -143,7 +140,8 @@ public struct RemoteDesktopView: View {
     @ViewBuilder
     private func interactionLayer(
         viewSize: CGSize,
-        framebufferSize: CGSize
+        framebufferSize: CGSize,
+        framebufferOrigin: CGPoint
     ) -> some View {
         #if canImport(UIKit)
         RemoteInteractionView(
@@ -153,6 +151,7 @@ public struct RemoteDesktopView: View {
             touchHandler: touchHandler,
             keyboardHandler: keyboardHandler,
             keyboardCapture: keyboardCapture,
+            framebufferOrigin: framebufferOrigin,
             // Adaptive mode's video composites the server cursor; only the
             // classic framebuffer path adopts the remote shape locally.
             remoteCursor: session.isHighPerformanceMode ? nil : session.remoteCursor)
@@ -163,10 +162,12 @@ public struct RemoteDesktopView: View {
             .contentShape(Rectangle())
             .gesture(fallbackTapGesture(
                 viewSize: viewSize,
-                framebufferSize: framebufferSize))
+                framebufferSize: framebufferSize,
+                framebufferOrigin: framebufferOrigin))
             .simultaneousGesture(fallbackDragGesture(
                 viewSize: viewSize,
-                framebufferSize: framebufferSize))
+                framebufferSize: framebufferSize,
+                framebufferOrigin: framebufferOrigin))
             .simultaneousGesture(fallbackMagnificationGesture(
                 viewSize: viewSize,
                 framebufferSize: framebufferSize))
@@ -360,28 +361,32 @@ public struct RemoteDesktopView: View {
     #if !canImport(UIKit)
     private func fallbackTapGesture(
         viewSize: CGSize,
-        framebufferSize: CGSize
+        framebufferSize: CGSize,
+        framebufferOrigin: CGPoint
     ) -> some Gesture {
         SpatialTapGesture()
             .onEnded { value in
                 guard let point = remotePoint(
                     value.location,
                     viewSize: viewSize,
-                    framebufferSize: framebufferSize) else { return }
+                    framebufferSize: framebufferSize,
+                    framebufferOrigin: framebufferOrigin) else { return }
                 touchHandler.handleTap(x: point.x, y: point.y)
             }
     }
 
     private func fallbackDragGesture(
         viewSize: CGSize,
-        framebufferSize: CGSize
+        framebufferSize: CGSize,
+        framebufferOrigin: CGPoint
     ) -> some Gesture {
         DragGesture(minimumDistance: 2)
             .onChanged { value in
                 guard let point = remotePoint(
                     value.location,
                     viewSize: viewSize,
-                    framebufferSize: framebufferSize) else { return }
+                    framebufferSize: framebufferSize,
+                    framebufferOrigin: framebufferOrigin) else { return }
                 fallbackDragRemotePoint = CGPoint(x: CGFloat(point.x), y: CGFloat(point.y))
                 touchHandler.handleDrag(x: point.x, y: point.y)
             }
@@ -389,7 +394,8 @@ public struct RemoteDesktopView: View {
                 let mapped = remotePoint(
                     value.location,
                     viewSize: viewSize,
-                    framebufferSize: framebufferSize)
+                    framebufferSize: framebufferSize,
+                    framebufferOrigin: framebufferOrigin)
                 let finalPoint = mapped ?? fallbackDragRemotePoint.map({
                     (x: UInt16($0.x), y: UInt16($0.y))
                 })
@@ -421,16 +427,107 @@ public struct RemoteDesktopView: View {
     private func remotePoint(
         _ point: CGPoint,
         viewSize: CGSize,
-        framebufferSize: CGSize
+        framebufferSize: CGSize,
+        framebufferOrigin: CGPoint = .zero
     ) -> (x: UInt16, y: UInt16)? {
         guard let mapped = viewport.framebufferPoint(
             for: point,
             viewSize: viewSize,
             framebufferSize: framebufferSize) else { return nil }
-        return (UInt16(mapped.x), UInt16(mapped.y))
+        return (
+            UInt16(min(CGFloat(UInt16.max), mapped.x + framebufferOrigin.x)),
+            UInt16(min(CGFloat(UInt16.max), mapped.y + framebufferOrigin.y)))
     }
     #endif
 }
+
+/// Owns the hot standard-framebuffer observation so publishing a new image
+/// does not invalidate the parent view that owns the HUD Menu.
+private struct StandardFramebufferContent: View {
+    @Bindable var session: VNCSession
+
+    var body: some View {
+        if let image = session.currentImage {
+            let displayedImage = cropped(image) ?? image
+            Image(decorative: displayedImage, scale: 1)
+                .interpolation(.high)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+        } else {
+            VStack(spacing: 16) {
+                ProgressView().controlSize(.large)
+                Text("Waiting for framebuffer...")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func cropped(_ image: CGImage) -> CGImage? {
+        guard let region = session.presentedFramebufferRegion else { return nil }
+        let imageBounds = CGRect(
+            x: 0, y: 0,
+            width: image.width, height: image.height)
+        let crop = region.integral.intersection(imageBounds)
+        guard !crop.isEmpty, crop != imageBounds else { return nil }
+        return image.cropping(to: crop)
+    }
+}
+
+#if canImport(UIKit)
+/// Keeps each display in its own decoder-backed renderer and positions it in
+/// the server's normalized desktop coordinate space.
+private struct AdaptiveDisplayView: View {
+    let primaryRenderer: VideoBandLayerRenderer
+    let secondaryRenderer: VideoBandLayerRenderer
+    let displayRegions: [CGRect]
+
+    var body: some View {
+        GeometryReader { geometry in
+            let regions = displayRegions.isEmpty
+                ? [CGRect(origin: .zero, size: geometry.size)]
+                : displayRegions
+            let union = regions.dropFirst().reduce(regions[0]) { $0.union($1) }
+            let scale = min(
+                geometry.size.width / max(1, union.width),
+                geometry.size.height / max(1, union.height))
+            let origin = CGPoint(
+                x: (geometry.size.width - union.width * scale) / 2,
+                y: (geometry.size.height - union.height * scale) / 2)
+
+            ZStack(alignment: .topLeading) {
+                videoDisplay(
+                    renderer: primaryRenderer,
+                    region: regions[0],
+                    scale: scale,
+                    origin: origin)
+                if regions.count > 1 {
+                    videoDisplay(
+                        renderer: secondaryRenderer,
+                        region: regions[1],
+                        scale: scale,
+                        origin: origin)
+                }
+            }
+        }
+        .background(Color.black)
+    }
+
+    private func videoDisplay(
+        renderer: VideoBandLayerRenderer,
+        region: CGRect,
+        scale: CGFloat,
+        origin: CGPoint
+    ) -> some View {
+        VideoBandView(renderer: renderer)
+            .frame(
+                width: region.width * scale,
+                height: region.height * scale)
+            .offset(
+                x: origin.x + region.minX * scale,
+                y: origin.y + region.minY * scale)
+    }
+}
+#endif
 
 #if !canImport(UIKit)
 private extension UnitPoint {

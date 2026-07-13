@@ -1918,15 +1918,34 @@ final class AppleMessagesTests: XCTestCase {
         XCTAssertEqual(offer.rawPayload, payload)
         XCTAssertEqual(offer.messageVersion, 0)
         XCTAssertEqual(offer.messageType, 1)
-        XCTAssertEqual(offer.audioStreamUDPPort, 0x7750)
-        XCTAssertEqual(offer.audioStreamFlags, 0x38e045d9)
-        XCTAssertEqual(offer.videoStream1UDPPort, 0xcef3)
-        XCTAssertEqual(offer.videoStream1Flags, 0xf4b2788e)
-        XCTAssertEqual(offer.videoStream2UDPPort, 0x6df5)
+        XCTAssertEqual(offer.audioStreamUDPPort, 0x36ff)
+        XCTAssertEqual(offer.audioStreamFlags, 0x775038e0)
+        XCTAssertEqual(offer.videoStream1UDPPort, 0x45d9)
+        XCTAssertEqual(offer.videoStream1Flags, 0xcef3f4b2)
+        XCTAssertEqual(offer.videoStream2UDPPort, 0x788e)
         XCTAssertEqual(offer.videoStreamDisplayCount, 2)
         XCTAssertEqual(offer.codecType, 0)
         XCTAssertEqual(offer.width, 0)
         XCTAssertEqual(offer.height, 0)
+    }
+
+    func testAppleMediaStreamOfferUsesSecondaryReceiverPortForDisplayCount() throws {
+        var payload = Data(
+            repeating: 0,
+            count: AppleMediaStreamOffer.wirePayloadSize)
+        payload[14] = 0x17
+        payload[15] = 0x0d
+        payload[20] = 0x17
+        payload[21] = 0x0e
+        var reader = MessageReader(data: payload)
+        let two = try AppleMediaStreamOffer(reader: &reader)
+        XCTAssertEqual(two.videoStreamDisplayCount, 2)
+
+        payload[20] = 0
+        payload[21] = 0
+        reader = MessageReader(data: payload)
+        let one = try AppleMediaStreamOffer(reader: &reader)
+        XCTAssertEqual(one.videoStreamDisplayCount, 1)
     }
 
     func testAppleMediaStreamConfigurationWireBytes() {

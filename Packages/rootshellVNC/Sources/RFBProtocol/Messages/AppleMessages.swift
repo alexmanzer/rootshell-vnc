@@ -111,7 +111,7 @@ public struct AppleMediaStreamOffer: Sendable, Equatable {
     public let videoStream1Flags: UInt32?
     /// UDP port advertised for the secondary video stream in native message 1.
     public let videoStream2UDPPort: UInt16?
-    /// Display count inferred from the native secondary-video flag byte.
+    /// Number of video receivers advertised by the native secondary-stream flag.
     public let videoStreamDisplayCount: Int?
     /// FourCC-style codec type (e.g., `avc1` for H.264, `hvc1` for HEVC).
     public let codecType: UInt32
@@ -142,11 +142,11 @@ public struct AppleMediaStreamOffer: Sendable, Equatable {
         self.rawPayload = rawPayload
         self.messageVersion = messageVersion ?? Self.readUInt16(rawPayload, at: 0)
         self.messageType = messageType ?? Self.readUInt16(rawPayload, at: 2)
-        self.audioStreamUDPPort = audioStreamUDPPort ?? Self.readUInt16(rawPayload, at: 10)
-        self.audioStreamFlags = audioStreamFlags ?? Self.readUInt32(rawPayload, at: 12)
-        self.videoStream1UDPPort = videoStream1UDPPort ?? Self.readUInt16(rawPayload, at: 16)
-        self.videoStream1Flags = videoStream1Flags ?? Self.readUInt32(rawPayload, at: 18)
-        self.videoStream2UDPPort = videoStream2UDPPort ?? Self.readUInt16(rawPayload, at: 22)
+        self.audioStreamUDPPort = audioStreamUDPPort ?? Self.readUInt16(rawPayload, at: 8)
+        self.audioStreamFlags = audioStreamFlags ?? Self.readUInt32(rawPayload, at: 10)
+        self.videoStream1UDPPort = videoStream1UDPPort ?? Self.readUInt16(rawPayload, at: 14)
+        self.videoStream1Flags = videoStream1Flags ?? Self.readUInt32(rawPayload, at: 16)
+        self.videoStream2UDPPort = videoStream2UDPPort ?? Self.readUInt16(rawPayload, at: 20)
         self.videoStreamDisplayCount = videoStreamDisplayCount
             ?? Self.videoStreamDisplayCount(rawPayload)
         self.codecType = codecType
@@ -165,11 +165,11 @@ public struct AppleMediaStreamOffer: Sendable, Equatable {
         self.rawPayload = payload
         self.messageVersion = Self.readUInt16(payload, at: 0)
         self.messageType = Self.readUInt16(payload, at: 2)
-        self.audioStreamUDPPort = Self.readUInt16(payload, at: 10)
-        self.audioStreamFlags = Self.readUInt32(payload, at: 12)
-        self.videoStream1UDPPort = Self.readUInt16(payload, at: 16)
-        self.videoStream1Flags = Self.readUInt32(payload, at: 18)
-        self.videoStream2UDPPort = Self.readUInt16(payload, at: 22)
+        self.audioStreamUDPPort = Self.readUInt16(payload, at: 8)
+        self.audioStreamFlags = Self.readUInt32(payload, at: 10)
+        self.videoStream1UDPPort = Self.readUInt16(payload, at: 14)
+        self.videoStream1Flags = Self.readUInt32(payload, at: 16)
+        self.videoStream2UDPPort = Self.readUInt16(payload, at: 20)
         self.videoStreamDisplayCount = Self.videoStreamDisplayCount(payload)
 
         var payloadReader = MessageReader(data: payload)
@@ -196,8 +196,13 @@ public struct AppleMediaStreamOffer: Sendable, Equatable {
     }
 
     private static func videoStreamDisplayCount(_ data: Data) -> Int? {
-        guard 24 < data.count else { return nil }
-        return data[data.startIndex + 24] & 0x01 == 0 ? 1 : 2
+        guard let videoStream2UDPPort = readUInt16(data, at: 20) else {
+            return nil
+        }
+        // Message one contains one port/flags pair per receiver. A zero third
+        // port means audio + primary video; a nonzero port means the server
+        // constructed the secondary video receiver as well.
+        return videoStream2UDPPort == 0 ? 1 : 2
     }
 }
 

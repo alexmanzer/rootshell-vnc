@@ -38,7 +38,7 @@ struct BoundedRTPSequenceHistory {
 /// draining this buffer happen in one actor turn, so packets on either side of
 /// the handoff cannot overtake one another.
 struct AppleMediaPacketHandoff {
-    typealias Sink = @Sendable (Data) -> Void
+    typealias Sink = @Sendable (Data, Int?) -> Void
 
     struct DrainResult: Equatable {
         let packetCount: Int
@@ -56,7 +56,7 @@ struct AppleMediaPacketHandoff {
     private let maximumPackets: Int
     private let maximumBytes: Int
     private var sink: Sink?
-    private var pending: [Data] = []
+    private var pending: [(data: Data, displayIndex: Int?)] = []
     private var pendingBytes = 0
     private(set) var overflowed = false
     private(set) var droppedPacketCount = 0
@@ -69,9 +69,12 @@ struct AppleMediaPacketHandoff {
     var bufferedPacketCount: Int { pending.count }
     var bufferedByteCount: Int { pendingBytes }
 
-    mutating func deliver(_ packet: Data) -> DeliveryResult {
+    mutating func deliver(
+        _ packet: Data,
+        displayIndex: Int? = nil
+    ) -> DeliveryResult {
         if let sink {
-            sink(packet)
+            sink(packet, displayIndex)
             return .delivered
         }
 
@@ -85,7 +88,7 @@ struct AppleMediaPacketHandoff {
             return .overflow
         }
 
-        pending.append(packet)
+        pending.append((packet, displayIndex))
         pendingBytes += packet.count
         return .buffered
     }
@@ -105,7 +108,7 @@ struct AppleMediaPacketHandoff {
         pending.removeAll(keepingCapacity: true)
         pendingBytes = 0
         for packet in packets {
-            newSink(packet)
+            newSink(packet.data, packet.displayIndex)
         }
         return DrainResult(
             packetCount: packets.count,

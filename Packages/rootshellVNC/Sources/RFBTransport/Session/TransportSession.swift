@@ -2,6 +2,42 @@ import Foundation
 import RFBProtocol
 import Security
 
+/// Decode the stable display records in Apple's DisplayInfo2 (encoding 1105).
+/// The payload includes its two-byte length prefix. Version 5 stores the
+/// display count at byte 20 and places each 56-byte record's UInt16 display ID
+/// at byte 40. Rectangles are `(minY, minX, maxY, maxX)`; the second rectangle
+/// is in framebuffer pixels and is therefore used for rendering and input.
+func appleDisplayInfo2Records(_ payload: Data) -> [AppleDisplayInfo] {
+    guard payload.count >= 40 else { return [] }
+    let start = payload.startIndex
+    func uint16(at offset: Int) -> UInt16 {
+        UInt16(payload[start + offset]) << 8
+            | UInt16(payload[start + offset + 1])
+    }
+    let count = Int(uint16(at: 20))
+    guard count > 0, count <= 16 else { return [] }
+
+    return (0..<count).compactMap { index in
+        let idOffset = 40 + index * 56
+        guard idOffset + 21 < payload.count else { return nil }
+        let id = UInt32(uint16(at: idOffset))
+        let minY = Int(uint16(at: idOffset + 10))
+        let minX = Int(uint16(at: idOffset + 12))
+        let maxY = Int(uint16(at: idOffset + 14))
+        let maxX = Int(uint16(at: idOffset + 16))
+        guard maxX > minX, maxY > minY else { return nil }
+        let flags = UInt32(uint16(at: idOffset + 18)) << 16
+            | UInt32(uint16(at: idOffset + 20))
+        return AppleDisplayInfo(
+            displayIndex: id,
+            originX: Int32(minX),
+            originY: Int32(minY),
+            width: UInt32(maxX - minX),
+            height: UInt32(maxY - minY),
+            flags: flags)
+    }
+}
+
 /// Events emitted by the transport session for consumption by the UI layer.
 public enum SessionEvent: Sendable {
     /// The connection state has changed.
@@ -27,6 +63,9 @@ public enum SessionEvent: Sendable {
 
     /// Apple display info pseudo-encoding received.
     case displayInfo(AppleDisplayInfo)
+
+    /// Standard RFB multi-screen layout received.
+    case desktopLayout(ExtendedDesktopSizePayload)
 
     /// Apple media stream offer pseudo-encoding received.
     case mediaStreamOffer(AppleMediaStreamOffer)
@@ -62,6 +101,16 @@ private struct PendingRemoteDisplaySize: Sendable, Equatable {
     let pixelHeight: UInt16
     let pointWidth: UInt16
     let pointHeight: UInt16
+}
+
+/// Resolve the number of Apple media receiver streams without ever asking for
+/// a display the server did not offer. Kept outside the actor so the negotiation
+/// rule can be verified without a live VNC server.
+func selectedAppleMediaDisplayCount(
+    offered: Int?,
+    requested: Int
+) -> Int {
+    min(max(1, offered ?? 1), min(2, max(1, requested)))
 }
 
 /// A basic key or pointer message eligible for single-write batching.
@@ -109,6 +158,9 @@ public actor TransportSession {
     private var appleRemoteDisplaySizeSink: (@Sendable (UInt16, UInt16) -> Void)?
     private var activeAppleMediaTilesPerFrame = Int(
         AppleMediaVideoMode.negotiatedTilesPerFrame)
+    /// Physical or virtual screen geometry announced by Apple's encrypted
+    /// DisplayInfo2 control record, in the server's display order.
+    private var appleMediaDisplayInfos: [AppleDisplayInfo] = []
     /// Per-SSRC packet jitter buffer. UDP reordering is repaired here before an
     /// HEVC fragmentation unit reaches the decoder.
     private var appleMediaRTPReorderBuffer = AppleMediaRTPReorderBuffer()
@@ -166,6 +218,7 @@ public actor TransportSession {
     private var sentAppleMediaPostAcceptEncodings = false
     private var sentAppleMediaPostAcceptViewerInfo = false
     private var sentAppleMediaPostAnswerViewerInfo = false
+    private var sentAppleMediaReconfigurationRequest = false
     private var sentAppleMediaInitialSetDisplay = false
     private var sentAppleMediaAutoFrameUpdate = false
     private var appleMediaGenerationTracker = AppleMediaNegotiationGenerationTracker()
@@ -174,9 +227,12 @@ public actor TransportSession {
     private var appleMediaControlBuffer = Data()
     private var appleDecryptedRFBBuffer = Data()
     private var emittedAppleMediaControlDiagnostics = 0
+    private var latestAppleMediaControlDiagnostic: String?
     private var appleSessionKey: Data?
     private var appleEncryptedControlChannel: AESCBCChannel?
     private var appleMediaComCryptionChannel: AppleComCryptionChannel?
+    private var applePreviousMediaComCryptionChannel: AppleComCryptionChannel?
+    private var applePreviousMediaServerPacketID: UInt32 = 0
     private var appleMediaServerPacketID: UInt32 = 0
     private var appleMediaClientPacketID: UInt32 = 0
     private var pendingAppleMediaRTPStream: PendingAppleMediaRTPStream?
@@ -200,6 +256,10 @@ public actor TransportSession {
     private var appleMediaFeedbackRoutes: [AppleMediaFeedbackRoute] = []
     private var appleMediaFeedbackRouteByRemoteSSRC: [UInt32: AppleMediaFeedbackRoute] = [:]
     private var appleMediaVideoLocalSSRCs: [UInt32] = []
+    /// Audio, video-one, and video-two offer lengths returned by the most
+    /// recent native AVC message two. Kept as a live-probe diagnostic so a
+    /// rejected second offer is distinguishable from RTP routing failure.
+    private var appleMediaAnswerStreamLengths: [Int] = []
     /// Primary receiver SSRC retained as a plaintext/debugging fallback.
     private var appleMediaLocalSSRC: UInt32 = 0
     /// Video SSRCs seen on the media path and the channel each arrived on, so
@@ -258,6 +318,13 @@ public actor TransportSession {
         var initialized = false
     }
     private var appleMediaDisplayCount: Int = 1
+    /// User-selected upper bound shared by Apple display selection, HEVC
+    /// receiver negotiation, and virtual display configuration.
+    private let requestedDisplayCount: Int
+    /// Whether the selected mode asks Apple to create client-sized virtual
+    /// displays. Physical "All Displays" is one combined receiver; multiple
+    /// independent receivers belong to this virtual-display path.
+    private let requestsVirtualDisplays: Bool
     /// Message-1 bit advertised by the server. The native viewer only adds the
     /// HDR capability option to its video negotiator when this bit is present.
     private var appleMediaSupportsHDR = false
@@ -354,7 +421,9 @@ public actor TransportSession {
         username: String? = nil,
         preferredPixelFormat: PixelFormat = .bgra8888,
         preferredEncodings: [Encoding]? = nil,
-        preferFullQualityVideo: Bool = false
+        preferFullQualityVideo: Bool = false,
+        displayCount: Int = 1,
+        requestsVirtualDisplays: Bool = false
     ) {
         let environment = ProcessInfo.processInfo.environment
         self.runtimeEnvironment = environment
@@ -387,6 +456,8 @@ public actor TransportSession {
         self.host = resolvedHost
         self.password = password
         self.username = username
+        self.requestedDisplayCount = min(2, max(1, displayCount))
+        self.requestsVirtualDisplays = requestsVirtualDisplays
         self.requestAppleMediaStream = configuredEncodings.contains(.appleH264)
         self.appleDCTRequested = shouldUseAppleDCT
         self.appleClassicAutoUpdateRequested = shouldUseAppleClassicAutoUpdate
@@ -556,6 +627,22 @@ public actor TransportSession {
     /// Number of distinct video RTP sources (screen bands) seen this session.
     public var videoSourceCount: Int {
         appleMediaVideoSSRCChannels.count
+    }
+
+    /// Diagnostic mapping from authenticated remote video SSRCs to negotiated
+    /// receiver numbers (1 or 2).
+    public var videoSourceReceiverIndexes: [Int] {
+        appleMediaFeedbackRouteByRemoteSSRC.values
+            .map(\.streamIndex)
+            .sorted()
+    }
+
+    public var mediaAnswerStreamLengths: [Int] {
+        appleMediaAnswerStreamLengths
+    }
+
+    public var mediaControlDiagnostic: String? {
+        latestAppleMediaControlDiagnostic
     }
 
     public var currentAppleMediaTilesPerFrame: Int {
@@ -1125,6 +1212,7 @@ public actor TransportSession {
                 }
                 let layout = try ExtendedDesktopSizePayload(data: payload)
                 try await noteStandardDesktopSizeSupport(layout)
+                continuation?.yield(.desktopLayout(layout))
                 pixelData = payload
 
             case .encryptionInfo:
@@ -1144,6 +1232,8 @@ public actor TransportSession {
                 var diReader = MessageReader(data: diData)
                 let info = try AppleDisplayInfo(reader: &diReader)
                 continuation?.yield(.displayInfo(info))
+                try await sendAppleStandardDisplaySelectionIfNeeded(
+                    displayID: info.displayIndex)
                 // Feed to state machine (informational, no response)
                 let _ = stateMachine.handle(event: .receivedAppleDisplayInfo(info))
                 pixelData = Data()
@@ -1151,29 +1241,7 @@ public actor TransportSession {
             case .mediaStreamOffer:
                 // Apple RFBMediaStreamMessage1: current macOS payload is 36 bytes.
                 let offerData = try await tcp.read(exactly: AppleMediaStreamOffer.wirePayloadSize)
-                var offerReader = MessageReader(data: offerData)
-                let offer = try AppleMediaStreamOffer(reader: &offerReader)
-                if !isAppleMediaComCryptionTransition(offer.rawPayload) {
-                    // Only request as many displays as we render. Requesting the
-                    // server's full count (e.g. 2) makes it encode a second video
-                    // stream we never show — splitting the encode budget and
-                    // doubling our real-time decode load. The app renders one
-                    // display, so cap to 1 unless explicitly raised.
-                    let maxDisplays = runtimeEnvironment["ROOTSHELL_VNC_MAX_DISPLAYS"]
-                        .flatMap(Int.init) ?? 1
-                    appleMediaDisplayCount = min(offer.videoStreamDisplayCount ?? 1, max(1, maxDisplays))
-                    // ScreenSharing reads bit 1 of byte 0x14 in the native
-                    // message-1 structure before adding HDR mode 3.
-                    if offer.rawPayload.count > 0x14 {
-                        appleMediaSupportsHDR = offer.rawPayload[offer.rawPayload.startIndex + 0x14] & 0x02 != 0
-                    }
-                }
-                try configureAppleMediaComCryptionIfPresent(offer.rawPayload)
-                try await configureAppleMediaUDP(for: offer)
-                continuation?.yield(.mediaStreamOffer(offer))
-                // Feed to state machine to drive the answer response (Finding 6)
-                let msActions = stateMachine.handle(event: .receivedMediaStreamOffer(offer))
-                try await executeActions(msActions)
+                try await handleAppleMediaStreamOfferPayload(offerData)
                 pixelData = offerData
 
             case .cursor:
@@ -1223,6 +1291,11 @@ public actor TransportSession {
                     | Int(payload[payload.startIndex + 1])
                 if length > 0 {
                     payload.append(try await tcp.read(exactly: length))
+                }
+                for info in appleDisplayInfo2Records(payload) {
+                    continuation?.yield(.displayInfo(info))
+                    try await sendAppleStandardDisplaySelectionIfNeeded(
+                        displayID: info.displayIndex)
                 }
                 pixelData = payload
 
@@ -1453,14 +1526,43 @@ public actor TransportSession {
                 log.debug("Queued SetPixelFormat")
 
             case .sendSetEncodings(let encodings):
-                pending.append(ClientMessage.setEncodings(encodings).serialize())
-                log.debug("Queued SetEncodings (\(encodings.count) encodings)")
                 if requestAppleMediaStream && !sentAppleMediaStreamConfiguration {
+                    if requestedDisplayCount > 1,
+                       !sentAppleMediaInitialSetDisplay {
+                        // Display selection must precede media message one.
+                        // Otherwise screensharingd creates only video receiver
+                        // one, then combines the desktops into that receiver
+                        // when the late SetDisplay arrives.
+                        pending.append(appleSetDisplayMessage(
+                            isGlobal: true,
+                            displayID: 0))
+                        sentAppleMediaInitialSetDisplay = true
+                    }
+                    pending.append(ClientMessage.setEncodings(encodings).serialize())
+                    log.debug("Queued SetEncodings (\(encodings.count) encodings)")
                     if !pending.isEmpty {
                         try await sendClientPayload(pending)
                         pending = Data()
                     }
                     try await sendAppleMediaStreamSetupIfNeeded()
+                } else {
+                    pending.append(ClientMessage.setEncodings(encodings).serialize())
+                    log.debug("Queued SetEncodings (\(encodings.count) encodings)")
+                    if requestedDisplayCount > 1,
+                       (appleServerCapabilities != nil
+                           || stateMachine.negotiatedVersion?.isApple == true),
+                       !sentAppleMediaInitialSetDisplay {
+                    // Apple's Standard viewer sends SetDisplay in the initial
+                    // client burst. SetDesktopSize changes monitor topology;
+                    // it does not select which existing monitor(s) the server
+                    // should encode. Byte 1 is the server's
+                    // combineAllDisplaysFlag, so one display must explicitly
+                    // clear it or screensharingd keeps returning the composite.
+                    pending.append(appleSetDisplayMessage(
+                        isGlobal: requestedDisplayCount > 1,
+                        displayID: 0))
+                    sentAppleMediaInitialSetDisplay = true
+                    }
                 }
 
             case .sendFramebufferUpdateRequest(let incremental, let width, let height):
@@ -1564,10 +1666,13 @@ public actor TransportSession {
             dumpAppleMediaClientRecordIfRequested(answer.wireBytes())
             try await tcp.send(answer.wireBytes())
             if answer.accepted {
+                let isInitialAcceptance = !acceptedAppleMediaStream
                 acceptedAppleMediaStream = true
-                drainedAppleMediaControlBytes = 0
-                appleMediaControlBuffer.removeAll(keepingCapacity: true)
-                appleDecryptedRFBBuffer.removeAll(keepingCapacity: true)
+                if isInitialAcceptance {
+                    drainedAppleMediaControlBytes = 0
+                    appleMediaControlBuffer.removeAll(keepingCapacity: true)
+                    appleDecryptedRFBBuffer.removeAll(keepingCapacity: true)
+                }
                 emittedAppleMediaControlDiagnostics = 0
                 appleMediaServerPacketID = 0
                 appleMediaClientPacketID = 0
@@ -1604,6 +1709,12 @@ public actor TransportSession {
     private func sendAppleMediaPostAnswerViewerInfoIfNeeded(for payload: Data) async throws {
         guard requestAppleMediaStream,
               isAppleAVCMediaAnswerPayload(payload) else { return }
+        if let lengths = appleAVCMediaAnswerStreamLengths(payload) {
+            appleMediaAnswerStreamLengths = lengths
+            log.info(
+                "Apple AVC message 2 accepted offer lengths "
+                    + "audio=\(lengths[0]) video=\(lengths[1]) video2=\(lengths[2])")
+        }
         _ = appleMediaGenerationTracker.finishMessageTwo()
         guard !sentAppleMediaPostAnswerViewerInfo else { return }
         let viewerInfo = appleMediaStreamConfiguration(localPort: appleMediaConfigurationUDPPort())
@@ -1675,7 +1786,25 @@ public actor TransportSession {
     private func handleAppleMediaServerControlIfPresent(_ payload: Data) async throws -> Bool {
         guard let control = appleMediaServerControl(payload) else { return false }
         log.debug("Received Apple media server control encoding=0x\(String(control.encoding, radix: 16)) length=\(control.body.count)")
-        if control.encoding == 0x455 {
+        if control.encoding == 0x450 {
+            try await requestAppleMediaReconfigurationIfNeeded()
+        } else if control.encoding == 0x451 {
+            let displays = appleDisplayInfo2Records(control.body)
+            if !displays.isEmpty {
+                appleMediaDisplayInfos = displays
+                appleMediaDisplayCount = requestsVirtualDisplays
+                        && lastSentRemoteDisplaySize != nil
+                    ? min(requestedDisplayCount, displays.count)
+                    : 1
+                for display in displays {
+                    continuation?.yield(.displayInfo(display))
+                }
+                log.info(
+                    "Apple media DisplayInfo2 announced \(displays.count) screens: "
+                        + displays.map { "\($0.width)x\($0.height)" }
+                            .joined(separator: ", "))
+            }
+        } else if control.encoding == 0x455 {
             try await sendAppleMediaInitialSetDisplayIfNeeded()
             try await sendAppleMediaAutoFrameUpdateIfNeeded()
         } else if control.encoding == 0x456 {
@@ -1686,10 +1815,61 @@ public actor TransportSession {
         return true
     }
 
+    private func requestAppleMediaReconfigurationIfNeeded() async throws {
+        guard requestAppleMediaStream,
+              requestedDisplayCount > 1,
+              appleDisplayReconfigurationGeneration != nil,
+              !sentAppleMediaReconfigurationRequest else { return }
+        sentAppleMediaReconfigurationRequest = true
+        try await sendAppleEncryptedClientPayload(
+            ClientMessage.appleMediaStreamRequest.serialize())
+        log.info("Requested Apple media renegotiation for virtual displays")
+    }
+
     private func sendAppleMediaInitialSetDisplayIfNeeded() async throws {
         guard !sentAppleMediaInitialSetDisplay else { return }
+        if requestsVirtualDisplays {
+            sentAppleMediaInitialSetDisplay = true
+            return
+        }
+        let combinesAllDisplays: Bool
+        switch runtimeEnvironment["ROOTSHELL_VNC_SET_DISPLAY_MODE"] {
+        case "single": combinesAllDisplays = false
+        case "global": combinesAllDisplays = true
+        case "skip": return
+        default: combinesAllDisplays = requestedDisplayCount > 1
+        }
+        let displayID: UInt32
+        if combinesAllDisplays {
+            displayID = 0
+        } else {
+            guard let firstDisplay = appleMediaDisplayInfos.first else {
+                // DisplayInfo2 normally precedes 0x455/0x456. If it does not,
+                // wait for a later control record rather than sending display
+                // ID zero, which is not a portable alias for the main screen.
+                return
+            }
+            displayID = firstDisplay.displayIndex
+        }
         sentAppleMediaInitialSetDisplay = true
-        try await sendAppleEncryptedClientPayload(appleSetDisplayMessage(isGlobal: true, displayID: 0))
+        try await sendAppleEncryptedClientPayload(appleSetDisplayMessage(
+            isGlobal: combinesAllDisplays,
+            displayID: displayID))
+    }
+
+    private func sendAppleStandardDisplaySelectionIfNeeded(
+        displayID: UInt32
+    ) async throws {
+        guard !requestAppleMediaStream,
+              requestedDisplayCount == 1,
+              !sentAppleMediaInitialSetDisplay else { return }
+        sentAppleMediaInitialSetDisplay = true
+        // A non-global SetDisplay requires the server's real display ID. Zero
+        // is not a portable synonym for the main monitor; screensharingd stores
+        // this UInt32 and validates it against its active display list.
+        try await sendClientPayload(appleSetDisplayMessage(
+            isGlobal: false,
+            displayID: displayID))
     }
 
     private func appleSetDisplayMessage(isGlobal: Bool, displayID: UInt32) -> Data {
@@ -1814,25 +1994,28 @@ public actor TransportSession {
     private func sendStandardDesktopSize(
         _ requested: PendingRemoteDisplaySize
     ) async throws {
+        // SetDesktopSize changes the server's monitor topology; it is not a
+        // display-selection mechanism. Keep Match Client to one screen and
+        // select existing standard-mode displays in the presentation layer.
         let existing = standardDesktopLayout?.screens.first
         let screen = SetDesktopSizeScreen(
             id: existing?.id ?? 0,
             width: requested.pixelWidth,
             height: requested.pixelHeight,
             flags: existing?.flags ?? 0)
-        let message = ClientMessage.setDesktopSize(SetDesktopSizeRequest(
+        let request = SetDesktopSizeRequest(
             width: requested.pixelWidth,
             height: requested.pixelHeight,
-            screens: [screen]))
+            screens: [screen])
+        let message = ClientMessage.setDesktopSize(request)
         try await sendClientPayload(message.serialize())
         lastSentRemoteDisplaySize = requested
         pendingRemoteDisplaySize = nil
         appleRemoteDisplaySizeSink?(
-            requested.pixelWidth,
-            requested.pixelHeight)
+            request.width,
+            request.height)
         log.info(
-            "Requested standard remote desktop \(requested.pixelWidth)x"
-                + "\(requested.pixelHeight)")
+            "Requested standard remote desktop \(request.width)x\(request.height)")
     }
 
     private func sendAppleVirtualDisplaySize(
@@ -1855,44 +2038,57 @@ public actor TransportSession {
         activeAppleMediaTilesPerFrame = AppleMediaVideoMode.activeTileCount(
             pixelWidth: Int(requested.pixelWidth),
             pixelHeight: Int(requested.pixelHeight))
-        let display = AppleVirtualDisplay(
-            name: "rootshell Virtual Display",
-            widthInMillimeters: Float(requested.pointWidth) * millimetersPerPoint,
-            heightInMillimeters: Float(requested.pointHeight) * millimetersPerPoint,
-            maximumPixelWidth: appleVirtualDisplayMaximumPixelWidth,
-            maximumPixelHeight: appleVirtualDisplayMaximumPixelHeight,
-            modes: [mode])
+        let displays = (0..<requestedDisplayCount).map { index in
+            AppleVirtualDisplay(
+                name: requestedDisplayCount == 1
+                    ? "rootshell Virtual Display"
+                    : "rootshell Virtual Display \(index + 1)",
+                widthInMillimeters: Float(requested.pointWidth) * millimetersPerPoint,
+                heightInMillimeters: Float(requested.pointHeight) * millimetersPerPoint,
+                maximumPixelWidth: appleVirtualDisplayMaximumPixelWidth,
+                maximumPixelHeight: appleVirtualDisplayMaximumPixelHeight,
+                originX: UInt16(Int(requested.pixelWidth) * index),
+                identifier: UInt32(7 + index),
+                modes: [mode])
+        }
         let message = ClientMessage.appleDisplayConfiguration(
-            AppleDisplayConfiguration(displays: [display]))
+            AppleDisplayConfiguration(displays: displays))
         // The Apple media re-offer that follows command 29 is generated from
         // these session dimensions. ServerInit is not repeated for a virtual
         // display change, so retaining the physical framebuffer here would
         // advertise decoder geometry for the retired capture source.
         let previousWidth = fbWidth
         let previousHeight = fbHeight
+        let previousDisplayCount = appleMediaDisplayCount
         fbWidth = requested.pixelWidth
         fbHeight = requested.pixelHeight
-        if requestAppleMediaStream, completedInitialAppleMediaNegotiation {
+        appleMediaDisplayCount = displays.count
+        if requestAppleMediaStream {
             appleDisplayReconfigurationGeneration =
                 appleMediaGenerationTracker.generation &+ 1
+            sentAppleMediaReconfigurationRequest = false
         }
         do {
             try await sendClientPayload(message.serialize())
         } catch {
             fbWidth = previousWidth
             fbHeight = previousHeight
+            appleMediaDisplayCount = previousDisplayCount
             appleDisplayReconfigurationGeneration = nil
             throw error
         }
         lastSentRemoteDisplaySize = requested
         pendingRemoteDisplaySize = nil
+        let aggregateWidth = UInt16(min(
+            Int(UInt16.max),
+            Int(requested.pixelWidth) * displays.count))
         appleRemoteDisplaySizeSink?(
-            requested.pixelWidth,
+            aggregateWidth,
             requested.pixelHeight)
         log.info(
             "Requested Apple dynamic virtual display \(requested.pixelWidth)x"
                 + "\(requested.pixelHeight) pixels (\(requested.pointWidth)x"
-                + "\(requested.pointHeight) points)")
+                + "\(requested.pointHeight) points), count=\(displays.count)")
     }
 
     private nonisolated func appleMediaServerControl(_ payload: Data) -> (encoding: UInt16, body: Data)? {
@@ -1913,7 +2109,7 @@ public actor TransportSession {
         guard bodyEnd <= payload.endIndex else { return nil }
 
         switch encoding {
-        case 0x451, 0x455, 0x456:
+        case 0x450, 0x451, 0x453, 0x455, 0x456:
             return (encoding, Data(payload[bodyStart..<bodyEnd]))
         default:
             return nil
@@ -2013,10 +2209,17 @@ public actor TransportSession {
                         if try await handleAppleMediaServerControlIfPresent(record.payload) {
                             continue
                         }
+                        let isAVCMediaRecord = findAppleAVCMediaMessage(
+                            in: record.payload) != nil
                         _ = try await handleAppleAVCServerMediaMessageIfPresent(record.payload)
                         try await sendAppleMediaPostAnswerViewerInfoIfNeeded(for: record.payload)
-                        appleDecryptedRFBBuffer.append(record.payload)
-                        try await drainAppleDecryptedRFBBuffer()
+                        let isRFBRecord = record.payload.first.map { first in
+                            first == 0 || first == 2 || first == 3
+                        } ?? false
+                        if !isAVCMediaRecord, isRFBRecord {
+                            appleDecryptedRFBBuffer.append(record.payload)
+                            try await drainAppleDecryptedRFBBuffer()
+                        }
 
                         let candidatePackets = extractAppleMediaRTPPackets(from: record.payload)
                         for packet in confirmedAppleMediaRTPPackets(from: candidatePackets) {
@@ -2081,6 +2284,7 @@ public actor TransportSession {
             plaintextPrefix: plaintextPrefix,
             decryptError: decryptError
         )
+        latestAppleMediaControlDiagnostic = decryptError
 
         if drainedAppleMediaControlBytes <= 4096 {
             log.debug("Drained Apple media TCP control stream chunk \(chunk.count) bytes")
@@ -2145,7 +2349,9 @@ public actor TransportSession {
                         <= appleDecryptedRFBBuffer.endIndex else { return false }
                 pixelDataLength = ExtendedDesktopSizePayload.wireSize(
                     screenCount: appleDecryptedRFBBuffer[offset])
-            case .encryptionInfo, .serverDisplayInfo, .mediaStreamOffer, .mediaStreamAnswer:
+            case .mediaStreamOffer:
+                pixelDataLength = AppleMediaStreamOffer.wirePayloadSize
+            case .encryptionInfo, .serverDisplayInfo, .mediaStreamAnswer:
                 pixelDataLength = 0
             case .cursor:
                 let pixelBytes = Int(rect.width) * Int(rect.height) * pixelFormat.bytesPerPixel
@@ -2161,6 +2367,8 @@ public actor TransportSession {
             if rect.encoding == .extendedDesktopSize {
                 let layout = try ExtendedDesktopSizePayload(data: pixelData)
                 try await noteStandardDesktopSizeSupport(layout)
+            } else if rect.encoding == .mediaStreamOffer {
+                try await handleAppleMediaStreamOfferPayload(pixelData)
             }
             rectsWithData.append((rect, pixelData))
             if rect.isSuccessfulDesktopResize {
@@ -2174,6 +2382,30 @@ public actor TransportSession {
         }
         continuation?.yield(.framebufferUpdate(rectsWithData))
         return true
+    }
+
+    private func handleAppleMediaStreamOfferPayload(_ offerData: Data) async throws {
+        var offerReader = MessageReader(data: offerData)
+        let offer = try AppleMediaStreamOffer(reader: &offerReader)
+        if !isAppleMediaComCryptionTransition(offer.rawPayload) {
+            // Native Screen Sharing gets videoStreamDisplayCount from
+            // screenConfiguration.screens, populated by DisplayInfo2; keep
+            // the wire interpretation only for old virtual-display servers.
+            if appleMediaDisplayInfos.isEmpty,
+               requestsVirtualDisplays {
+                appleMediaDisplayCount = selectedAppleMediaDisplayCount(
+                    offered: offer.videoStreamDisplayCount,
+                    requested: requestedDisplayCount)
+            }
+            appleMediaSupportsHDR = offer.videoStream1Flags.map { flags in
+                flags & 0x02 != 0
+            } ?? false
+        }
+        try configureAppleMediaComCryptionIfPresent(offer.rawPayload)
+        try await configureAppleMediaUDP(for: offer)
+        continuation?.yield(.mediaStreamOffer(offer))
+        let actions = stateMachine.handle(event: .receivedMediaStreamOffer(offer))
+        try await executeActions(actions)
     }
 
     private func drainAppleDecryptedServerCutText() throws -> Bool {
@@ -2207,11 +2439,13 @@ public actor TransportSession {
 
         try ensureAppleEncryptedControlChannel()
         guard let channel = appleEncryptedControlChannel else {
-            throw VNCProtocolError.protocolViolation("Apple encrypted channel is unavailable")
+            throw VNCProtocolError.protocolViolation(
+                "Apple encrypted channel is unavailable")
         }
-
         let key = try channel.decryptECBBlock(encryptedKey)
         let iv = try channel.decryptECBBlock(encryptedIV)
+        applePreviousMediaComCryptionChannel = appleMediaComCryptionChannel
+        applePreviousMediaServerPacketID = appleMediaServerPacketID
         appleMediaComCryptionChannel = try AppleComCryptionChannel(key: key, iv: iv)
         appleMediaServerPacketID = 0
         appleMediaClientPacketID = 0
@@ -2234,6 +2468,20 @@ public actor TransportSession {
     private func decryptAppleMediaComCryptionRecord(
         _ encryptedRecord: Data
     ) throws -> AppleComCryptionChannel.Record {
+        if let previous = applePreviousMediaComCryptionChannel {
+            do {
+                let record = try previous.decryptRecord(
+                    encryptedRecord,
+                    expectedPacketID: applePreviousMediaServerPacketID)
+                applePreviousMediaServerPacketID = record.packetID &+ 1
+                return record
+            } catch {
+                // Old-channel records are contiguous. Its first authentication
+                // failure is the generation boundary; discard the now-advanced
+                // CBC state and try the untouched replacement channel.
+                applePreviousMediaComCryptionChannel = nil
+            }
+        }
         guard let channel = appleMediaComCryptionChannel else {
             throw VNCProtocolError.protocolViolation("Apple media ComCryption channel is unavailable")
         }
@@ -2569,6 +2817,17 @@ public actor TransportSession {
             return false
         }
         return messageType == 2
+    }
+
+    private nonisolated func appleAVCMediaAnswerStreamLengths(_ payload: Data) -> [Int]? {
+        guard let message = findAppleAVCMediaMessage(in: payload),
+              message.messageType == 2,
+              let audio = readUInt16BE(message.body, at: 8),
+              let video = readUInt16BE(message.body, at: 10),
+              let video2 = readUInt16BE(message.body, at: 12) else {
+            return nil
+        }
+        return [Int(audio), Int(video), Int(video2)]
     }
 
     private nonisolated func validPropertyListRange(
@@ -2944,9 +3203,11 @@ public actor TransportSession {
 
     private func appleMediaServerConfigurationMessage() throws -> Data {
         let generatedAudioOffer = try appleAVCMediaStreamOffer(mode: 8)
-        let generatedVideoOffer = try appleAVCMediaStreamOffer(mode: 7)
+        let generatedVideoOffer = try appleAVCMediaStreamOffer(
+            mode: 7,
+            displayIndex: 0)
         let generatedVideo2Offer = appleMediaDisplayCount > 1
-            ? try appleAVCMediaStreamOffer(mode: 7)
+            ? try appleAVCMediaStreamOffer(mode: 7, displayIndex: 1)
             : nil
         let audioOffer = generatedAudioOffer.data
         let videoOffer = generatedVideoOffer.data
@@ -3000,6 +3261,10 @@ public actor TransportSession {
         message[0] = 0x1c
         writeUInt16BE(UInt16(totalLength - 4), into: &message, at: 2)
         writeUInt16BE(3, into: &message, at: 4)
+        // Native receiver flags: bit 0/1 advertise 60 fps for screen one/two;
+        // bit 2 means the viewer does not require the cursor to remain visible;
+        // bit 3 identifies the native viewer app. Match the native non-viewer,
+        // independently rendered-cursor configuration.
         writeUInt32BE(4, into: &message, at: 6)
         writeUInt16BE(UInt16(audioOffer.count), into: &message, at: 10)
         writeUInt16BE(UInt16(videoOffer.count), into: &message, at: 12)
@@ -3034,7 +3299,10 @@ public actor TransportSession {
         let ssrc: UInt32
     }
 
-    private func appleAVCMediaStreamOffer(mode: Int) throws -> GeneratedAppleMediaOffer {
+    private func appleAVCMediaStreamOffer(
+        mode: Int,
+        displayIndex: Int? = nil
+    ) throws -> GeneratedAppleMediaOffer {
         // Mode 8 is Apple's system-audio profile and mode 7 is its screen-video
         // profile. Full Quality is not another media mode: the native client
         // leaves AVC entirely and requests lossless RFB encodings.
@@ -3047,16 +3315,27 @@ public actor TransportSession {
         let random = try randomBytes(count: 4)
         var ssrc = random.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
         if ssrc == 0 { ssrc = 1 }
+        let displayInfo = displayIndex.flatMap { index in
+            appleMediaDisplayInfos.indices.contains(index)
+                ? appleMediaDisplayInfos[index]
+                : nil
+        }
+        let profileWidth = displayInfo.map { UInt16(clamping: $0.width) }
+            ?? fbWidth
+        let profileHeight = displayInfo.map { UInt16(clamping: $0.height) }
+            ?? fbHeight
         let profile = AppleMediaNegotiationProfile(
-            framebufferWidth: fbWidth,
-            framebufferHeight: fbHeight,
+            framebufferWidth: profileWidth,
+            framebufferHeight: profileHeight,
             supportsHDR: appleMediaSupportsHDR,
             tilesPerFrame: UInt64(activeAppleMediaTilesPerFrame)
         )
         log.debug(
             "Generated Apple media \(mode == 8 ? "audio" : "screen") offer "
                 + "ssrc=\(ssrc) aspect=\(profile.aspectRatio.landscapeWidth)/"
-                + "\(profile.aspectRatio.landscapeHeight) hdr=\(appleMediaSupportsHDR)"
+                + "\(profile.aspectRatio.landscapeHeight) "
+                + "display=\(displayIndex.map { String($0 + 1) } ?? "audio") "
+                + "hdr=\(appleMediaSupportsHDR)"
         )
         let data = try profile.makeOffer(
             kind: mode == 8 ? .audio : .screen,
@@ -3545,6 +3824,22 @@ public actor TransportSession {
     /// Install a fast-path sink for decrypted video RTP. Pass `nil` to revert to
     /// buffering packets until a new sink is installed.
     public func setAppleMediaRTPSink(_ sink: (@Sendable (Data) -> Void)?) {
+        let routedSink: (@Sendable (Data, Int?) -> Void)?
+        if let sink {
+            routedSink = { packet, _ in
+                sink(packet)
+            }
+        } else {
+            routedSink = nil
+        }
+        setAppleMediaRoutedRTPSink(routedSink)
+    }
+
+    /// Install a media sink that also identifies which negotiated display owns
+    /// each video packet. Audio packets have no display index.
+    public func setAppleMediaRoutedRTPSink(
+        _ sink: (@Sendable (Data, Int?) -> Void)?
+    ) {
         let drained = appleMediaPacketHandoff.installSink(sink)
         if drained.packetCount > 0 {
             log.info("Drained \(drained.packetCount) ordered startup RTP packets "
@@ -3569,7 +3864,13 @@ public actor TransportSession {
 
     private func emitAppleMediaRTPPacket(_ packet: Data) {
         dumpAppleMediaDecodedRTPIfRequested(packet)
-        if appleMediaPacketHandoff.deliver(packet) == .overflow {
+        let displayIndex = appleMediaRTPSSRC(packet)
+            .flatMap { appleMediaFeedbackRouteByRemoteSSRC[$0] }
+            .map { max(0, $0.streamIndex - 1) }
+        if appleMediaPacketHandoff.deliver(
+            packet,
+            displayIndex: displayIndex
+        ) == .overflow {
             log.error("Media ingress overflow while waiting for decoder sink")
         }
     }
@@ -3788,6 +4089,7 @@ public actor TransportSession {
             log.info("First video RTP for ssrc=0x\(String(header.ssrc, radix: 16))")
         }
         let requiredInitialSources = activeAppleMediaTilesPerFrame
+            * appleMediaDisplayCount
         if !completedInitialAppleMediaNegotiation,
            appleMediaVideoSSRCChannels.count >= requiredInitialSources {
             completedInitialAppleMediaNegotiation = true
@@ -3797,7 +4099,8 @@ public actor TransportSession {
         }
         if let awaitedGeneration = appleDisplayReconfigurationGeneration,
            appleMediaGenerationTracker.generation >= awaitedGeneration,
-           appleMediaVideoSSRCChannels.count >= activeAppleMediaTilesPerFrame {
+           appleMediaVideoSSRCChannels.count
+                >= activeAppleMediaTilesPerFrame * appleMediaDisplayCount {
             appleDisplayReconfigurationGeneration = nil
             if let pendingRemoteDisplaySize,
                pendingRemoteDisplaySize != lastSentRemoteDisplaySize {

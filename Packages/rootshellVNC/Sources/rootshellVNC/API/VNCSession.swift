@@ -22,6 +22,21 @@ private actor MediaRecoveryCoordinator {
     }
 }
 
+/// Union the selected leading displays and translate the result into the
+/// framebuffer's normalized coordinate space.
+func normalizedSelectedDisplayRegion(
+    _ regions: [CGRect],
+    displayCount: Int
+) -> CGRect? {
+    guard let first = regions.first else { return nil }
+    let all = regions.dropFirst().reduce(first) { $0.union($1) }
+    let count = min(max(1, displayCount), regions.count)
+    let selected = regions.prefix(count).dropFirst().reduce(first) {
+        $0.union($1)
+    }
+    return selected.offsetBy(dx: -all.minX, dy: -all.minY)
+}
+
 /// Coalesces the transport's per-packet callback into ordered media-queue
 /// batches. A fullscreen reference picture can contain thousands of RTP
 /// packets; scheduling one Dispatch block for each packet creates avoidable
@@ -110,6 +125,19 @@ public final class VNCSession {
     /// Whether the server is using high-performance (HEVC/H.264) mode.
     public var isHighPerformanceMode: Bool = false
 
+    /// Number of independently decoded Apple video displays in the current
+    /// media generation.
+    public private(set) var activeVideoDisplayCount: Int = 1
+
+    /// Server display rectangles, normalized into framebuffer coordinates and
+    /// ordered as announced by the server (primary first). Standard mode uses
+    /// these to present only the number of displays selected by the user.
+    private(set) var remoteDisplayRegions: [CGRect] = []
+    @ObservationIgnored
+    private var remoteDisplayRegionByID: [UInt32: CGRect] = [:]
+    @ObservationIgnored
+    private var remoteDisplayRegionOrder: [UInt32] = []
+
     /// The remote cursor shape from the Cursor pseudo-encoding, adopted by
     /// the local system pointer. Nil when the server has not sent a shape
     /// (or sent an explicit empty one) — callers fall back to the default.
@@ -130,6 +158,7 @@ public final class VNCSession {
     private var framebuffer: Framebuffer?
     private var renderer: FramebufferRenderer?
     private var videoStreamManager: VideoStreamManager?
+    private var secondaryVideoStreamManager: VideoStreamManager?
     @ObservationIgnored
     private var remoteAudioPlayer: AppleRemoteAudioPlayer?
     private var eventTask: Task<Void, Never>?
@@ -160,6 +189,29 @@ public final class VNCSession {
     /// pushing a full-screen CGImage through SwiftUI every frame.
     @ObservationIgnored
     public let videoBandRenderer = VideoBandLayerRenderer()
+    /// Independent renderer for the second Apple media stream. A second
+    /// display is a separate HEVC reference chain, not another band of display
+    /// one, and must never share its decoder or band compositor.
+    @ObservationIgnored
+    public let secondaryVideoBandRenderer = VideoBandLayerRenderer()
+    var primaryVideoDecodeProgress: VideoStreamManager.DecodeProgress? {
+        videoStreamManager?.decodeProgress
+    }
+    var secondaryVideoDecodeProgress: VideoStreamManager.DecodeProgress? {
+        secondaryVideoStreamManager?.decodeProgress
+    }
+    func activeTransportVideoSourceCount() async -> Int {
+        await transportSession?.videoSourceCount ?? 0
+    }
+    func activeTransportVideoReceiverIndexes() async -> [Int] {
+        await transportSession?.videoSourceReceiverIndexes ?? []
+    }
+    func activeTransportMediaAnswerStreamLengths() async -> [Int] {
+        await transportSession?.mediaAnswerStreamLengths ?? []
+    }
+    func activeTransportMediaControlDiagnostic() async -> String? {
+        await transportSession?.mediaControlDiagnostic
+    }
     /// Serial queue for feeding media packets to the decoder off the main
     /// thread. At ~3000 packets/s, demux + decode submission on the main actor
     /// backed up the whole pipeline; VideoStreamManager is thread-safe and a
@@ -247,6 +299,10 @@ public final class VNCSession {
         currentImage = nil
         remoteCursor = nil
         isHighPerformanceMode = false
+        activeVideoDisplayCount = 1
+        remoteDisplayRegions = []
+        remoteDisplayRegionByID = [:]
+        remoteDisplayRegionOrder = []
         trailingSnapshotTask?.cancel()
         trailingSnapshotTask = nil
         lastImagePublishNanos = 0
@@ -255,6 +311,7 @@ public final class VNCSession {
         lastRequestedClientDisplaySize = nil
         diagnostics.isHighPerformanceMode = false
         videoBandRenderer.reset()
+        secondaryVideoBandRenderer.reset()
         diagnostics.reset()
         diagnostics.connectionStartTime = Date()
         remoteAudioPlayer?.stop()
@@ -333,12 +390,19 @@ public final class VNCSession {
         currentImage = nil
         remoteCursor = nil
         isHighPerformanceMode = false
+        activeVideoDisplayCount = 1
+        remoteDisplayRegions = []
+        remoteDisplayRegionByID = [:]
+        remoteDisplayRegionOrder = []
         trailingSnapshotTask?.cancel()
         trailingSnapshotTask = nil
         lastImagePublishNanos = 0
         videoBandRenderer.reset()
+        secondaryVideoBandRenderer.reset()
         videoStreamManager?.stopStream()
         videoStreamManager = nil
+        secondaryVideoStreamManager?.stopStream()
+        secondaryVideoStreamManager = nil
         remoteAudioPlayer?.stop()
         remoteAudioPlayer = nil
 
@@ -611,6 +675,15 @@ public final class VNCSession {
 
         case .displayInfo(let info):
             logger.info("Display info: \(info.width)x\(info.height) at (\(info.originX),\(info.originY))")
+            updateRemoteDisplayRegion(
+                id: info.displayIndex,
+                x: Int(info.originX),
+                y: Int(info.originY),
+                width: Int(info.width),
+                height: Int(info.height))
+
+        case .desktopLayout(let layout):
+            updateRemoteDisplayRegions(layout.screens)
 
         case .mediaStreamOffer(let offer):
             logger.info(
@@ -621,6 +694,10 @@ public final class VNCSession {
                     + "payloadBytes=\(offer.rawPayload.count)"
             )
             isHighPerformanceMode = true
+            activeVideoDisplayCount = configuration.displaySizingMode == .matchClient
+                ? min(configuration.displayCount,
+                      offer.videoStreamDisplayCount ?? 1)
+                : 1
             diagnostics.isHighPerformanceMode = true
             await startVideoStream(offer: offer)
 
@@ -686,6 +763,88 @@ public final class VNCSession {
         hasEstablishedConnection = true
         lastError = nil
         connectionState = .connected
+    }
+
+    private func updateRemoteDisplayRegion(
+        id: UInt32,
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int
+    ) {
+        guard width > 0, height > 0 else { return }
+        if remoteDisplayRegionByID[id] == nil {
+            remoteDisplayRegionOrder.append(id)
+        }
+        remoteDisplayRegionByID[id] = CGRect(
+            x: x, y: y, width: width, height: height)
+        remoteDisplayRegions = remoteDisplayRegionOrder.compactMap {
+            remoteDisplayRegionByID[$0]
+        }
+    }
+
+    private func updateRemoteDisplayRegions(_ screens: [RFBScreenLayout]) {
+        guard !screens.isEmpty else { return }
+        remoteDisplayRegionByID.removeAll(keepingCapacity: true)
+        remoteDisplayRegionOrder = screens.map(\.id)
+        remoteDisplayRegions = screens.map {
+            let region = CGRect(
+                x: Int($0.x), y: Int($0.y),
+                width: Int($0.width), height: Int($0.height))
+            remoteDisplayRegionByID[$0.id] = region
+            return region
+        }
+    }
+
+    /// Selected framebuffer rectangle in the server's normalized desktop
+    /// coordinates. Nil means the server has not described its monitor layout.
+    var presentedFramebufferRegion: CGRect? {
+        // Match Client replaces the physical monitor topology with equal-sized
+        // virtual displays. DisplayInfo from the pre-reconfiguration desktop
+        // can remain in flight, so its rectangles are not authoritative here.
+        guard !(isHighPerformanceMode
+                && configuration.displaySizingMode == .matchClient) else {
+            return nil
+        }
+        return normalizedSelectedDisplayRegion(
+            remoteDisplayRegions,
+            displayCount: configuration.displayCount)
+    }
+
+    var presentedFramebufferSize: CGSize {
+        presentedFramebufferRegion?.size ?? CGSize(
+            width: framebufferWidth,
+            height: framebufferHeight)
+    }
+
+    var presentedVideoDisplayRegions: [CGRect] {
+        let count = max(1, activeVideoDisplayCount)
+        if configuration.displaySizingMode != .matchClient,
+           remoteDisplayRegions.count >= count {
+            if count == 1,
+               configuration.displayCount > 1,
+               remoteDisplayRegions.count >= configuration.displayCount {
+                // Apple's physical "All Displays" mode is one HEVC stream
+                // whose format is the union of the selected monitor regions.
+                // Present that stream once at the composite aspect ratio.
+                let selected = Array(
+                    remoteDisplayRegions.prefix(configuration.displayCount))
+                guard let first = selected.first else { return [] }
+                let union = selected.dropFirst().reduce(first) { $0.union($1) }
+                return [CGRect(origin: .zero, size: union.size)]
+            }
+            let selected = Array(remoteDisplayRegions.prefix(count))
+            guard let first = selected.first else { return [] }
+            let union = selected.dropFirst().reduce(first) { $0.union($1) }
+            return selected.map { $0.offsetBy(dx: -union.minX, dy: -union.minY) }
+        }
+
+        let totalWidth = max(1, framebufferWidth)
+        let width = CGFloat(totalWidth) / CGFloat(count)
+        let height = CGFloat(max(1, framebufferHeight))
+        return (0..<count).map {
+            CGRect(x: CGFloat($0) * width, y: 0, width: width, height: height)
+        }
     }
 
     private func handleFramebufferUpdate(
@@ -784,11 +943,52 @@ public final class VNCSession {
                 + "-> \(newWidth)x\(newHeight)")
         framebufferWidth = newWidth
         framebufferHeight = newHeight
-        videoBandRenderer.setScreenSize(width: newWidth, height: newHeight)
+        func mediaDisplaySize(at index: Int) -> (width: Int, height: Int) {
+            if isHighPerformanceMode,
+               configuration.displaySizingMode != .matchClient,
+               remoteDisplayRegions.indices.contains(index) {
+                if index == 0,
+                   activeVideoDisplayCount == 1,
+                   configuration.displayCount > 1,
+                   remoteDisplayRegions.count >= configuration.displayCount {
+                    let selected = remoteDisplayRegions.prefix(
+                        configuration.displayCount)
+                    if let first = selected.first {
+                        let union = selected.dropFirst().reduce(first) {
+                            $0.union($1)
+                        }
+                        return (Int(union.width), Int(union.height))
+                    }
+                }
+                let region = remoteDisplayRegions[index]
+                return (Int(region.width), Int(region.height))
+            }
+            let width = activeVideoDisplayCount > 1
+                ? newWidth / activeVideoDisplayCount
+                : newWidth
+            return (width, newHeight)
+        }
+        let primarySize = mediaDisplaySize(at: 0)
+        videoBandRenderer.setScreenSize(
+            width: primarySize.width,
+            height: primarySize.height)
+        if activeVideoDisplayCount > 1 {
+            let secondarySize = mediaDisplaySize(at: 1)
+            secondaryVideoBandRenderer.setScreenSize(
+                width: secondarySize.width,
+                height: secondarySize.height)
+        }
 
         if let manager = videoStreamManager {
+            let secondaryManager = secondaryVideoStreamManager
+            let secondarySize = mediaDisplaySize(at: 1)
             mediaQueue.async {
-                manager.updateFrameGeometry(width: newWidth, height: newHeight)
+                manager.updateFrameGeometry(
+                    width: primarySize.width,
+                    height: primarySize.height)
+                secondaryManager?.updateFrameGeometry(
+                    width: secondarySize.width,
+                    height: secondarySize.height)
             }
         }
     }
@@ -815,21 +1015,49 @@ public final class VNCSession {
               geometry.height <= Int(UInt16.max) else { return }
 
         appliedMediaGeometryGeneration = geometry.mediaGeneration
-        guard geometry.width != framebufferWidth
+        if configuration.displaySizingMode != .matchClient,
+           configuration.displayCount > 1,
+           remoteDisplayRegions.count >= configuration.displayCount {
+            // In Apple's physical All Displays mode the codec raster can stay
+            // at the primary encoder size. ScreenConfiguration is the native
+            // authority for the combined canvas and pointer coordinates.
+            let selected = remoteDisplayRegions.prefix(
+                configuration.displayCount)
+            if let first = selected.first {
+                let union = selected.dropFirst().reduce(first) {
+                    $0.union($1)
+                }
+                videoBandRenderer.setScreenSize(
+                    width: Int(union.width),
+                    height: Int(union.height))
+            }
+            return
+        }
+        videoBandRenderer.setScreenSize(
+            width: geometry.width,
+            height: geometry.height)
+
+        // A physical multi-display session can contain unequal monitors. Its
+        // server layout remains authoritative for the aggregate canvas; the
+        // primary stream's format only describes display zero.
+        guard activeVideoDisplayCount == 1
+                || configuration.displaySizingMode == .matchClient else {
+            return
+        }
+        let aggregateWidth = geometry.width * activeVideoDisplayCount
+        guard aggregateWidth <= Int(UInt16.max) else { return }
+        guard aggregateWidth != framebufferWidth
                 || geometry.height != framebufferHeight else { return }
 
         logger.info(
             "Applying HEVC media resize \(framebufferWidth)x\(framebufferHeight) "
-                + "-> \(geometry.width)x\(geometry.height) "
+                + "-> \(aggregateWidth)x\(geometry.height) "
                 + "generation=\(geometry.mediaGeneration)")
         renderer?.handleDesktopResize(
-            width: UInt16(geometry.width),
+            width: UInt16(aggregateWidth),
             height: UInt16(geometry.height))
-        framebufferWidth = geometry.width
+        framebufferWidth = aggregateWidth
         framebufferHeight = geometry.height
-        videoBandRenderer.setScreenSize(
-            width: geometry.width,
-            height: geometry.height)
     }
 
     private func handleError(_ error: VNCProtocolError) {
@@ -868,6 +1096,8 @@ public final class VNCSession {
         }
         videoStreamManager?.stopStream()
         videoStreamManager = nil
+        secondaryVideoStreamManager?.stopStream()
+        secondaryVideoStreamManager = nil
         remoteAudioPlayer?.stop()
         remoteAudioPlayer = nil
     }
@@ -909,7 +1139,10 @@ public final class VNCSession {
             username: credentials.username,
             preferredPixelFormat: configuration.effectivePixelFormat,
             preferredEncodings: configuration.effectiveEncodings,
-            preferFullQualityVideo: configuration.videoQualityMode == .fullQuality)
+            preferFullQualityVideo: configuration.videoQualityMode == .fullQuality,
+            displayCount: configuration.displayCount,
+            requestsVirtualDisplays:
+                configuration.displaySizingMode == .matchClient)
         transportSession = transport
 
         if configuration.displaySizingMode == .matchClient,
@@ -1119,6 +1352,7 @@ public final class VNCSession {
 
         if isHighPerformanceMode {
             videoStreamManager?.noteMediaInterruption()
+            secondaryVideoStreamManager?.noteMediaInterruption()
             remoteAudioPlayer?.reset()
         }
 
@@ -1153,6 +1387,7 @@ public final class VNCSession {
         let manager = videoStreamManager ?? VideoStreamManager()
         videoStreamManager = manager
         videoBandRenderer.reset()
+        secondaryVideoBandRenderer.reset()
 
         if configuration.enableRemoteAudio {
             if remoteAudioPlayer == nil {
@@ -1167,8 +1402,38 @@ public final class VNCSession {
             remoteAudioPlayer = nil
         }
 
-        let width = framebufferWidth > 0 ? framebufferWidth : Int(offer.width)
-        let height = framebufferHeight > 0 ? framebufferHeight : Int(offer.height)
+        let fallbackWidth = framebufferWidth > 0 ? framebufferWidth : Int(offer.width)
+        let fallbackHeight = framebufferHeight > 0 ? framebufferHeight : Int(offer.height)
+        func displaySize(at index: Int) -> (width: Int, height: Int) {
+            if index == 0,
+               activeVideoDisplayCount == 1,
+               configuration.displaySizingMode != .matchClient,
+               configuration.displayCount > 1,
+               remoteDisplayRegions.count >= configuration.displayCount {
+                let selected = remoteDisplayRegions.prefix(
+                    configuration.displayCount)
+                if let first = selected.first {
+                    let union = selected.dropFirst().reduce(first) {
+                        $0.union($1)
+                    }
+                    return (Int(union.width), Int(union.height))
+                }
+            }
+            if remoteDisplayRegions.indices.contains(index) {
+                let region = remoteDisplayRegions[index]
+                return (Int(region.width), Int(region.height))
+            }
+            if configuration.displaySizingMode == .matchClient,
+               let preparedClientDisplaySize {
+                return (
+                    Int(preparedClientDisplaySize.pixelWidth),
+                    Int(preparedClientDisplaySize.pixelHeight))
+            }
+            return (fallbackWidth, fallbackHeight)
+        }
+        let primarySize = displaySize(at: 0)
+        let width = primarySize.width
+        let height = primarySize.height
         let initialTileCount = await transportSession?.currentAppleMediaTilesPerFrame
             ?? Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
         videoBandRenderer.setScreenSize(width: width, height: height)
@@ -1217,6 +1482,50 @@ public final class VNCSession {
             frameCallback: callback
         )
 
+        let secondaryManager: VideoStreamManager?
+        let secondaryCoalescer: BandFrameCoalescer?
+        let secondaryDecodedBands: DecodedBandTracker?
+        if activeVideoDisplayCount > 1 {
+            let secondManager = secondaryVideoStreamManager ?? VideoStreamManager()
+            secondaryVideoStreamManager = secondManager
+            let secondSize = displaySize(at: 1)
+            secondaryVideoBandRenderer.setScreenSize(
+                width: secondSize.width,
+                height: secondSize.height)
+            secondaryVideoBandRenderer.configureExpectedBandCount(initialTileCount)
+            let secondCoalescer = BandFrameCoalescer(
+                renderer: secondaryVideoBandRenderer,
+                expectedSourceCount: initialTileCount)
+            let secondDecodedBands = DecodedBandTracker()
+            secondManager.onFrameGeometryChange = { [weak self] geometry in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.secondaryVideoBandRenderer.setScreenSize(
+                        width: geometry.width,
+                        height: geometry.height)
+                }
+            }
+            secondManager.startStream(
+                streamID: offer.streamID,
+                width: secondSize.width,
+                height: secondSize.height,
+                usesDecodingOrderNumbers: initialTileCount > 1,
+                numberOfTiles: initialTileCount
+            ) { pixelBuffer, ssrc in
+                secondDecodedBands.record(ssrc)
+                secondCoalescer.submit(ssrc: ssrc, pixelBuffer: pixelBuffer)
+            }
+            secondaryManager = secondManager
+            secondaryCoalescer = secondCoalescer
+            secondaryDecodedBands = secondDecodedBands
+        } else {
+            secondaryVideoStreamManager?.stopStream()
+            secondaryVideoStreamManager = nil
+            secondaryManager = nil
+            secondaryCoalescer = nil
+            secondaryDecodedBands = nil
+        }
+
         let streamGeneration = manager.decodeProgress.streamGeneration
         let recoveryCoordinator = MediaRecoveryCoordinator()
 
@@ -1234,7 +1543,10 @@ public final class VNCSession {
                 for tick in 1...14 {
                     try? await Task.sleep(for: .seconds(1))
                     guard let transport, let m = watchdogManager, m.isStreamActive else { return }
-                    let sources = await transport.videoSourceCount
+                    // This watchdog owns display zero's decoder. The transport
+                    // source count includes every negotiated display, so use
+                    // this display's negotiated band count here.
+                    let sources = initialTileCount
                     let decoded = decodedBands.count
                     lastStatus = (decoded, sources)
                     if sources > 0 && decoded >= sources {
@@ -1483,6 +1795,24 @@ public final class VNCSession {
                     }
                 }
             }
+            let secondaryVideoPacketCoalescer = secondaryManager.map { manager in
+                OrderedMediaPacketCoalescer(queue: queue) { packets in
+                    for packet in packets {
+                        manager.feedRTPData(packet)
+                    }
+                }
+            }
+            secondaryManager?.onLossDetected = { [weak transport] ssrc in
+                guard let transport else { return }
+                Task { await transport.requestVideoKeyframe(ssrc: ssrc) }
+            }
+            secondaryManager?.onDecoderFailure = { [weak transport, weak secondaryManager] failure in
+                guard let transport, let secondaryManager else { return }
+                queue.async {
+                    _ = secondaryManager.recoverDecoderInSession()
+                    Task { await transport.requestVideoKeyframe(ssrc: failure.ssrc) }
+                }
+            }
             await transport.setAppleMediaGenerationSink { generation, numberOfTiles in
                 queue.async {
                     sinkManager.prepareForStreamReconfiguration(
@@ -1492,6 +1822,17 @@ public final class VNCSession {
                     generationCoalescer.beginStreamGeneration(
                         generation,
                         expectedSourceCount: numberOfTiles)
+                    if let secondaryManager,
+                       let secondaryCoalescer,
+                       let secondaryDecodedBands {
+                        secondaryManager.prepareForStreamReconfiguration(
+                            mediaGeneration: generation,
+                            numberOfTiles: numberOfTiles)
+                        secondaryDecodedBands.reset()
+                        secondaryCoalescer.beginStreamGeneration(
+                            generation,
+                            expectedSourceCount: numberOfTiles)
+                    }
 
                     // The connection-level startup watchdog cannot validate a
                     // replacement generation: its SSRC set belongs to retired
@@ -1552,9 +1893,12 @@ public final class VNCSession {
                     self?.applyDesktopResizeMetadata(width: width, height: height)
                 }
             }
-            await transport.setAppleMediaRTPSink { packet in
+            await transport.setAppleMediaRoutedRTPSink { packet, displayIndex in
                 if AppleRemoteAudioPlayer.canHandleRTPPacket(packet) {
                     sinkAudioPlayer?.enqueueRTPPacket(packet)
+                } else if displayIndex == 1,
+                          let secondaryVideoPacketCoalescer {
+                    secondaryVideoPacketCoalescer.enqueue(packet)
                 } else {
                     videoPacketCoalescer.enqueue(packet)
                 }

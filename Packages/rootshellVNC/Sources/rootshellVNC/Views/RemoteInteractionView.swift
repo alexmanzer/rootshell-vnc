@@ -18,6 +18,7 @@ struct RemoteInteractionView: UIViewRepresentable {
     let touchHandler: TouchInputHandler
     let keyboardHandler: KeyboardInputHandler
     let keyboardCapture: VNCKeyboardCapture
+    let framebufferOrigin: CGPoint
     let remoteCursor: RemoteCursor?
 
     func makeCoordinator() -> Coordinator {
@@ -45,6 +46,7 @@ struct RemoteInteractionView: UIViewRepresentable {
             viewport: viewport,
             keyboardActive: keyboardActive,
             keyboardCaptured: keyboardCapture.isCaptured,
+            framebufferOrigin: framebufferOrigin,
             remoteCursor: remoteCursor)
     }
 
@@ -69,6 +71,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private lazy var hardwareKeyboard = HardwareKeyboardController(
         keyboardHandler: keyboardHandler)
     private var framebufferSize: CGSize = .zero
+    private var framebufferOrigin: CGPoint = .zero
     private var viewport = RemoteViewportState()
     private var softwareKeyboardRequested = false
     private var lastPointerPoint: (x: UInt16, y: UInt16)?
@@ -295,9 +298,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         viewport: RemoteViewportState,
         keyboardActive: Bool,
         keyboardCaptured: Bool,
+        framebufferOrigin: CGPoint,
         remoteCursor: RemoteCursor?
     ) {
         self.framebufferSize = framebufferSize
+        self.framebufferOrigin = framebufferOrigin
         self.viewport = viewport
         self.viewport.clampOffset(
             viewSize: bounds.size,
@@ -1198,8 +1203,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             viewSize: bounds.size,
             framebufferSize: framebufferSize) else { return nil }
         let result = (
-            UInt16(min(CGFloat(UInt16.max), max(0, point.x))),
-            UInt16(min(CGFloat(UInt16.max), max(0, point.y))))
+            UInt16(min(
+                CGFloat(UInt16.max),
+                max(0, point.x + framebufferOrigin.x))),
+            UInt16(min(
+                CGFloat(UInt16.max),
+                max(0, point.y + framebufferOrigin.y))))
         lastKnownFramebufferPoint = result
         return result
     }

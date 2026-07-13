@@ -1,0 +1,153 @@
+import CoreGraphics
+import XCTest
+@testable import rootshellVNC
+
+/// Opt-in end-to-end coverage for Apple's physical multi-display server.
+///
+///     VNC_TEST_DISPLAY_SELECTION=1 VNC_TEST_HOST=localhost \
+///       VNC_TEST_USERNAME=... VNC_TEST_PASSWORD=... \
+///       swift test --filter LiveDisplaySelectionTests
+final class LiveDisplaySelectionTests: XCTestCase {
+    @MainActor
+    func testStandardOneDisplayAndAdaptiveTwoDisplays() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["VNC_TEST_DISPLAY_SELECTION"] == "1" else {
+            throw XCTSkip("Set VNC_TEST_DISPLAY_SELECTION=1 to run the live display probe")
+        }
+        guard let host = environment["VNC_TEST_HOST"], !host.isEmpty,
+              let password = environment["VNC_TEST_PASSWORD"], !password.isEmpty else {
+            throw XCTSkip("Set VNC_TEST_HOST and VNC_TEST_PASSWORD")
+        }
+        let credentials = VNCCredentials(
+            host: host,
+            port: UInt16(environment["VNC_TEST_PORT"] ?? "5900") ?? 5900,
+            password: password,
+            username: environment["VNC_TEST_USERNAME"])
+        let mode = environment["VNC_TEST_DISPLAY_SELECTION_MODE"] ?? "all"
+
+        if mode != "adaptive" {
+            let twoDisplayStandard = try await standardGeometry(
+                displayCount: 2,
+                credentials: credentials)
+            let oneDisplayStandard = try await standardGeometry(
+                displayCount: 1,
+                credentials: credentials)
+            print(
+                "DISPLAY PROBE standard two=\(twoDisplayStandard) "
+                    + "one=\(oneDisplayStandard)")
+            XCTAssertLessThan(
+                oneDisplayStandard.width * oneDisplayStandard.height,
+                twoDisplayStandard.width * twoDisplayStandard.height,
+                "Standard displayCount=1 must not present the two-display composite")
+        }
+        guard mode != "standard" else { return }
+
+        let adaptiveSizingMode: VNCConfiguration.DisplaySizingMode =
+            environment["VNC_TEST_DISPLAY_SIZING_MODE"] == "matchClient"
+                ? .matchClient : .remoteDisplay
+        let adaptive = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .adaptive,
+            displaySizingMode: adaptiveSizingMode,
+            displayCount: 2,
+            enableRemoteAudio: false,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0)))
+        if adaptiveSizingMode == .matchClient {
+            adaptive.updateRemoteDisplaySize(
+                viewSize: CGSize(width: 1512, height: 982),
+                displayScale: 2)
+        }
+        try await adaptive.connect(credentials: credentials)
+        defer { adaptive.disconnect() }
+
+        let adaptiveTimeout = TimeInterval(
+            environment["VNC_TEST_ADAPTIVE_TIMEOUT"] ?? "25") ?? 25
+        let deadline = Date().addingTimeInterval(adaptiveTimeout)
+        while Date() < deadline {
+            if adaptive.activeVideoDisplayCount == 2,
+               adaptive.videoBandRenderer.frameCommitCount > 0,
+               adaptive.secondaryVideoBandRenderer.frameCommitCount > 0 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let adaptiveWidth = adaptive.framebufferWidth
+        let adaptiveHeight = adaptive.framebufferHeight
+        let adaptiveRegions = adaptive.remoteDisplayRegions
+        let primaryCommits = adaptive.videoBandRenderer.frameCommitCount
+        let secondaryCommits = adaptive.secondaryVideoBandRenderer.frameCommitCount
+        let primaryProgress = adaptive.primaryVideoDecodeProgress
+        let secondaryProgress = adaptive.secondaryVideoDecodeProgress
+        let sourceCount = await adaptive.activeTransportVideoSourceCount()
+        let receiverIndexes = await adaptive.activeTransportVideoReceiverIndexes()
+        let answerLengths = await adaptive.activeTransportMediaAnswerStreamLengths()
+        let controlDiagnostic = await adaptive.activeTransportMediaControlDiagnostic()
+        print("DISPLAY PROBE adaptive framebuffer=\(adaptiveWidth)x\(adaptiveHeight)")
+        print("DISPLAY PROBE adaptive regions=\(adaptiveRegions)")
+        print(
+            "DISPLAY PROBE adaptive commits primary=\(primaryCommits) "
+                + "secondary=\(secondaryCommits)")
+        print(
+            "DISPLAY PROBE adaptive sources=\(sourceCount) "
+                + "receivers=\(receiverIndexes) "
+                + "answerLengths=\(answerLengths) "
+                + "control=\(controlDiagnostic ?? "none") "
+                + "primaryProgress=\(String(describing: primaryProgress))")
+        print(
+            "DISPLAY PROBE adaptive secondaryProgress="
+                + String(describing: secondaryProgress))
+        XCTAssertEqual(
+            adaptive.activeVideoDisplayCount,
+            adaptiveSizingMode == .matchClient ? 2 : 1)
+        XCTAssertGreaterThan(adaptive.videoBandRenderer.frameCommitCount, 0)
+        if adaptive.activeVideoDisplayCount > 1 {
+            XCTAssertGreaterThan(
+                adaptive.secondaryVideoBandRenderer.frameCommitCount,
+                0)
+            XCTAssertEqual(adaptive.presentedVideoDisplayRegions.count, 2)
+        } else {
+            // Native Remote Mac's Displays mode uses one composite HEVC
+            // receiver. Two independent receivers are the virtual-display
+            // (Match Client) mode.
+            XCTAssertEqual(adaptive.presentedVideoDisplayRegions.count, 1)
+            XCTAssertEqual(
+                adaptive.presentedVideoDisplayRegions.first?.size,
+                CGSize(width: adaptiveWidth, height: adaptiveHeight))
+        }
+    }
+
+    @MainActor
+    private func standardGeometry(
+        displayCount: Int,
+        credentials: VNCCredentials
+    ) async throws -> CGSize {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .standard,
+            displaySizingMode: .remoteDisplay,
+            displayCount: displayCount,
+            enableRemoteAudio: false,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0)))
+        try await session.connect(credentials: credentials)
+
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            if session.currentImage != nil,
+               session.presentedFramebufferSize.width > 0,
+               session.presentedFramebufferSize.height > 0 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        let result = session.presentedFramebufferSize
+        print(
+            "DISPLAY PROBE standard count=\(displayCount) "
+                + "framebuffer=\(session.framebufferWidth)x\(session.framebufferHeight) "
+                + "presented=\(result) regions=\(session.remoteDisplayRegions)")
+        session.disconnect()
+        try await Task.sleep(for: .milliseconds(500))
+        return result
+    }
+}

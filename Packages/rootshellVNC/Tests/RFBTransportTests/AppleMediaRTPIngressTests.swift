@@ -9,7 +9,7 @@ final class AppleMediaRTPIngressTests: XCTestCase {
 
         XCTAssertEqual(handoff.deliver(Data([1])), .buffered)
         XCTAssertEqual(handoff.deliver(Data([2])), .buffered)
-        let result = handoff.installSink { received.append($0) }
+        let result = handoff.installSink { packet, _ in received.append(packet) }
         XCTAssertEqual(result.packetCount, 2)
         XCTAssertEqual(result.byteCount, 2)
         XCTAssertFalse(result.overflowed)
@@ -25,11 +25,29 @@ final class AppleMediaRTPIngressTests: XCTestCase {
         XCTAssertEqual(handoff.deliver(Data([1])), .buffered)
         XCTAssertEqual(handoff.deliver(Data([2])), .buffered)
         XCTAssertEqual(handoff.deliver(Data([3])), .overflow)
-        let result = handoff.installSink { received.append($0) }
+        let result = handoff.installSink { packet, _ in received.append(packet) }
 
         XCTAssertTrue(result.overflowed)
         XCTAssertEqual(result.droppedPacketCount, 1)
         XCTAssertEqual(received.values, [Data([1]), Data([2])])
+    }
+
+    func testHandoffPreservesDisplayRouteAcrossStartupDrain() {
+        let received = LockedRoutedPackets()
+        var handoff = AppleMediaPacketHandoff(maximumPackets: 8, maximumBytes: 128)
+
+        XCTAssertEqual(
+            handoff.deliver(Data([1]), displayIndex: 0),
+            .buffered)
+        XCTAssertEqual(
+            handoff.deliver(Data([2]), displayIndex: 1),
+            .buffered)
+        _ = handoff.installSink { packet, displayIndex in
+            received.append(packet, displayIndex: displayIndex)
+        }
+
+        XCTAssertEqual(received.values.map(\.0), [Data([1]), Data([2])])
+        XCTAssertEqual(received.values.map(\.1), [0, 1])
     }
 
     func testStartupHoldRestoresPacketsThatArriveOutOfOrder() {
@@ -358,6 +376,23 @@ private final class LockedPackets: @unchecked Sendable {
     }
 
     var values: [Data] {
+        lock.lock()
+        defer { lock.unlock() }
+        return packets
+    }
+}
+
+private final class LockedRoutedPackets: @unchecked Sendable {
+    private let lock = NSLock()
+    private var packets: [(Data, Int?)] = []
+
+    func append(_ packet: Data, displayIndex: Int?) {
+        lock.lock()
+        packets.append((packet, displayIndex))
+        lock.unlock()
+    }
+
+    var values: [(Data, Int?)] {
         lock.lock()
         defer { lock.unlock() }
         return packets

@@ -7,6 +7,11 @@ import RFBProtocol
 /// All properties have sensible defaults.
 public struct VNCConfiguration: Sendable {
 
+    /// Compatibility display-count choices. A value of `2` means Apple's
+    /// "all displays combined" topology; use ``DisplayMode`` when the exact
+    /// native topology matters.
+    public static let supportedDisplayCounts = 1...2
+
     /// How the server chooses the remote framebuffer dimensions.
     public enum DisplaySizingMode: String, Sendable, Equatable, CaseIterable, Identifiable {
         /// Keep the server's existing physical or virtual display size.
@@ -30,6 +35,42 @@ public struct VNCConfiguration: Sendable {
             case .matchClient:
                 "Match this window or iPad aspect ratio. Supported Macs use a separate virtual display; other VNC servers resize only when they advertise support."
             }
+        }
+    }
+
+    /// Native Apple display topology requested for the session.
+    public enum DisplayMode: String, Sendable, Equatable, CaseIterable, Identifiable {
+        /// Select one server display (the main display until a specific remote
+        /// display is chosen after discovery).
+        case oneDisplay
+        /// Show the server's physical displays as one combined desktop.
+        case allDisplaysCombined
+        /// Create two client-sized virtual displays with independent streams.
+        case twoVirtualDisplays
+
+        public var id: Self { self }
+
+        public var title: String {
+            switch self {
+            case .oneDisplay: "One Display"
+            case .allDisplaysCombined: "All Displays (Combined)"
+            case .twoVirtualDisplays: "Two Virtual Displays"
+            }
+        }
+
+        public var explanation: String {
+            switch self {
+            case .oneDisplay:
+                "Use one remote display for the lowest bandwidth and decoding load."
+            case .allDisplaysCombined:
+                "Show the remote Mac's physical displays in one combined desktop, matching Apple Screen Sharing."
+            case .twoVirtualDisplays:
+                "Ask a capable Mac for two client-sized virtual displays with independent Adaptive video streams."
+            }
+        }
+
+        fileprivate var count: Int {
+            self == .oneDisplay ? 1 : 2
         }
     }
 
@@ -73,7 +114,49 @@ public struct VNCConfiguration: Sendable {
     public var videoQualityMode: VideoQualityMode
 
     /// Whether a capable server should render at the client viewport size.
-    public var displaySizingMode: DisplaySizingMode
+    public var displaySizingMode: DisplaySizingMode {
+        didSet {
+            guard oldValue != displaySizingMode else { return }
+            if displaySizingMode == .matchClient,
+               displayMode == .allDisplaysCombined {
+                displayMode = .oneDisplay
+            } else if displaySizingMode == .remoteDisplay,
+                      displayMode == .twoVirtualDisplays {
+                displayMode = .oneDisplay
+            }
+        }
+    }
+
+    /// Explicit native display topology. This distinguishes Apple's physical
+    /// combined mode from its two-independent-virtual-display mode.
+    public var displayMode: DisplayMode {
+        didSet {
+            switch displayMode {
+            case .allDisplaysCombined:
+                displaySizingMode = .remoteDisplay
+            case .twoVirtualDisplays:
+                displaySizingMode = .matchClient
+            case .oneDisplay:
+                break
+            }
+        }
+    }
+
+    /// Compatibility display-count spelling for the native display topology.
+    ///
+    /// `1` selects one display and `2` selects Apple's combined physical-
+    /// display desktop in both Standard and Adaptive modes. Use
+    /// ``displayMode`` to request an explicit topology. Values are clamped to
+    /// `1...2`.
+    public var displayCount: Int {
+        get { displayMode.count }
+        set {
+            let count = Self.clampedDisplayCount(newValue)
+            displayMode = count == 1
+                ? .oneDisplay
+                : .allDisplaysCombined
+        }
+    }
 
     /// Whether negotiated remote system audio should play on this device.
     public var enableRemoteAudio: Bool
@@ -125,6 +208,8 @@ public struct VNCConfiguration: Sendable {
         enableHighPerformanceMode: Bool = true,
         videoQualityMode: VideoQualityMode = .adaptive,
         displaySizingMode: DisplaySizingMode = .matchClient,
+        displayCount: Int = 1,
+        displayMode: DisplayMode? = nil,
         enableRemoteAudio: Bool = true,
         targetFrameRate: Int = 30,
         enableProtocolTrace: Bool = false,
@@ -134,11 +219,25 @@ public struct VNCConfiguration: Sendable {
         self.preferredEncodings = preferredEncodings
         self.enableHighPerformanceMode = enableHighPerformanceMode
         self.videoQualityMode = videoQualityMode
-        self.displaySizingMode = displaySizingMode
+        let resolvedDisplayMode = displayMode ?? (
+            Self.clampedDisplayCount(displayCount) == 1
+                ? .oneDisplay
+                : .allDisplaysCombined)
+        self.displaySizingMode = switch resolvedDisplayMode {
+        case .allDisplaysCombined: .remoteDisplay
+        case .twoVirtualDisplays: .matchClient
+        case .oneDisplay: displaySizingMode
+        }
+        self.displayMode = resolvedDisplayMode
         self.enableRemoteAudio = enableRemoteAudio
         self.targetFrameRate = max(1, min(120, targetFrameRate))
         self.enableProtocolTrace = enableProtocolTrace
         self.reconnectionPolicy = reconnectionPolicy
+    }
+
+    private static func clampedDisplayCount(_ count: Int) -> Int {
+        min(supportedDisplayCounts.upperBound,
+            max(supportedDisplayCounts.lowerBound, count))
     }
 
     /// The interval between frame requests, derived from ``targetFrameRate``.
@@ -189,6 +288,13 @@ public struct VNCConfiguration: Sendable {
             for encoding in standardEncodings.reversed() {
                 encodings.removeAll { $0 == encoding }
                 encodings.insert(encoding, at: 0)
+            }
+            // Apple's SetDisplay message selects a physical display by the ID
+            // announced through ServerDisplayInfo. Standard mode needs the
+            // same metadata as adaptive mode when the user requests one
+            // monitor instead of the combined desktop.
+            if !encodings.contains(.serverDisplayInfo) {
+                encodings.append(.serverDisplayInfo)
             }
         } else if videoQualityMode == .fullQuality {
             // Full Quality targets fast local networks: bandwidth is

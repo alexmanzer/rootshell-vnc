@@ -254,6 +254,18 @@ final class LiveStandardModeProbeTests: XCTestCase {
                         height: Int(si.framebufferHeight),
                         pixelFormat: pixelFormat)
                 case .framebufferUpdate(let rectsWithData):
+                    if env["VNC_PROBE_DISPLAY_LAYOUT"] == "1" {
+                        for (rect, payload) in rectsWithData
+                        where rect.encoding == .unknown(1101)
+                                || rect.encoding == .unknown(1105) {
+                            let hex = payload.map {
+                                String(format: "%02x", $0)
+                            }.joined(separator: " ")
+                            print(
+                                "PROBE displayLayout encoding="
+                                    + "\(rect.encoding.rawValue) bytes=\(payload.count) \(hex)")
+                        }
+                    }
                     await stats.record(rects: rectsWithData)
                     if let result = rendererBox.apply(
                         rectsWithData,
