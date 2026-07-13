@@ -45,10 +45,13 @@ final class LiveDisplaySelectionTests: XCTestCase {
         let adaptiveSizingMode: VNCConfiguration.DisplaySizingMode =
             environment["VNC_TEST_DISPLAY_SIZING_MODE"] == "matchClient"
                 ? .matchClient : .remoteDisplay
+        let adaptiveDisplayCount = min(
+            2,
+            max(1, Int(environment["VNC_TEST_DISPLAY_COUNT"] ?? "2") ?? 2))
         let adaptive = VNCSession(configuration: VNCConfiguration(
             videoQualityMode: .adaptive,
             displaySizingMode: adaptiveSizingMode,
-            displayCount: 2,
+            displayCount: adaptiveDisplayCount,
             enableRemoteAudio: false,
             reconnectionPolicy: VNCReconnectionPolicy(
                 isEnabled: false,
@@ -63,11 +66,14 @@ final class LiveDisplaySelectionTests: XCTestCase {
 
         let adaptiveTimeout = TimeInterval(
             environment["VNC_TEST_ADAPTIVE_TIMEOUT"] ?? "25") ?? 25
+        let expectedActiveDisplayCount = adaptiveSizingMode == .matchClient
+            ? adaptiveDisplayCount : 1
         let deadline = Date().addingTimeInterval(adaptiveTimeout)
         while Date() < deadline {
-            if adaptive.activeVideoDisplayCount == 2,
+            if adaptive.activeVideoDisplayCount == expectedActiveDisplayCount,
                adaptive.videoBandRenderer.frameCommitCount > 0,
-               adaptive.secondaryVideoBandRenderer.frameCommitCount > 0 {
+               (expectedActiveDisplayCount == 1
+                    || adaptive.secondaryVideoBandRenderer.frameCommitCount > 0) {
                 break
             }
             try await Task.sleep(for: .milliseconds(100))
@@ -99,7 +105,7 @@ final class LiveDisplaySelectionTests: XCTestCase {
                 + String(describing: secondaryProgress))
         XCTAssertEqual(
             adaptive.activeVideoDisplayCount,
-            adaptiveSizingMode == .matchClient ? 2 : 1)
+            expectedActiveDisplayCount)
         XCTAssertGreaterThan(adaptive.videoBandRenderer.frameCommitCount, 0)
         if adaptive.activeVideoDisplayCount > 1 {
             XCTAssertGreaterThan(
@@ -111,9 +117,17 @@ final class LiveDisplaySelectionTests: XCTestCase {
             // receiver. Two independent receivers are the virtual-display
             // (Match Client) mode.
             XCTAssertEqual(adaptive.presentedVideoDisplayRegions.count, 1)
+            let expectedRegionSize: CGSize
+            if adaptiveDisplayCount > 1 {
+                expectedRegionSize = CGSize(
+                    width: adaptiveWidth,
+                    height: adaptiveHeight)
+            } else {
+                expectedRegionSize = try XCTUnwrap(adaptiveRegions.first).size
+            }
             XCTAssertEqual(
                 adaptive.presentedVideoDisplayRegions.first?.size,
-                CGSize(width: adaptiveWidth, height: adaptiveHeight))
+                expectedRegionSize)
         }
     }
 

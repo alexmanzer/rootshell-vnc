@@ -781,6 +781,7 @@ public final class VNCSession {
         remoteDisplayRegions = remoteDisplayRegionOrder.compactMap {
             remoteDisplayRegionByID[$0]
         }
+        applyDiscoveredRemoteMediaGeometry()
     }
 
     private func updateRemoteDisplayRegions(_ screens: [RFBScreenLayout]) {
@@ -793,6 +794,36 @@ public final class VNCSession {
                 width: Int($0.width), height: Int($0.height))
             remoteDisplayRegionByID[$0.id] = region
             return region
+        }
+        applyDiscoveredRemoteMediaGeometry()
+    }
+
+    /// ServerInit is the full physical desktop union, while Apple's media
+    /// receiver targets the selected single or combined topology. Apply
+    /// DisplayInfo as soon as it arrives so the band compositor and input
+    /// aspect use the receiver's real geometry on first connections as well as
+    /// reconnects.
+    private func applyDiscoveredRemoteMediaGeometry() {
+        guard isHighPerformanceMode,
+              configuration.displaySizingMode == .remoteDisplay,
+              let manager = videoStreamManager,
+              !remoteDisplayRegions.isEmpty else { return }
+
+        let selectedCount = min(
+            max(1, configuration.displayCount),
+            remoteDisplayRegions.count)
+        guard let first = remoteDisplayRegions.first else { return }
+        let selected = remoteDisplayRegions.prefix(selectedCount)
+            .dropFirst()
+            .reduce(first) { $0.union($1) }
+        let width = Int(selected.width)
+        let height = Int(selected.height)
+        guard width > 0, height > 0 else { return }
+
+        videoBandRenderer.setScreenSize(width: width, height: height)
+        let queue = mediaQueue
+        queue.async {
+            manager.updateFrameGeometry(width: width, height: height)
         }
     }
 

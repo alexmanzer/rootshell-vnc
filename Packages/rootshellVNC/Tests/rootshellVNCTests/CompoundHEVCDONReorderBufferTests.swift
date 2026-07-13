@@ -157,6 +157,22 @@ final class CompoundHEVCDONReorderBufferTests: XCTestCase {
             3)
     }
 
+    func testNegotiatedTileCountCapsBandInferenceFromPhysicalDesktopUnion() {
+        let manager = VideoStreamManager()
+        manager.startStream(
+            streamID: 1,
+            width: 5120,
+            height: 4844,
+            usesDecodingOrderNumbers: true,
+            numberOfTiles: 2
+        ) { _, _ in }
+
+        _ = manager.acceptCodedDimensions(width: 5120, height: 1440)
+
+        XCTAssertEqual(manager.frameGeometrySnapshot.expectedBandCount, 2)
+        manager.stopStream()
+    }
+
     private func startedBuffer(at firstDON: UInt16) -> CompoundHEVCDONReorderBuffer {
         var reorder = CompoundHEVCDONReorderBuffer()
         _ = reorder.enqueue([nal(firstDON &+ 2)])

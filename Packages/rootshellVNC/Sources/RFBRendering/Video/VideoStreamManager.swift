@@ -298,6 +298,8 @@ public final class VideoStreamManager: @unchecked Sendable {
         self.fullFrameHeight = height
         self.usesDecodingOrderNumbers = usesDecodingOrderNumbers
         self.numberOfTiles = numberOfTiles ?? (usesDecodingOrderNumbers ? 2 : 1)
+        self.donReorderBuffer = CompoundHEVCDONReorderBuffer(
+            expectedSourceCount: self.numberOfTiles)
         self.frameCallback = frameCallback
         self.presentationTimeline.reset()
         self.submittedFrameCount = 0
@@ -383,7 +385,8 @@ public final class VideoStreamManager: @unchecked Sendable {
         earlyVCLBuffer.removeAll()
         lossStats = LossStats()
         gatedIRAPLogCount = 0
-        donReorderBuffer = CompoundHEVCDONReorderBuffer()
+        donReorderBuffer = CompoundHEVCDONReorderBuffer(
+            expectedSourceCount: self.numberOfTiles)
         sequentialAccessUnitAssembler.reset()
         lock.unlock()
 
@@ -1150,9 +1153,16 @@ public final class VideoStreamManager: @unchecked Sendable {
 
     private func updateExpectedBandCountLocked() {
         guard fullFrameHeight > 0, codedBandHeight > 0 else { return }
-        let count = Self.expectedBandCount(
-            fullFrameHeight: fullFrameHeight,
-            codedBandHeight: codedBandHeight)
+        // ServerInit can describe the union of every physical monitor before
+        // DisplayInfo identifies the one receiver selected for this media
+        // stream. Never infer more sources than the AVC negotiation created;
+        // otherwise a 5K primary in a taller multi-monitor desktop makes the
+        // DON bootstrap wait forever for SSRCs that do not exist.
+        let count = min(
+            numberOfTiles,
+            Self.expectedBandCount(
+                fullFrameHeight: fullFrameHeight,
+                codedBandHeight: codedBandHeight))
         guard count != expectedBandCount else { return }
         expectedBandCount = count
         donReorderBuffer.reconfigureExpectedSourceCount(count)
