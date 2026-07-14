@@ -31,8 +31,8 @@ final class RemoteViewportStateTests: XCTestCase {
 
     func testPinchKeepsRemotePixelUnderAnchor() throws {
         var viewport = RemoteViewportState()
-        // Keep the requested offset within the no-empty-space pan bounds so
-        // clamping does not intentionally move the anchor.
+        // Keep the requested offset within the pan bounds so clamping does
+        // not intentionally move the anchor.
         let anchor = CGPoint(x: 250, y: 470)
         let before = try XCTUnwrap(viewport.framebufferPoint(
             for: anchor,
@@ -54,7 +54,7 @@ final class RemoteViewportStateTests: XCTestCase {
         XCTAssertEqual(after.y, before.y, accuracy: 0.001)
     }
 
-    func testPanClampsDesktopToViewportEdges() {
+    func testPanAllowsDesktopEdgesToReachViewportCenter() throws {
         var viewport = RemoteViewportState()
         viewport.zoom(
             by: 2,
@@ -66,10 +66,81 @@ final class RemoteViewportStateTests: XCTestCase {
             viewSize: viewSize,
             framebufferSize: framebufferSize)
 
-        XCTAssertEqual(viewport.offset.width, 500, accuracy: 0.001)
-        XCTAssertEqual(viewport.offset.height, 62.5, accuracy: 0.001)
+        XCTAssertEqual(viewport.offset.width, 1_000, accuracy: 0.001)
+        XCTAssertEqual(viewport.offset.height, 562.5, accuracy: 0.001)
+
+        var frame = try XCTUnwrap(viewport.displayedFrame(
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertEqual(frame.minX, viewSize.width / 2, accuracy: 0.001)
+        XCTAssertEqual(frame.minY, viewSize.height / 2, accuracy: 0.001)
+
+        viewport.pan(
+            by: CGSize(width: -20_000, height: -20_000),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        XCTAssertEqual(viewport.offset.width, -1_000, accuracy: 0.001)
+        XCTAssertEqual(viewport.offset.height, -562.5, accuracy: 0.001)
+        frame = try XCTUnwrap(viewport.displayedFrame(
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertEqual(frame.maxX, viewSize.width / 2, accuracy: 0.001)
+        XCTAssertEqual(frame.maxY, viewSize.height / 2, accuracy: 0.001)
 
         viewport.reset()
+        XCTAssertTrue(viewport.isIdentity)
+    }
+
+    func testAspectFitDesktopCanUseHalfViewportMargin() throws {
+        var viewport = RemoteViewportState()
+        viewport.pan(
+            by: CGSize(width: 10_000, height: 10_000),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        let frame = try XCTUnwrap(viewport.displayedFrame(
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertEqual(frame.minX, viewSize.width / 2, accuracy: 0.001)
+        XCTAssertEqual(frame.minY, viewSize.height / 2, accuracy: 0.001)
+    }
+
+    func testPinchingInAtMinimumScaleRecentersDesktop() {
+        var viewport = RemoteViewportState()
+        viewport.pan(
+            by: CGSize(width: 10_000, height: 10_000),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+        XCTAssertFalse(viewport.isIdentity)
+
+        viewport.zoom(
+            by: 0.5,
+            around: CGPoint(x: 900, y: 100),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        XCTAssertTrue(viewport.isIdentity)
+    }
+
+    func testPinchingDownToMinimumScaleRecentersDesktop() {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 4,
+            around: CGPoint(x: 250, y: 750),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+        viewport.pan(
+            by: CGSize(width: 300, height: -200),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        viewport.zoom(
+            by: 0.01,
+            around: CGPoint(x: 900, y: 100),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
         XCTAssertTrue(viewport.isIdentity)
     }
 
@@ -81,6 +152,7 @@ final class RemoteViewportStateTests: XCTestCase {
             viewSize: viewSize,
             framebufferSize: framebufferSize)
         XCTAssertEqual(viewport.scale, RemoteViewportState.maximumScale)
+        XCTAssertEqual(viewport.scale, 10)
 
         viewport.zoom(
             by: 0.001,

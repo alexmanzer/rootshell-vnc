@@ -8,7 +8,7 @@ import CoreGraphics
 /// one source of truth.
 struct RemoteViewportState: Equatable, Sendable {
     static let minimumScale: CGFloat = 1
-    static let maximumScale: CGFloat = 5
+    static let maximumScale: CGFloat = 10
 
     private(set) var scale: CGFloat = minimumScale
     private(set) var offset: CGSize = .zero
@@ -35,6 +35,13 @@ struct RemoteViewportState: Equatable, Sendable {
         let newScale = min(
             Self.maximumScale,
             max(Self.minimumScale, oldScale * factor))
+        // Matching UIScrollView's minimum-zoom behavior, pinching inward at
+        // the fitted scale restores the canonical centered viewport. This
+        // also gives a panned-but-unzoomed desktop an immediate natural reset.
+        if newScale == Self.minimumScale, factor < 1 {
+            reset()
+            return
+        }
         guard newScale != oldScale else { return }
 
         // Keep the remote pixel under the gesture centroid stationary.
@@ -67,8 +74,11 @@ struct RemoteViewportState: Equatable, Sendable {
             return
         }
 
-        let horizontalLimit = max(0, (frame.width - viewSize.width) / 2)
-        let verticalLimit = max(0, (frame.height - viewSize.height) / 2)
+        // Keep the desktop from disappearing completely while allowing a
+        // generous working margin around every edge. At the limit, the edge
+        // being moved inward may reach the viewport center, but not cross it.
+        let horizontalLimit = frame.width / 2
+        let verticalLimit = frame.height / 2
         offset.width = min(horizontalLimit, max(-horizontalLimit, offset.width))
         offset.height = min(verticalLimit, max(-verticalLimit, offset.height))
     }
