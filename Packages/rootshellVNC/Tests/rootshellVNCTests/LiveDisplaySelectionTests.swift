@@ -9,6 +9,63 @@ import XCTest
 ///       swift test --filter LiveDisplaySelectionTests
 final class LiveDisplaySelectionTests: XCTestCase {
     @MainActor
+    func testRepeatedStandardOneDisplayFirstFrame() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["VNC_TEST_STANDARD_FIRST_FRAME"] == "1" else {
+            throw XCTSkip(
+                "Set VNC_TEST_STANDARD_FIRST_FRAME=1 to run the repeated Standard first-frame probe")
+        }
+        guard let host = environment["VNC_TEST_HOST"], !host.isEmpty,
+              let password = environment["VNC_TEST_PASSWORD"], !password.isEmpty else {
+            throw XCTSkip("Set VNC_TEST_HOST and VNC_TEST_PASSWORD")
+        }
+        let credentials = VNCCredentials(
+            host: host,
+            port: UInt16(environment["VNC_TEST_PORT"] ?? "5900") ?? 5900,
+            password: password,
+            username: environment["VNC_TEST_USERNAME"])
+        let attemptCount = max(
+            1, Int(environment["VNC_TEST_STANDARD_ATTEMPTS"] ?? "5") ?? 5)
+        let timeout = TimeInterval(
+            environment["VNC_TEST_STANDARD_TIMEOUT"] ?? "15") ?? 15
+
+        for attempt in 1...attemptCount {
+            let session = VNCSession(configuration: VNCConfiguration(
+                videoQualityMode: .standard,
+                displaySizingMode: .remoteDisplay,
+                displayCount: 1,
+                enableRemoteAudio: false,
+                reconnectionPolicy: VNCReconnectionPolicy(
+                    isEnabled: false,
+                    maximumAttempts: 0)))
+            let started = Date()
+            try await session.connect(credentials: credentials)
+
+            let deadline = started.addingTimeInterval(timeout)
+            var receivedNonBlackFrame = false
+            while Date() < deadline {
+                if let image = session.currentImage,
+                   Self.containsNonBlackPixel(image) {
+                    receivedNonBlackFrame = true
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            let elapsed = Date().timeIntervalSince(started)
+            print(
+                "STANDARD FIRST FRAME attempt=\(attempt)/\(attemptCount) "
+                    + "nonBlack=\(receivedNonBlackFrame) "
+                    + "elapsed=\(String(format: "%.2f", elapsed))s "
+                    + "framebuffer=\(session.framebufferWidth)x\(session.framebufferHeight)")
+            session.disconnect()
+            XCTAssertTrue(
+                receivedNonBlackFrame,
+                "Standard one-display attempt \(attempt) remained black for \(timeout)s")
+            try await Task.sleep(for: .milliseconds(500))
+        }
+    }
+
+    @MainActor
     func testStandardOneDisplayAndAdaptiveTwoDisplays() async throws {
         let environment = ProcessInfo.processInfo.environment
         guard environment["VNC_TEST_DISPLAY_SELECTION"] == "1" else {
@@ -163,5 +220,24 @@ final class LiveDisplaySelectionTests: XCTestCase {
         session.disconnect()
         try await Task.sleep(for: .milliseconds(500))
         return result
+    }
+
+    /// Standard mode negotiates BGRA8888. Ignore the alpha byte so a fully
+    /// opaque black framebuffer does not count as rendered desktop content.
+    private static func containsNonBlackPixel(_ image: CGImage) -> Bool {
+        guard image.bitsPerPixel == 32,
+              let providerData = image.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(providerData) else { return false }
+        for row in 0..<image.height {
+            let rowStart = row * image.bytesPerRow
+            for column in 0..<image.width {
+                let pixel = rowStart + column * 4
+                if bytes[pixel] != 0 || bytes[pixel + 1] != 0
+                    || bytes[pixel + 2] != 0 {
+                    return true
+                }
+            }
+        }
+        return false
     }
 }

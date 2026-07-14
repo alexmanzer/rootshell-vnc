@@ -81,6 +81,175 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    func testAppleStandardOneDisplayWaitsForPostSelectionDCTReference() async throws {
+        let connection = ScriptedRFBConnection()
+        let width: UInt16 = 2
+        let height: UInt16 = 1
+        let displayID: UInt32 = 7
+
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: width, height: height, name: "apple-scripted"))
+
+        // The first update announces the display ID and also carries a DCT
+        // base encoded before SetDisplay can take effect. This is the ordering
+        // that used to accept a black base and prematurely enable auto updates.
+        var displayInfo = Data()
+        for value in [displayID, 0, 0, UInt32(width), UInt32(height), 1] {
+            displayInfo.append(Self.uint32Bytes(value))
+        }
+        script.append(Self.framebufferUpdate([
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: 0, height: 0,
+                    encoding: Encoding.serverDisplayInfo.rawValue),
+                displayInfo
+            ),
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: width, height: height,
+                    encoding: Encoding.appleMultiVariantScreenshare.rawValue),
+                Data([0, 0, 0, 1, 0])
+            ),
+        ]))
+        await connection.enqueueServerBytes(script)
+
+        let encodings: [Encoding] = [
+            .appleMultiVariantScreenshare,
+            .unknown(1105), .unknown(1104),
+            .serverDisplayInfo, .raw,
+        ]
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: encodings,
+            displayCount: 1,
+            connection: connection)
+
+        let updateTask = Task {
+            var updateCount = 0
+            for await event in session.events {
+                guard case .framebufferUpdate = event else { continue }
+                updateCount += 1
+                try? await session.finishFramebufferUpdate()
+                if updateCount == 2 { return updateCount }
+            }
+            return updateCount
+        }
+
+        try await session.connect()
+
+        let setDisplay = Data([
+            0x0d, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, UInt8(displayID),
+        ])
+        let fullRequest = ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+        let autoUpdate = ClientMessage.appleAutoFramebufferUpdate(
+            intervalMilliseconds: 0,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+
+        let requestedPostSelectionReference = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return sent.range(of: setDisplay) != nil && sent.suffix(fullRequest.count) == fullRequest
+        }
+        XCTAssertTrue(requestedPostSelectionReference)
+        var sent = await connection.sentBytes()
+        XCTAssertNil(sent.range(of: autoUpdate))
+
+        // A reference received after SetDisplay is now authoritative and may
+        // transition the connection to Apple's automatic DCT update stream.
+        await connection.enqueueServerBytes(Self.framebufferUpdate([
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: width, height: height,
+                    encoding: Encoding.appleMultiVariantScreenshare.rawValue),
+                Data([0, 0, 0, 1, 0])
+            ),
+        ]))
+
+        let enabledAutoUpdates = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return sent.suffix(autoUpdate.count) == autoUpdate
+        }
+        XCTAssertTrue(enabledAutoUpdates)
+        let updateCount = await updateTask.value
+        XCTAssertEqual(updateCount, 2)
+
+        sent = await connection.sentBytes()
+        XCTAssertNotNil(sent.range(of: setDisplay))
+        await session.disconnect()
+    }
+
+    func testAppleStandardCombinedDisplayAcceptsInitialDCTReference() async throws {
+        let connection = ScriptedRFBConnection()
+        let width: UInt16 = 4
+        let height: UInt16 = 1
+
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: width, height: height, name: "apple-combined"))
+        script.append(Self.framebufferUpdate([
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: width, height: height,
+                    encoding: Encoding.appleMultiVariantScreenshare.rawValue),
+                Data([0, 0, 0, 1, 0])
+            ),
+        ]))
+        await connection.enqueueServerBytes(script)
+
+        let encodings: [Encoding] = [
+            .appleMultiVariantScreenshare,
+            .unknown(1105), .unknown(1104),
+            .serverDisplayInfo, .raw,
+        ]
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: encodings,
+            displayCount: 2,
+            connection: connection)
+        let updateTask = Task {
+            for await event in session.events {
+                guard case .framebufferUpdate = event else { continue }
+                try? await session.finishFramebufferUpdate()
+                return true
+            }
+            return false
+        }
+
+        try await session.connect()
+
+        let globalSetDisplay = Data([
+            0x0d, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ])
+        let autoUpdate = ClientMessage.appleAutoFramebufferUpdate(
+            intervalMilliseconds: 0,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+        let enabledAutoUpdates = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return sent.range(of: globalSetDisplay) != nil
+                && sent.suffix(autoUpdate.count) == autoUpdate
+        }
+        XCTAssertTrue(enabledAutoUpdates)
+        let receivedUpdate = await updateTask.value
+        XCTAssertTrue(receivedUpdate)
+
+        await session.disconnect()
+    }
+
     func testConnectRefusesAppleMediaModeOverCustomTransport() async throws {
         let connection = ScriptedRFBConnection()
         let session = TransportSession(
@@ -164,6 +333,44 @@ final class TransportSessionScriptedTests: XCTestCase {
             UInt8(raw & 0xff),
         ])
         return data
+    }
+
+    private static func framebufferUpdate(
+        _ rects: [(header: Data, payload: Data)]
+    ) -> Data {
+        var data = Data([
+            0,
+            0,
+            UInt8((rects.count >> 8) & 0xff),
+            UInt8(rects.count & 0xff),
+        ])
+        for rect in rects {
+            data.append(rect.header)
+            data.append(rect.payload)
+        }
+        return data
+    }
+
+    private static func uint32Bytes(_ value: UInt32) -> Data {
+        Data([
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8(value & 0xff),
+        ])
+    }
+
+    private static func waitUntil(
+        timeout: Duration = .seconds(2),
+        condition: @escaping @Sendable () async -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await condition()
     }
 
     /// Bound an event-stream wait so a protocol bug fails the test instead of
