@@ -22,6 +22,20 @@ public struct VNCKeyboardModifiers: OptionSet, Sendable {
     public static let command = Self(rawValue: 1 << 3)
 }
 
+/// A shortcut owned by a container application even while ordinary keyboard
+/// input is captured by the remote desktop. The package omits these chords
+/// from its ordinary responder key commands so the container can choose
+/// whether each chord is handled locally or sent to VNC.
+public struct VNCHostKeyboardShortcut: Equatable, Sendable {
+    public let input: String
+    public let modifiers: VNCKeyboardModifiers
+
+    public init(input: String, modifiers: VNCKeyboardModifiers) {
+        self.input = input
+        self.modifiers = modifiers
+    }
+}
+
 #if canImport(UIKit)
 /// The primary input view used by the remote responder.
 @MainActor
@@ -75,6 +89,36 @@ public struct VNCKeyboardInputViews {
 public final class VNCKeyboardCapture {
     public private(set) var isCaptured: Bool
 
+    /// Whether pointer interaction with the remote desktop should implicitly
+    /// enable ordinary remote input capture.
+    public let automaticallyCapturesOnInteraction: Bool
+
+    /// Chords that remain owned by a container application while ordinary
+    /// VNC keyboard capture stays active.
+    public let reservedHostShortcuts: [VNCHostKeyboardShortcut]
+
+    /// Destination for the narrow set of container-owned shortcuts. `false`
+    /// routes them to the container; `true` routes them to VNC. This does not
+    /// change ordinary VNC keyboard input.
+    public private(set) var routesReservedHostShortcutsToVNC: Bool = false
+
+    /// Called when the remote input responder receives a shortcut reserved by
+    /// its container. The container chooses exactly one destination according
+    /// to ``routesReservedHostShortcutsToVNC``.
+    @ObservationIgnored
+    public var onReservedHostShortcut: (@MainActor (VNCHostKeyboardShortcut) -> Void)?
+
+    public var hasReservedHostShortcuts: Bool {
+        !reservedHostShortcuts.isEmpty
+    }
+
+    /// State displayed by the package HUD. Container integrations toggle only
+    /// the reserved-shortcut destination; standalone viewers retain broad
+    /// capture.
+    public var isCaptureModeEnabled: Bool {
+        hasReservedHostShortcuts ? routesReservedHostShortcutsToVNC : isCaptured
+    }
+
     #if canImport(UIKit)
     /// Atomic host input-view configuration. Standalone clients can leave
     /// this at ``VNCKeyboardInputViews/packageDefault``.
@@ -111,8 +155,14 @@ public final class VNCKeyboardCapture {
     /// keyboard, and observe it to mirror HUD- or user-driven changes.
     public var softwareKeyboardRequested: Bool = false
 
-    public init(isCaptured: Bool = true) {
+    public init(
+        isCaptured: Bool = true,
+        automaticallyCapturesOnInteraction: Bool = true,
+        reservedHostShortcuts: [VNCHostKeyboardShortcut] = []
+    ) {
         self.isCaptured = isCaptured
+        self.automaticallyCapturesOnInteraction = automaticallyCapturesOnInteraction
+        self.reservedHostShortcuts = reservedHostShortcuts
     }
 
     public func capture() {
@@ -125,5 +175,21 @@ public final class VNCKeyboardCapture {
 
     public func toggle() {
         isCaptured.toggle()
+    }
+
+    /// Toggle the mode represented by the HUD/host toolbar. When a container
+    /// supplied reserved shortcuts this switches their exclusive destination.
+    public func toggleCaptureMode() {
+        if hasReservedHostShortcuts {
+            routesReservedHostShortcutsToVNC.toggle()
+        } else {
+            toggle()
+        }
+    }
+
+    /// Choose the reserved-shortcut destination without changing ordinary
+    /// hardware-keyboard capture.
+    public func routeReservedHostShortcutsToVNC(_ enabled: Bool) {
+        routesReservedHostShortcutsToVNC = enabled
     }
 }

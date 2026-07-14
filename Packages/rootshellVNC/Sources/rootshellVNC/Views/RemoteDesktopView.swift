@@ -344,17 +344,26 @@ public struct RemoteDesktopView: View {
                 }
             }
 
-            Button {
-                keyboardCapture.toggle()
-                if !keyboardCapture.isCaptured {
-                    keyboardActive = false
+            if keyboardCapture.hasReservedHostShortcuts {
+                Toggle(isOn: Binding(
+                    get: { keyboardCapture.routesReservedHostShortcutsToVNC },
+                    set: { keyboardCapture.routeReservedHostShortcutsToVNC($0) }
+                )) {
+                    Label("Route Reserved Shortcuts to VNC", systemImage: "keyboard.badge.ellipsis")
                 }
-            } label: {
-                Label(
-                    keyboardCapture.isCaptured
-                        ? "Release Keyboard Capture" : "Capture Keyboard",
-                    systemImage: keyboardCapture.isCaptured
-                        ? "keyboard.badge.ellipsis" : "keyboard")
+            } else {
+                Button {
+                    keyboardCapture.toggle()
+                    if !keyboardCapture.isCaptured {
+                        keyboardActive = false
+                    }
+                } label: {
+                    Label(
+                        keyboardCapture.isCaptured
+                            ? "Release Keyboard Capture" : "Capture Keyboard",
+                        systemImage: keyboardCapture.isCaptured
+                            ? "keyboard.badge.ellipsis" : "keyboard")
+                }
             }
 
             Menu {

@@ -135,6 +135,18 @@ public struct KeyboardInputHandler {
             supplementalModifiers: supplementalModifiers)
     }
 
+    /// Send a shortcut chord with a short key-down interval. Unlike text and
+    /// toolbar taps, application shortcuts need a real held transition so the
+    /// remote window system can recognize combinations such as Command-Shift-[.
+    public func handleShortcutTap(
+        _ character: Character,
+        modifiers: VNCKeyboardModifiers
+    ) {
+        handleChord(RemoteKeyChord(
+            modifiers: Self.keysyms(for: modifiers),
+            key: Self.keysymForCharacter(character)))
+    }
+
     /// Handle a complete keysym tap wrapped in container-supplied modifiers.
     @discardableResult
     public func handleKeysymTap(

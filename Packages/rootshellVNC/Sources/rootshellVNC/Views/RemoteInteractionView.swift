@@ -173,16 +173,50 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     override var keyCommands: [UIKeyCommand]? {
         guard keyboardCapture.isCaptured else { return viewerCommandKeyCommands }
         #if targetEnvironment(macCatalyst)
-        return standardRemoteKeyCommands
+        return reservedHostKeyCommands
+            + standardRemoteKeyCommands
             + viewerCommandKeyCommands
             + remoteControlKeyCommands
         #else
-        return commandCompatibilityKeyCommands
+        return reservedHostKeyCommands
+            + commandCompatibilityKeyCommands
             + standardRemoteKeyCommands
             + viewerCommandKeyCommands
             + remoteCommandKeyCommands
         #endif
     }
+
+    /// Explicit commands for the small set of chords owned by a containing
+    /// app. Keeping these on the focused VNC responder avoids relying on menu
+    /// command arbitration, which is not consistent across iPad and Catalyst.
+    private lazy var reservedHostKeyCommands: [UIKeyCommand] = {
+        keyboardCapture.reservedHostShortcuts.flatMap { shortcut in
+            var signatures = [(
+                input: shortcut.input,
+                modifiers: Self.uiModifiers(for: shortcut.modifiers)
+            )]
+
+            // UIKit reports shifted punctuation differently by platform:
+            // iPad commonly uses "[" + Shift while Catalyst menu commands use
+            // "{" without Shift for the same physical key. Claim both forms.
+            if shortcut.modifiers.contains(.shift),
+               let shiftedInput = Self.shiftedHostShortcutInput(shortcut.input) {
+                var modifiers = Self.uiModifiers(for: shortcut.modifiers)
+                modifiers.remove(.shift)
+                signatures.append((shiftedInput, modifiers))
+            }
+
+            return signatures.map { signature in
+                let command = UIKeyCommand(
+                    input: signature.input,
+                    modifierFlags: signature.modifiers,
+                    action: #selector(handleReservedHostShortcut(_:)))
+                command.wantsPriorityOverSystemBehavior = true
+                command.allowsAutomaticLocalization = false
+                return command
+            }
+        }
+    }()
 
     private lazy var commandCompatibilityKeyCommands: [UIKeyCommand] = {
         [("h", "Command-H"), ("m", "Command-M")].map { input, title in
@@ -198,7 +232,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }()
 
     private lazy var standardRemoteKeyCommands: [UIKeyCommand] = {
-        RemoteCommand.allCases.map { remoteCommand in
+        RemoteCommand.allCases.filter { remoteCommand in
+            !isReservedHostShortcut(
+                input: Self.uiInput(for: remoteCommand.shortcut.input),
+                modifiers: Self.uiModifiers(for: remoteCommand.shortcut.modifiers))
+        }.map { remoteCommand in
             let command = UIKeyCommand(
                 input: Self.uiInput(for: remoteCommand.shortcut.input),
                 modifierFlags: Self.uiModifiers(
@@ -263,6 +301,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 ) || Self.isStandardRemoteShortcut(
                     input: String(input),
                     modifiers: modifiers
+                ) || isReservedHostShortcut(
+                    input: String(input),
+                    modifiers: modifiers
                 ) {
                     continue
                 }
@@ -316,6 +357,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 if Self.isReservedViewerShortcut(
                     input: String(input),
                     modifiers: modifiers)
+                    || isReservedHostShortcut(
+                        input: String(input),
+                        modifiers: modifiers)
                     || (modifiers == .command && (input == "h" || input == "m")) {
                     continue
                 }
@@ -547,6 +591,15 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 continue
             }
             let usage = UInt32(key.keyCode.rawValue)
+            // Some UIKit configurations bypass UIKeyCommand arbitration and
+            // deliver Command chords directly here. Claim host-owned chords
+            // before the generic hardware path can send their target key to
+            // VNC. Any modifier downs already sent are released below.
+            if let shortcut = reservedHostShortcut(matching: key) {
+                releaseAllPressedKeys()
+                keyboardCapture.onReservedHostShortcut?(shortcut)
+                continue
+            }
             if handleCommandCompatibilityAlias(key: key, usage: usage) {
                 continue
             }
@@ -578,20 +631,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         }
     }
 
-    /// Responder-chain probe used by a containing rootshell window to suppress
-    /// its own menu shortcuts while the remote desktop owns the keyboard.
-    @objc func claimRootshellKeyboardShortcut(_ sender: Any?) {
-        #if targetEnvironment(macCatalyst)
-        guard keyboardCapture.isCaptured,
-              let command = sender as? UIKeyCommand else { return }
-        forwardClaimedHostShortcut(command)
-        #endif
-    }
-
-    /// Command-Shift-M reaches this through the containing app's existing menu
-    /// action and remains available even after capture has been released.
+    /// The containing app's capture toggle reaches this through the responder
+    /// chain. Host integrations toggle only the reserved-shortcut destination;
+    /// standalone viewers retain the broad keyboard-capture behavior.
     @objc func toggleVNCKeyboardCapture(_ sender: Any?) {
-        keyboardCapture.toggle()
+        keyboardCapture.toggleCaptureMode()
         if !keyboardCapture.isCaptured {
             softwareKeyboardRequested = false
             onKeyboardActiveChange?(false)
@@ -603,13 +647,17 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        if action == #selector(claimRootshellKeyboardShortcut(_:)) {
-            return keyboardCapture.isCaptured
-        }
         if action == #selector(toggleVNCKeyboardCapture(_:)) {
             return true
         }
         return super.canPerformAction(action, withSender: sender)
+    }
+
+    @objc private func handleReservedHostShortcut(_ command: UIKeyCommand) {
+        guard keyboardCapture.isCaptured,
+              let shortcut = reservedHostShortcut(matching: command) else { return }
+        releaseAllPressedKeys()
+        keyboardCapture.onReservedHostShortcut?(shortcut)
     }
 
     @objc private func handleStandardRemoteCommand(_ command: UIKeyCommand) {
@@ -721,6 +769,93 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             || signature == ("q", [.alternate, .command])
     }
 
+    private func isReservedHostShortcut(
+        input: String,
+        modifiers: UIKeyModifierFlags
+    ) -> Bool {
+        let normalizedModifiers = modifiers.intersection([
+            .control, .alternate, .shift, .command,
+        ])
+        return keyboardCapture.reservedHostShortcuts.contains { shortcut in
+            shortcut.input.lowercased() == input.lowercased()
+                && Self.uiModifiers(for: shortcut.modifiers) == normalizedModifiers
+        }
+    }
+
+    private func reservedHostShortcut(
+        matching command: UIKeyCommand
+    ) -> VNCHostKeyboardShortcut? {
+        guard let input = command.input else { return nil }
+        let modifiers = command.modifierFlags.intersection([
+            .control, .alternate, .shift, .command,
+        ])
+        return keyboardCapture.reservedHostShortcuts.first { shortcut in
+            if shortcut.input.lowercased() == input.lowercased(),
+               Self.uiModifiers(for: shortcut.modifiers) == modifiers {
+                return true
+            }
+
+            guard shortcut.modifiers.contains(.shift),
+                  Self.shiftedHostShortcutInput(shortcut.input)?.lowercased()
+                    == input.lowercased() else { return false }
+            var shiftedModifiers = Self.uiModifiers(for: shortcut.modifiers)
+            shiftedModifiers.remove(.shift)
+            return shiftedModifiers == modifiers
+        }
+    }
+
+    private func reservedHostShortcut(
+        matching key: UIKey
+    ) -> VNCHostKeyboardShortcut? {
+        let modifiers = key.modifierFlags.intersection([
+            .control, .alternate, .shift, .command,
+        ])
+        let unmodifiedInput = key.charactersIgnoringModifiers.lowercased()
+        let modifiedInput = key.characters.lowercased()
+
+        return keyboardCapture.reservedHostShortcuts.first { shortcut in
+            let shortcutInput = shortcut.input.lowercased()
+            let shortcutModifiers = Self.uiModifiers(for: shortcut.modifiers)
+            if shortcutModifiers == modifiers,
+               (shortcutInput == unmodifiedInput || shortcutInput == modifiedInput) {
+                return true
+            }
+
+            guard shortcut.modifiers.contains(.shift),
+                  let shiftedInput = Self.shiftedHostShortcutInput(shortcut.input)?
+                    .lowercased(),
+                  shiftedInput == modifiedInput else { return false }
+
+            // Physical UIKey events normally retain Shift, while Catalyst can
+            // normalize shifted punctuation to the produced character and
+            // omit Shift. Accept both representations of the same key chord.
+            if shortcutModifiers == modifiers { return true }
+            var normalizedModifiers = shortcutModifiers
+            normalizedModifiers.remove(.shift)
+            return normalizedModifiers == modifiers
+        }
+    }
+
+    private static func shiftedHostShortcutInput(_ input: String) -> String? {
+        switch input {
+        case "[": "{"
+        case "]": "}"
+        case "\\": "|"
+        default: nil
+        }
+    }
+
+    private static func uiModifiers(
+        for modifiers: VNCKeyboardModifiers
+    ) -> UIKeyModifierFlags {
+        var flags: UIKeyModifierFlags = []
+        if modifiers.contains(.control) { flags.insert(.control) }
+        if modifiers.contains(.option) { flags.insert(.alternate) }
+        if modifiers.contains(.shift) { flags.insert(.shift) }
+        if modifiers.contains(.command) { flags.insert(.command) }
+        return flags
+    }
+
     @objc private func hardwareKeyboardDidConnect(_ notification: Notification) {
         onHardwareKeyboardAttachedChange?(true)
         #if targetEnvironment(macCatalyst)
@@ -822,16 +957,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         let keysym = KeyboardInputHandler.keysymForHIDUsage(
             usage,
             characters: characters)
-        _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
-    }
-
-    private func forwardClaimedHostShortcut(_ command: UIKeyCommand) {
-        ensureModifierKeys(for: command.modifierFlags)
-        guard let input = command.input,
-              let usage = Self.hidUsage(forCommandInput: input) else { return }
-        let keysym = KeyboardInputHandler.keysymForHIDUsage(
-            usage,
-            characters: input)
         _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
     }
 
@@ -1821,7 +1946,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     private func focusForHardwareKeyboard() {
-        keyboardCapture.capture()
+        if keyboardCapture.automaticallyCapturesOnInteraction {
+            keyboardCapture.capture()
+        }
         guard !isFirstResponder else { return }
         softwareKeyboardRequested = false
         becomeFirstResponder()
