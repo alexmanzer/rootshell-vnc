@@ -3,7 +3,7 @@ import XCTest
 @testable import RFBTransport
 
 final class AppleMediaFeedbackTests: XCTestCase {
-    func testFrameLossFeedbackWireLayoutMatchesAVConferenceAFBTypeSix() {
+    func testFrameLossFeedbackWireLayoutMatchesPSFBAFBTypeSix() {
         let packet = appleMediaFrameLossPacket(
             senderSSRC: 0x1122_3344,
             mediaSSRC: 0x5566_7788,
@@ -23,7 +23,7 @@ final class AppleMediaFeedbackTests: XCTestCase {
         ]))
     }
 
-    func testFullIntraRequestMatchesAVConferenceRTCPAddFIR() {
+    func testFullIntraRequestMatchesRTCPFullIntraRequestWireLayout() {
         XCTAssertEqual(
             appleMediaFullIntraRequestPacket(
                 senderSSRC: 0x1122_3344,
@@ -58,7 +58,7 @@ final class AppleMediaFeedbackTests: XCTestCase {
             [.init(packetID: .max, bitmask: 0x0005)])
     }
 
-    func testRCTLWireLayoutMatchesAVConferenceFields() {
+    func testRCTLWireLayoutMatchesNegotiatedMediaFields() {
         let data = AppleMediaRCTLFeedback(
             lossPercent: 7,
             echoTimestamp: 0x1234,
@@ -101,7 +101,7 @@ final class AppleMediaFeedbackTests: XCTestCase {
             0x3456)
     }
 
-    func testRCTLPacketIsStandaloneAVConferenceAPPReport() {
+    func testRCTLPacketIsStandaloneRTCPAPPReport() {
         let feedback = AppleMediaRCTLFeedback(
             lossPercent: 0,
             echoTimestamp: 0,

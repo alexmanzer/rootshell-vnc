@@ -4263,7 +4263,7 @@ public actor TransportSession {
             senderSSRC: sender) else { return }
         dumpAppleMediaOutgoingRTCPIfRequested(plaintext: compound, protected: protected)
         try? await channel.send(protected)
-        log.warning("Sent AVConference frame-loss feedback ssrc=0x\(String(mediaSSRC, radix: 16)) "
+        log.warning("Sent media frame-loss feedback ssrc=0x\(String(mediaSSRC, radix: 16)) "
             + "received=\(feedback.receivedPacketCount) framePackets=\(feedback.framePacketCount) "
             + "lost=\(feedback.lostPacketCount) feedbackStream=\(route.streamIndex)")
     }
