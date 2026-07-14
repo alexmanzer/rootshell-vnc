@@ -1,5 +1,13 @@
 import Foundation
 import RFBProtocol
+import RFBTransport
+
+/// Builds the byte-stream transport carrying one connection attempt.
+///
+/// The returned connection must be unconnected; the session calls
+/// `connect()` on it. Throw to fail the attempt.
+public typealias VNCTransportProvider =
+    @Sendable (_ host: String, _ port: UInt16) async throws -> any RFBConnection
 
 /// Configuration options for a VNC session.
 ///
@@ -113,11 +121,45 @@ public struct VNCConfiguration: Sendable {
     /// The backing connection-mode and quality profile to offer the server.
     public var videoQualityMode: VideoQualityMode {
         didSet {
+            // High Performance needs direct UDP reachability; a tunneled
+            // transport self-heals to Standard like the other mode couplings.
+            if videoQualityMode == .adaptive, transportProvider != nil {
+                videoQualityMode = .standard
+            }
             if videoQualityMode != .adaptive,
                displaySizingMode == .matchClient {
                 displaySizingMode = .remoteDisplay
             }
         }
+    }
+
+    /// Host-supplied factory for the connection carrying the RFB byte stream
+    /// (an SSH direct-tcpip channel, a tssh tunnel, ...). `nil` uses a direct
+    /// TCP connection.
+    ///
+    /// The provider is invoked once per connection **attempt** — the built-in
+    /// reconnection policy builds a fresh transport for every retry — so the
+    /// host must re-establish or verify its underlying tunnel (for example the
+    /// SSH session) on each call rather than handing out one dead channel.
+    ///
+    /// Apple's High Performance mode requires direct UDP reachability, so
+    /// installing a provider clamps ``videoQualityMode`` from `.adaptive` to
+    /// `.standard` and removes `.adaptive` from
+    /// ``availableVideoQualityModes``.
+    public var transportProvider: VNCTransportProvider? {
+        didSet {
+            if transportProvider != nil, videoQualityMode == .adaptive {
+                videoQualityMode = .standard
+            }
+        }
+    }
+
+    /// The quality modes selectable for the current transport. `.adaptive`
+    /// is unavailable over a custom transport.
+    public var availableVideoQualityModes: [VideoQualityMode] {
+        transportProvider == nil
+            ? VideoQualityMode.allCases
+            : [.standard, .fullQuality]
     }
 
     /// Whether a capable server should render at the client viewport size.
@@ -229,6 +271,8 @@ public struct VNCConfiguration: Sendable {
     ///   - enableHighPerformanceMode: Whether to enable HEVC when available.
     ///   - targetFrameRate: Desired frame rate for update requests.
     ///   - enableProtocolTrace: Whether to record protocol messages.
+    ///   - transportProvider: Optional factory for a host-supplied tunnel
+    ///     transport; clamps `.adaptive` quality to `.standard`.
     public init(
         preferredPixelFormat: PixelFormat? = nil,
         preferredEncodings: [Encoding] = [.copyRect, .raw],
@@ -240,12 +284,20 @@ public struct VNCConfiguration: Sendable {
         enableRemoteAudio: Bool = true,
         targetFrameRate: Int = 30,
         enableProtocolTrace: Bool = false,
-        reconnectionPolicy: VNCReconnectionPolicy = VNCReconnectionPolicy()
+        reconnectionPolicy: VNCReconnectionPolicy = VNCReconnectionPolicy(),
+        transportProvider: VNCTransportProvider? = nil
     ) {
         self.preferredPixelFormat = preferredPixelFormat
         self.preferredEncodings = preferredEncodings
         self.enableHighPerformanceMode = enableHighPerformanceMode
+        // Property observers do not run during init; apply the custom-
+        // transport clamp here so every later derivation sees the final mode.
+        let videoQualityMode = transportProvider != nil
+            && videoQualityMode == .adaptive
+            ? .standard
+            : videoQualityMode
         self.videoQualityMode = videoQualityMode
+        self.transportProvider = transportProvider
         let requestedDisplayMode = displayMode ?? (
             Self.clampedDisplayCount(displayCount) == 1
                 ? .oneDisplay

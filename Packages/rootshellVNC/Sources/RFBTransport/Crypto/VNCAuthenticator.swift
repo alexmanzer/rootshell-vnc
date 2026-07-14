@@ -19,7 +19,7 @@ public struct VNCAuthenticator: Authenticator, Sendable {
         self.password = password
     }
 
-    public func authenticate(connection: TCPConnection) async throws -> AuthenticationResult {
+    public func authenticate(connection: any RFBConnection) async throws -> AuthenticationResult {
         log.info("Starting VNC authentication (Type 2)")
 
         // Step 1: Read 16-byte challenge

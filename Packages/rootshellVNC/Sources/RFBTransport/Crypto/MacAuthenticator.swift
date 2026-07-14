@@ -50,7 +50,7 @@ public struct MacAuthenticator: Authenticator, Sendable {
     /// If false, MacAuthenticator will prepend it to the first message.
     public var securityTypeAlreadySent = false
 
-    public func authenticate(connection: TCPConnection) async throws -> AuthenticationResult {
+    public func authenticate(connection: any RFBConnection) async throws -> AuthenticationResult {
         log.info("Starting Mac Authentication (Type 33)")
 
         let rsaKey = try await requestRSAKey(connection: connection)
@@ -82,7 +82,7 @@ public struct MacAuthenticator: Authenticator, Sendable {
     }
 
     private func authenticateDHMode(
-        connection: TCPConnection,
+        connection: any RFBConnection,
         rsaKey: RSAPublicKey
     ) async throws -> AuthenticationResult {
         let aesKey = try generateAESKey()
@@ -109,7 +109,7 @@ public struct MacAuthenticator: Authenticator, Sendable {
     }
 
     private func authenticateSRPMode(
-        connection: TCPConnection,
+        connection: any RFBConnection,
         rsaKey: RSAPublicKey
     ) async throws -> AuthenticationResult {
         let requestBody = try buildSRPAuthenticationBody(rsaKey: rsaKey)
@@ -166,7 +166,7 @@ public struct MacAuthenticator: Authenticator, Sendable {
 
     // MARK: - Phase 1: RSA Key Exchange
 
-    private func requestRSAKey(connection: TCPConnection) async throws -> RSAPublicKey {
+    private func requestRSAKey(connection: any RFBConnection) async throws -> RSAPublicKey {
         // Step 1: Send RSA1 capability request
         // The security type byte (0x21) and the RSA1 request MUST be in the same
         // TCP segment — the macOS server reads them as one unit.
@@ -348,7 +348,7 @@ public struct MacAuthenticator: Authenticator, Sendable {
     /// Reads and parses server DH params, computes DH keys, builds response.
     /// Returns (sharedSecret, serverNonce, dhResponseData) — the response is NOT sent yet.
     private func parseDHParams(
-        connection: TCPConnection,
+        connection: any RFBConnection,
         aesKey: Data
     ) async throws -> (Data, Data, Data) {
 
@@ -765,7 +765,7 @@ public struct MacAuthenticator: Authenticator, Sendable {
     // MARK: - Wire helpers
 
     /// Send data prefixed with a 4-byte big-endian length.
-    private func sendLengthPrefixed(connection: TCPConnection, data: Data) async throws {
+    private func sendLengthPrefixed(connection: any RFBConnection, data: Data) async throws {
         var msg = Data(count: 4)
         let len = UInt32(data.count)
         msg[0] = UInt8((len >> 24) & 0xFF)
@@ -777,7 +777,7 @@ public struct MacAuthenticator: Authenticator, Sendable {
     }
 
     /// Read a big-endian UInt32 from the connection.
-    private func readUInt32(connection: TCPConnection) async throws -> UInt32 {
+    private func readUInt32(connection: any RFBConnection) async throws -> UInt32 {
         let data = try await connection.read(exactly: 4)
         return UInt32(data[0]) << 24 | UInt32(data[1]) << 16
              | UInt32(data[2]) << 8 | UInt32(data[3])

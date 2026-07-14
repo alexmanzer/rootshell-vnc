@@ -47,6 +47,7 @@ public struct RemoteDesktopView: View {
     private let keyboardHandler: KeyboardInputHandler
     private let isFullScreen: Bool
     private let toggleFullScreen: (() -> Void)?
+    private let hudMenuExtras: AnyView?
 
     public init(
         session: VNCSession,
@@ -54,7 +55,44 @@ public struct RemoteDesktopView: View {
         isFullScreen: Bool = false,
         toggleFullScreen: (() -> Void)? = nil
     ) {
+        self.init(
+            session: session,
+            keyboardCapture: keyboardCapture,
+            isFullScreen: isFullScreen,
+            toggleFullScreen: toggleFullScreen,
+            hudMenuExtras: nil)
+    }
+
+    /// Creates a remote desktop view whose HUD menu shows extra items between
+    /// the built-in viewport controls and the password/disconnect actions.
+    ///
+    /// The extras are captured once at init and type-erased; container apps
+    /// that want live state in these items should pass views that read their
+    /// own `@Observable` models so the hosted menu re-renders on change.
+    public init<MenuExtras: View>(
+        session: VNCSession,
+        keyboardCapture: VNCKeyboardCapture? = nil,
+        isFullScreen: Bool = false,
+        toggleFullScreen: (() -> Void)? = nil,
+        @ViewBuilder hudMenuExtras: () -> MenuExtras
+    ) {
+        self.init(
+            session: session,
+            keyboardCapture: keyboardCapture,
+            isFullScreen: isFullScreen,
+            toggleFullScreen: toggleFullScreen,
+            hudMenuExtras: AnyView(hudMenuExtras()))
+    }
+
+    private init(
+        session: VNCSession,
+        keyboardCapture: VNCKeyboardCapture?,
+        isFullScreen: Bool,
+        toggleFullScreen: (() -> Void)?,
+        hudMenuExtras: AnyView?
+    ) {
         self.session = session
+        self.hudMenuExtras = hudMenuExtras
         self._keyboardCapture = State(
             initialValue: keyboardCapture ?? VNCKeyboardCapture())
         self.isFullScreen = isFullScreen
@@ -166,6 +204,19 @@ public struct RemoteDesktopView: View {
                 .accessibilityHidden(true)
             #endif
         }
+        // Two-way sync with the host-visible keyboard request. The local
+        // @State stays authoritative for HUD-driven changes; the equality
+        // guards prevent onChange ping-pong between the two sources.
+        .onChange(of: keyboardActive) { _, active in
+            if keyboardCapture.softwareKeyboardRequested != active {
+                keyboardCapture.softwareKeyboardRequested = active
+            }
+        }
+        .onChange(of: keyboardCapture.softwareKeyboardRequested) { _, requested in
+            if keyboardActive != requested {
+                keyboardActive = requested
+            }
+        }
         #if canImport(UIKit)
         .background {
             DockedKeyboardInsetReader(metrics: $keyboardViewportMetrics)
@@ -242,118 +293,134 @@ public struct RemoteDesktopView: View {
 
     @ViewBuilder
     private var viewportControls: some View {
+        #if canImport(UIKit)
+        DraggableHUDOverlay {
+            hudMenu
+                .padding(12)
+        }
+        #else
         VStack {
             Spacer()
             HStack {
                 Spacer()
-                Menu {
-                    #if canImport(UIKit)
-                    if !hardwareKeyboardAttached {
-                        Button {
-                            keyboardCapture.capture()
-                            keyboardActive.toggle()
-                        } label: {
-                            Label(
-                                keyboardActive ? "Hide Keyboard" : "Show Keyboard",
-                                systemImage: keyboardActive
-                                    ? "keyboard.chevron.compact.down" : "keyboard")
-                        }
-                    }
-
-                    Button {
-                        keyboardCapture.toggle()
-                        if !keyboardCapture.isCaptured {
-                            keyboardActive = false
-                        }
-                    } label: {
-                        Label(
-                            keyboardCapture.isCaptured
-                                ? "Release Keyboard Capture" : "Capture Keyboard",
-                            systemImage: keyboardCapture.isCaptured
-                                ? "keyboard.badge.ellipsis" : "keyboard")
-                    }
-
-                    Menu {
-                        Section("Mac Specific") {
-                            ForEach(RemoteCommand.macSpecific) { command in
-                                Button(command.title) {
-                                    keyboardHandler.handleRemoteCommand(command)
-                                }
-                            }
-                        }
-
-                        Section("Other Commands") {
-                            Button("Dictate") {
-                                requestDictation()
-                            }
-
-                            ForEach(RemoteCommand.otherCommands) { command in
-                                Button(command.title) {
-                                    keyboardHandler.handleRemoteCommand(command)
-                                }
-                            }
-
-                            Button("Command-H") {
-                                keyboardHandler.handleCommandTap("h")
-                            }
-                            Button("Command-M") {
-                                keyboardHandler.handleCommandTap("m")
-                            }
-                        }
-                    } label: {
-                        Label(
-                            "Commands",
-                            systemImage: "command")
-                    }
-                    #endif
-
-                    Button {
-                        viewport.reset()
-                    } label: {
-                        Label("Fit Screen", systemImage: "arrow.down.right.and.arrow.up.left")
-                    }
-                    .disabled(viewport.isIdentity)
-
-                    if let toggleFullScreen {
-                        Button(action: toggleFullScreen) {
-                            Label(
-                                isFullScreen ? "Exit Full Screen" : "Enter Full Screen",
-                                systemImage: isFullScreen
-                                    ? "arrow.down.right.and.arrow.up.left"
-                                    : "arrow.up.left.and.arrow.down.right")
-                        }
-                    }
-
-                    Divider()
-
-                    Button {
-                        requestPasswordSend()
-                    } label: {
-                        Label("Type User Password", systemImage: "key.fill")
-                    }
-                    .disabled(!session.canSendLoginPassword)
-
-                    Divider()
-
-                    Button(role: .destructive) {
-                        session.disconnect()
-                    } label: {
-                        Label("Close Connection", systemImage: "xmark.circle")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.body.weight(.bold))
-                        .frame(width: 42, height: 42)
-                        .background(.ultraThinMaterial, in: Circle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.primary)
-                .accessibilityLabel("Remote Desktop Controls")
-                .help("Remote Desktop Controls")
+                hudMenu
             }
             .padding(12)
         }
         .allowsHitTesting(true)
+        #endif
+    }
+
+    @ViewBuilder
+    private var hudMenu: some View {
+        Menu {
+            #if canImport(UIKit)
+            if !hardwareKeyboardAttached {
+                Button {
+                    keyboardCapture.capture()
+                    keyboardActive.toggle()
+                } label: {
+                    Label(
+                        keyboardActive ? "Hide Keyboard" : "Show Keyboard",
+                        systemImage: keyboardActive
+                            ? "keyboard.chevron.compact.down" : "keyboard")
+                }
+            }
+
+            Button {
+                keyboardCapture.toggle()
+                if !keyboardCapture.isCaptured {
+                    keyboardActive = false
+                }
+            } label: {
+                Label(
+                    keyboardCapture.isCaptured
+                        ? "Release Keyboard Capture" : "Capture Keyboard",
+                    systemImage: keyboardCapture.isCaptured
+                        ? "keyboard.badge.ellipsis" : "keyboard")
+            }
+
+            Menu {
+                Section("Mac Specific") {
+                    ForEach(RemoteCommand.macSpecific) { command in
+                        Button(command.title) {
+                            keyboardHandler.handleRemoteCommand(command)
+                        }
+                    }
+                }
+
+                Section("Other Commands") {
+                    Button("Dictate") {
+                        requestDictation()
+                    }
+
+                    ForEach(RemoteCommand.otherCommands) { command in
+                        Button(command.title) {
+                            keyboardHandler.handleRemoteCommand(command)
+                        }
+                    }
+
+                    Button("Command-H") {
+                        keyboardHandler.handleCommandTap("h")
+                    }
+                    Button("Command-M") {
+                        keyboardHandler.handleCommandTap("m")
+                    }
+                }
+            } label: {
+                Label(
+                    "Commands",
+                    systemImage: "command")
+            }
+            #endif
+
+            Button {
+                viewport.reset()
+            } label: {
+                Label("Fit Screen", systemImage: "arrow.down.right.and.arrow.up.left")
+            }
+            .disabled(viewport.isIdentity)
+
+            if let toggleFullScreen {
+                Button(action: toggleFullScreen) {
+                    Label(
+                        isFullScreen ? "Exit Full Screen" : "Enter Full Screen",
+                        systemImage: isFullScreen
+                            ? "arrow.down.right.and.arrow.up.left"
+                            : "arrow.up.left.and.arrow.down.right")
+                }
+            }
+
+            if let hudMenuExtras {
+                hudMenuExtras
+            }
+
+            Divider()
+
+            Button {
+                requestPasswordSend()
+            } label: {
+                Label("Type User Password", systemImage: "key.fill")
+            }
+            .disabled(!session.canSendLoginPassword)
+
+            Divider()
+
+            Button(role: .destructive) {
+                session.disconnect()
+            } label: {
+                Label("Close Connection", systemImage: "xmark.circle")
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.body.weight(.bold))
+                .frame(width: 42, height: 42)
+                .background(.ultraThinMaterial, in: Circle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .accessibilityLabel("Remote Desktop Controls")
+        .help("Remote Desktop Controls")
     }
 
     private func requestPasswordSend() {

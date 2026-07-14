@@ -24,7 +24,7 @@ public struct DHAuthenticator: Authenticator, Sendable {
         self.password = password
     }
 
-    public func authenticate(connection: TCPConnection) async throws -> AuthenticationResult {
+    public func authenticate(connection: any RFBConnection) async throws -> AuthenticationResult {
         log.info("Starting Apple DH authentication (Type 30)")
 
         // Step 1: Read parameters from server

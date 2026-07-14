@@ -247,6 +247,32 @@ public final class VNCSession {
     /// The configuration for this session.
     public var configuration: VNCConfiguration
 
+    // MARK: - Host Hooks
+
+    /// Invoked on the main actor when the server publishes clipboard text
+    /// (RFB ServerCutText). Container applications set this to route the
+    /// remote clipboard into their own pasteboard handling; leaving it `nil`
+    /// (the default) keeps the log-only behavior.
+    @ObservationIgnored
+    public var onServerClipboardText: ((String) -> Void)?
+
+    /// While `true`, Match Client display-size requests are deferred instead
+    /// of sent. Container apps set this when the hosting view is occluded
+    /// (hidden tab, backgrounded window) so transient layout changes never
+    /// round-trip a resize to the server; clearing it applies the latest
+    /// deferred size once, deduplicated against the last request.
+    @ObservationIgnored
+    public var suspendsRemoteDisplaySizeUpdates: Bool = false {
+        didSet {
+            guard oldValue, !suspendsRemoteDisplaySizeUpdates,
+                  let deferred = deferredDisplaySizeUpdate else { return }
+            deferredDisplaySizeUpdate = nil
+            updateRemoteDisplaySize(
+                viewSize: deferred.viewSize,
+                displayScale: deferred.displayScale)
+        }
+    }
+
     // MARK: - Internal
 
     private var transportSession: TransportSession?
@@ -272,6 +298,9 @@ public final class VNCSession {
     /// display.
     @ObservationIgnored
     private var preparedClientDisplaySize: RemoteDisplaySize?
+    /// Latest viewport reported while size updates were suspended.
+    @ObservationIgnored
+    private var deferredDisplaySizeUpdate: (viewSize: CGSize, displayScale: CGFloat)?
     /// Single drain task for the ordered input queue. Gesture callbacks are
     /// synchronous, but transport writes are async; one pump prevents a release
     /// from overtaking its press while coalescing stale movement samples.
@@ -387,6 +416,14 @@ public final class VNCSession {
     public func connect(credentials: VNCCredentials) async throws {
         guard connectionState.canConnect else {
             throw VNCError.alreadyConnected
+        }
+
+        // Belt-and-braces: the configuration self-heals this combination in
+        // its property observers, so reaching this guard means a bug upstream.
+        if configuration.transportProvider != nil,
+           configuration.videoQualityMode == .adaptive {
+            throw VNCError.unsupportedFeature(
+                "High Performance mode requires a direct network connection and is unavailable over a tunneled transport.")
         }
 
         invalidateInputQueue()
@@ -657,6 +694,10 @@ public final class VNCSession {
         viewSize: CGSize,
         displayScale: CGFloat
     ) {
+        if suspendsRemoteDisplaySizeUpdates {
+            deferredDisplaySizeUpdate = (viewSize, displayScale)
+            return
+        }
         guard let requested = matchingClientDisplaySize(
             viewSize: viewSize,
             displayScale: displayScale) else { return }
@@ -765,6 +806,7 @@ public final class VNCSession {
                     details: "length=\(text.utf8.count)"
                 )
             }
+            onServerClipboardText?(text)
 
         case .bell:
             logger.debug("Server bell")
@@ -1282,6 +1324,15 @@ public final class VNCSession {
     }
 
     private func establishTransport(credentials: VNCCredentials) async throws {
+        // A custom transport is built fresh here for every attempt: the
+        // reconnect loop lands on this path per retry, and the provider
+        // contract requires a usable tunnel each time.
+        let customConnection: (any RFBConnection)?
+        if let provider = configuration.transportProvider {
+            customConnection = try await provider(credentials.host, credentials.port)
+        } else {
+            customConnection = nil
+        }
         let transport = TransportSession(
             host: credentials.host,
             port: credentials.port,
@@ -1292,7 +1343,8 @@ public final class VNCSession {
             preferFullQualityVideo: configuration.videoQualityMode == .fullQuality,
             displayCount: configuration.displayCount,
             requestsVirtualDisplays:
-                configuration.displaySizingMode == .matchClient)
+                configuration.displaySizingMode == .matchClient,
+            connection: customConnection)
         transportSession = transport
 
         if configuration.displaySizingMode == .matchClient,

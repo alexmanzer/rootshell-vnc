@@ -2,7 +2,7 @@ import Foundation
 import Network
 import RFBProtocol
 
-enum NetworkPathInterfaceKind: Sendable, Equatable {
+public enum NetworkPathInterfaceKind: Sendable, Equatable {
     case cellular
     case wifi
     case wiredEthernet
@@ -10,11 +10,23 @@ enum NetworkPathInterfaceKind: Sendable, Equatable {
     case other
 }
 
-struct NetworkPathCharacteristics: Sendable, Equatable {
-    let interface: NetworkPathInterfaceKind
-    let usesOtherInterface: Bool
-    let isExpensive: Bool
-    let isConstrained: Bool
+public struct NetworkPathCharacteristics: Sendable, Equatable {
+    public let interface: NetworkPathInterfaceKind
+    public let usesOtherInterface: Bool
+    public let isExpensive: Bool
+    public let isConstrained: Bool
+
+    public init(
+        interface: NetworkPathInterfaceKind,
+        usesOtherInterface: Bool,
+        isExpensive: Bool,
+        isConstrained: Bool
+    ) {
+        self.interface = interface
+        self.usesOtherInterface = usesOtherInterface
+        self.isExpensive = isExpensive
+        self.isConstrained = isConstrained
+    }
 }
 
 /// Async wrapper around NWConnection for TCP communication with an RFB server.
@@ -252,7 +264,7 @@ public actor TCPConnection {
     /// Snapshot the route selected for the actual RFB connection. This is more
     /// accurate than a process-wide path monitor when a VPN or multiple active
     /// interfaces are present.
-    func pathCharacteristics() -> NetworkPathCharacteristics? {
+    public func pathCharacteristics() -> NetworkPathCharacteristics? {
         guard let path = connection?.currentPath else { return nil }
         let interface: NetworkPathInterfaceKind
         if path.usesInterfaceType(.cellular) {
@@ -273,6 +285,10 @@ public actor TCPConnection {
             isConstrained: path.isConstrained)
     }
 }
+
+// Actor-isolated methods satisfy the async requirements and the nonisolated
+// synchronous close() satisfies `close() async`; no body changes needed.
+extension TCPConnection: RFBConnection {}
 
 private final class ConnectionResumeBox: @unchecked Sendable {
     private let lock = NSLock()

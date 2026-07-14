@@ -121,17 +121,22 @@ public enum ClientInputEvent: Sendable, Equatable {
 
 /// An actor that manages the full lifecycle of a VNC connection.
 ///
-/// `TransportSession` owns a `TCPConnection` for network I/O, a
+/// `TransportSession` owns an ``RFBConnection`` for network I/O (a direct
+/// `TCPConnection` by default, or a host-injected tunnel), a
 /// `ConnectionStateMachine` for protocol logic, and drives the RFB handshake
-/// by reading from TCP, feeding events to the state machine, and executing
-/// the resulting actions.
+/// by reading from the connection, feeding events to the state machine, and
+/// executing the resulting actions.
 ///
 /// Consumers observe the session through the `events` `AsyncStream`.
 public actor TransportSession {
 
     // MARK: - Properties
 
-    private let tcp: TCPConnection
+    private let tcp: any RFBConnection
+    /// Whether the connection was injected by the host instead of the default
+    /// direct TCP path. Apple's High Performance media mode needs direct UDP
+    /// reachability and is refused over a custom transport.
+    private let usesCustomTransport: Bool
     private var stateMachine: ConnectionStateMachine
     private let host: String
     private let password: String
@@ -414,6 +419,10 @@ public actor TransportSession {
     ///   - port: The server port (typically 5900).
     ///   - password: The VNC password for authentication.
     ///   - username: Optional username for Apple DH/SRP authentication.
+    ///   - connection: Optional host-provided transport (an SSH or tssh
+    ///     tunnel). When `nil`, a direct `TCPConnection` to `host:port` is
+    ///     used. Apple's High Performance (UDP media) mode is refused over a
+    ///     custom transport.
     public init(
         host: String,
         port: UInt16,
@@ -423,7 +432,8 @@ public actor TransportSession {
         preferredEncodings: [Encoding]? = nil,
         preferFullQualityVideo: Bool = false,
         displayCount: Int = 1,
-        requestsVirtualDisplays: Bool = false
+        requestsVirtualDisplays: Bool = false,
+        connection: (any RFBConnection)? = nil
     ) {
         let environment = ProcessInfo.processInfo.environment
         self.runtimeEnvironment = environment
@@ -438,8 +448,11 @@ public actor TransportSession {
         // Force IPv4 for "localhost": it resolves to both ::1 and 127.0.0.1, and
         // if TCP connects over IPv6 the server sends UDP media to ::1 while our
         // media socket is IPv4-only — so no video arrives. Pin both to 127.0.0.1.
+        // A custom transport dials the host itself, so the pin only applies to
+        // the default direct path.
         let resolvedHost = (host == "localhost") ? "127.0.0.1" : host
-        self.tcp = TCPConnection(host: resolvedHost, port: port)
+        self.usesCustomTransport = connection != nil
+        self.tcp = connection ?? TCPConnection(host: resolvedHost, port: port)
         let configuredEncodings =
             preferredEncodings ?? ConnectionStateMachine.defaultPreferredEncodings
         let shouldUseAppleDCT =
@@ -478,6 +491,11 @@ public actor TransportSession {
     /// processes incoming server messages and emits events.
     public func connect() async throws {
         log.info("Starting connection")
+
+        if usesCustomTransport, requestAppleMediaStream {
+            throw VNCProtocolError.protocolViolation(
+                "High Performance (UDP media) mode cannot run over a custom transport")
+        }
 
         isDisconnecting = false
         terminalDisconnectHandled = false
@@ -788,7 +806,7 @@ public actor TransportSession {
         appleMediaGenerationSink = nil
         appleRemoteDisplaySizeSink = nil
         await stopAppleMediaUDP()
-        tcp.close()
+        await tcp.close()
         let actions = stateMachine.handle(event: .userRequestedDisconnect)
         emitState()
         for action in actions {
@@ -1127,7 +1145,7 @@ public actor TransportSession {
         _ = stateMachine.handle(event: .connectionLost(error))
         emitState()
         await stopAppleMediaUDP()
-        tcp.close()
+        await tcp.close()
         continuation?.yield(.disconnected)
         continuation?.finish()
     }
@@ -1654,7 +1672,7 @@ public actor TransportSession {
 
         case .disconnect:
             await stopAppleMediaUDP()
-            tcp.close()
+            await tcp.close()
             continuation?.yield(.disconnected)
 
         case .sendEncryptionResponse:

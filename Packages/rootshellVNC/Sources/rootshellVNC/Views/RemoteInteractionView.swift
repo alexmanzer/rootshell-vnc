@@ -64,6 +64,7 @@ struct RemoteInteractionView: UIViewRepresentable {
             viewport: viewport,
             keyboardActive: keyboardActive,
             keyboardCaptured: keyboardCapture.isCaptured,
+            inputViewsGeneration: keyboardCapture.inputViewsGeneration,
             framebufferOrigin: framebufferOrigin,
             requestPasswordSend: requestPasswordSend,
             requestDictation: requestDictation,
@@ -101,6 +102,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private var framebufferOrigin: CGPoint = .zero
     private var viewport = RemoteViewportState()
     private var softwareKeyboardRequested = false
+    private var lastSeenInputViewsGeneration: UInt64 = 0
     private var lastPointerPoint: (x: UInt16, y: UInt16)?
     private var remoteCursor: RemoteCursor?
     private var pointerDragActive = false
@@ -341,6 +343,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         self.requestDictation = requestDictation
         self.toggleFullScreen = toggleFullScreen
         self.disconnect = disconnect
+        self.lastSeenInputViewsGeneration = keyboardCapture.inputViewsGeneration
         super.init(frame: .zero)
         backgroundColor = .clear
         isMultipleTouchEnabled = true
@@ -413,9 +416,20 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
     /// Suppress the software keyboard while retaining hardware-keyboard focus
     /// after mouse/trackpad interaction. The explicit keyboard button switches
-    /// this back to the system keyboard on touch devices.
+    /// this back to the system keyboard on touch devices. A container app can
+    /// replace the input view entirely (toolbar-only mode) through
+    /// ``VNCKeyboardCapture/inputViewProvider``.
     override var inputView: UIView? {
-        softwareKeyboardRequested ? nil : suppressedInputView
+        if let inputViewProvider = keyboardCapture.inputViewProvider {
+            return inputViewProvider()
+        }
+        return softwareKeyboardRequested ? nil : suppressedInputView
+    }
+
+    /// The container app supplies an optional keyboard toolbar through
+    /// ``VNCKeyboardCapture/inputAccessoryViewProvider``.
+    override var inputAccessoryView: UIView? {
+        keyboardCapture.inputAccessoryViewProvider?()
     }
 
     var hasText: Bool { true }
@@ -425,6 +439,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         viewport: RemoteViewportState,
         keyboardActive: Bool,
         keyboardCaptured: Bool,
+        inputViewsGeneration: UInt64,
         framebufferOrigin: CGPoint,
         requestPasswordSend: @escaping () -> Void,
         requestDictation: @escaping () -> Void,
@@ -450,11 +465,18 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
         let keyboardModeChanged = keyboardActive != softwareKeyboardRequested
         softwareKeyboardRequested = keyboardActive
+        let inputViewsChanged = inputViewsGeneration != lastSeenInputViewsGeneration
+        lastSeenInputViewsGeneration = inputViewsGeneration
         if keyboardCaptured {
             if !isFirstResponder { becomeFirstResponder() }
-            if keyboardModeChanged { reloadInputViews() }
+            if keyboardModeChanged || (inputViewsChanged && isFirstResponder) {
+                reloadInputViews()
+            }
         } else {
             hardwareKeyboard.releaseAll()
+            if inputViewsChanged, isFirstResponder {
+                reloadInputViews()
+            }
         }
     }
 

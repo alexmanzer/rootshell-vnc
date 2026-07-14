@@ -16,7 +16,7 @@ public struct AuthenticationResult: Sendable, Equatable {
 ///
 /// Each supported security type (VNC Auth, Apple DH, SRP) provides an
 /// implementation that performs the complete authentication exchange
-/// over the TCP connection.
+/// over the connection.
 public protocol Authenticator: Sendable {
 
     /// Perform the authentication handshake over the given connection.
@@ -25,7 +25,7 @@ public protocol Authenticator: Sendable {
     /// the response, and send it. It should NOT read the SecurityResult —
     /// that is handled by the transport session.
     ///
-    /// - Parameter connection: The TCP connection to the VNC server.
+    /// - Parameter connection: The transport connection to the VNC server.
     /// - Throws: ``VNCProtocolError`` on authentication protocol errors.
-    func authenticate(connection: TCPConnection) async throws -> AuthenticationResult
+    func authenticate(connection: any RFBConnection) async throws -> AuthenticationResult
 }
