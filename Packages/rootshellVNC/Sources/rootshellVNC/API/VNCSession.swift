@@ -558,6 +558,34 @@ public final class VNCSession {
         scheduleReconnect(immediate: true)
     }
 
+    /// Reconnect an active session using a replacement configuration while
+    /// retaining the credentials already held by the session.
+    ///
+    /// This is intended for UI actions that change handshake-level options,
+    /// such as the video transport or remote display sizing mode. The
+    /// transition deliberately avoids `.disconnected`, so container apps can
+    /// distinguish a configuration restart from an intentional close.
+    ///
+    /// - Returns: `true` when the restart was accepted. A session must be
+    ///   connected, have retained credentials, and not already be reconnecting.
+    @discardableResult
+    public func reconnect(with configuration: VNCConfiguration) -> Bool {
+        guard connectionState.isConnected,
+              activeCredentials != nil,
+              reconnectTask == nil else { return false }
+
+        self.configuration = configuration
+        intentionallyDisconnected = false
+
+        // Mirror the proven media-bootstrap recovery path: close the old
+        // transport while the reconnect task performs ordered cleanup and
+        // establishes a fresh transport with the replacement configuration.
+        let transport = transportSession
+        Task { await transport?.disconnect() }
+        scheduleReconnect(immediate: true, minimumAttempts: 1)
+        return true
+    }
+
     // MARK: - Input Events
 
     /// Whether the active connection has a password available for the remote
@@ -1262,6 +1290,12 @@ public final class VNCSession {
         logger.info("Disconnected")
         cleanupTransport(clearCredentials: intentionallyDisconnected)
 
+        // A manual configuration restart or media-bootstrap recovery already
+        // owns the replacement attempt. Do not publish `.disconnected` (which
+        // host apps interpret as an intentional close) or enqueue a duplicate
+        // reconnect when the retired transport reports its shutdown.
+        if reconnectTask != nil { return }
+
         guard !intentionallyDisconnected,
               hasEstablishedConnection,
               activeCredentials != nil,
@@ -1286,6 +1320,19 @@ public final class VNCSession {
         if clearCredentials {
             activeCredentials = nil
         }
+
+        // These values describe the retired transport's negotiated media and
+        // display topology. Keeping them across a configuration reconnect can
+        // leave SwiftUI rendering the High Performance video path after the
+        // replacement connection has negotiated Standard framebuffer mode.
+        isHighPerformanceMode = false
+        activeVideoDisplayCount = 1
+        remoteDisplayRegions = []
+        remoteDisplayRegionByID = [:]
+        remoteDisplayRegionOrder = []
+        remoteCursor = nil
+        diagnostics.isHighPerformanceMode = false
+
         videoStreamManager?.stopStream()
         videoStreamManager = nil
         secondaryVideoStreamManager?.stopStream()
@@ -1360,10 +1407,14 @@ public final class VNCSession {
         try await transport.connect()
     }
 
-    private func scheduleReconnect(immediate: Bool = false) {
+    private func scheduleReconnect(
+        immediate: Bool = false,
+        minimumAttempts: Int = 0
+    ) {
         guard reconnectTask == nil, let credentials = activeCredentials else { return }
         let policy = configuration.reconnectionPolicy
-        guard policy.maximumAttempts > 0 else {
+        let maximumAttempts = max(policy.maximumAttempts, minimumAttempts)
+        guard maximumAttempts > 0 else {
             connectionState = .failed("Reconnection is disabled for this session.")
             return
         }
@@ -1372,12 +1423,12 @@ public final class VNCSession {
             guard let self else { return }
             defer { self.reconnectTask = nil }
 
-            for attempt in 1...policy.maximumAttempts {
+            for attempt in 1...maximumAttempts {
                 guard !Task.isCancelled, !self.intentionallyDisconnected else { return }
                 let delay = immediate && attempt == 1 ? 0 : policy.delay(forAttempt: attempt)
                 self.connectionState = .reconnecting(attempt: attempt, delay: delay)
                 self.logger.warning(
-                    "Connection lost; retry \(attempt)/\(policy.maximumAttempts) in "
+                    "Connection lost; retry \(attempt)/\(maximumAttempts) in "
                         + String(format: "%.1f", delay) + "s")
 
                 do {
@@ -1419,7 +1470,7 @@ public final class VNCSession {
 
             self.cleanupTransport(clearCredentials: false)
             self.connectionState = .failed(
-                "Couldn’t reconnect after \(policy.maximumAttempts) attempts. Check the network or server, then try again.")
+                "Couldn’t reconnect after \(maximumAttempts) attempts. Check the network or server, then try again.")
         }
     }
 

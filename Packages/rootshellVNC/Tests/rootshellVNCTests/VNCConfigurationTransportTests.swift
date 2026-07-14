@@ -41,6 +41,108 @@ private final class ProviderRecorder: @unchecked Sendable {
     }
 }
 
+/// Successful in-memory RFB 3.8 connection used to exercise session-level
+/// reconnects without exposing or persisting credentials in the test.
+private actor SuccessfulRFBConnection: RFBConnection {
+    private var serverBytes: Data
+    private var readOffset = 0
+    private var closed = false
+    private var readWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(name: String) {
+        var script = Data("RFB 003.008\n".utf8)
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(width: 1024, height: 768, name: name))
+        self.serverBytes = script
+    }
+
+    func connect() async throws {
+        if closed { throw VNCProtocolError.connectionClosed }
+    }
+
+    func read(exactly count: Int) async throws -> Data {
+        while true {
+            if closed { throw VNCProtocolError.connectionClosed }
+            if serverBytes.count - readOffset >= count {
+                return consume(count)
+            }
+            await withCheckedContinuation { readWaiters.append($0) }
+        }
+    }
+
+    func read(upTo maxCount: Int) async throws -> Data {
+        while true {
+            if closed { throw VNCProtocolError.connectionClosed }
+            let available = serverBytes.count - readOffset
+            if available > 0 { return consume(min(available, maxCount)) }
+            await withCheckedContinuation { readWaiters.append($0) }
+        }
+    }
+
+    func send(_ data: Data) async throws {
+        if closed { throw VNCProtocolError.connectionClosed }
+    }
+
+    func close() {
+        closed = true
+        let waiters = readWaiters
+        readWaiters = []
+        for waiter in waiters { waiter.resume() }
+    }
+
+    func setDisconnectHandler(
+        _ handler: (@Sendable (VNCProtocolError) -> Void)?
+    ) async {}
+
+    private func consume(_ count: Int) -> Data {
+        let start = serverBytes.startIndex + readOffset
+        let result = serverBytes.subdata(in: start..<(start + count))
+        readOffset += count
+        return result
+    }
+
+    private nonisolated static func serverInitMessage(
+        width: UInt16,
+        height: UInt16,
+        name: String
+    ) -> Data {
+        var data = Data()
+        data.append(contentsOf: [UInt8(width >> 8), UInt8(width & 0xff)])
+        data.append(contentsOf: [UInt8(height >> 8), UInt8(height & 0xff)])
+        data.append(PixelFormat.bgra8888.wireBytes())
+        let nameBytes = Data(name.utf8)
+        let length = UInt32(nameBytes.count)
+        data.append(contentsOf: [
+            UInt8((length >> 24) & 0xff),
+            UInt8((length >> 16) & 0xff),
+            UInt8((length >> 8) & 0xff),
+            UInt8(length & 0xff),
+        ])
+        data.append(nameBytes)
+        return data
+    }
+}
+
+private final class SuccessfulProviderRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var calls: [(host: String, port: UInt16)] = []
+
+    func makeConnection(host: String, port: UInt16) -> any RFBConnection {
+        lock.lock()
+        calls.append((host, port))
+        let attempt = calls.count
+        lock.unlock()
+        return SuccessfulRFBConnection(name: "attempt-\(attempt)")
+    }
+
+    var recorded: [(host: String, port: UInt16)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
+}
+
 final class VNCConfigurationTransportTests: XCTestCase {
 
     private static let stubProvider: VNCTransportProvider = { _, _ in
@@ -124,5 +226,73 @@ final class VNCConfigurationTransportTests: XCTestCase {
         XCTAssertEqual(calls.count, 1)
         XCTAssertEqual(calls.first?.host, "vnc.internal")
         XCTAssertEqual(calls.first?.port, 5901)
+    }
+
+    @MainActor
+    func testReconnectAppliesConfigurationAndRetainsActiveCredentials() async throws {
+        let recorder = SuccessfulProviderRecorder()
+        var configuration = VNCConfiguration(
+            videoQualityMode: .fullQuality,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0))
+        configuration.transportProvider = { host, port in
+            recorder.makeConnection(host: host, port: port)
+        }
+
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "vnc.internal",
+            port: 5901,
+            password: "secret"))
+        let initiallyConnected = await waitUntil {
+            session.connectionState.isConnected
+        }
+        XCTAssertTrue(initiallyConnected)
+
+        // Model the negotiated state left by the High Performance transport
+        // that the HUD is replacing with Standard mode.
+        session.isHighPerformanceMode = true
+
+        var replacement = session.configuration
+        replacement.videoQualityMode = .standard
+        XCTAssertTrue(session.reconnect(with: replacement))
+        XCTAssertFalse(session.reconnect(with: replacement))
+
+        let reconnected = await waitUntil {
+            recorder.recorded.count == 2 && session.connectionState.isConnected
+        }
+        XCTAssertTrue(reconnected)
+        XCTAssertEqual(session.configuration.videoQualityMode, .standard)
+        XCTAssertFalse(session.isHighPerformanceMode)
+        XCTAssertEqual(recorder.recorded.map(\.host), ["vnc.internal", "vnc.internal"])
+        XCTAssertEqual(recorder.recorded.map(\.port), [5901, 5901])
+
+        session.disconnect()
+    }
+
+    @MainActor
+    func testReconnectRejectsIdleSessionWithoutChangingConfiguration() {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .standard))
+        var replacement = session.configuration
+        replacement.videoQualityMode = .fullQuality
+
+        XCTAssertFalse(session.reconnect(with: replacement))
+        XCTAssertEqual(session.configuration.videoQualityMode, .standard)
+    }
+
+    @MainActor
+    private func waitUntil(
+        timeout: Duration = .seconds(2),
+        condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return condition()
     }
 }
