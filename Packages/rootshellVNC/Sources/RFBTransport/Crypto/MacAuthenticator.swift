@@ -5,9 +5,10 @@ import Security
 import BigInt
 import RFBProtocol
 
-/// Type 33 "Mac Authentication" — RSA key exchange plus Apple-private password modes.
+/// Type 33 "Mac Authentication" — RSA key exchange plus protocol-defined
+/// password modes.
 ///
-/// Protocol flow (reverse-engineered from macOS pcap captures):
+/// Protocol flow:
 ///
 /// **Phase 1: RSA Key Exchange**
 /// 1. C→S: `[0x21] [len=10] [01 00 RSA1 00 00 00 00]` — capability request
@@ -258,7 +259,7 @@ public struct MacAuthenticator: Authenticator, Sendable {
                 "Type 33 encrypted credential block must be 128 bytes, got \(encryptedCredentials.count)")
         }
 
-        // Plain Type 33 password auth, accepted by current macOS AppleVNCServer:
+        // Plain Type-33 password authentication record:
         // [0:2]    version = 0x0100
         // [2:6]    "RSA1"
         // [6:8]    auth selector = 0x0001
@@ -449,7 +450,7 @@ public struct MacAuthenticator: Authenticator, Sendable {
         }
 
         // Step 3: Build client DH response.
-        // Format observed in macOS pcap (1076 bytes body):
+        // Type-33 DH response format (1076-byte body):
         // [01 00 RSA1 00 02] = 8-byte header
         // [UInt16 section_length = 682]
         // [UInt32 inner_length = 678]
@@ -665,8 +666,7 @@ public struct MacAuthenticator: Authenticator, Sendable {
         if ProcessInfo.processInfo.environment["ROOTSHELL_VNC_TYPE33_SRP_PROOF_USERNAME"] == "1" {
             proofUsername = Data(username.utf8)
         } else {
-            // AppleVNCServer appears to pass an empty username string into
-            // ccsrp_server_compute_session() for this mechanism.
+            // This mechanism defines the SRP proof with an empty username.
             proofUsername = Data()
         }
         let userHash = sha512(proofUsername)
@@ -692,9 +692,8 @@ public struct MacAuthenticator: Authenticator, Sendable {
         let colonPassword = Data([0x3A]) + passwordBytes
         let stockUserHash = sha512(userColonPassword)
         let stockNoUserHash = sha512(colonPassword)
-        // ScreenSharing's srp_client_mech_step2 first derives a 128-byte
-        // password with CCKeyDerivationPBKDF(kCCPBKDF2, HMAC-SHA512), then
-        // passes that derived password into ccsrp_client_process_challenge().
+        // This SRP profile first derives a 128-byte password with
+        // PBKDF2-HMAC-SHA512, then uses it as the SRP password input.
         let appleSRPPassword = try pbkdf2HMACSHA512(
             key: passwordBytes, salt: salt, iterations: iterations, keyLength: 128)
         let saltedPassword64 = try pbkdf2HMACSHA512(

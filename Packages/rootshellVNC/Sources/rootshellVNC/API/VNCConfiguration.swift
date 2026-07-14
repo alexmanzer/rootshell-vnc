@@ -334,8 +334,8 @@ public struct VNCConfiguration: Sendable {
     /// The pixel format the session negotiates and decodes with.
     ///
     /// An explicit ``preferredPixelFormat`` always wins (pass `.rgb555` for
-    /// 16-bit "thousands" color — measured ~3x smaller ZRLE payloads against
-    /// macOS Screen Sharing when bandwidth, not color, is the constraint).
+    /// 16-bit "thousands" color, which typically produces substantially smaller
+    /// ZRLE payloads when bandwidth, not color, is the constraint).
     /// The default stays full color in every mode.
     var effectivePixelFormat: PixelFormat {
         preferredPixelFormat ?? .bgra8888

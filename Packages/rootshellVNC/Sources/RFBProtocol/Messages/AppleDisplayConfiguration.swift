@@ -31,9 +31,8 @@ public struct AppleVirtualDisplayMode: Sendable, Equatable {
     }
 }
 
-/// One display record in Apple's display-configuration command. The layout is
-/// reconstructed from the installed ScreenSharing framework's typed serializer;
-/// production code does not link or call that private framework.
+/// One display record in Apple's display-configuration command, encoded using
+/// the fixed wire layout defined below.
 public struct AppleVirtualDisplay: Sendable, Equatable {
     public static let nameByteCount = 120
     public static let fixedWireSize = 156

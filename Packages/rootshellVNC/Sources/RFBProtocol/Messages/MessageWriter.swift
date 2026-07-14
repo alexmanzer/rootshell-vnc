@@ -259,7 +259,7 @@ public enum MessageWriter: Sendable {
         return data
     }
 
-    /// Serialize `_RFBPostGestureEventScroll` exactly as the native client:
+    /// Serialize the gesture-scroll subtype using its defined wire layout:
     /// three big-endian Float32 deltas, natural direction, phase, gesture mask,
     /// and framebuffer coordinates in a 32-byte type-23 payload.
     public static func writeAppleGestureScrollEvent(
@@ -284,10 +284,9 @@ public enum MessageWriter: Sendable {
 
     /// Serialize Apple's client media-stream configuration request.
     ///
-    /// Current macOS Screen Sharing sends this `0x21` message after ServerInit
-    /// and before accepting the `RFBMediaStreamMessage1Encoding` offer. The
-    /// payload is an Apple-private structure; these defaults match the local
-    /// Screen Sharing client and request one accelerated video stream.
+    /// Send this `0x21` message after ServerInit and before accepting the
+    /// `RFBMediaStreamMessage1Encoding` offer. The payload selects the default
+    /// accelerated single-video-stream profile.
     public static func writeAppleMediaStreamConfiguration() -> Data {
         let payload = Data([
             0x00, 0x01, 0x00, 0x00,
@@ -319,8 +318,8 @@ public enum MessageWriter: Sendable {
 
     /// Serialize Apple's client media-stream request.
     ///
-    /// macOS Screen Sharing sends this `0x12` message immediately after the
-    /// `0x21` media-stream configuration. It prompts the server to send the
+    /// Send this `0x12` message immediately after the `0x21` media-stream
+    /// configuration. It prompts the server to send the
     /// `RFBMediaStreamMessage1Encoding` offer rectangle.
     public static func writeAppleMediaStreamRequest() -> Data {
         Data([

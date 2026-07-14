@@ -1,11 +1,9 @@
 import Foundation
 
-/// Frame-loss report consumed by AVConference's screen-video transmitter.
+/// Frame-loss report for the negotiated screen-video transmitter.
 ///
-/// The wire layout and field meanings come from the local AVConference
-/// `VideoReceiver_SendRTCPResiliencyInfo` / `RTCPAddPSFBAlfbPacket` path. This
-/// is ordinary RTCP PSFB application feedback; no private framework is linked
-/// or called by the client.
+/// The wire format is an RTCP PSFB application-feedback packet carrying frame
+/// timing and packet-loss counters.
 struct AppleMediaFrameLossFeedback: Equatable, Sendable {
     /// RTP timestamp of the damaged frame.
     let frameRTPTimestamp: UInt32
@@ -25,7 +23,7 @@ private enum AppleMediaResiliencyWire {
     static let frameLossLengthInWordsMinusOne: UInt16 = 5
 }
 
-/// Serialize AVConference frame-loss feedback as one 24-byte RTCP PSFB packet.
+/// Serialize frame-loss feedback as one 24-byte RTCP PSFB packet.
 /// The caller prefixes a Receiver Report and applies SRTCP before transmission.
 func appleMediaFrameLossPacket(
     senderSSRC: UInt32,
@@ -50,10 +48,8 @@ func appleMediaFrameLossPacket(
     return packet
 }
 
-/// Serialize the PSFB FIR emitted by AVConference's
-/// `VideoReceiver_NoVideoDisplayedTimeoutCallback`. The receiver first reports
-/// concrete frame loss with AFB type 6; if no frame is displayed afterwards,
-/// native escalates to this FIR and resets its expected decoding order.
+/// Serialize the PSFB FIR used when AFB type-6 loss feedback does not restore
+/// video output. The receiver then resets its expected decoding order.
 func appleMediaFullIntraRequestPacket(
     senderSSRC: UInt32,
     mediaSSRC: UInt32,

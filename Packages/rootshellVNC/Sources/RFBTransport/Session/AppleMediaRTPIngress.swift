@@ -557,7 +557,7 @@ struct AppleMediaRTPReorderBuffer {
     }
 
     /// Read only standard RTP fields. The full RTP parser remains in the
-    /// rendering layer; loss accounting needs no HEVC or Apple-private bytes.
+    /// rendering layer; loss accounting needs no HEVC payload bytes.
     private func frameBoundary(in packet: Data) -> RTPFrameBoundary? {
         guard packet.count >= 12 else { return nil }
         let base = packet.startIndex

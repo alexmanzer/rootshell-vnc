@@ -3,10 +3,9 @@ import Darwin
 import Foundation
 import RFBProtocol
 
-/// Tracks the native AVC message-1/answer lifecycle across in-session media
-/// reconfigurations. ScreenSharing sets its `mediaStreamMessage1Received` bit
-/// on message 1, rejects another while an answer is pending, and clears the bit
-/// when message 2 arrives. A display resize starts another complete cycle.
+/// Tracks the AVC message-1/answer lifecycle across in-session media
+/// reconfigurations. The protocol permits one pending offer at a time; message
+/// 2 completes that exchange, and a display resize starts a new cycle.
 struct AppleMediaNegotiationGenerationTracker {
     struct Transition: Sendable, Equatable {
         let generation: UInt64
@@ -66,11 +65,10 @@ public enum AppleMediaVideoMode {
 /// Portable encoder for the Viceroy v1 media-negotiation message used by
 /// Apple's RFB media-stream extension.
 ///
-/// The previous implementation replayed a captured compressed protobuf. That
-/// accidentally replayed a creation timestamp, an RTP SSRC, endpoint metadata,
-/// and display capabilities from the machine on which it was captured. Apart
-/// from advertising the wrong client, reusing an SSRC and creation time can be
-/// interpreted as a colliding or stale media session.
+/// The message is generated per session so its creation timestamp, RTP SSRC,
+/// endpoint metadata, and display capabilities identify the current client.
+/// Reusing an SSRC or creation time can be interpreted as a colliding or stale
+/// media session.
 struct AppleMediaNegotiationProfile: Sendable {
     /// The Viceroy screen stream is negotiated as a logical local-network
     /// transport even when the device reaches that network through cellular
@@ -80,7 +78,7 @@ struct AppleMediaNegotiationProfile: Sendable {
     private static let screenVideoTransportType: UInt64 = 1
 
     /// Viceroy negotiates the minimum of the peers' values. Four matches the
-    /// native Screen Sharing profile and preserves full-resolution Retina
+    /// compound screen profile and preserves full-resolution Retina
     /// capture instead of downscaling into the one-tile encoder budget.
     static var publicDecoderTilesPerFrame: UInt64 {
         AppleMediaVideoMode.negotiatedTilesPerFrame
@@ -97,10 +95,9 @@ struct AppleMediaNegotiationProfile: Sendable {
         let portraitWidth: UInt32
         let portraitHeight: UInt32
 
-        /// Native Viceroy's screen codec capability pair. These are not the
-        /// current framebuffer dimensions: a native MacBook capture advertises
-        /// this same pair for its non-16:9 display. The server uses it while
-        /// selecting its encoder/tiling profile.
+        /// Screen-codec capability pair. These are aspect-ratio capabilities,
+        /// not the current framebuffer dimensions; the server uses them while
+        /// selecting its encoder and tiling profile.
         static let screenCodec = AspectRatio(
             landscapeWidth: 16,
             landscapeHeight: 9,
@@ -115,7 +112,7 @@ struct AppleMediaNegotiationProfile: Sendable {
     struct Endpoint: Sendable, Equatable {
         /// Viewer/answerer role in the endpoint-info protobuf.
         var role: UInt32 = 0
-        /// Endpoint-info schema version emitted by the native negotiator.
+        /// Endpoint-info schema version defined by this negotiation profile.
         var schemaVersion: UInt32 = 1
         var productIdentifier: String
         var mediaSoftwareVersion: String

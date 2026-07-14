@@ -1,7 +1,7 @@
 import Foundation
 
-/// AVConference's video-stream configuration selects its low-precision echo
-/// representation by dropping the standard 90 kHz RTP timestamp's low byte.
+/// The video-stream profile defines a low-precision echo timestamp by dropping
+/// the standard 90 kHz RTP timestamp's low byte.
 func appleMediaRCTLLowPrecisionEchoTimestamp(_ timestamp: UInt32) -> UInt16 {
     UInt16(truncatingIfNeeded: timestamp >> 8)
 }
@@ -19,7 +19,7 @@ func appleMediaRCTLIntervalLossPercent(received: Int, lost: Int) -> UInt8 {
         Int((Double(safeLost) * 100 / Double(expected)).rounded())))
 }
 
-/// Verified 20-byte payload used by AVConference's RTCP APP `RCTL` packet.
+/// Twenty-byte payload used by the RTCP APP `RCTL` packet.
 /// The packed word at bytes 16...17 is bursty-loss (high nibble) plus the low
 /// 12 bits of the cumulative received-packet count. It is not jitter depth or
 /// a second packet-loss fraction.
@@ -35,9 +35,8 @@ struct AppleMediaRCTLFeedback: Equatable {
 
     func serialized() -> Data {
         var data = Data(capacity: 20)
-        // Version 2 plus AVConference's VCRC, extended-feedback, and packet-
-        // count flags. This is the exact header produced by
-        // VCMediaControlInfoSerializeWithData for feedback-only video.
+        // Version 2 with VCRC, extended-feedback, and packet-count flags for
+        // the feedback-only video profile.
         let mediaControlVersion2: UInt8 = 2 << 6
         let vcrcFieldsPresent: UInt8 = 0x05
         let extendedFeedbackFieldsPresent: UInt8 = 0x08
@@ -66,7 +65,7 @@ struct AppleMediaRCTLFeedback: Equatable {
     }
 }
 
-/// Build the complete AVConference rate-control APP packet. The payload is
+/// Build the complete rate-control APP packet. The payload is
 /// always 20 bytes, so the RTCP packet is 8 32-bit words and its RFC 3550
 /// length field is 7 (packet words minus one).
 func appleMediaRCTLPacket(

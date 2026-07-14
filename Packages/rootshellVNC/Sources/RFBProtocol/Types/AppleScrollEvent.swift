@@ -2,7 +2,7 @@ import Foundation
 
 /// The complete scroll-wheel state carried by Apple's precise RFB scroll
 /// command. Its fields mirror the coarse, fixed-point, point, and phase data
-/// forwarded by the native Screen Sharing client.
+/// forwarded by the precise-scroll profile.
 public struct AppleScrollEvent: Sendable, Equatable {
     public static let messageType: UInt8 = 0x17
     public static let payloadByteCount: UInt16 = 54

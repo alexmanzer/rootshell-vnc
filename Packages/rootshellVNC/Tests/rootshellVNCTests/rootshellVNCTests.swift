@@ -571,7 +571,7 @@ final class AppleAdaptiveDCTDecoderTests: XCTestCase {
     }
 
     func testCapturedType0HeaderSeparatesCommandAndDataStreams() throws {
-        // Shape of the live 40-byte message captured from macOS encoding 1011.
+        // Forty-byte interoperability fixture for encoding 1011.
         var payload = Data([0, 0, 0, 36, 0, 15, 25, 0, 0, 10])
         payload.append(contentsOf: [0x54, 0x54, 0x36, 0x80])
         payload.append(Data(repeating: 0xA5, count: 26))
@@ -917,9 +917,8 @@ final class RemoteDisplaySizeTests: XCTestCase {
         }
     }
 
-    /// The server's screen encoder streams at 30 fps above the 4K-UHD pixel
-    /// area (measured live 2026-07-12: 3840x2160 → 60 fps, 3840x2304 and
-    /// 3696x2416 → 30 fps). Oversized client viewports must be fitted into
+    /// The screen profile uses 60 fps through 3840x2160 and 30 fps for larger
+    /// areas such as 3840x2304 and 3696x2416. Oversized client viewports must be fitted into
     /// that 60 fps tier, preserving aspect ratio and exact 2x backing.
     func testClientViewportLargerThanUHDIsFittedIntoThe60FPSTier() {
         XCTAssertEqual(

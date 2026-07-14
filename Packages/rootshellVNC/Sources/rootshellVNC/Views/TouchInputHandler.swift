@@ -216,7 +216,7 @@ public struct TouchInputHandler {
         return pointDelta > 0 ? 1 : -1
     }
 
-    /// Forward the gesture envelope that native Screen Sharing places around
+    /// Forward the gesture envelope defined around
     /// precise scroll-wheel records.
     public func handleGesture(
         kind: AppleGestureEvent.Kind,

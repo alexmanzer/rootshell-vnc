@@ -264,8 +264,8 @@ final class AppleAdaptiveDCTDecoder {
 
         var commands = BitReader(message.commandBytes)
         var data = BitReader(message.dataBytes)
-        // The native decoder seeds its MSB reader from byte zero, shifts once, and starts
-        // command decoding with seven live bits. The first bit is reserved.
+        // The bitstream starts at byte zero with one reserved bit followed by
+        // seven command bits.
         _ = try commands.readBits(1)
         let tilesWide = (Int(rect.width) + 7) / 8
         let tilesHigh = (Int(rect.height) + 7) / 8
@@ -911,8 +911,8 @@ final class AppleAdaptiveDCTDecoder {
         }
     }
 
-    /// Integer DCT_ISLOW used by stb_image. The native decoder wraps the same routine;
-    /// retaining its shifts and biases makes scalar and SIMD output identical.
+    /// Integer DCT_ISLOW used by stb_image. Retaining its shifts and biases
+    /// makes scalar and SIMD output identical.
     private func inverseDCT(
         _ coefficients: [Int16], offset: Int, quantization: [UInt16]
     ) -> [UInt8] {
@@ -1038,7 +1038,7 @@ final class AppleAdaptiveDCTDecoder {
         0xf9, 0xfa,
     ]
 
-    /// JPEG-derived defaults embedded in the native decoder.
+    /// JPEG-derived default quantization values for this encoding profile.
     private static let defaultLuma: [UInt8] = [
         16, 11, 11, 14, 24, 22, 24, 33,
         11, 12, 11, 11, 26, 18, 19, 23,

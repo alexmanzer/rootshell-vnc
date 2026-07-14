@@ -7,10 +7,9 @@ struct RemoteDisplaySize: Sendable, Equatable {
     /// Client inside the largest coded dimension this receiver can sustain.
     private static let maximumDecodedPixelDimension: CGFloat = 5120
 
-    /// The server's screen encoder halves its frame rate above the 4K-UHD
-    /// area tier. Measured live against macOS Screen Sharing (2026-07-12):
-    /// 3840×2160 and below stream at 60 fps; 3840×2304 and 3696×2416 stream
-    /// at 30 fps. A Match Client window larger than UHD must therefore trade
+    /// The negotiated screen profile uses a 60 fps tier through 3840×2160 and
+    /// a 30 fps tier for larger areas such as 3840×2304 and 3696×2416. A Match
+    /// Client window larger than UHD must therefore trade
     /// a few percent of backing resolution for the full 60 fps.
     private static let maximumSustained60FPSPixelArea: CGFloat = 3840 * 2160
 

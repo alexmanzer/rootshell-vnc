@@ -3,8 +3,8 @@ import Foundation
 @testable import RFBTransport
 
 /// Regression test for Apple's SRTCP (cipher suite 5 = AES-256-CM / HMAC-SHA1-80,
-/// SRTCP variant with labels 3/4/5). Vector captured from a live macOS Screen
-/// Sharing server: the 46-byte server-to-viewer media key and one protected
+/// SRTCP variant with labels 3/4/5). The interoperability vector contains a
+/// 46-byte server-to-viewer media key and one protected
 /// Sender Report (SSRC 0x11812aa6).
 final class AppleSRTCPContextTests: XCTestCase {
 

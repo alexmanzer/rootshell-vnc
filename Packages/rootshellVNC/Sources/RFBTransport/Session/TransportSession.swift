@@ -214,8 +214,7 @@ public actor TransportSession {
     private var appleMediaNetworkProfile: AppleMediaNetworkProfile = .unknown
     // NOTE (2026-07-12): do NOT scale the initial advertised capacity by
     // framebuffer area. The server ignores the RCTL estimate while sending its
-    // bootstrap IRAP (measured: advertising 4 Mbps vs 60 Mbps produced an
-    // identical startup burst), but the reduced value still leaks into
+    // bootstrap IRAP, but the reduced value still leaks into
     // keyframe-recovery readiness and the ramp origin — at 5K it slowed and
     // destabilized the bootstrap the scaling was meant to protect.
     private var sentAppleMediaStreamConfiguration = false
@@ -289,16 +288,16 @@ public actor TransportSession {
     private var appleMediaReceptionStats: [UInt32: AppleMediaReceptionStats] = [:]
     private var appleMediaLastSRLSR: UInt32 = 0
     private var appleMediaLastSRArrivalNanos: UInt64 = 0
-    /// Low-precision form of the standard RTP timestamp echoed by native RCTL.
+    /// Low-precision form of the standard RTP timestamp echoed by RCTL.
     /// This is unrelated to the RTP media-control extension and RTCP LSR.
     private var appleMediaLastRTPEchoTimestampQ10: UInt16 = 0
     private var appleRCTLPreviousRTPTimestamp: UInt32?
     private var appleRCTLEchoTimestampArrivalNanos: UInt64 = 0
     private var appleRCTLTotalPacketsReceived: UInt32 = 0
     /// RTCP APP "RCTL" rate-control feedback (drives the server's adaptive
-    /// encoder bitrate). Native sends this ~20 Hz; without it the server encodes
-    /// at a constant maximum bitrate. The burst-loss accumulator is reset after
-    /// each report; the receive count is cumulative like the native client.
+    /// encoder bitrate). This profile sends it at approximately 20 Hz; without
+    /// it the server encodes at a constant maximum bitrate. The burst-loss
+    /// accumulator resets after each report; the receive count is cumulative.
     private var appleRCTLFeedbackTask: Task<Void, Never>?
     private var appleRCTLPacketsInterval: Int = 0
     private var appleRCTLLostInterval: Int = 0
@@ -393,8 +392,8 @@ public actor TransportSession {
     /// size queued until the current generation proves ready.
     private var appleDisplayReconfigurationGeneration: UInt64?
     /// Stable virtual-display capability envelope. Changing these maxima in
-    /// the same command that installs a mode makes WindowServer renegotiate the
-    /// backing scale; requests wider than the old 3840 value intermittently
+    /// the same command that installs a mode can renegotiate the backing scale;
+    /// requests wider than the old 3840 value intermittently
     /// landed on a 1× surface even though the mode explicitly described 2×.
     private let appleVirtualDisplayMaximumPixelWidth: UInt32 = 8_192
     private let appleVirtualDisplayMaximumPixelHeight: UInt32 = 8_192
@@ -978,7 +977,6 @@ public actor TransportSession {
     }
 
     private func sendClientInit() async throws {
-        // Native Screen Sharing exposes `DRUnavailableInStandardConnection`:
         // Apple's capability-bearing 0xc1 mode and virtual displays belong to
         // its media connection, not to a Zlib/ZRLE Standard session. Forcing
         // 0xc1 without completing media setup leaves the server waiting and the
@@ -1548,8 +1546,8 @@ public actor TransportSession {
                     if requestedDisplayCount > 1,
                        !sentAppleMediaInitialSetDisplay {
                         // Display selection must precede media message one.
-                        // Otherwise screensharingd creates only video receiver
-                        // one, then combines the desktops into that receiver
+                        // Otherwise only the first video receiver is created,
+                        // and the desktops are combined into that receiver
                         // when the late SetDisplay arrives.
                         pending.append(appleSetDisplayMessage(
                             isGlobal: true,
@@ -1575,7 +1573,7 @@ public actor TransportSession {
                     // it does not select which existing monitor(s) the server
                     // should encode. Byte 1 is the server's
                     // combineAllDisplaysFlag, so one display must explicitly
-                    // clear it or screensharingd keeps returning the composite.
+                    // clear it or the server keeps returning the composite.
                     pending.append(appleSetDisplayMessage(
                         isGlobal: requestedDisplayCount > 1,
                         displayID: 0))
@@ -1883,8 +1881,8 @@ public actor TransportSession {
               !sentAppleMediaInitialSetDisplay else { return }
         sentAppleMediaInitialSetDisplay = true
         // A non-global SetDisplay requires the server's real display ID. Zero
-        // is not a portable synonym for the main monitor; screensharingd stores
-        // this UInt32 and validates it against its active display list.
+        // is not a portable synonym for the main monitor; the server validates
+        // this UInt32 against its active display list.
         try await sendClientPayload(appleSetDisplayMessage(
             isGlobal: false,
             displayID: displayID))
@@ -2039,8 +2037,8 @@ public actor TransportSession {
     private func sendAppleVirtualDisplaySize(
         _ requested: PendingRemoteDisplaySize
     ) async throws {
-        // Screen Sharing describes a 2× virtual display with both pixel and
-        // point dimensions. A nominal 110 points/inch gives the virtual display
+        // The display command describes a 2× virtual display with both pixel
+        // and point dimensions. A nominal 110 points/inch gives the virtual display
         // a stable physical size without affecting its explicit HiDPI mode.
         let millimetersPerPoint = Float(25.4 / 110.0)
         let mode = AppleVirtualDisplayMode(
@@ -2050,7 +2048,7 @@ public actor TransportSession {
             pointHeight: UInt32(requested.pointHeight))
         // These are fixed capability maxima, not the active mode or an active
         // resolution cap. The requested pixel/point pair below selects 2×.
-        // Viceroy's virtual encoder emits multiple tiles only above its capture
+        // The virtual encoder emits multiple tiles only above its capture
         // size threshold. Demanding them for a smaller Match Client window
         // completes control negotiation but creates no RTP source at all.
         activeAppleMediaTilesPerFrame = AppleMediaVideoMode.activeTileCount(
@@ -2406,9 +2404,8 @@ public actor TransportSession {
         var offerReader = MessageReader(data: offerData)
         let offer = try AppleMediaStreamOffer(reader: &offerReader)
         if !isAppleMediaComCryptionTransition(offer.rawPayload) {
-            // Native Screen Sharing gets videoStreamDisplayCount from
-            // screenConfiguration.screens, populated by DisplayInfo2; keep
-            // the wire interpretation only for old virtual-display servers.
+            // DisplayInfo2 is authoritative for the stream display count; keep
+            // the offer-field interpretation only for old virtual-display servers.
             if appleMediaDisplayInfos.isEmpty,
                requestsVirtualDisplays {
                 appleMediaDisplayCount = selectedAppleMediaDisplayCount(
@@ -3031,7 +3028,7 @@ public actor TransportSession {
     private func parseAppleMediaRTPHeader(_ data: Data) -> AppleMediaRTPHeader? {
         guard data.count >= 12 else { return nil }
         let base = data.startIndex
-        // Apple's observed RTP/SRTP packets use the minimal RTP header
+        // This RTP/SRTP profile uses the minimal RTP header
         // (`0x80`) and payload type in the dynamic/video range. A loose
         // version-bit check has too many false positives in encrypted media.
         guard data[base] == 0x80 || data[base] == 0x90 else { return nil }
@@ -3209,8 +3206,8 @@ public actor TransportSession {
         sentAppleMediaServerConfiguration = true
         log.debug("Sent Apple media server configuration message length=\(configuration.count)")
 
-        // Native feedback-only AVConference starts its 50 ms RCTL source as
-        // soon as the receiver is configured, before the first inbound RTP.
+        // Start the 50 ms feedback-only RCTL source as soon as the receiver is
+        // configured, before the first inbound RTP.
         // That outgoing authenticated packet also establishes cellular/VPN
         // NAT mappings. Waiting for video first deadlocks: the server cannot
         // reach our UDP socket until we send, and we previously did not send
@@ -3231,8 +3228,8 @@ public actor TransportSession {
         let videoOffer = generatedVideoOffer.data
         let video2Offer = generatedVideo2Offer?.data
 
-        // RTCPAddFIR reads the receiver context's local/negotiated RTP SSRC for
-        // its sender field. Using an unrelated random SSRC produces a valid
+        // The FIR sender field uses the receiver's negotiated local RTP SSRC.
+        // Using an unrelated random SSRC produces a valid
         // SRTCP packet that the server does not associate with this receiver.
         appleMediaVideoLocalSSRCs = [generatedVideoOffer.ssrc]
         if let generatedVideo2Offer {
@@ -3322,8 +3319,8 @@ public actor TransportSession {
         displayIndex: Int? = nil
     ) throws -> GeneratedAppleMediaOffer {
         // Mode 8 is Apple's system-audio profile and mode 7 is its screen-video
-        // profile. Full Quality is not another media mode: the native client
-        // leaves AVC entirely and requests lossless RFB encodings.
+        // profile. Full Quality is not another media mode; it leaves AVC and
+        // requests lossless RFB encodings.
         var negotiatorMode = mode
         if mode != 8, let override = runtimeEnvironment["ROOTSHELL_VNC_AVC_MODE"]
             .flatMap(Int.init) {
@@ -3427,9 +3424,8 @@ public actor TransportSession {
         try await startAppleMediaStreamUDPIfNeeded(bindings: bindings)
 
         // A type-1 AVC media message is the request for a fresh client media
-        // configuration. Native ScreenSharing creates its negotiators, offers,
-        // and keys in `handleAVCMediaEncoding:` and immediately enqueues that
-        // configuration for transmission before message 2 arrives. Waiting
+        // configuration. The client must create its offers and keys, then
+        // enqueue that configuration before message 2 arrives. Waiting
         // for the separate 0x456 control record happened to work at startup,
         // where it follows type 1 almost immediately, but a display resize
         // does not send 0x456 first: the server retransmits type 1 while it is
@@ -3439,7 +3435,7 @@ public actor TransportSession {
         return true
     }
 
-    /// Begin one native message-1/answer media cycle. All fields reset here are
+    /// Begin one message-1/answer media cycle. All fields reset here are
     /// scoped to the encoded media generation; the TCP/RFB connection, input
     /// path, UDP sockets, and installed RTP sink remain intact.
     private func beginAppleMediaGeneration(
@@ -3524,8 +3520,8 @@ public actor TransportSession {
     }
 
     /// Extract plausible per-stream UDP ports from a type-1 media message body.
-    /// The native struct places 16-bit ports at both stride schemes seen in
-    /// captures (0x08/0x0e/0x14 and 0x0a/0x10/0x16); collect every nonzero
+    /// The message variants place 16-bit ports at two stride schemes
+    /// (0x08/0x0e/0x14 and 0x0a/0x10/0x16); collect every nonzero
     /// candidate so we bind whichever the server actually uses.
     private nonisolated func appleMediaServerPorts(from body: Data) -> [UInt16] {
         let candidateOffsets = [0x08, 0x0a, 0x0e, 0x10, 0x14, 0x16]
@@ -3590,7 +3586,7 @@ public actor TransportSession {
     }
 
     private func startAppleMediaUDPChannel(binding: AppleMediaUDPBinding) async throws {
-        // Mirror native `+[SSSession udpSocketWithAVCMediaStreamConfig:port:]`:
+        // Configure the symmetric-port media socket:
         //   socket(AF_INET, DGRAM) + SO_REUSEADDR + SO_REUSEPORT
         //   + bind(INADDR_ANY:port) + connect(serverIP:port)
         // Symmetric RTP uses the same port both ends; SO_REUSEPORT is what lets
@@ -3598,7 +3594,7 @@ public actor TransportSession {
         // machine). Network.framework does not reliably expose SO_REUSEPORT,
         // which is why the previous unconnected listener never received on
         // loopback.
-        // On loopback the native symmetric scheme (local==remote==same port)
+        // On loopback the symmetric scheme (local==remote==same port)
         // self-delivers: server and client share an identical 4-tuple, so
         // SO_REUSEPORT hashing sends the server's packets to its own socket.
         // Ephemeral mode binds a distinct local port and relies on the server
@@ -3807,10 +3803,9 @@ public actor TransportSession {
 
     private var appleMediaFIRSeq: UInt8 = 0
 
-    /// Native no-video-displayed recovery is RR + PSFB FIR, followed by a reset
-    /// of expected decoding order. Do not layer PLI and legacy FIR variants into
-    /// the same compound packet; AVConference's negotiated receiver uses the
-    /// RFC 5104 FIR form emitted by `RTCPAddFIR`.
+    /// No-video-displayed recovery uses RR + PSFB FIR, followed by a reset of
+    /// expected decoding order. Do not layer PLI and legacy FIR variants into
+    /// the same compound packet; this profile uses the RFC 5104 FIR form.
     private func sendAppleMediaKeyframeRequest(mediaSSRC: UInt32, on channel: PosixUDPChannel) async {
         guard let route = appleMediaFeedbackRoute(forRemoteSSRC: mediaSSRC) else { return }
         let sender = route.localSSRC
@@ -4243,9 +4238,8 @@ public actor TransportSession {
         }
     }
 
-    /// Send AVConference's negotiated frame-loss feedback (PSFB AFB type 6).
-    /// Unlike PLI/FIR, this is the resiliency signal used by the Screen Sharing
-    /// encoder to produce the recovery IDR for an LTR-enabled screen stream.
+    /// Send negotiated frame-loss feedback (PSFB AFB type 6). Unlike PLI/FIR,
+    /// this signal requests a recovery IDR for an LTR-enabled screen stream.
     private func sendAppleMediaFrameLossFeedback(
         _ feedback: AppleMediaFrameLossFeedback,
         mediaSSRC: UInt32,
@@ -4319,8 +4313,8 @@ public actor TransportSession {
     }
 
     /// Ask the server to retransmit missing RTP packets while the per-SSRC
-    /// jitter buffer holds newer packets. AVConference has a dedicated NACK/
-    /// retransmission-cache path; without this step a single lost fragment
+    /// jitter buffer holds newer packets. The media profile supports NACK and
+    /// retransmission; without this step a single lost fragment
     /// becomes a missing HEVC picture and corrupts its dependent pictures.
     private func sendAppleMediaNACK(
         missingSequences: [UInt16],
@@ -4517,8 +4511,8 @@ public actor TransportSession {
 
     /// Dead-man for a wedged jitter buffer: video RTP is being ingested but
     /// nothing has been released downstream for well over the maximum gap
-    /// wait. Observed live (2026-07-12) after a confirmed loss landed inside
-    /// a media renegotiation window: every subsequent packet was swallowed and
+    /// wait. This can occur when a confirmed loss lands inside a media
+    /// renegotiation window: subsequent packets remain queued and
     /// the display stayed black while audio continued. Resetting the buffer
     /// re-anchors sequence tracking; the resulting jump surfaces as a normal
     /// loss and heals through keyframe recovery.
@@ -4538,8 +4532,8 @@ public actor TransportSession {
         appleMediaLastVideoReleaseNanos = now
     }
 
-    /// Mirror feedback-only AVConference's RTP receive accounting. It updates
-    /// the echo only when a forward-moving RTP timestamp begins, then sends the
+    /// Apply the feedback-only RTP receive-accounting rules. Update the echo
+    /// only when a forward-moving RTP timestamp begins, then send the
     /// low-precision form selected by Apple's video-stream configuration.
     private func updateAppleRCTLEchoTimestamp(
         _ timestamp: UInt32,
@@ -4660,10 +4654,8 @@ public actor TransportSession {
                     + "reorderQueued=\(appleMediaRTPReorderBuffer.queuedPacketCount)")
         }
 
-        // AVConference's `VCVideoStreamRateAdaptationFeedbackOnly` passes a
-        // parameter block containing only the RCTL flag to
-        // `RTPSendRateControlPacket`. Keep the wire shape identical: ordinary
-        // Receiver Reports have their own 1 Hz loop below.
+        // The feedback-only profile sends an RCTL APP packet by itself;
+        // ordinary Receiver Reports have their own 1 Hz loop below.
         for (route, channels) in targets {
             let app = appleMediaRCTLPacket(
                 senderSSRC: route.localSSRC,

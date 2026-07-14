@@ -3,8 +3,8 @@ import Foundation
 @testable import RFBTransport
 
 /// Regression tests for Apple's AVC media SRTP (cipher suite 5 =
-/// AES_256_CM_HMAC_SHA1_80). The vector below was captured from a live macOS
-/// Screen Sharing server: the 46-byte server-to-viewer media key, one protected
+/// AES_256_CM_HMAC_SHA1_80). The interoperability vector contains a 46-byte
+/// server-to-viewer media key, one protected
 /// SRTP video packet, and the expected unprotected RTP (header + ext +
 /// decrypted HEVC payload, with the 10-byte auth tag removed).
 final class AppleSRTPContextTests: XCTestCase {

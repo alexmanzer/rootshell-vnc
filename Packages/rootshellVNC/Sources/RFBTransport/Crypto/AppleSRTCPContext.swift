@@ -11,8 +11,8 @@ import RFBProtocol
 /// own session keys with labels 3/4/5 and appends a 4-byte SRTCP index word
 /// (E-flag + 31-bit index) plus a 10-byte auth tag.
 ///
-/// Validated on the wire: unprotecting a captured server Sender Report with the
-/// server-to-viewer key authenticates and decrypts to sane counters.
+/// The interoperability vector verifies that a server-to-viewer key
+/// authenticates and decrypts a valid Sender Report.
 public final class AppleSRTCPContext: @unchecked Sendable {
 
     private static let masterKeyLength = 32

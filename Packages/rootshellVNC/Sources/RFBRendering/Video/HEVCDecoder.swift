@@ -36,8 +36,7 @@ public enum HEVCDecoderError: Error, Sendable, LocalizedError {
 }
 
 /// Metadata that identifies one band inside Apple's compound HEVC screen
-/// frame. The private VCP wrapper supplies these same keys before handing a
-/// sample to the underlying VideoToolbox decoder.
+/// frame. These keys accompany each sample passed to VideoToolbox.
 public struct HEVCTileMetadata: Sendable, Equatable {
     public let tileID: UInt32
     public let tileOrder: UInt32

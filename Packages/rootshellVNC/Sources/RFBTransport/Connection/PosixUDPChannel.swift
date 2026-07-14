@@ -79,8 +79,8 @@ struct BoundedDatagramFIFO {
 
 /// A UDP channel backed directly by a POSIX socket.
 ///
-/// This mirrors Apple Screen Sharing's native
-/// `+[SSSession udpSocketWithAVCMediaStreamConfig:port:]` exactly:
+/// The media transport requires a symmetric-port UDP socket configured as
+/// follows:
 ///
 /// ```
 /// fd = socket(AF_INET, SOCK_DGRAM, 0)
@@ -91,10 +91,10 @@ struct BoundedDatagramFIFO {
 /// ```
 ///
 /// `Network.framework` (`NWListener`/`NWConnection`) does not reliably expose
-/// `SO_REUSEPORT`, which the native path requires so the viewer can bind the
+/// `SO_REUSEPORT`, which this transport requires so the viewer can bind the
 /// *same* UDP port the server already holds (this is what makes loopback and
-/// symmetric-port RTP work). This actor uses the raw BSD API so the behavior
-/// matches the native client bit-for-bit.
+/// symmetric-port RTP work). This actor uses the BSD socket API to satisfy
+/// those transport requirements.
 public actor PosixUDPChannel {
 
     // MARK: - Properties

@@ -3,9 +3,9 @@ import Foundation
 import CoreMedia
 @testable import RFBRendering
 
-/// Replays a real decrypted-RTP capture through the experimental interleaved
-/// tile path. This is a transport/reordering regression test; public per-SSRC
-/// decoders do not reproduce Apple's private reference-picture remapping.
+/// Replays a decrypted-RTP fixture through the experimental interleaved tile
+/// path. This regression test verifies the compound stream's reference-picture
+/// ordering.
 ///
 ///   ROOTSHELL_VNC_DECODED_RTP=/tmp/vnccap/local_rtp.bin \
 ///   swift test --filter ReorderRecoveryTests

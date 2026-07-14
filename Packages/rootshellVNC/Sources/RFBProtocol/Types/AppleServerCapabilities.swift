@@ -9,7 +9,7 @@ public struct AppleServerCapabilities: Sendable, Equatable {
     public static let commandBitmapByteCount = 16
     public static let serverInitPrefixByteCount = 2 + 4 + commandBitmapByteCount
 
-    /// Precise scroll-wheel event command used by the native Screen Sharing
+    /// Precise scroll-wheel event command used by the Apple RFB
     /// client. Servers that do not advertise it must receive ordinary RFB
     /// pointer wheel-button events instead.
     public static let preciseScrollCommand = AppleScrollEvent.messageType

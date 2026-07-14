@@ -157,10 +157,9 @@ public final class VideoStreamManager: @unchecked Sendable {
 
     // MARK: - Loss detection & recovery
     //
-    // AVConference does not submit dependent pictures after it detects a lost
-    // base-layer frame. Its VCP wrapper enters a skip state, sends its frame-
-    // loss feedback through RTCP, and resumes only on HEVC IDR_N_LP (type 20).
-    // Public VideoToolbox needs the same pre-decode gate: once a damaged P-frame
+    // After a lost base-layer frame, dependent pictures are withheld while
+    // frame-loss feedback is sent through RTCP. Decoding resumes on HEVC
+    // IDR_N_LP (type 20). VideoToolbox needs the same pre-decode gate: once a damaged P-frame
     // reaches the hardware session it reports a missing reference and remains
     // poisoned even though later packet assembly is valid.
     private var seenVideoSSRCs: Set<UInt32> = []
@@ -175,8 +174,8 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var lastLossNanos: UInt64 = 0
     /// Kill-switch for A/B testing: ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY=1.
     var lossRecoveryEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY"] != "1"
-    /// Drop-until-IDR gate. Opt-in only. Measured live 2026-07-12: the server
-    /// DOES answer a keyframe request with a recovery IDR_N_LP plus fresh
+    /// Drop-until-IDR gate. Opt-in only. The recovery exchange can provide an
+    /// IDR_N_LP plus fresh
     /// parameter sets (~300 ms round trip), so the correct loss behavior is to
     /// keep the mature session, skip the frames VideoToolbox rejects, request
     /// a keyframe, and let the IDR re-anchor decode. Gating every band until
@@ -617,7 +616,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         let fresh: Bool
         if irapGateEnabled {
             fresh = awaitingIRAP.isEmpty
-            // Compound tiles share one VCP reference timeline. The server sends
+            // Compound tiles share one decoding-reference timeline. The server sends
             // the recovery IDR on the base SSRC even when a sibling lost RTP,
             // so stop every dependent tile until that global reset arrives.
             awaitingIRAP.formUnion(seenVideoSSRCs)
@@ -631,8 +630,8 @@ public final class VideoStreamManager: @unchecked Sendable {
 
     /// Whether a VCL NAL should reach the decoder. A recovery IDR is allowed
     /// through, but the gate stays latched until VideoToolbox outputs it.
-    /// AVConference's VCP wrapper resumes specifically for HEVC NAL type 20
-    /// (IDR_N_LP); CRA and dependent pictures remain withheld.
+    /// The compound-video recovery profile resumes specifically for HEVC NAL
+    /// type 20 (IDR_N_LP); CRA and dependent pictures remain withheld.
     func shouldDecodeVCL(nalType: UInt8, ssrc: UInt32) -> Bool {
         lock.lock()
         if nalType == 20 {
@@ -734,8 +733,8 @@ public final class VideoStreamManager: @unchecked Sendable {
         rebuildDecoderInSession(requireLatchedFailure: false)
     }
 
-    /// Mirror AVConference's no-video-displayed fail-safe after it sends FIR:
-    /// discard receiver-side partial assembly and choose a fresh compound DON
+    /// Apply the no-video-displayed fail-safe after sending FIR: discard
+    /// receiver-side partial assembly and choose a fresh compound DON
     /// origin from the recovery picture. Parameter sets and the working public
     /// VideoToolbox session remain intact.
     public func resetExpectedDecodingOrderForRecovery() {
@@ -902,7 +901,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     }
 
     /// Frame-level VideoToolbox failures that must NOT invalidate the session.
-    /// Apple's screen stream sends exactly one IRAP at startup and never again:
+    /// The screen-stream profile normally sends its IRAP at startup:
     /// a session rebuilt after reference loss holds no references at all, so
     /// every dependent picture fails (-17694) until a full intra-refresh sweep
     /// happens to align with a rebuild — in practice a frozen display and an
@@ -1264,8 +1263,8 @@ public final class VideoStreamManager: @unchecked Sendable {
             })
     }
 
-    /// Build the compound-frame metadata Apple normally installs in its VCP
-    /// wrapper. SSRC order is the stable top-to-bottom band identity; DON is
+    /// Build the compound-frame metadata required by the decoder. SSRC order
+    /// is the stable top-to-bottom band identity; DON is
     /// global, so subtracting the band order yields the frame's decode base.
     private func compoundTileMetadata(
         ssrc: UInt32,

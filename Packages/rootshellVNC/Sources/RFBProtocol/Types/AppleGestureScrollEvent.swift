@@ -1,6 +1,6 @@
 import Foundation
 
-/// Apple's parallel gesture-scroll record. Native Screen Sharing emits this
+/// Apple's parallel gesture-scroll record. The precise-scroll profile emits this
 /// alongside each precise wheel record so AppKit locks the gesture to the view
 /// under the cursor when the began phase arrives.
 public struct AppleGestureScrollEvent: Sendable, Equatable {

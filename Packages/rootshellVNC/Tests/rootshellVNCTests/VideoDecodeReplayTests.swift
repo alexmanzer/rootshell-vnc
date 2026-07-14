@@ -3,13 +3,12 @@ import Foundation
 @testable import RFBTransport
 @testable import RFBRendering
 
-/// Replays real captured Apple media UDP packets through the full receive path
+/// Replays Apple media UDP fixtures through the full receive path
 /// (SRTP unprotect -> VideoStreamManager -> HEVCDecoder) to exercise the
 /// hardware decode path end-to-end without the GUI or a live server.
 ///
-/// This is the exact path that crashed the SwiftUI app once real RTP started
-/// flowing. It is gated on capture files so it only runs when you point it at a
-/// capture produced with ROOTSHELL_VNC_DUMP_SRTP_KEYS / ROOTSHELL_VNC_DUMP_MEDIA_UDP:
+/// This regression path is gated on fixture files supplied through
+/// ROOTSHELL_VNC_DUMP_SRTP_KEYS / ROOTSHELL_VNC_DUMP_MEDIA_UDP:
 ///
 ///   ROOTSHELL_VNC_REPLAY_KEYS=/tmp/.../srtp_keys.bin \
 ///   ROOTSHELL_VNC_REPLAY_UDP=/tmp/.../media_udp.bin \

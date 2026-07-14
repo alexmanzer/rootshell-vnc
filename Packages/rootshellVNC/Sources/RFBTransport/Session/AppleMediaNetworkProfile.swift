@@ -64,7 +64,7 @@ struct AppleMediaNetworkProfile: Sendable, Equatable {
             }
             // A VPN/private-overlay route still uses cellular capacity, but the
             // RFB screen peer is a logical local-network endpoint. Native
-            // Screen Sharing's screen rule collection explicitly negotiates
+            // The screen rule collection explicitly negotiates
             // the local/Wi-Fi transport in this mode; cellular-only rules yield
             // a successful control answer with no compatible video source.
             let privateOverlay = path.usesOtherInterface

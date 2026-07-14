@@ -18,7 +18,7 @@ public final class VideoBandLayerRenderer {
 
     private var bandLayers: [UInt32: CALayer] = [:]
     private var bandBuffers: [UInt32: CVPixelBuffer] = [:] // retained so VideoToolbox can't recycle a displayed buffer
-    private var previousBandBuffers: [UInt32: CVPixelBuffer] = [:] // retained one commit longer: WindowServer may still scan out the just-replaced surface
+    private var previousBandBuffers: [UInt32: CVPixelBuffer] = [:] // retained one commit longer so presentation can finish before reuse
     private var bandHeight: CGFloat = 0
     private var screenWidth: CGFloat = 0
     private var screenHeight: CGFloat = 0
@@ -109,9 +109,8 @@ public final class VideoBandLayerRenderer {
             needsLayout = true
         }
         for (ssrc, pixelBuffer) in buffers {
-            // Keep the just-replaced buffer alive one extra commit: WindowServer
-            // can still be scanning out its IOSurface this frame, and releasing
-            // it returns it to VideoToolbox's pool for immediate overwrite.
+            // Keep the just-replaced buffer alive for one extra commit so
+            // presentation finishes before it returns to the decoder pool.
             previousBandBuffers[ssrc] = bandBuffers[ssrc]
             bandBuffers[ssrc] = pixelBuffer
             bandHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))

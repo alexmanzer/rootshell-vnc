@@ -59,7 +59,7 @@ public struct AppleRemoteAudioRTPPacket: Sendable, Equatable {
 }
 
 /// Parses the public wire formats negotiated by Apple's Remote Desktop audio
-/// stream. AVConference identifies payload 101 as 48 kHz stereo MPEG-4
+/// stream. The negotiated profile assigns payload 101 to 48 kHz stereo MPEG-4
 /// AAC-ELD with SBR. The live system-audio encoder applies AAC bundling inside
 /// the codec and sends one complete access unit per RTP payload. RFC 3640
 /// external bundling remains available when selected by negotiation.

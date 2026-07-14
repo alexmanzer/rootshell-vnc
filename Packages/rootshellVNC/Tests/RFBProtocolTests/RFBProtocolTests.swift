@@ -918,8 +918,8 @@ final class MessageWriterTests: XCTestCase {
             0x00, 0x00, 0x00, 0x00,
         ]))
 
-        // Fixed display record reconstructed field-for-field from Apple's
-        // serializer. The name occupies a zero-padded 120-byte field.
+        // Fixed display record encoded field-for-field in command wire order.
+        // The name occupies a zero-padded 120-byte field.
         XCTAssertEqual(Data(data[12..<14]), Data([0x00, 0xb8]))
         XCTAssertEqual(Data(data[14..<19]), Data([0x69, 0x50, 0x61, 0x64, 0x00]))
         XCTAssertEqual(Data(data[134..<142]), Data([

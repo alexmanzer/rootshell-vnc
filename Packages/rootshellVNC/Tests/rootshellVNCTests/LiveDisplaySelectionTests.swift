@@ -113,7 +113,7 @@ final class LiveDisplaySelectionTests: XCTestCase {
                 0)
             XCTAssertEqual(adaptive.presentedVideoDisplayRegions.count, 2)
         } else {
-            // Native Remote Mac's Displays mode uses one composite HEVC
+            // Remote Mac's Displays mode uses one composite HEVC
             // receiver. Two independent receivers are the virtual-display
             // (Match Client) mode.
             XCTAssertEqual(adaptive.presentedVideoDisplayRegions.count, 1)

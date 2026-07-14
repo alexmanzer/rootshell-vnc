@@ -133,8 +133,8 @@ final class AppleMediaFeedbackTests: XCTestCase {
     }
 
     func testAppleMediaRTPFrameExtensionMatchesCapturedScreenPacket() {
-        // Prefix of a decrypted Screen Sharing HEVC packet captured from the
-        // native server. The apparent 0x9311 "profile" is media-control
+        // Prefix of a decrypted HEVC interoperability fixture. The apparent
+        // 0x9311 "profile" is media-control
         // version/status plus flags/LTR bits.
         let packet = Data([
             0x90, 0x64, 0x30, 0x9f, 0, 0, 0, 0,

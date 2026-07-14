@@ -245,8 +245,7 @@ public struct AppleMediaStreamAnswer: Sendable, Equatable {
         }
     }
 
-    /// Serialize to the client-to-server media stream answer observed from
-    /// Apple's Screen Sharing client.
+    /// Serialize the client-to-server media-stream answer wire format.
     public func wireBytes() -> Data {
         var data = Data(count: 8)
         data[0] = 0x12

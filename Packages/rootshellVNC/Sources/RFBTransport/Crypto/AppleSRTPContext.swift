@@ -5,9 +5,8 @@ import RFBProtocol
 
 /// Receive-side SRTP unprotect for Apple's AVC media stream packets.
 ///
-/// AVConference stores media keys as 46-byte blobs and native Screen Sharing
-/// configures SRTP/SRTCP cipher suite `5`. Confirmed empirically against a live
-/// server: suite 5 is **AES_256_CM_HMAC_SHA1_80** — a 32-byte AES-256 master
+/// The media profile carries 46-byte keys and selects SRTP/SRTCP cipher suite
+/// `5`: **AES_256_CM_HMAC_SHA1_80**, with a 32-byte AES-256 master
 /// key followed by a 14-byte master salt (32 + 14 = 46), with an 80-bit
 /// (10-byte) HMAC-SHA1 authentication tag. The server-to-viewer key
 /// (`...EncryptionKeyServerToViewer`) is the one used to decrypt inbound video.

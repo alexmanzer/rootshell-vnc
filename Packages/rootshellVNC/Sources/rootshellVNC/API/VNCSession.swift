@@ -1347,7 +1347,7 @@ public final class VNCSession {
     /// dead. Only a fresh connection renegotiates media. (Deliberately no
     /// capacity reduction on retry: the server ignores our advertised rate
     /// during bootstrap, and a lowered controller origin destabilizes large
-    /// framebuffers — measured 2026-07-12.)
+    /// framebuffers.)
     private func noteMediaBootstrapHealthy() {
         // Bootstrap health currently needs no state; kept as the single hook
         // point for future per-connection learning.
@@ -1884,7 +1884,7 @@ public final class VNCSession {
 
         // Transport-confirmed RTP loss sends native AFB type-6 feedback before
         // releasing the post-gap packet. If no video is displayed afterwards,
-        // AVConference's fail-safe escalates to PSFB FIR and resets expected
+        // The media fail-safe escalates to PSFB FIR and resets expected
         // decoding order. A persistent supervisor keyed off the gate state
         // mirrors that two-stage behavior. It must not be an event-driven
         // task: markLossLocked only fires onLossDetected for a *fresh* latch,

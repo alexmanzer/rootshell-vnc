@@ -4,8 +4,8 @@ import Foundation
 /// the standard RTP header-extension slot.
 ///
 /// Unlike RFC 8285 extensions, the first two bytes are not an opaque profile
-/// identifier. AVConference uses them as a version/status byte and a flags/LTR
-/// byte. The following big-endian word count is still the ordinary RTP
+/// identifier. This profile defines them as a version/status byte and a
+/// flags/LTR byte. The following big-endian word count remains the RTP
 /// extension length.
 struct AppleMediaRTPMediaControlInfo: Equatable {
     let version: UInt8
@@ -16,8 +16,7 @@ struct AppleMediaRTPMediaControlInfo: Equatable {
     let frameSequenceNumber: UInt16?
 }
 
-/// Parse Apple's media-control RTP extension without depending on
-/// AVConference or any other private framework.
+/// Parse the media-control RTP extension from its wire representation.
 func appleMediaRTPMediaControlInfo(
     _ packet: Data
 ) -> AppleMediaRTPMediaControlInfo? {
@@ -34,8 +33,8 @@ func appleMediaRTPMediaControlInfo(
 
     let statusAndVersion = packet[extensionOffset]
     let version = statusAndVersion >> 6
-    // AVConference's validator accepts the three versions used by this
-    // structure. Reject zero so an unrelated extension cannot be mistaken for
+    // The media-control profile defines versions 1 through 3. Reject zero so
+    // an unrelated extension cannot be mistaken for
     // media control merely because its flags happen to line up.
     guard (1...3).contains(version) else { return nil }
 
@@ -55,9 +54,8 @@ func appleMediaRTPMediaControlInfo(
 
     if flagsAndLTRBits & ltrTimestampPresent != 0 {
         guard cursor + 4 <= extensionEnd else { return nil }
-        // AVConference stores this optional field directly on its little-
-        // endian Apple platforms; it does not apply the network-byte-order
-        // conversion used by the frame fields below.
+        // This optional field is little-endian, unlike the network-byte-order
+        // frame fields below.
         ltrTimestamp = UInt32(packet[cursor])
             | UInt32(packet[cursor + 1]) << 8
             | UInt32(packet[cursor + 2]) << 16

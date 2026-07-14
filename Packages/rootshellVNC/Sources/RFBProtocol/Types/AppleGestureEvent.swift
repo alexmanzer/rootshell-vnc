@@ -1,6 +1,6 @@
 import Foundation
 
-/// Gesture envelope sent by Apple's Screen Sharing client around precise
+/// Gesture envelope defined around precise
 /// scroll-wheel records.
 ///
 /// `RFBPostGestureEventStart` and `RFBPostGestureEventEnd` serialize these as

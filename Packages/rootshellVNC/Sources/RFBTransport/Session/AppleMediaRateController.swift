@@ -11,8 +11,7 @@ import Foundation
 /// link can sustain a higher motion bitrate. RCTL is advisory feedback; this
 /// class does not impose a second congestion controller.
 final class AppleMediaRateController {
-    /// AVConference's RemoteDesktopScreenSharing settings return 20 Mbps from
-    /// `minBandwidth`; captured negotiation also contains 40/60 Mbps screen
+    /// The negotiated screen profile uses a 20 Mbps minimum and 40/60 Mbps
     /// maxima. Receiver feedback may still report a lower path estimate, so the
     /// controller must not clamp its RCTL value to the media arbitration range.
     static let nativeScreenMinimumBitrateBps: Double = 20_000_000
@@ -72,8 +71,8 @@ final class AppleMediaRateController {
                 // headroom. Applying another factor here kept feedback below
                 // the profile's real 20/40/60/75/100 Mbps tiers.
                 targetUtilization: value("ROOTSHELL_VNC_RC_TARGET_UTILIZATION", default: 1.0),
-                // Conservative AIMD: native VCRC's low-latency controller logs
-                // exponential congestion backoff and continuous recovery. A
+                // Conservative AIMD uses exponential congestion backoff and
+                // continuous recovery. A
                 // 10% probe avoids our former 32 -> 40 Mbps one-step pulse.
                 rampFactor: value("ROOTSHELL_VNC_RC_RAMP_FACTOR", default: 1.10),
                 // Before the first congestion signal, quickly test beyond the
@@ -152,8 +151,8 @@ final class AppleMediaRateController {
         UInt32(clamping: Int64(capacityEstimate.rounded()))
     }
 
-    /// OWRD is deliberately unavailable for this stream. Captured screen-share
-    /// RTP timestamps are constant/undocumented, so reporting zero is safer than
+    /// OWRD is deliberately unavailable for this stream. Screen-share RTP
+    /// timestamps do not provide a usable delay signal, so zero is safer than
     /// manufacturing queue growth or a fake nominal delay.
     var owrdSeconds: Double { 0 }
 
