@@ -274,3 +274,90 @@ struct ScrollPointAccumulator: Equatable, Sendable {
         return whole
     }
 }
+
+/// Holds the first few points of a scroll long enough to distinguish a
+/// deliberate horizontal swipe from ordinary two-dimensional scrolling.
+///
+/// AppKit's fluid swipe tracking (used by controls such as Mail's message-row
+/// actions) abandons a horizontal swipe when the opening samples contain
+/// enough vertical movement. Direct iPad touches are substantially noisier
+/// than a Mac trackpad. Once horizontal intent is clear, keep that physical
+/// gesture on the horizontal axis. Vertical and genuinely diagonal scrolling
+/// remain unrestricted.
+struct HorizontalScrollIntentFilter: Equatable, Sendable {
+    private enum State: Equatable, Sendable {
+        case undecided
+        case horizontal
+        case unrestricted
+    }
+
+    private static let decisionDistance: CGFloat = 4
+    private static let horizontalDominance: CGFloat = 1.25
+    private static let verticalDominance: CGFloat = 2
+    private static let unrestrictedDecisionDistance: CGFloat = 8
+
+    private var state: State = .undecided
+    private var pendingX: CGFloat = 0
+    private var pendingY: CGFloat = 0
+
+    var isHorizontallyLocked: Bool {
+        state == .horizontal
+    }
+
+    mutating func consume(deltaX: CGFloat, deltaY: CGFloat) -> CGPoint {
+        guard deltaX.isFinite, deltaY.isFinite else { return CGPoint(x: 0, y: 0) }
+
+        switch state {
+        case .horizontal:
+            return CGPoint(x: deltaX, y: 0)
+        case .unrestricted:
+            return CGPoint(x: deltaX, y: deltaY)
+        case .undecided:
+            pendingX += deltaX
+            pendingY += deltaY
+
+            let absoluteX = abs(pendingX)
+            let absoluteY = abs(pendingY)
+            guard max(absoluteX, absoluteY) >= Self.decisionDistance else {
+                return CGPoint(x: 0, y: 0)
+            }
+
+            if absoluteX >= absoluteY * Self.horizontalDominance {
+                state = .horizontal
+                return drain(horizontalOnly: true)
+            }
+
+            // Keep clearly vertical starts responsive, but do not lock an
+            // ambiguous opening wobble to unrestricted scrolling after only
+            // a few points. A finger can easily begin at (3, 4) before its
+            // horizontal intent becomes apparent.
+            if absoluteY >= absoluteX * Self.verticalDominance
+                || max(absoluteX, absoluteY) >= Self.unrestrictedDecisionDistance {
+                state = .unrestricted
+                return drain(horizontalOnly: false)
+            }
+            return CGPoint(x: 0, y: 0)
+        }
+    }
+
+    mutating func flush() -> CGPoint {
+        guard state == .undecided else { return CGPoint(x: 0, y: 0) }
+        state = .unrestricted
+        return drain(horizontalOnly: false)
+    }
+
+    mutating func reset() {
+        state = .undecided
+        pendingX = 0
+        pendingY = 0
+    }
+
+    private mutating func drain(horizontalOnly: Bool) -> CGPoint {
+        let result = CGPoint(
+            x: pendingX,
+            y: horizontalOnly ? 0 : pendingY)
+        pendingX = 0
+        pendingY = 0
+        return result
+    }
+}

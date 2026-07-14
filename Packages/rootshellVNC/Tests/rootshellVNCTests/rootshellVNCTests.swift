@@ -1979,6 +1979,52 @@ final class TouchInputHandlerTests: XCTestCase {
         XCTAssertEqual(accumulator.remainderY, -0.2, accuracy: 0.0001)
     }
 
+    func testHorizontalScrollIntentDropsOpeningVerticalJitter() {
+        var filter = HorizontalScrollIntentFilter()
+
+        assertPoint(filter.consume(deltaX: 2, deltaY: 0.8), x: 0, y: 0)
+        assertPoint(filter.consume(deltaX: 3, deltaY: 0.7), x: 5, y: 0)
+        XCTAssertTrue(filter.isHorizontallyLocked)
+        assertPoint(filter.consume(deltaX: 4, deltaY: -2), x: 4, y: 0)
+    }
+
+    func testAmbiguousTouchOpeningCanResolveHorizontally() {
+        var filter = HorizontalScrollIntentFilter()
+
+        assertPoint(filter.consume(deltaX: 3, deltaY: 4), x: 0, y: 0)
+        assertPoint(filter.consume(deltaX: 4, deltaY: 0), x: 7, y: 0)
+    }
+
+    func testVerticalAndDiagonalScrollRemainUnrestricted() {
+        var vertical = HorizontalScrollIntentFilter()
+        assertPoint(vertical.consume(deltaX: 1, deltaY: 5), x: 1, y: 5)
+        XCTAssertFalse(vertical.isHorizontallyLocked)
+        assertPoint(vertical.consume(deltaX: 2, deltaY: 3), x: 2, y: 3)
+
+        var diagonal = HorizontalScrollIntentFilter()
+        assertPoint(diagonal.consume(deltaX: 3, deltaY: 3), x: 0, y: 0)
+        assertPoint(diagonal.consume(deltaX: 5, deltaY: 5), x: 8, y: 8)
+    }
+
+    func testShortUndecidedScrollFlushesWithoutLosingMovement() {
+        var filter = HorizontalScrollIntentFilter()
+
+        assertPoint(filter.consume(deltaX: 1.5, deltaY: -1), x: 0, y: 0)
+        assertPoint(filter.flush(), x: 1.5, y: -1)
+        assertPoint(filter.flush(), x: 0, y: 0)
+    }
+
+    private func assertPoint(
+        _ point: CGPoint,
+        x: CGFloat,
+        y: CGFloat,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(point.x, x, accuracy: 0.0001, file: file, line: line)
+        XCTAssertEqual(point.y, y, accuracy: 0.0001, file: file, line: line)
+    }
+
     func testInputQueueCoalescesStalePointerPositionsButKeepsRunStart() {
         var queue = SessionInputQueue()
         queue.enqueue(.pointer(buttonMask: 1, x: 10, y: 20))
