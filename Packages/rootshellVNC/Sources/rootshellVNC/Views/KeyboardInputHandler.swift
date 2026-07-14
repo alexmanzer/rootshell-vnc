@@ -121,6 +121,39 @@ public struct KeyboardInputHandler {
         sendKeyEvent(false, keysym)
     }
 
+    /// Handle a complete key tap with modifiers supplied by a container UI.
+    /// RFB modifiers are independent key transitions, so this deliberately
+    /// sends the printable keysym instead of converting Control chords to C0
+    /// bytes.
+    @discardableResult
+    public func handleKeyTap(
+        _ character: Character,
+        supplementalModifiers: VNCKeyboardModifiers
+    ) -> Bool {
+        handleKeysymTap(
+            Self.keysymForCharacter(character),
+            supplementalModifiers: supplementalModifiers)
+    }
+
+    /// Handle a complete keysym tap wrapped in container-supplied modifiers.
+    @discardableResult
+    public func handleKeysymTap(
+        _ keysym: UInt32,
+        supplementalModifiers: VNCKeyboardModifiers
+    ) -> Bool {
+        guard keysym != 0 else { return false }
+        let modifiers = Self.keysyms(for: supplementalModifiers)
+        for modifier in modifiers {
+            sendKeyEvent(true, modifier)
+        }
+        sendKeyEvent(true, keysym)
+        sendKeyEvent(false, keysym)
+        for modifier in modifiers.reversed() {
+            sendKeyEvent(false, modifier)
+        }
+        return true
+    }
+
     /// Send an already-converted X11 keysym. Platform responder adapters use
     /// this for hardware-keyboard HID events so key-down and key-up remain
     /// distinct.
@@ -301,5 +334,17 @@ public struct KeyboardInputHandler {
             return charactersIgnoringModifiers
         }
         return characters
+    }
+
+    /// X11 keysyms for host-supplied modifiers in stable press order.
+    public nonisolated static func keysyms(
+        for modifiers: VNCKeyboardModifiers
+    ) -> [UInt32] {
+        var result: [UInt32] = []
+        if modifiers.contains(.control) { result.append(keysymControlL) }
+        if modifiers.contains(.option) { result.append(keysymAltL) }
+        if modifiers.contains(.shift) { result.append(keysymShiftL) }
+        if modifiers.contains(.command) { result.append(keysymSuperL) }
+        return result
     }
 }

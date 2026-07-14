@@ -1035,6 +1035,60 @@ final class KeyboardInputHandlerTests: XCTestCase {
     }
 
     @MainActor
+    func testSupplementalControlCProducesCompleteRFBChord() {
+        var transitions: [HardwareKeyboardTransition] = []
+        let handler = KeyboardInputHandler { downFlag, keysym in
+            transitions.append(HardwareKeyboardTransition(
+                downFlag: downFlag,
+                keysym: keysym))
+        }
+
+        XCTAssertTrue(handler.handleKeyTap(
+            "c",
+            supplementalModifiers: [.control]))
+        XCTAssertEqual(transitions, [
+            HardwareKeyboardTransition(
+                downFlag: true,
+                keysym: KeyboardInputHandler.keysymControlL),
+            HardwareKeyboardTransition(downFlag: true, keysym: 0x63),
+            HardwareKeyboardTransition(downFlag: false, keysym: 0x63),
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymControlL),
+        ])
+    }
+
+    @MainActor
+    func testSupplementalModifiersUseStableReverseReleaseOrder() {
+        var transitions: [HardwareKeyboardTransition] = []
+        let handler = KeyboardInputHandler { downFlag, keysym in
+            transitions.append(HardwareKeyboardTransition(
+                downFlag: downFlag,
+                keysym: keysym))
+        }
+
+        XCTAssertTrue(handler.handleKeysymTap(
+            KeyboardInputHandler.keysymBackspace,
+            supplementalModifiers: [.control, .option, .shift, .command]))
+        XCTAssertEqual(transitions.map(\.keysym), [
+            KeyboardInputHandler.keysymControlL,
+            KeyboardInputHandler.keysymAltL,
+            KeyboardInputHandler.keysymShiftL,
+            KeyboardInputHandler.keysymSuperL,
+            KeyboardInputHandler.keysymBackspace,
+            KeyboardInputHandler.keysymBackspace,
+            KeyboardInputHandler.keysymSuperL,
+            KeyboardInputHandler.keysymShiftL,
+            KeyboardInputHandler.keysymAltL,
+            KeyboardInputHandler.keysymControlL,
+        ])
+        XCTAssertEqual(transitions.map(\.downFlag), [
+            true, true, true, true, true,
+            false, false, false, false, false,
+        ])
+    }
+
+    @MainActor
     func testStandardRemoteCommandAliasesMatchScreensDefaults() {
         let expected: [RemoteCommand: RemoteCommandShortcut] = [
             .missionControl: RemoteCommandShortcut(
@@ -1278,6 +1332,47 @@ final class HardwareKeyboardStateTests: XCTestCase {
             state.release(usage: 0x04),
             HardwareKeyboardTransition(downFlag: false, keysym: 0x41))
         XCTAssertNil(state.release(usage: 0x04))
+    }
+
+    func testSupplementalModifiersStayDownAcrossOverlappingKeys() {
+        var state = SupplementalHardwareModifierState()
+
+        XCTAssertEqual(state.begin(
+            usage: 0x06,
+            keysyms: [KeyboardInputHandler.keysymControlL]), [
+                HardwareKeyboardTransition(
+                    downFlag: true,
+                    keysym: KeyboardInputHandler.keysymControlL),
+            ])
+        XCTAssertTrue(state.begin(
+            usage: 0x07,
+            keysyms: [KeyboardInputHandler.keysymControlL]).isEmpty)
+        XCTAssertTrue(state.end(usage: 0x06).isEmpty)
+        XCTAssertEqual(state.end(usage: 0x07), [
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymControlL),
+        ])
+    }
+
+    func testSupplementalModifierReleaseAllUsesReverseActivationOrder() {
+        var state = SupplementalHardwareModifierState()
+        _ = state.begin(
+            usage: 0x06,
+            keysyms: [
+                KeyboardInputHandler.keysymControlL,
+                KeyboardInputHandler.keysymAltL,
+            ])
+
+        XCTAssertEqual(state.releaseAll(), [
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymAltL),
+            HardwareKeyboardTransition(
+                downFlag: false,
+                keysym: KeyboardInputHandler.keysymControlL),
+        ])
+        XCTAssertTrue(state.releaseAll().isEmpty)
     }
 
     func testReleaseAllUsesReversePressOrderAndOnlyReleasesOnce() {

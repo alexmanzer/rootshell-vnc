@@ -48,6 +48,69 @@ struct HardwareKeyboardState: Sendable {
     }
 }
 
+/// Bookkeeping for host-toolbar modifiers wrapped around physical key
+/// presses. A modifier remains down until every overlapping target key that
+/// borrowed it has been released.
+struct SupplementalHardwareModifierState: Sendable {
+    private var keysymsByUsage: [UInt32: [UInt32]] = [:]
+    private var referenceCounts: [UInt32: Int] = [:]
+    private var activationOrder: [UInt32] = []
+
+    func contains(usage: UInt32) -> Bool {
+        keysymsByUsage[usage] != nil
+    }
+
+    mutating func begin(
+        usage: UInt32,
+        keysyms: [UInt32]
+    ) -> [HardwareKeyboardTransition] {
+        guard usage != 0, keysymsByUsage[usage] == nil else { return [] }
+        keysymsByUsage[usage] = keysyms
+        var transitions: [HardwareKeyboardTransition] = []
+        for keysym in keysyms where keysym != 0 {
+            let count = referenceCounts[keysym, default: 0]
+            if count == 0 {
+                activationOrder.append(keysym)
+                transitions.append(HardwareKeyboardTransition(
+                    downFlag: true,
+                    keysym: keysym))
+            }
+            referenceCounts[keysym] = count + 1
+        }
+        return transitions
+    }
+
+    mutating func end(usage: UInt32) -> [HardwareKeyboardTransition] {
+        guard let keysyms = keysymsByUsage.removeValue(forKey: usage) else {
+            return []
+        }
+        var transitions: [HardwareKeyboardTransition] = []
+        for keysym in keysyms.reversed() {
+            let next = max(0, (referenceCounts[keysym] ?? 1) - 1)
+            if next == 0 {
+                referenceCounts.removeValue(forKey: keysym)
+                activationOrder.removeAll { $0 == keysym }
+                transitions.append(HardwareKeyboardTransition(
+                    downFlag: false,
+                    keysym: keysym))
+            } else {
+                referenceCounts[keysym] = next
+            }
+        }
+        return transitions
+    }
+
+    mutating func releaseAll() -> [HardwareKeyboardTransition] {
+        let transitions = activationOrder.reversed().map {
+            HardwareKeyboardTransition(downFlag: false, keysym: $0)
+        }
+        keysymsByUsage.removeAll(keepingCapacity: true)
+        referenceCounts.removeAll(keepingCapacity: true)
+        activationOrder.removeAll(keepingCapacity: true)
+        return transitions
+    }
+}
+
 #if canImport(UIKit)
 import UIKit
 

@@ -23,6 +23,14 @@ private struct DockedKeyboardViewportMetrics: Equatable {
 }
 #endif
 
+/// Chooses which layer owns keyboard and accessory clearance for the remote
+/// viewport. Container apps with a shared pane layout can opt out of the
+/// package spacer while the standalone view keeps automatic avoidance.
+public enum VNCKeyboardAvoidanceMode: Equatable, Sendable {
+    case automatic
+    case hostManaged
+}
+
 /// Displays the remote desktop and provides one input/viewport layer for both
 /// Adaptive video and Full Quality framebuffer rendering.
 public struct RemoteDesktopView: View {
@@ -48,18 +56,21 @@ public struct RemoteDesktopView: View {
     private let isFullScreen: Bool
     private let toggleFullScreen: (() -> Void)?
     private let hudMenuExtras: AnyView?
+    private let keyboardAvoidanceMode: VNCKeyboardAvoidanceMode
 
     public init(
         session: VNCSession,
         keyboardCapture: VNCKeyboardCapture? = nil,
         isFullScreen: Bool = false,
-        toggleFullScreen: (() -> Void)? = nil
+        toggleFullScreen: (() -> Void)? = nil,
+        keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic
     ) {
         self.init(
             session: session,
             keyboardCapture: keyboardCapture,
             isFullScreen: isFullScreen,
             toggleFullScreen: toggleFullScreen,
+            keyboardAvoidanceMode: keyboardAvoidanceMode,
             hudMenuExtras: nil)
     }
 
@@ -74,6 +85,7 @@ public struct RemoteDesktopView: View {
         keyboardCapture: VNCKeyboardCapture? = nil,
         isFullScreen: Bool = false,
         toggleFullScreen: (() -> Void)? = nil,
+        keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
     ) {
         self.init(
@@ -81,6 +93,7 @@ public struct RemoteDesktopView: View {
             keyboardCapture: keyboardCapture,
             isFullScreen: isFullScreen,
             toggleFullScreen: toggleFullScreen,
+            keyboardAvoidanceMode: keyboardAvoidanceMode,
             hudMenuExtras: AnyView(hudMenuExtras()))
     }
 
@@ -89,6 +102,7 @@ public struct RemoteDesktopView: View {
         keyboardCapture: VNCKeyboardCapture?,
         isFullScreen: Bool,
         toggleFullScreen: (() -> Void)?,
+        keyboardAvoidanceMode: VNCKeyboardAvoidanceMode,
         hudMenuExtras: AnyView?
     ) {
         self.session = session
@@ -97,6 +111,7 @@ public struct RemoteDesktopView: View {
             initialValue: keyboardCapture ?? VNCKeyboardCapture())
         self.isFullScreen = isFullScreen
         self.toggleFullScreen = toggleFullScreen
+        self.keyboardAvoidanceMode = keyboardAvoidanceMode
         self.touchHandler = TouchInputHandler(
             sendPointerEvent: { [session] buttonMask, x, y in
                 session.sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
@@ -199,9 +214,11 @@ public struct RemoteDesktopView: View {
             }
 
             #if canImport(UIKit)
-            Color.clear
-                .frame(height: keyboardViewportMetrics.keyboardInset)
-                .accessibilityHidden(true)
+            if keyboardAvoidanceMode == .automatic {
+                Color.clear
+                    .frame(height: keyboardViewportMetrics.keyboardInset)
+                    .accessibilityHidden(true)
+            }
             #endif
         }
         // Two-way sync with the host-visible keyboard request. The local
@@ -525,7 +542,9 @@ public struct RemoteDesktopView: View {
 
     #if canImport(UIKit)
     private func updateRemoteDisplaySizeFromMeasuredContainer() {
-        let size = keyboardViewportMetrics.availableSize
+        let size = keyboardAvoidanceMode == .automatic
+            ? keyboardViewportMetrics.availableSize
+            : keyboardViewportMetrics.containerSize
         guard size.width > 0, size.height > 0 else { return }
         updateRemoteDisplaySize(for: size)
     }

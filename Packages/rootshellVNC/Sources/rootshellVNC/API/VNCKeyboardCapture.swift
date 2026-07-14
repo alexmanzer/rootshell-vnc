@@ -3,6 +3,68 @@ import Observation
 import UIKit
 #endif
 
+/// Modifiers supplied by a container-provided keyboard UI.
+///
+/// These are additive to modifiers reported by a physical keyboard. The
+/// remote input responder applies them to the next software- or
+/// hardware-keyboard input and then calls the capture object's consumption
+/// callback so hosts can clear one-shot state while retaining locked state.
+public struct VNCKeyboardModifiers: OptionSet, Sendable {
+    public let rawValue: UInt8
+
+    public init(rawValue: UInt8) {
+        self.rawValue = rawValue
+    }
+
+    public static let control = Self(rawValue: 1 << 0)
+    public static let option = Self(rawValue: 1 << 1)
+    public static let shift = Self(rawValue: 1 << 2)
+    public static let command = Self(rawValue: 1 << 3)
+}
+
+#if canImport(UIKit)
+/// The primary input view used by the remote responder.
+@MainActor
+public enum VNCKeyboardPrimaryInputView {
+    /// Retain the package default: show the system keyboard only when it has
+    /// been explicitly requested, otherwise use the package's suppressed
+    /// zero-sized input view so hardware keyboard capture remains active.
+    case packageDefault
+
+    /// Always ask UIKit for the system software keyboard.
+    case systemKeyboard
+
+    /// Use a host-provided primary input view. A zero-height view allows an
+    /// accessory-only toolbar while keeping the software keyboard hidden.
+    case custom(UIView)
+
+    /// Use the system keyboard when it is explicitly requested and otherwise
+    /// use the host view. This is the normal accessory-only integration mode:
+    /// the package HUD can still summon the software keyboard without waiting
+    /// for a host-side state round trip.
+    case systemKeyboardWhenRequested(otherwise: UIView)
+}
+
+/// One coherent snapshot of the input views supplied by a container app.
+/// Updating the snapshot causes a focused responder to reload both views
+/// together, preventing primary/accessory state from getting out of sync.
+@MainActor
+public struct VNCKeyboardInputViews {
+    public var primary: VNCKeyboardPrimaryInputView
+    public var accessory: UIView?
+
+    public init(
+        primary: VNCKeyboardPrimaryInputView = .packageDefault,
+        accessory: UIView? = nil
+    ) {
+        self.primary = primary
+        self.accessory = accessory
+    }
+
+    public static var packageDefault: Self { Self() }
+}
+#endif
+
 /// Coordinates ownership of hardware-keyboard input for a remote desktop.
 ///
 /// Standalone clients can use the controller created by `RemoteDesktopView`.
@@ -14,25 +76,9 @@ public final class VNCKeyboardCapture {
     public private(set) var isCaptured: Bool
 
     #if canImport(UIKit)
-    /// Supplies the `inputAccessoryView` for the remote input responder.
-    ///
-    /// Container applications set this to attach their own keyboard toolbar
-    /// above the software keyboard. Return `nil` for no accessory (the
-    /// default when unset). Reassigning the provider bumps
-    /// ``inputViewsGeneration`` so a focused responder reloads immediately.
-    public var inputAccessoryViewProvider: (@MainActor () -> UIView?)? {
-        didSet { inputViewsGeneration &+= 1 }
-    }
-
-    /// Supplies a replacement `inputView` for the remote input responder,
-    /// enabling a toolbar-only mode that shows the accessory without the
-    /// system keyboard.
-    ///
-    /// When `nil` (the default), the remote input view keeps its built-in
-    /// behavior: the software keyboard is suppressed unless explicitly
-    /// requested. Reassigning the provider bumps ``inputViewsGeneration`` so
-    /// a focused responder reloads immediately.
-    public var inputViewProvider: (@MainActor () -> UIView?)? {
+    /// Atomic host input-view configuration. Standalone clients can leave
+    /// this at ``VNCKeyboardInputViews/packageDefault``.
+    public var inputViews: VNCKeyboardInputViews = .packageDefault {
         didSet { inputViewsGeneration &+= 1 }
     }
 
@@ -47,6 +93,16 @@ public final class VNCKeyboardCapture {
         inputViewsGeneration &+= 1
     }
     #endif
+
+    /// Modifiers contributed by a host toolbar. The remote responder merges
+    /// these with physical modifiers without turning Control chords into C0
+    /// text bytes.
+    public var supplementalModifiers: VNCKeyboardModifiers = []
+
+    /// Called after a non-modifier key is successfully dispatched with
+    /// nonempty supplemental modifiers. Hosts use this to consume one-shot
+    /// state; locked state can remain in ``supplementalModifiers``.
+    public var onSupplementalModifiersConsumed: (@MainActor () -> Void)?
 
     /// Whether the software keyboard should be shown for the remote desktop.
     ///

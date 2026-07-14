@@ -125,6 +125,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private var momentumDisplayLink: CADisplayLink?
     private let suppressedInputView = UIView(frame: .zero)
     private var consumedRemoteAliasUsages: Set<UInt32> = []
+    /// Supplemental toolbar modifiers held around each physical key until its
+    /// matching key-up. Reference counts keep overlapping physical presses
+    /// from releasing a shared synthetic modifier too early.
+    private var supplementalModifierState = SupplementalHardwareModifierState()
     private weak var monitoredCatalystKeyboardInput: GCKeyboardInput?
     #if DEBUG
     private let inputLog = VNCLogger(category: "InputRouting")
@@ -426,20 +430,26 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
     /// Suppress the software keyboard while retaining hardware-keyboard focus
     /// after mouse/trackpad interaction. The explicit keyboard button switches
-    /// this back to the system keyboard on touch devices. A container app can
-    /// replace the input view entirely (toolbar-only mode) through
-    /// ``VNCKeyboardCapture/inputViewProvider``.
+    /// this back to the system keyboard on touch devices. Container apps can
+    /// atomically replace the primary and accessory views through
+    /// ``VNCKeyboardCapture/inputViews``.
     override var inputView: UIView? {
-        if let inputViewProvider = keyboardCapture.inputViewProvider {
-            return inputViewProvider()
+        switch keyboardCapture.inputViews.primary {
+        case .packageDefault:
+            return softwareKeyboardRequested ? nil : suppressedInputView
+        case .systemKeyboard:
+            return nil
+        case .custom(let view):
+            return view
+        case .systemKeyboardWhenRequested(let fallback):
+            return softwareKeyboardRequested ? nil : fallback
         }
-        return softwareKeyboardRequested ? nil : suppressedInputView
     }
 
-    /// The container app supplies an optional keyboard toolbar through
-    /// ``VNCKeyboardCapture/inputAccessoryViewProvider``.
+    /// The container app supplies an optional keyboard toolbar in the same
+    /// atomic snapshot as the primary input view.
     override var inputAccessoryView: UIView? {
-        keyboardCapture.inputAccessoryViewProvider?()
+        keyboardCapture.inputViews.accessory
     }
 
     var hasText: Bool { true }
@@ -483,7 +493,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 reloadInputViews()
             }
         } else {
-            hardwareKeyboard.releaseAll()
+            releaseAllPressedKeys()
             if inputViewsChanged, isFirstResponder {
                 reloadInputViews()
             }
@@ -503,14 +513,26 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     func insertText(_ text: String) {
+        let modifiers = keyboardCapture.supplementalModifiers
+        var dispatched = false
         for character in text {
-            keyboardHandler.handleKeyTap(character)
+            dispatched = keyboardHandler.handleKeyTap(
+                character,
+                supplementalModifiers: modifiers) || dispatched
+        }
+        if dispatched, !modifiers.isEmpty {
+            keyboardCapture.onSupplementalModifiersConsumed?()
         }
     }
 
     func deleteBackward() {
-        keyboardHandler.handleKeyPress(.delete)
-        keyboardHandler.handleKeyRelease(.delete)
+        let modifiers = keyboardCapture.supplementalModifiers
+        let dispatched = keyboardHandler.handleKeysymTap(
+            KeyboardInputHandler.keysymBackspace,
+            supplementalModifiers: modifiers)
+        if dispatched, !modifiers.isEmpty {
+            keyboardCapture.onSupplementalModifiersConsumed?()
+        }
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -548,6 +570,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 unhandled.insert(press)
                 continue
             }
+            beginSupplementalModifiersIfNeeded(for: usage)
             _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
         }
         if !unhandled.isEmpty {
@@ -1036,12 +1059,67 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 unhandled.insert(press)
                 continue
             }
+            endSupplementalModifiers(for: usage)
         }
         return unhandled
     }
 
     private func releaseAllPressedKeys() {
         hardwareKeyboard.releaseAll()
+        releaseAllSupplementalModifiers()
+    }
+
+    private func beginSupplementalModifiersIfNeeded(for usage: UInt32) {
+        // Modifier-only presses already have explicit physical transitions.
+        guard !(0xE0...0xE7).contains(usage),
+              !supplementalModifierState.contains(usage: usage) else { return }
+
+        let configured = keyboardCapture.supplementalModifiers
+        guard !configured.isEmpty else { return }
+        let keysyms = KeyboardInputHandler.keysyms(for: configured).filter {
+            !physicalModifierIsPressed(for: $0)
+        }
+
+        // Beginning with an empty list still records a repeat sentinel when
+        // every configured modifier is already held physically.
+        supplementalModifierState.begin(usage: usage, keysyms: keysyms)
+            .forEach(sendSupplementalTransition)
+        keyboardCapture.onSupplementalModifiersConsumed?()
+    }
+
+    private func endSupplementalModifiers(for usage: UInt32) {
+        supplementalModifierState.end(usage: usage)
+            .forEach(sendSupplementalTransition)
+    }
+
+    private func releaseAllSupplementalModifiers() {
+        supplementalModifierState.releaseAll()
+            .forEach(sendSupplementalTransition)
+    }
+
+    private func sendSupplementalTransition(_ transition: HardwareKeyboardTransition) {
+        keyboardHandler.handleKeysym(
+            downFlag: transition.downFlag,
+            keysym: transition.keysym)
+    }
+
+    private func physicalModifierIsPressed(for keysym: UInt32) -> Bool {
+        switch keysym {
+        case KeyboardInputHandler.keysymControlL:
+            return hardwareKeyboard.contains(usage: 0xE0)
+                || hardwareKeyboard.contains(usage: 0xE4)
+        case KeyboardInputHandler.keysymShiftL:
+            return hardwareKeyboard.contains(usage: 0xE1)
+                || hardwareKeyboard.contains(usage: 0xE5)
+        case KeyboardInputHandler.keysymAltL:
+            return hardwareKeyboard.contains(usage: 0xE2)
+                || hardwareKeyboard.contains(usage: 0xE6)
+        case KeyboardInputHandler.keysymSuperL:
+            return hardwareKeyboard.contains(usage: 0xE3)
+                || hardwareKeyboard.contains(usage: 0xE7)
+        default:
+            return false
+        }
     }
 
     @objc private func applicationWillResignActive() {
