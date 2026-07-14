@@ -271,10 +271,10 @@ final class SecurityTypeTests: XCTestCase {
         XCTAssertEqual(SecurityType.vncAuthentication.negotiationPriority, 1)
         XCTAssertEqual(SecurityType.apple30.negotiationPriority, 2)
         XCTAssertEqual(SecurityType.macAuthentication.negotiationPriority, 3)
+        XCTAssertEqual(SecurityType.vencrypt.negotiationPriority, 4)
         // SRP not yet implemented (client-speaks-first protocol)
         XCTAssertNil(SecurityType.srp.negotiationPriority)
         XCTAssertNil(SecurityType.tight.negotiationPriority)
-        XCTAssertNil(SecurityType.vencrypt.negotiationPriority)
         XCTAssertNil(SecurityType.kerberos.negotiationPriority)
         XCTAssertNil(SecurityType.unknown(99).negotiationPriority)
     }
@@ -289,6 +289,12 @@ final class SecurityTypeTests: XCTestCase {
         let macPriority = SecurityType.macAuthentication.negotiationPriority!
         let dhPriority = SecurityType.apple30.negotiationPriority!
         XCTAssertGreaterThan(macPriority, dhPriority)
+    }
+
+    func testVeNCryptHasHighestSupportedNegotiationPriority() {
+        let vencryptPriority = SecurityType.vencrypt.negotiationPriority!
+        let macPriority = SecurityType.macAuthentication.negotiationPriority!
+        XCTAssertGreaterThan(vencryptPriority, macPriority)
     }
 
     func testEquatable() {
@@ -1179,6 +1185,7 @@ final class EncodingTests: XCTestCase {
 
     func testPseudoEncodingRawValues() {
         XCTAssertEqual(Encoding.cursor.rawValue, -239)
+        XCTAssertEqual(Encoding.lastRect.rawValue, -224)
         XCTAssertEqual(Encoding.desktopSize.rawValue, -223)
         XCTAssertEqual(Encoding.extendedDesktopSize.rawValue, -308)
     }
@@ -1200,6 +1207,7 @@ final class EncodingTests: XCTestCase {
         XCTAssertEqual(Encoding(rawValue: 1), .copyRect)
         XCTAssertEqual(Encoding(rawValue: 16), .zrle)
         XCTAssertEqual(Encoding(rawValue: -239), .cursor)
+        XCTAssertEqual(Encoding(rawValue: -224), .lastRect)
         XCTAssertEqual(Encoding(rawValue: 1002), .appleSubZlibThousands)
         XCTAssertEqual(Encoding(rawValue: 1010), .appleH264)
         XCTAssertEqual(Encoding(rawValue: 1011), .appleMultiVariantScreenshare)
@@ -1417,11 +1425,76 @@ final class ConnectionStateMachineTests: XCTestCase {
         _ = sm.handle(event: .connected)
         _ = sm.handle(event: .receivedProtocolVersion(.v3_3))
 
-        let actions = sm.handle(event: .receivedSecurityTypes([.none]))
+        let actions = sm.handle(event: .receivedServerSelectedSecurityType(.none))
         XCTAssertEqual(sm.selectedSecurityType, SecurityType.none)
         XCTAssertEqual(sm.state, .waitingForServerInit)
-        // Should have 2 actions: sendSecurityType + requestServerInit
-        XCTAssertEqual(actions.count, 2)
+        // In RFB 3.3 the server chooses the type. The client must not echo a
+        // selection byte because that byte would be parsed as ClientInit.
+        XCTAssertEqual(actions.count, 1)
+        guard case .requestServerInit = actions.first else {
+            return XCTFail("Expected requestServerInit without a security selection")
+        }
+    }
+
+    func testAutomaticSecurityPrefersPortableVNCAuthOnConventionalServer() {
+        var sm = ConnectionStateMachine()
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.v3_8))
+
+        let actions = sm.handle(event: .receivedSecurityTypes([
+            .vencrypt, .vncAuthentication, .none,
+        ]))
+        XCTAssertEqual(sm.selectedSecurityType, .vncAuthentication)
+        XCTAssertEqual(actions.count, 1)
+        guard case .sendSecurityType(.vncAuthentication) = actions.first else {
+            return XCTFail("Expected portable VNC authentication")
+        }
+    }
+
+    func testRequireEncryptionSelectsVeNCrypt() {
+        var sm = ConnectionStateMachine(securityPolicy: .requireEncryption)
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.v3_8))
+
+        let actions = sm.handle(event: .receivedSecurityTypes([
+            .vncAuthentication, .vencrypt,
+        ]))
+        XCTAssertEqual(sm.selectedSecurityType, .vencrypt)
+        XCTAssertEqual(actions.count, 1)
+        guard case .sendSecurityType(.vencrypt) = actions.first else {
+            return XCTFail("Expected VeNCrypt")
+        }
+    }
+
+    func testRequireEncryptionRejectsUnencryptedRFB33ServerSelection() {
+        for selected in [SecurityType.none, .vncAuthentication] {
+            var sm = ConnectionStateMachine(securityPolicy: .requireEncryption)
+            _ = sm.handle(event: .connected)
+            _ = sm.handle(event: .receivedProtocolVersion(.v3_3))
+
+            let actions = sm.handle(
+                event: .receivedServerSelectedSecurityType(selected))
+            XCTAssertNil(sm.selectedSecurityType)
+            guard case .failed(.authenticationFailed) = sm.state else {
+                return XCTFail("Expected requireEncryption to reject \(selected)")
+            }
+            XCTAssertEqual(actions.count, 1)
+            guard case .reportError(.authenticationFailed) = actions.first else {
+                return XCTFail("Expected an authentication policy error")
+            }
+        }
+    }
+
+    func testRequireEncryptionAcceptsVeNCryptRFB33ServerSelection() {
+        var sm = ConnectionStateMachine(securityPolicy: .requireEncryption)
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.v3_3))
+
+        let actions = sm.handle(
+            event: .receivedServerSelectedSecurityType(.vencrypt))
+        XCTAssertEqual(sm.selectedSecurityType, .vencrypt)
+        XCTAssertEqual(sm.state, .authenticating(.vencrypt))
+        XCTAssertTrue(actions.isEmpty)
     }
 
     // MARK: - Empty security types -> failure

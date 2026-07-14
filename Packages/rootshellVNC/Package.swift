@@ -16,6 +16,12 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/attaswift/BigInt.git", from: "5.3.0"),
+        // Already used and resolved by the host application. RFBTransport
+        // consumes these products directly for VeNCrypt STARTTLS rather than
+        // introducing a second TLS/crypto implementation.
+        .package(url: "https://github.com/apple/swift-nio.git", exact: "2.95.0"),
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.36.0"),
+        .package(url: "https://github.com/apple/swift-nio-transport-services.git", exact: "1.26.0"),
     ],
     targets: [
         // MARK: - RFBProtocol (pure types, parsing, state machine — Foundation only)
@@ -32,6 +38,10 @@ let package = Package(
             dependencies: [
                 "RFBProtocol",
                 .product(name: "BigInt", package: "BigInt"),
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOTLS", package: "swift-nio"),
+                .product(name: "NIOSSL", package: "swift-nio-ssl"),
+                .product(name: "NIOTransportServices", package: "swift-nio-transport-services"),
             ],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),

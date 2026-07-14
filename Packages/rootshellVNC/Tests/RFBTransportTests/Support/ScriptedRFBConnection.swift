@@ -20,6 +20,7 @@ actor ScriptedRFBConnection: RFBConnection {
     private var disconnectHandler: (@Sendable (VNCProtocolError) -> Void)?
     private var readWaiters: [CheckedContinuation<Void, Never>] = []
     private var onSend: (@Sendable (Data) -> Data?)?
+    private var tlsUpgradeEndpoint: (String, UInt16)?
 
     // MARK: - Test scripting
 
@@ -45,6 +46,10 @@ actor ScriptedRFBConnection: RFBConnection {
     /// Everything the client has sent, concatenated in order.
     func sentBytes() -> Data {
         sent
+    }
+
+    func upgradedTLSEndpoint() -> (String, UInt16)? {
+        tlsUpgradeEndpoint
     }
 
     /// Simulate an out-of-band transport failure reported through the
@@ -96,6 +101,14 @@ actor ScriptedRFBConnection: RFBConnection {
         _ handler: (@Sendable (VNCProtocolError) -> Void)?
     ) {
         disconnectHandler = handler
+    }
+
+    func supportsTLSUpgrade() async -> Bool { true }
+
+    func startTLS(configuration: RFBTLSConfiguration) async throws {
+        tlsUpgradeEndpoint = (
+            configuration.serverHostname,
+            configuration.serverPort)
     }
 
     // MARK: - Internals

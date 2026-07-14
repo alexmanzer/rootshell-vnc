@@ -133,7 +133,7 @@ public final class FramebufferRenderer: @unchecked Sendable {
                     cursorUpdate = update
                 }
 
-            case .encryptionInfo, .serverDisplayInfo,
+            case .lastRect, .encryptionInfo, .serverDisplayInfo,
                  .mediaStreamOffer, .mediaStreamAnswer:
                 break
 

@@ -20,6 +20,7 @@ public enum Encoding: Sendable, Equatable, Hashable {
     // MARK: - Standard pseudo-encodings
 
     case cursor
+    case lastRect
     case desktopSize
     case extendedDesktopSize
 
@@ -56,6 +57,7 @@ public enum Encoding: Sendable, Equatable, Hashable {
         case .zlibhex:              return 8
         case .zrle:                 return 16
         case .cursor:               return -239
+        case .lastRect:             return -224
         case .desktopSize:          return -223
         case .extendedDesktopSize:  return -308
         case .appleJPEG:            return -1000
@@ -83,6 +85,7 @@ public enum Encoding: Sendable, Equatable, Hashable {
         case 8:     self = .zlibhex
         case 16:    self = .zrle
         case -239:  self = .cursor
+        case -224:  self = .lastRect
         case -223:  self = .desktopSize
         case -308:  self = .extendedDesktopSize
         case -1000: self = .appleJPEG

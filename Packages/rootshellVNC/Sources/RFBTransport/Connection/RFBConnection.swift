@@ -1,6 +1,49 @@
 import Foundation
 import RFBProtocol
 
+/// Certificate details supplied when platform trust rejects a VeNCrypt peer.
+public struct VNCCertificateValidationRequest: Sendable {
+    public let host: String
+    public let port: UInt16
+    public let certificateChainDER: [Data]
+
+    public init(host: String, port: UInt16, certificateChainDER: [Data]) {
+        self.host = host
+        self.port = port
+        self.certificateChainDER = certificateChainDER
+    }
+}
+
+public enum VNCCertificateValidationResult: Sendable, Equatable {
+    /// Accept this handshake without changing persistent trust.
+    case acceptOnce
+    /// Accept this handshake after the validation handler has persisted its
+    /// trust decision. The transport deliberately owns no credential store;
+    /// handlers must complete persistence before returning this result.
+    case acceptAndStore
+    case reject
+}
+
+public typealias VNCCertificateValidationHandler = @Sendable (
+    VNCCertificateValidationRequest
+) async -> VNCCertificateValidationResult
+
+public struct RFBTLSConfiguration: Sendable {
+    public let serverHostname: String
+    public let serverPort: UInt16
+    public let certificateValidationHandler: VNCCertificateValidationHandler?
+
+    public init(
+        serverHostname: String,
+        serverPort: UInt16,
+        certificateValidationHandler: VNCCertificateValidationHandler? = nil
+    ) {
+        self.serverHostname = serverHostname
+        self.serverPort = serverPort
+        self.certificateValidationHandler = certificateValidationHandler
+    }
+}
+
 /// A reliable, ordered byte stream carrying one RFB session.
 ///
 /// `TCPConnection` is the default implementation; hosts may inject their own
@@ -53,10 +96,25 @@ public protocol RFBConnection: Sendable {
     /// Tunneled transports typically cannot describe the underlying path
     /// and use the default `nil`.
     func pathCharacteristics() async -> NetworkPathCharacteristics?
+
+    /// Whether this byte stream can install TLS after the plaintext RFB
+    /// version/security exchange used by VeNCrypt.
+    func supportsTLSUpgrade() async -> Bool
+
+    /// Upgrade the existing byte stream in-place. Reads and writes after this
+    /// returns carry decrypted/encrypted application bytes respectively.
+    func startTLS(configuration: RFBTLSConfiguration) async throws
 }
 
 extension RFBConnection {
     public func pathCharacteristics() async -> NetworkPathCharacteristics? {
         nil
+    }
+
+    public func supportsTLSUpgrade() async -> Bool { false }
+
+    public func startTLS(configuration _: RFBTLSConfiguration) async throws {
+        throw VNCProtocolError.protocolViolation(
+            "This connection transport cannot upgrade to TLS")
     }
 }

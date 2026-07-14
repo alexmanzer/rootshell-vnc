@@ -1391,7 +1391,9 @@ public final class VNCSession {
             displayCount: configuration.displayCount,
             requestsVirtualDisplays:
                 configuration.displaySizingMode == .matchClient,
-            connection: customConnection)
+            connection: customConnection,
+            securityPolicy: configuration.securityPolicy,
+            certificateValidationHandler: configuration.certificateValidationHandler)
         transportSession = transport
 
         if configuration.displaySizingMode == .matchClient,

@@ -34,6 +34,9 @@ public struct ConnectionStateMachine: Sendable {
     /// The preferred encoding list to request from the server.
     public var preferredEncodings: [Encoding]
 
+    public var securityPolicy: VNCSecurityPolicy
+    public var hasUsername: Bool
+
     public static let defaultPreferredEncodings: [Encoding] = [
         // Prefer copyRect (cheap) then raw (simple, reliable).
         // ZRLE/Zlib are available through the renderer but left to higher-level
@@ -49,10 +52,14 @@ public struct ConnectionStateMachine: Sendable {
 
     public init(
         preferredPixelFormat: PixelFormat = .bgra8888,
-        preferredEncodings: [Encoding] = ConnectionStateMachine.defaultPreferredEncodings
+        preferredEncodings: [Encoding] = ConnectionStateMachine.defaultPreferredEncodings,
+        securityPolicy: VNCSecurityPolicy = .automatic,
+        hasUsername: Bool = false
     ) {
         self.preferredPixelFormat = preferredPixelFormat
         self.preferredEncodings = preferredEncodings
+        self.securityPolicy = securityPolicy
+        self.hasUsername = hasUsername
     }
 
     // MARK: - Event handling
@@ -102,7 +109,12 @@ public struct ConnectionStateMachine: Sendable {
                 return [.reportError(error)]
             }
 
-            let selected = selectBestSecurityType(from: types)
+            guard let selected = selectBestSecurityType(from: types) else {
+                let error = VNCProtocolError.authenticationFailed(
+                    "The server does not offer the requested security method")
+                state = .failed(error)
+                return [.reportError(error)]
+            }
             selectedSecurityType = selected
 
             switch selected {
@@ -121,6 +133,23 @@ public struct ConnectionStateMachine: Sendable {
             default:
                 state = .authenticating(selected)
                 return [.sendSecurityType(selected)]
+            }
+
+        case (.waitingForSecurityTypes, .receivedServerSelectedSecurityType(let selected)):
+            guard securityTypeIsAllowed(selected) else {
+                let error = VNCProtocolError.authenticationFailed(
+                    "The server selected a security method that violates the configured policy")
+                state = .failed(error)
+                return [.reportError(error)]
+            }
+            selectedSecurityType = selected
+            switch selected {
+            case .none:
+                state = .waitingForServerInit
+                return [.requestServerInit]
+            default:
+                state = .authenticating(selected)
+                return []
             }
 
         // MARK: authenticating
@@ -227,7 +256,13 @@ public struct ConnectionStateMachine: Sendable {
 
     // MARK: - Security type selection
 
-    private func selectBestSecurityType(from types: [SecurityType]) -> SecurityType {
+    private func selectBestSecurityType(from types: [SecurityType]) -> SecurityType? {
+        // A diagnostic override must never downgrade an explicitly encrypted
+        // session. Handle this policy before consulting process state.
+        if securityPolicy == .requireEncryption {
+            return types.contains(.vencrypt) ? .vencrypt : nil
+        }
+
         if let forced = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_SECURITY_TYPE"] {
             let selected: SecurityType? = {
                 switch forced.lowercased() {
@@ -247,10 +282,56 @@ public struct ConnectionStateMachine: Sendable {
             }
         }
 
-        let ranked = types
-            .filter { $0.negotiationPriority != nil }
-            .sorted { ($0.negotiationPriority ?? -1) > ($1.negotiationPriority ?? -1) }
+        switch securityPolicy {
+        case .none:
+            return types.contains(.none) ? SecurityType.none : nil
+        case .vncAuthentication:
+            return types.contains(.vncAuthentication) ? .vncAuthentication : nil
+        case .apple30:
+            return types.contains(.apple30) ? .apple30 : nil
+        case .macAuthentication:
+            return types.contains(.macAuthentication) ? .macAuthentication : nil
+        case .requireEncryption:
+            // Handled before diagnostic overrides above.
+            return types.contains(.vencrypt) ? .vencrypt : nil
+        case .automatic:
+            if negotiatedVersion?.isApple == true, hasUsername {
+                if types.contains(.macAuthentication) { return .macAuthentication }
+                if types.contains(.apple30) { return .apple30 }
+            }
+            // TigerVNC commonly offers anonymous TLSVnc alongside VncAuth.
+            // NIOSSL cannot negotiate anonymous cipher suites, so take the
+            // interoperable choice when both outer types are present. X509-
+            // only servers (including secured wayvnc) still select VeNCrypt.
+            if types.contains(.vncAuthentication) { return .vncAuthentication }
+            if types.contains(.vencrypt) { return .vencrypt }
+            if types.contains(.none) { return SecurityType.none }
+            return nil
+        }
+    }
 
-        return ranked.first ?? types.first ?? .none
+    /// RFB 3.3 does not let the client choose a type, but a server-selected
+    /// type still has to satisfy the user's policy before any authentication
+    /// or ClientInit bytes are sent.
+    private func securityTypeIsAllowed(_ type: SecurityType) -> Bool {
+        switch securityPolicy {
+        case .requireEncryption:
+            return type == .vencrypt
+        case .none:
+            return type == .none
+        case .vncAuthentication:
+            return type == .vncAuthentication
+        case .apple30:
+            return type == .apple30
+        case .macAuthentication:
+            return type == .macAuthentication
+        case .automatic:
+            switch type {
+            case .none, .vncAuthentication, .vencrypt, .apple30, .macAuthentication:
+                return true
+            default:
+                return false
+            }
+        }
     }
 }

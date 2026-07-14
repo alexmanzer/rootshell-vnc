@@ -55,4 +55,67 @@ final class AuthenticatorScriptedTests: XCTestCase {
             XCTAssertEqual(error, .connectionClosed)
         }
     }
+
+    func testVeNCryptX509PlainNegotiationAndCredentials() async throws {
+        let connection = ScriptedRFBConnection()
+        var serverBytes = Data([0, 2, 0, 3])
+        for subtype: UInt32 in [260, 261, 262] {
+            serverBytes.append(contentsOf: [
+                UInt8((subtype >> 24) & 0xff),
+                UInt8((subtype >> 16) & 0xff),
+                UInt8((subtype >> 8) & 0xff),
+                UInt8(subtype & 0xff),
+            ])
+        }
+        await connection.enqueueServerBytes(serverBytes)
+
+        let authenticator = VeNCryptAuthenticator(
+            host: "linux.example",
+            port: 5901,
+            username: "alice",
+            password: "secret")
+        _ = try await authenticator.authenticate(connection: connection)
+
+        var expected = Data([0, 2, 0, 0, 1, 6]) // version + X509Plain(262)
+        expected.append(contentsOf: [0, 0, 0, 5, 0, 0, 0, 6])
+        expected.append(Data("alice".utf8))
+        expected.append(Data("secret".utf8))
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(sent, expected)
+        let endpoint = await connection.upgradedTLSEndpoint()
+        XCTAssertEqual(endpoint?.0, "linux.example")
+        XCTAssertEqual(endpoint?.1, 5901)
+    }
+
+    func testVeNCryptRejectsAnonymousTLSOnlyServer() async throws {
+        let connection = ScriptedRFBConnection()
+        // TLSNone/TLSVnc/TLSPlain require obsolete anonymous cipher suites.
+        var serverBytes = Data([0, 2, 0, 3])
+        for subtype: UInt32 in [257, 258, 259] {
+            serverBytes.append(contentsOf: [
+                UInt8((subtype >> 24) & 0xff),
+                UInt8((subtype >> 16) & 0xff),
+                UInt8((subtype >> 8) & 0xff),
+                UInt8(subtype & 0xff),
+            ])
+        }
+        await connection.enqueueServerBytes(serverBytes)
+
+        do {
+            _ = try await VeNCryptAuthenticator(
+                host: "linux.example",
+                port: 5900,
+                username: nil,
+                password: "secret"
+            ).authenticate(connection: connection)
+            XCTFail("Expected anonymous-only VeNCrypt negotiation to fail")
+        } catch let error as VNCProtocolError {
+            guard case .authenticationFailed = error else {
+                XCTFail("Expected authenticationFailed, got \(error)")
+                return
+            }
+        }
+        let endpoint = await connection.upgradedTLSEndpoint()
+        XCTAssertNil(endpoint)
+    }
 }

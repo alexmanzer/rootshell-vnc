@@ -7,6 +7,162 @@ import RFBProtocol
 /// read loop without a live VNC server.
 final class TransportSessionScriptedTests: XCTestCase {
 
+    func testRFB33ServerSelectedNoneDoesNotSendSecuritySelectionByte() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_3.wireBytes()
+        script.append(contentsOf: [0, 0, 0, SecurityType.none.rawValue])
+        script.append(Self.serverInitMessage(
+            width: 640, height: 480, name: "legacy-linux"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "legacy-linux.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.copyRect, .raw],
+            connection: connection)
+        try await session.connect()
+
+        var expected = ProtocolVersion.v3_3.wireBytes()
+        expected.append(0x01) // ClientInit, immediately after the version.
+        expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
+        expected.append(ClientMessage.setEncodings([
+            .copyRect, .raw, .zrle, .zlib, .cursor,
+            .desktopSize, .extendedDesktopSize,
+        ]).serialize())
+        expected.append(ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0, y: 0, width: 640, height: 480).serialize())
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(sent, expected)
+        await session.disconnect()
+    }
+
+    func testRFB33RequireEncryptionStopsBeforeUnencryptedClientInit() async {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_3.wireBytes()
+        script.append(contentsOf: [0, 0, 0, SecurityType.none.rawValue])
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "legacy-linux.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            connection: connection,
+            securityPolicy: .requireEncryption)
+        do {
+            try await session.connect()
+            XCTFail("Expected requireEncryption to reject RFB 3.3 None")
+        } catch let error as VNCProtocolError {
+            guard case .authenticationFailed = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        // Only the version response is allowed. In particular, no ClientInit
+        // byte may be sent after the policy rejection.
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(sent, ProtocolVersion.v3_3.wireBytes())
+        await session.disconnect()
+    }
+
+    func testRFB37NoneSkipsSecurityResultWithoutReportingUnexpectedMessage() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_7.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        // RFB 3.7 None proceeds directly to ServerInit: there is no
+        // SecurityResult between the security selection and this message.
+        script.append(Self.serverInitMessage(
+            width: 800, height: 600, name: "rfb37-none"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "linux.example",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.copyRect, .raw],
+            connection: connection)
+        try await session.connect()
+
+        let reachedServerInitWithoutError = await Self.withTimeout(seconds: 2) {
+            for await event in session.events {
+                switch event {
+                case .serverInit:
+                    return true
+                case .error:
+                    return false
+                default:
+                    break
+                }
+            }
+            return false
+        }
+        XCTAssertEqual(reachedServerInitWithoutError, true)
+
+        var expected = ProtocolVersion.v3_7.wireBytes()
+        expected.append(SecurityType.none.rawValue)
+        expected.append(0x01) // ClientInit, with no intervening result.
+        expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
+        expected.append(ClientMessage.setEncodings([
+            .copyRect, .raw, .zrle, .zlib, .cursor,
+            .desktopSize, .extendedDesktopSize,
+        ]).serialize())
+        expected.append(ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0, y: 0, width: 800, height: 600).serialize())
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(sent, expected)
+        await session.disconnect()
+    }
+
+    func testRFB37VeNCryptConsumesSecurityResultAndPreservesLocalhostTLSIdentity() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_7.wireBytes()
+        script.append(contentsOf: [1, SecurityType.vencrypt.rawValue])
+        // VeNCrypt 0.2 accepted, with X509None as the sole subtype.
+        script.append(contentsOf: [0, 2, 0, 1])
+        script.append(Self.uint32Bytes(260))
+        script.append(contentsOf: [0, 0, 0, 0]) // RFB SecurityResult OK
+        script.append(Self.serverInitMessage(
+            width: 1024, height: 768, name: "rfb37-vencrypt"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "localhost",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.copyRect, .raw],
+            connection: connection,
+            securityPolicy: .requireEncryption)
+        try await session.connect()
+
+        // The transport may dial/media-route localhost over IPv4, but TLS
+        // must validate the certificate against the user-entered identity.
+        let tlsEndpoint = await connection.upgradedTLSEndpoint()
+        XCTAssertEqual(tlsEndpoint?.0, "localhost")
+        XCTAssertEqual(tlsEndpoint?.1, 5900)
+
+        var expected = ProtocolVersion.v3_7.wireBytes()
+        expected.append(SecurityType.vencrypt.rawValue)
+        expected.append(contentsOf: [0, 2]) // VeNCrypt version
+        expected.append(Self.uint32Bytes(260)) // X509None
+        expected.append(0x01) // ClientInit follows SecurityResult.
+        expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
+        expected.append(ClientMessage.setEncodings([
+            .copyRect, .raw, .zrle, .zlib, .cursor,
+            .desktopSize, .extendedDesktopSize,
+        ]).serialize())
+        expected.append(ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0, y: 0, width: 1024, height: 768).serialize())
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(sent, expected)
+        await session.disconnect()
+    }
+
     func testPlainRFB38HandshakeAndRawUpdateOverScriptedConnection() async throws {
         let connection = ScriptedRFBConnection()
 
@@ -34,8 +190,10 @@ final class TransportSessionScriptedTests: XCTestCase {
         expectedClientBytes.append(0x01) // ClientInit: shared session
         expectedClientBytes.append(
             ClientMessage.setPixelFormat(.bgra8888).serialize())
-        expectedClientBytes.append(
-            ClientMessage.setEncodings([.copyRect, .raw]).serialize())
+        expectedClientBytes.append(ClientMessage.setEncodings([
+            .copyRect, .raw, .zrle, .zlib, .cursor,
+            .desktopSize, .extendedDesktopSize,
+        ]).serialize())
         expectedClientBytes.append(ClientMessage.framebufferUpdateRequest(
             incremental: false, x: 0, y: 0, width: 1024, height: 768
         ).serialize())
@@ -78,6 +236,50 @@ final class TransportSessionScriptedTests: XCTestCase {
             FramebufferRect(x: 0, y: 0, width: 2, height: 1, encoding: .raw))
         XCTAssertEqual(receivedUpdate?.first?.1, pixels)
 
+        await session.disconnect()
+    }
+
+    func testLastRectTerminatesUnknownLengthUpdateWithoutDesynchronizing() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_8.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 800, height: 600, name: "tight-linux"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "tight-linux.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.tight, .lastRect, .raw],
+            connection: connection)
+        try await session.connect()
+
+        var update = Data([0, 0, 0xff, 0xff])
+        update.append(Self.rectangleHeader(
+            x: 0, y: 0, width: 0, height: 0,
+            encoding: Encoding.lastRect.rawValue))
+        update.append(2) // Bell is the next complete server message.
+        await connection.enqueueServerBytes(update)
+
+        let sawUpdateThenBell = await Self.withTimeout(seconds: 2) {
+            var sawUpdate = false
+            for await event in session.events {
+                switch event {
+                case .framebufferUpdate:
+                    sawUpdate = true
+                case .bell:
+                    return sawUpdate
+                case .error:
+                    return false
+                default:
+                    break
+                }
+            }
+            return false
+        }
+        XCTAssertEqual(sawUpdateThenBell, true)
         await session.disconnect()
     }
 
@@ -252,6 +454,7 @@ final class TransportSessionScriptedTests: XCTestCase {
 
     func testConnectRefusesAppleMediaModeOverCustomTransport() async throws {
         let connection = ScriptedRFBConnection()
+        await connection.enqueueServerBytes(ProtocolVersion.apple.wireBytes())
         let session = TransportSession(
             host: "scripted.test",
             port: 5900,

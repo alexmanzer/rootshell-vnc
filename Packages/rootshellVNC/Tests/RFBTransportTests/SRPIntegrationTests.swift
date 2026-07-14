@@ -130,7 +130,7 @@ final class SRPIntegrationTests: XCTestCase {
             tryParseDH(allBytes)
         }
 
-        conn.close()
+        await conn.close()
         print("\n=== END WIRE DUMP ===\n")
     }
 

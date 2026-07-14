@@ -4,6 +4,21 @@ import CryptoKit
 @testable import RFBTransport
 import RFBProtocol
 
+final class TCPConnectionTLSNameTests: XCTestCase {
+    func testIPAddressEndpointsDoNotBecomeTLSServerNames() {
+        XCTAssertNil(TCPConnection.tlsServerName(for: "192.168.1.10"))
+        XCTAssertNil(TCPConnection.tlsServerName(for: "127.0.0.1"))
+        XCTAssertNil(TCPConnection.tlsServerName(for: "::1"))
+        XCTAssertNil(TCPConnection.tlsServerName(for: "[2001:db8::1]"))
+    }
+
+    func testDNSHostRemainsTLSServerName() {
+        XCTAssertEqual(
+            TCPConnection.tlsServerName(for: "desktop.example.com"),
+            "desktop.example.com")
+    }
+}
+
 final class AppleScrollFallbackTests: XCTestCase {
     func testAppleStandardSessionUsesPreciseInputWithoutCapabilityBlock() {
         XCTAssertTrue(TransportSession.shouldUseApplePreciseInput(

@@ -15,6 +15,10 @@ public enum ConnectionEvent: Sendable {
     /// The server's security type list was received.
     case receivedSecurityTypes([SecurityType])
 
+    /// RFB 3.3 carries one server-selected UInt32 security type. Unlike 3.7+
+    /// the client must not echo a selection byte before authentication.
+    case receivedServerSelectedSecurityType(SecurityType)
+
     /// The server sent an authentication challenge (e.g., VNC Auth 16-byte challenge).
     case receivedAuthChallenge(Data)
 

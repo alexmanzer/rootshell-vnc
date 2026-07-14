@@ -119,7 +119,7 @@ final class LiveStandardModeProbeTests: XCTestCase {
             // Native Apple-capable ordering, including LastRect and the four
             // capability encodings required by the adaptive protocol.
             preferred = [
-                .appleMultiVariantScreenshare, .tight, .unknown(-224),
+                .appleMultiVariantScreenshare, .tight, .lastRect,
                 .zrle, .zlib, .copyRect,
                 .unknown(1105), .unknown(1101), .unknown(1100), .unknown(1104),
                 .raw, .unknown(-23),

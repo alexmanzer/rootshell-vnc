@@ -138,9 +138,16 @@ public actor TransportSession {
     /// reachability and is refused over a custom transport.
     private let usesCustomTransport: Bool
     private var stateMachine: ConnectionStateMachine
-    private let host: String
+    /// Address used for direct TCP and Apple UDP media. `localhost` is pinned
+    /// to IPv4 because the Apple media socket is IPv4-only.
+    private let dialHost: String
+    /// Original endpoint identity used for TLS certificate validation. This
+    /// must not inherit address-family rewrites applied to `dialHost`.
+    private let tlsIdentityHost: String
+    private let port: UInt16
     private let password: String
     private let username: String?
+    private let certificateValidationHandler: VNCCertificateValidationHandler?
     /// Environment-backed diagnostics and experiment switches are launch-time
     /// configuration. Materializing ProcessInfo.environment copies and bridges
     /// the complete process environment, so never do it on the RTP hot path.
@@ -208,7 +215,10 @@ public actor TransportSession {
     private var udpReadTasks: [Task<Void, Never>] = []
     private var udpChannels: [PosixUDPChannel] = []
     private let log = VNCLogger(category: "TransportSession")
-    private let requestAppleMediaStream: Bool
+    /// The profile requested Apple's accelerated media mode. It becomes active
+    /// only after the server proves it is an Apple RFB 3.889 endpoint.
+    private let requestedAppleMediaStream: Bool
+    private var requestAppleMediaStream = false
     /// Legacy direct-transport switch for disabling adaptive rate control. The
     /// public Full Quality mode never enters the lossy media path at all.
     private var appleMediaNetworkProfile: AppleMediaNetworkProfile = .unknown
@@ -432,7 +442,9 @@ public actor TransportSession {
         preferFullQualityVideo: Bool = false,
         displayCount: Int = 1,
         requestsVirtualDisplays: Bool = false,
-        connection: (any RFBConnection)? = nil
+        connection: (any RFBConnection)? = nil,
+        securityPolicy: VNCSecurityPolicy = .automatic,
+        certificateValidationHandler: VNCCertificateValidationHandler? = nil
     ) {
         let environment = ProcessInfo.processInfo.environment
         self.runtimeEnvironment = environment
@@ -463,14 +475,19 @@ public actor TransportSession {
                 && configuredEncodings.contains(.unknown(1104))
         self.stateMachine = ConnectionStateMachine(
             preferredPixelFormat: preferredPixelFormat,
-            preferredEncodings: configuredEncodings
+            preferredEncodings: configuredEncodings,
+            securityPolicy: securityPolicy,
+            hasUsername: username?.isEmpty == false
         )
-        self.host = resolvedHost
+        self.dialHost = resolvedHost
+        self.tlsIdentityHost = host
+        self.port = port
         self.password = password
         self.username = username
+        self.certificateValidationHandler = certificateValidationHandler
         self.requestedDisplayCount = min(2, max(1, displayCount))
         self.requestsVirtualDisplays = requestsVirtualDisplays
-        self.requestAppleMediaStream = configuredEncodings.contains(.appleH264)
+        self.requestedAppleMediaStream = configuredEncodings.contains(.appleH264)
         self.appleDCTRequested = shouldUseAppleDCT
         self.appleClassicAutoUpdateRequested = shouldUseAppleClassicAutoUpdate
         self.awaitingAppleDCTInitialReference = shouldUseAppleDCT
@@ -491,11 +508,6 @@ public actor TransportSession {
     public func connect() async throws {
         log.info("Starting connection")
 
-        if usesCustomTransport, requestAppleMediaStream {
-            throw VNCProtocolError.protocolViolation(
-                "High Performance (UDP media) mode cannot run over a custom transport")
-        }
-
         isDisconnecting = false
         terminalDisconnectHandled = false
         handshakeComplete = false
@@ -511,7 +523,7 @@ public actor TransportSession {
         try await tcp.connect()
         appleMediaNetworkProfile = AppleMediaNetworkProfile.detect(
             from: await tcp.pathCharacteristics(),
-            remoteHost: host)
+            remoteHost: dialHost)
         log.info(
             "Apple media bearer=\(appleMediaNetworkProfile.name) "
                 + "initialBWE=\(Int(appleMediaNetworkProfile.initialCapacityBps / 1_000))kbps "
@@ -823,6 +835,22 @@ public actor TransportSession {
         let serverVersion = try ProtocolVersion(data: versionData)
         log.info("Server version: \(serverVersion)")
 
+        requestAppleMediaStream = requestedAppleMediaStream && serverVersion.isApple
+        if requestAppleMediaStream, usesCustomTransport {
+            throw VNCProtocolError.protocolViolation(
+                "High Performance (UDP media) mode cannot run over a custom transport")
+        }
+        if requestedAppleMediaStream, !serverVersion.isApple {
+            stateMachine.preferredEncodings = Self.portableEncodings(
+                from: stateMachine.preferredEncodings,
+                preferTight: true)
+            log.info("Conventional RFB server detected; using portable Standard mode")
+        } else if !serverVersion.isApple {
+            stateMachine.preferredEncodings = Self.portableEncodings(
+                from: stateMachine.preferredEncodings,
+                preferTight: stateMachine.preferredEncodings.contains(.tight))
+        }
+
         let actions1 = stateMachine.handle(event: .receivedProtocolVersion(serverVersion))
         emitState()
         try await executeActions(actions1)
@@ -835,9 +863,10 @@ public actor TransportSession {
         }
 
         // Step 3: Read security result
-        // Apple auth types (30, 33) handle their own result internally or
-        // go straight to ServerInit. Only standard VNC types need a separate
-        // SecurityResult message.
+        // Apple auth types (30, 33) have server-specific result handling.
+        // For standard RFB 3.7, None alone omits SecurityResult; every
+        // authenticating type, including VeNCrypt, must consume it before
+        // ServerInit.
         let selectedType = stateMachine.selectedSecurityType
         if selectedType == .macAuthentication {
             // Type 33: MacAuthenticator reads its own auth result internally.
@@ -850,13 +879,8 @@ public actor TransportSession {
             let negotiatedVersion = stateMachine.negotiatedVersion ?? .v3_8
             if negotiatedVersion.isAtLeast(.v3_8) {
                 try await readSecurityResult(canReadReason: true)
-            } else if selectedType == .vncAuthentication {
+            } else if selectedType != SecurityType.none {
                 try await readSecurityResult(canReadReason: false)
-            } else {
-                // No auth result for .none on < 3.8
-                let actions = stateMachine.handle(event: .authenticationSucceeded)
-                emitState()
-                try await executeActions(actions)
             }
         }
 
@@ -884,6 +908,7 @@ public actor TransportSession {
         let actions = stateMachine.handle(event: .receivedSecurityTypes(types))
         emitState()
         try await executeActions(actions)
+        try throwIfHandshakeFailed()
 
         // If we selected an authenticating type, perform the auth now
         if case .authenticating(let secType) = stateMachine.state {
@@ -906,13 +931,51 @@ public actor TransportSession {
         }
 
         let secType = SecurityType(rawValue: UInt8(secTypeRaw & 0xFF))
-        let actions = stateMachine.handle(event: .receivedSecurityTypes([secType]))
+        let actions = stateMachine.handle(
+            event: .receivedServerSelectedSecurityType(secType))
         emitState()
         try await executeActions(actions)
+        try throwIfHandshakeFailed()
 
         if case .authenticating(let st) = stateMachine.state {
             try await performAuthentication(st)
         }
+    }
+
+    private func throwIfHandshakeFailed() throws {
+        guard case .failed(let error) = stateMachine.state else { return }
+        throw error
+    }
+
+    private nonisolated static func portableEncodings(
+        from configured: [Encoding],
+        preferTight: Bool
+    ) -> [Encoding] {
+        var result: [Encoding] = []
+        func append(_ encoding: Encoding) {
+            if !result.contains(encoding) { result.append(encoding) }
+        }
+
+        if preferTight {
+            append(.tight)
+            append(.lastRect)
+        }
+        for encoding in configured {
+            switch encoding {
+            case .tight, .lastRect, .zrle, .zlib, .copyRect, .raw:
+                append(encoding)
+            default:
+                break
+            }
+        }
+        append(.zrle)
+        append(.zlib)
+        append(.copyRect)
+        append(.raw)
+        append(.cursor)
+        append(.desktopSize)
+        append(.extendedDesktopSize)
+        return result
     }
 
     private func performAuthentication(_ securityType: SecurityType) async throws {
@@ -933,6 +996,14 @@ public actor TransportSession {
             )
             macAuth.securityTypeAlreadySent = securityTypeSentSeparately
             authenticator = macAuth
+        case .vencrypt:
+            authenticator = VeNCryptAuthenticator(
+                host: tlsIdentityHost,
+                port: port,
+                username: username,
+                password: password,
+                certificateValidationHandler: certificateValidationHandler
+            )
         case .srp:
             authenticator = SRPAuthenticator(
                 username: username ?? "user",
@@ -1101,7 +1172,8 @@ public actor TransportSession {
                     _ = try await tcp.read(exactly: 7)
                 default:
                     log.warning("Unknown server message type: \(messageType)")
-                    continuation?.yield(.error(.protocolViolation("Unknown message type: \(messageType)")))
+                    throw VNCProtocolError.protocolViolation(
+                        "Unknown server message type: \(messageType)")
                 }
             } catch is CancellationError {
                 break
@@ -1168,6 +1240,14 @@ public actor TransportSession {
             let rectData = try await tcp.read(exactly: FramebufferRect.wireSize)
             var reader = MessageReader(data: rectData)
             let rect = try FramebufferRect(reader: &reader)
+
+            // TightVNC-compatible servers may declare 0xffff rectangles and
+            // terminate the update with LastRect. It is header-only and must
+            // stop parsing immediately or the next server message is mistaken
+            // for another rectangle header.
+            if rect.encoding == .lastRect {
+                break
+            }
 
             let pixelData: Data
 
@@ -1513,7 +1593,6 @@ public actor TransportSession {
     private func handleBell() async {
         let actions = stateMachine.handle(event: .receivedBell)
         for action in actions { await executeActionNoThrow(action) }
-        continuation?.yield(.bell)
     }
 
     private func handleServerCutText() async throws {
@@ -1531,7 +1610,6 @@ public actor TransportSession {
 
         let actions = stateMachine.handle(event: .receivedServerCutText(text))
         for action in actions { await executeActionNoThrow(action) }
-        continuation?.yield(.clipboardText(text))
     }
 
     // MARK: - Action execution
@@ -3615,7 +3693,7 @@ public actor TransportSession {
         let ephemeral = runtimeEnvironment["ROOTSHELL_VNC_MEDIA_UDP_EPHEMERAL"] == "1"
         let channel = PosixUDPChannel(
             localPort: ephemeral ? nil : binding.localPort,
-            remoteHost: host,
+            remoteHost: dialHost,
             remotePort: binding.remotePort,
             enableReusePort: true
         )

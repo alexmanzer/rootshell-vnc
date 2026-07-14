@@ -44,21 +44,37 @@ public enum SecurityType: Sendable, Equatable, Hashable {
         }
     }
 
-    /// Preference order for automatic selection (higher = more preferred).
-    /// Returns `nil` for types we cannot negotiate — these are skipped during
-    /// selection so the client never chooses a type it cannot actually perform.
+    /// Generic preference order for supported types (higher = more preferred).
+    /// Returns `nil` for types this client cannot negotiate. The built-in
+    /// automatic policy also considers server context and interoperability, so
+    /// it does not select solely by this value.
     public var negotiationPriority: Int? {
         switch self {
         case .none:                return 0
         case .vncAuthentication:   return 1
         case .apple30:             return 2
         case .macAuthentication:   return 3
+        case .vencrypt:            return 4
         // Not yet implemented:
         case .srp:                 return nil
         case .tight:               return nil
-        case .vencrypt:            return nil
         case .kerberos:            return nil
         case .unknown:             return nil
         }
     }
+}
+
+/// User-facing policy for selecting the outer RFB security type.
+///
+/// `.automatic` is deliberately compatibility-first: Apple authentication is
+/// considered only for Apple servers with a username, while conventional
+/// servers use VNC Authentication when available and VeNCrypt when it is the
+/// server's only supported authenticated option.
+public enum VNCSecurityPolicy: String, Sendable, Equatable, Hashable, CaseIterable {
+    case automatic
+    case requireEncryption
+    case none
+    case vncAuthentication
+    case apple30
+    case macAuthentication
 }

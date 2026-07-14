@@ -15,6 +15,20 @@ public typealias VNCTransportProvider =
 /// All properties have sensible defaults.
 public struct VNCConfiguration: Sendable {
 
+    public typealias SecurityPolicy = VNCSecurityPolicy
+    public typealias CertificateValidationRequest = VNCCertificateValidationRequest
+    public typealias CertificateValidationResult = VNCCertificateValidationResult
+    public typealias CertificateValidationHandler = VNCCertificateValidationHandler
+
+    /// Security negotiation policy. Automatic is the zero-configuration
+    /// default and adapts to Apple and conventional RFB servers.
+    public var securityPolicy: VNCSecurityPolicy
+
+    /// Called only when the platform trust store rejects a VeNCrypt X.509
+    /// certificate. Hosts can implement TOFU without weakening validation for
+    /// publicly trusted certificates.
+    public var certificateValidationHandler: VNCCertificateValidationHandler?
+
     /// Compatibility display-count choices. A value of `2` means Apple's
     /// "all displays combined" topology; use ``DisplayMode`` when the exact
     /// native topology matters.
@@ -285,7 +299,9 @@ public struct VNCConfiguration: Sendable {
         targetFrameRate: Int = 30,
         enableProtocolTrace: Bool = false,
         reconnectionPolicy: VNCReconnectionPolicy = VNCReconnectionPolicy(),
-        transportProvider: VNCTransportProvider? = nil
+        transportProvider: VNCTransportProvider? = nil,
+        securityPolicy: VNCSecurityPolicy = .automatic,
+        certificateValidationHandler: VNCCertificateValidationHandler? = nil
     ) {
         self.preferredPixelFormat = preferredPixelFormat
         self.preferredEncodings = preferredEncodings
@@ -319,6 +335,8 @@ public struct VNCConfiguration: Sendable {
         self.targetFrameRate = max(1, min(120, targetFrameRate))
         self.enableProtocolTrace = enableProtocolTrace
         self.reconnectionPolicy = reconnectionPolicy
+        self.securityPolicy = securityPolicy
+        self.certificateValidationHandler = certificateValidationHandler
     }
 
     private static func clampedDisplayCount(_ count: Int) -> Int {
@@ -366,7 +384,7 @@ public struct VNCConfiguration: Sendable {
             // Prefer Apple's low-latency adaptive DCT path with portable
             // full-color fallbacks for servers that do not support it.
             let standardEncodings: [Encoding] = [
-                .appleMultiVariantScreenshare, .tight, .unknown(-224),
+                .appleMultiVariantScreenshare, .tight, .lastRect,
                 .zrle, .zlib, .copyRect,
                 .unknown(1105), .unknown(1101), .unknown(1100), .unknown(1104),
                 .raw, .unknown(-23),

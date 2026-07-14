@@ -394,7 +394,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(
             Array(effective.prefix(12)),
             [
-                .appleMultiVariantScreenshare, .tight, .unknown(-224),
+                .appleMultiVariantScreenshare, .tight, .lastRect,
                 .zrle, .zlib, .copyRect,
                 .unknown(1105), .unknown(1101), .unknown(1100), .unknown(1104),
                 .raw, .unknown(-23),
