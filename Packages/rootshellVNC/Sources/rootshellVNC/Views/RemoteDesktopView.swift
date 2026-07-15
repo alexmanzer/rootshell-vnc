@@ -378,6 +378,10 @@ public struct RemoteDesktopView: View {
                 }
             }
 
+            if let hudMenuExtras {
+                hudMenuExtras
+            }
+
             if keyboardCapture.hasReservedHostShortcuts {
                 Toggle(isOn: Binding(
                     get: { keyboardCapture.routesReservedHostShortcutsToVNC },
@@ -453,10 +457,6 @@ public struct RemoteDesktopView: View {
 
             if let clipboardSynchronizer {
                 VNCClipboardMenu(synchronizer: clipboardSynchronizer)
-            }
-
-            if let hudMenuExtras {
-                hudMenuExtras
             }
 
             Divider()
