@@ -995,6 +995,15 @@ final class KeyboardInputHandlerTests: XCTestCase {
             KeyboardInputHandler.keysymForHIDUsage(0x50, characters: ""),
             KeyboardInputHandler.keysymLeft)
         XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x4F, characters: ""),
+            KeyboardInputHandler.keysymRight)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x51, characters: ""),
+            KeyboardInputHandler.keysymDown)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0x52, characters: ""),
+            KeyboardInputHandler.keysymUp)
+        XCTAssertEqual(
             KeyboardInputHandler.keysymForHIDUsage(0x3A, characters: ""),
             KeyboardInputHandler.keysymF1)
         XCTAssertEqual(

@@ -175,12 +175,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         #if targetEnvironment(macCatalyst)
         return reservedHostKeyCommands
             + standardRemoteKeyCommands
+            + remoteNavigationKeyCommands
             + viewerCommandKeyCommands
             + remoteControlKeyCommands
         #else
         return reservedHostKeyCommands
             + commandCompatibilityKeyCommands
             + standardRemoteKeyCommands
+            + remoteNavigationKeyCommands
             + viewerCommandKeyCommands
             + remoteCommandKeyCommands
         #endif
@@ -243,6 +245,27 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                     for: remoteCommand.shortcut.modifiers),
                 action: #selector(handleStandardRemoteCommand(_:)))
             command.discoverabilityTitle = remoteCommand.title
+            command.wantsPriorityOverSystemBehavior = true
+            command.allowsAutomaticLocalization = false
+            return command
+        }
+    }()
+
+    /// Arrow keys are navigation commands to UIKit, so they may be consumed
+    /// by the focus system before a hardware `UIPress` reaches this view.
+    /// Explicitly claiming the unmodified variants keeps them on the VNC
+    /// responder path while keyboard capture is active.
+    private lazy var remoteNavigationKeyCommands: [UIKeyCommand] = {
+        [
+            UIKeyCommand.inputUpArrow,
+            UIKeyCommand.inputDownArrow,
+            UIKeyCommand.inputLeftArrow,
+            UIKeyCommand.inputRightArrow,
+        ].map { input in
+            let command = UIKeyCommand(
+                input: input,
+                modifierFlags: [],
+                action: #selector(handleRemoteNavigationKey(_:)))
             command.wantsPriorityOverSystemBehavior = true
             command.allowsAutomaticLocalization = false
             return command
@@ -665,6 +688,26 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
               let remoteCommand = Self.remoteCommand(matching: command) else { return }
         releaseAllPressedKeys()
         keyboardHandler.handleRemoteCommand(remoteCommand)
+    }
+
+    @objc private func handleRemoteNavigationKey(_ command: UIKeyCommand) {
+        guard keyboardCapture.isCaptured,
+              let input = command.input else { return }
+
+        let usage: UInt32
+        switch input {
+        case UIKeyCommand.inputUpArrow: usage = 0x52
+        case UIKeyCommand.inputDownArrow: usage = 0x51
+        case UIKeyCommand.inputLeftArrow: usage = 0x50
+        case UIKeyCommand.inputRightArrow: usage = 0x4F
+        default: return
+        }
+
+        beginSupplementalModifiersIfNeeded(for: usage)
+        let keysym = KeyboardInputHandler.keysymForHIDUsage(
+            usage,
+            characters: input)
+        _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
     }
 
     @objc private func handleCommandCompatibilityAlias(_ command: UIKeyCommand) {
