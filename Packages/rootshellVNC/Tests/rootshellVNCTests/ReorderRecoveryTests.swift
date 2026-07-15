@@ -3,13 +3,152 @@ import Foundation
 import CoreMedia
 @testable import RFBRendering
 
-/// Replays a decrypted-RTP fixture through the experimental interleaved tile
-/// path. This regression test verifies the compound stream's reference-picture
-/// ordering.
+/// Replays a decrypted-RTP fixture through the compound interleaved-band path.
+/// This regression test verifies the stream's reference-picture ordering.
 ///
 ///   ROOTSHELL_VNC_DECODED_RTP=/tmp/vnccap/local_rtp.bin \
 ///   swift test --filter ReorderRecoveryTests
 final class ReorderRecoveryTests: XCTestCase {
+
+    /// Opt-in structural dump used to compare Apple's interleaved stream index
+    /// with the public receiver's SSRC/DON routing. It performs no writes.
+    func testDescribeCapturedCompoundRoutingWhenRequested() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["ROOTSHELL_VNC_DESCRIBE_ROUTING"] == "1",
+              let inputPath = environment["ROOTSHELL_VNC_DECODED_RTP"] else {
+            throw XCTSkip(
+                "Set ROOTSHELL_VNC_DESCRIBE_ROUTING=1 and ROOTSHELL_VNC_DECODED_RTP")
+        }
+
+        let capture = try Data(contentsOf: URL(fileURLWithPath: inputPath))
+        let demuxer = RTPDemuxer(usesDecodingOrderNumbers: true)
+        var reorder = CompoundHEVCDONReorderBuffer(expectedSourceCount: 4)
+        var offset = capture.startIndex
+        var describedAccessUnits = 0
+        var sourceOrdinals: [UInt32: Int] = [:]
+
+        while offset + 2 <= capture.endIndex, describedAccessUnits < 80 {
+            let length = Int(capture[offset]) << 8 | Int(capture[offset + 1])
+            offset += 2
+            guard offset + length <= capture.endIndex else { break }
+            let bytes = Data(capture[offset ..< offset + length])
+            offset += length
+            guard !RTPDemuxer.isRTCPPacket(bytes),
+                  let packet = try? demuxer.parsePacket(bytes),
+                  packet.payloadType == 100 else { continue }
+
+            for unit in demuxer.feedPacket(packet) where unit.nal.count >= 2 {
+                let type = (unit.nal[unit.nal.startIndex] >> 1) & 0x3f
+                if sourceOrdinals[unit.ssrc] == nil {
+                    sourceOrdinals[unit.ssrc] = sourceOrdinals.count
+                }
+                if (32...34).contains(type) {
+                    print(
+                        "parameter type=\(type) ssrc=0x\(String(unit.ssrc, radix: 16)) "
+                            + "source=\(sourceOrdinals[unit.ssrc]!) don=\(unit.don) "
+                            + "bytes=\(unit.nal.count)")
+                    continue
+                }
+                guard type <= 31 else { continue }
+                for accessUnit in reorder.enqueue([unit]).orderedAccessUnits {
+                    let first = accessUnit.nals[0].nal
+                    let firstType = (first[first.startIndex] >> 1) & 0x3f
+                    let layerID = ((UInt16(first[first.startIndex]) & 1) << 5)
+                        | (UInt16(first[first.startIndex + 1]) >> 3)
+                    let temporalID = first[first.startIndex + 1] & 7
+                    let ordinal = sourceOrdinals[accessUnit.ssrc] ?? -1
+                    print(
+                        "au don=\(accessUnit.don) mod4=\(Int(accessUnit.don) & 3) "
+                            + "source=\(ordinal) ssrc=0x\(String(accessUnit.ssrc, radix: 16)) "
+                            + "rtp=\(accessUnit.timestamp) type=\(firstType) "
+                            + "layer=\(layerID) temporal=\(temporalID) "
+                            + "nals=\(accessUnit.nals.count) bytes="
+                            + "\(accessUnit.nals.reduce(0) { $0 + $1.nal.count })")
+                    describedAccessUnits += 1
+                    if describedAccessUnits >= 80 { break }
+                }
+                if describedAccessUnits >= 80 { break }
+            }
+        }
+
+        XCTAssertEqual(sourceOrdinals.count, 4)
+        XCTAssertGreaterThan(describedAccessUnits, 20)
+    }
+
+    /// Opt-in diagnostic exporter. This uses the same public RTP demuxer and
+    /// compound DON scheduler as the app, but writes Annex-B access units for
+    /// an independent decoder. Ordinary test and app runs perform no write.
+    func testExportCapturedCompoundAnnexBWhenRequested() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let inputPath = environment["ROOTSHELL_VNC_DECODED_RTP"],
+              let outputPath = environment["ROOTSHELL_VNC_HEVC_OUT"] else {
+            throw XCTSkip(
+                "Set ROOTSHELL_VNC_DECODED_RTP and ROOTSHELL_VNC_HEVC_OUT")
+        }
+        let capture = try Data(contentsOf: URL(fileURLWithPath: inputPath))
+        var packets: [Data] = []
+        var offset = capture.startIndex
+        while offset + 2 <= capture.endIndex {
+            let length = Int(capture[offset]) << 8 | Int(capture[offset + 1])
+            offset += 2
+            guard offset + length <= capture.endIndex else { break }
+            packets.append(Data(capture[offset ..< offset + length]))
+            offset += length
+        }
+
+        let demuxer = RTPDemuxer(usesDecodingOrderNumbers: true)
+        var reorder = CompoundHEVCDONReorderBuffer(expectedSourceCount: 4)
+        var annexB = Data()
+        var accessUnitCount = 0
+        var parameterSetCount = 0
+        let startCode = Data([0, 0, 0, 1])
+
+        func append(_ nal: Data, to output: inout Data) {
+            output.append(startCode)
+            output.append(nal)
+        }
+
+        for bytes in packets {
+            guard !RTPDemuxer.isRTCPPacket(bytes),
+                  let packet = try? demuxer.parsePacket(bytes),
+                  packet.payloadType == 100 else { continue }
+            for unit in demuxer.feedPacket(packet) where unit.nal.count >= 2 {
+                let type = (unit.nal[unit.nal.startIndex] >> 1) & 0x3f
+                switch type {
+                case 32...34:
+                    append(unit.nal, to: &annexB)
+                    parameterSetCount += 1
+                case 0...31:
+                    let result = reorder.enqueue([unit])
+                    for accessUnit in result.orderedAccessUnits {
+                        for nal in accessUnit.nals {
+                            append(nal.nal, to: &annexB)
+                        }
+                        accessUnitCount += 1
+                    }
+                default:
+                    break
+                }
+            }
+        }
+
+        try annexB.write(to: URL(fileURLWithPath: outputPath), options: .atomic)
+        print(
+            "exported \(accessUnitCount) access units, "
+                + "\(parameterSetCount) parameter sets, \(annexB.count) bytes")
+        XCTAssertGreaterThan(accessUnitCount, 100)
+        XCTAssertGreaterThan(parameterSetCount, 0)
+    }
+
+    func testNonGatingRecoveryRequestsRepeatForDistinctLossEpisodes() {
+        let manager = VideoStreamManager()
+        manager.irapGateEnabled = false
+
+        XCTAssertTrue(manager.noteLossForTesting(nowNanos: 1_000_000_000))
+        XCTAssertFalse(manager.noteLossForTesting(nowNanos: 1_100_000_000))
+        XCTAssertFalse(manager.noteLossForTesting(nowNanos: 1_999_999_999))
+        XCTAssertTrue(manager.noteLossForTesting(nowNanos: 2_000_000_000))
+    }
 
     func testCompoundRecoveryBaseIDRDoesNotReleaseDependentsBeforeDecoderOutput() {
         let manager = VideoStreamManager()

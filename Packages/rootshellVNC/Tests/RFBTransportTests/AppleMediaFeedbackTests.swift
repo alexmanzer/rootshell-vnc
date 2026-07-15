@@ -3,13 +3,25 @@ import XCTest
 @testable import RFBTransport
 
 final class AppleMediaFeedbackTests: XCTestCase {
+    func testCompoundRecoverySelectsLowestBaseSSRC() {
+        XCTAssertEqual(
+            appleMediaCompoundBaseSSRC([
+                0x75b0_2a4e,
+                0x75b0_2a4c,
+                0x75b0_2a4f,
+                0x75b0_2a4d,
+            ]),
+            0x75b0_2a4c)
+        XCTAssertNil(appleMediaCompoundBaseSSRC([]))
+    }
+
     func testFrameLossFeedbackWireLayoutMatchesPSFBAFBTypeSix() {
         let packet = appleMediaFrameLossPacket(
             senderSSRC: 0x1122_3344,
             mediaSSRC: 0x5566_7788,
             feedback: AppleMediaFrameLossFeedback(
                 frameRTPTimestamp: 0x99aa_bbcc,
-                receivedPacketCount: 0xddee,
+                frameSequenceNumber: 0xddee,
                 framePacketCount: 0xf0,
                 lostPacketCount: 0x0f))
 
@@ -36,6 +48,39 @@ final class AppleMediaFeedbackTests: XCTestCase {
                 0x55, 0x66, 0x77, 0x88,
                 0x09, 0x00, 0x00, 0x00,
             ]))
+    }
+
+    func testLTRAcknowledgementMatchesNativeRTCPAPPWireLayout() {
+        XCTAssertEqual(
+            appleMediaLTRAcknowledgementPacket(
+                senderSSRC: 0x1122_3344,
+                rtpTimestamp: 0x5566_7788),
+            Data([
+                0x80, 0xcc, 0x00, 0x03,
+                0x11, 0x22, 0x33, 0x44,
+                0x00, 0x00, 0x00, 0x05,
+                0x55, 0x66, 0x77, 0x88,
+            ]))
+    }
+
+    func testReceiverReportCompoundAddsNativeEmptyCNAMESDES() {
+        let sender: UInt32 = 0x1122_3344
+        let rr = Data([
+            0x81, 0xc9, 0x00, 0x07,
+            0x11, 0x22, 0x33, 0x44,
+        ] + Array(repeating: 0, count: 24))
+
+        let compound = appleMediaReceiverReportCompound(
+            receiverReport: rr,
+            senderSSRC: sender)
+
+        XCTAssertEqual(compound.count, 44)
+        XCTAssertEqual(compound.prefix(32), rr)
+        XCTAssertEqual(compound.suffix(12), Data([
+            0x81, 0xca, 0x00, 0x02,
+            0x11, 0x22, 0x33, 0x44,
+            0x01, 0x00, 0x00, 0x00,
+        ]))
     }
 
     func testNativeScreenRateProfileIsTwentyToSixtyMegabits() {
@@ -71,7 +116,7 @@ final class AppleMediaFeedbackTests: XCTestCase {
         ).serialized()
 
         XCTAssertEqual(data, Data([
-            0x8d, 0x07, 0x00, 0x04,
+            0x85, 0x07, 0x00, 0x04,
             0x12, 0x34, 0x00, 0x00,
             0x00, 0x00, 0x56, 0x78,
             0x9a, 0xbc, 0xde, 0xf0,
@@ -151,6 +196,26 @@ final class AppleMediaFeedbackTests: XCTestCase {
                 ltrTimestamp: nil,
                 totalPacketsPerFrame: 60,
                 frameSequenceNumber: 0x77c0))
+        XCTAssertNil(appleMediaLTRAcknowledgementTimestamp(packet))
+
+        var completedPacket = packet
+        completedPacket[1] |= 0x80
+        completedPacket[4] = 0x55
+        completedPacket[5] = 0x66
+        completedPacket[6] = 0x77
+        completedPacket[7] = 0x88
+        XCTAssertEqual(
+            appleMediaLTRAcknowledgementTimestamp(completedPacket),
+            0x5566_7788)
+    }
+
+    func testLTRAccessUnitWithoutLTRBitsIsNotAcknowledged() {
+        let packet = Data([
+            0x90, 0xe4, 0x30, 0x9f, 0x55, 0x66, 0x77, 0x88,
+            0x07, 0x0d, 0xfa, 0x0e,
+            0x93, 0x01, 0x00, 0x01, 0x00, 0x3c, 0x77, 0xc0,
+        ])
+        XCTAssertNil(appleMediaLTRAcknowledgementTimestamp(packet))
     }
 
     func testAppleMediaRTPMediaControlParsesLTRTimestampAndFrameFields() {
@@ -293,6 +358,75 @@ final class AppleMediaFeedbackTests: XCTestCase {
 
         XCTAssertEqual(controller.bandwidthEstimateBps, 40_000_000)
         XCTAssertEqual(controller.peakQueueDelaySeconds, 0.044, accuracy: 0.000_001)
+    }
+
+    func testRateControllerOWRDTracksPositiveReceiveClockDrift() {
+        let controller = AppleMediaRateController(maxTargetBps: 60_000_000)
+        let startTimestamp: UInt32 = 1_000
+        let startTime = 100.0
+        XCTAssertEqual(AppleMediaRateController.screenRTPClockRate, 24_000)
+
+        // Native 60-fps screen traffic advances by 400 ticks on its 24 kHz
+        // RTP clock. The first timestamp primes the feedback-only receiver;
+        // the next two establish equal-rate send and receive clocks.
+        for frame in 0..<3 {
+            controller.onVideoPacket(
+                ssrc: 1,
+                rtpTimestamp: startTimestamp + UInt32(frame * 400),
+                bytes: 1_200,
+                now: startTime + Double(frame) / 60)
+        }
+        XCTAssertLessThan(controller.owrdSeconds, 0.001)
+
+        // Add 20 ms of receiver-side delay. The native 10%/0.01% EMA pair
+        // reports roughly 2 ms on the first delayed sample.
+        controller.onVideoPacket(
+            ssrc: 1,
+            rtpTimestamp: startTimestamp + 1_200,
+            bytes: 1_200,
+            now: startTime + 3.0 / 60 + 0.020)
+        XCTAssertGreaterThan(controller.owrdSeconds, 0.001)
+        XCTAssertLessThan(controller.owrdSeconds, 0.003)
+    }
+
+    func testRateControllerOWRDIgnoresBackwardCompoundTimestamp() {
+        let controller = AppleMediaRateController(maxTargetBps: 60_000_000)
+        controller.onVideoPacket(
+            ssrc: 1, rtpTimestamp: 10_000, bytes: 1_200, now: 100)
+        controller.onVideoPacket(
+            ssrc: 1, rtpTimestamp: 10_400, bytes: 1_200, now: 100.017)
+        controller.onVideoPacket(
+            ssrc: 1, rtpTimestamp: 10_800, bytes: 1_200, now: 100.034)
+        let before = controller.owrdSeconds
+
+        // Another compound SSRC can deliver the preceding frame after a
+        // newer timestamp has already advanced the shared stream clock.
+        controller.onVideoPacket(
+            ssrc: 2, rtpTimestamp: 10_400, bytes: 1_200, now: 100.060)
+        XCTAssertEqual(controller.owrdSeconds, before)
+    }
+
+    func testRateControllerResetsOWRDForNewMediaClockOrigin() {
+        let controller = AppleMediaRateController(maxTargetBps: 60_000_000)
+        for frame in 0..<4 {
+            controller.onVideoPacket(
+                ssrc: 1,
+                rtpTimestamp: 1_000 + UInt32(frame * 400),
+                bytes: 1_200,
+                now: 100 + Double(frame) / 60 + (frame == 3 ? 0.020 : 0))
+        }
+        XCTAssertGreaterThan(controller.owrdSeconds, 0)
+
+        controller.resetMediaGenerationMeasurements()
+        XCTAssertEqual(controller.owrdSeconds, 0)
+
+        // A completely unrelated new RTP origin must establish a fresh
+        // baseline rather than producing a saturated delay sample.
+        controller.onVideoPacket(
+            ssrc: 2, rtpTimestamp: 0xf000_0000, bytes: 1_200, now: 200)
+        controller.onVideoPacket(
+            ssrc: 2, rtpTimestamp: 0xf000_0190, bytes: 1_200, now: 200.017)
+        XCTAssertEqual(controller.owrdSeconds, 0)
     }
 
     func testRoutePriorCanProbeQuicklyToFullCapacityBeforeCongestion() {

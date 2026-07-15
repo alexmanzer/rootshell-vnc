@@ -5,19 +5,6 @@ import CoreVideo
 import RFBProtocol
 @testable import RFBRendering
 
-final class HEVCTileMetadataTests: XCTestCase {
-    func testNativeVCPAttachmentKeysCarryCompoundFrameIdentity() {
-        let metadata = HEVCTileMetadata(
-            tileID: 2,
-            tileOrder: 2,
-            decodingOrderBase: 120)
-
-        XCTAssertEqual(metadata.sampleAttachments["TileID"], 2)
-        XCTAssertEqual(metadata.sampleAttachments["TileOrder"], 2)
-        XCTAssertEqual(metadata.sampleAttachments["decodingOrderBase"], 120)
-    }
-}
-
 final class StandardFramebufferPipelineTests: XCTestCase {
     func testAppleDCTBaseWaitsForEveryRefinementBand() {
         var tracker = AppleDCTRefinementTracker()
@@ -205,7 +192,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(config.displayMode, .oneDisplay)
         XCTAssertEqual(config.displayCount, 1)
         XCTAssertTrue(config.enableRemoteAudio)
-        XCTAssertEqual(config.targetFrameRate, 30)
+        XCTAssertEqual(config.targetFrameRate, 60)
         XCTAssertFalse(config.enableProtocolTrace)
         XCTAssertTrue(config.reconnectionPolicy.isEnabled)
         XCTAssertEqual(config.reconnectionPolicy.maximumAttempts, 8)
@@ -1812,6 +1799,29 @@ final class VideoBandGeometryTests: XCTestCase {
             renderer.containerLayer.sublayers?.count,
             1,
             "The first new frame must replace, not accumulate with, old SSRC layers")
+    }
+
+    @MainActor
+    func testPartialFinalBandKeepsCodedHeightAndIsClippedByDesktop() throws {
+        let renderer = VideoBandLayerRenderer()
+        renderer.setViewBounds(CGRect(x: 0, y: 0, width: 100, height: 110))
+        renderer.setScreenSize(width: 100, height: 110)
+        renderer.setBands([
+            10: try makePixelBuffer(width: 100, height: 30),
+            11: try makePixelBuffer(width: 100, height: 30),
+            12: try makePixelBuffer(width: 100, height: 30),
+            13: try makePixelBuffer(width: 100, height: 30),
+        ])
+
+        let frames = try XCTUnwrap(renderer.containerLayer.sublayers)
+            .map(\.frame)
+            .sorted { $0.minY < $1.minY }
+        XCTAssertEqual(frames.count, 4)
+        let finalFrame = try XCTUnwrap(frames.last)
+        XCTAssertEqual(finalFrame.height, 30, accuracy: 0.001)
+        XCTAssertEqual(finalFrame.maxY, 120, accuracy: 0.001)
+        XCTAssertEqual(renderer.containerLayer.bounds.height, 110, accuracy: 0.001)
+        XCTAssertTrue(renderer.containerLayer.masksToBounds)
     }
 
     private func makePixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {

@@ -32,6 +32,37 @@ struct AppleMediaNegotiationGenerationTracker {
     }
 }
 
+enum AppleMediaViewerClient: Sendable, Equatable {
+    case remoteDesktopScreenSharing
+    case appleRemoteDesktop
+}
+
+/// Flags at byte 6 of Apple's media-server configuration message.
+///
+/// The native implementation advertises 60-fps support independently for the
+/// two possible screen streams, clears the send-cursor requirement when the
+/// viewer composites the cursor itself, and reserves bit 3 for Apple Remote
+/// Desktop (the Screen Sharing client leaves it clear).
+func appleMediaReceiverFlags(
+    displayCount: Int,
+    supports60FPS: Bool = false,
+    sendsCursor: Bool = false,
+    client: AppleMediaViewerClient = .remoteDesktopScreenSharing
+) -> UInt32 {
+    let screenCount = max(0, min(displayCount, 2))
+    let requestedMask = screenCount > 0
+        ? (UInt32(1) << UInt32(screenCount)) - 1
+        : 0
+    var flags = supports60FPS ? requestedMask : 0
+    if !sendsCursor {
+        flags |= 1 << 2
+    }
+    if client == .appleRemoteDesktop {
+        flags |= 1 << 3
+    }
+    return flags
+}
+
 /// Selects Apple's native compound screen-video profile.
 public enum AppleMediaVideoMode {
     public static var usesTiledHEVC: Bool { true }
@@ -42,23 +73,26 @@ public enum AppleMediaVideoMode {
     }
 
     public static var negotiatedTilesPerFrame: UInt64 {
-        // A/B diagnostic override (Viceroy negotiates min(peer values), so
-        // this can only lower or restore the native four-tile profile).
+        // A/B diagnostic override. Viceroy negotiates the minimum of the
+        // peers' values, so this can only lower or restore the native mode-7
+        // four-tile decoder capability.
         if let override = ProcessInfo.processInfo.environment[
             "ROOTSHELL_VNC_TILES_PER_FRAME"],
            let value = UInt64(override), (1...4).contains(value) {
             return value
         }
-        return 2
+        return 4
     }
 
-    /// Tile sessions below the encoder's size threshold must remain single
-    /// tile. Larger captures use the negotiated horizontal HEVC band count.
+    /// Number of sources expected from the negotiated compound HEVC profile.
+    ///
+    /// This must follow the wire capability, not a capture-area heuristic. A
+    /// 3136x1584 server generation (just below the old five-megapixel cutoff)
+    /// still emits four DONL-bearing SSRCs; treating it as one conventional
+    /// RTP stream prevents its parameter sets from being parsed at all.
     public static func activeTileCount(pixelWidth: Int, pixelHeight: Int) -> Int {
         guard pixelWidth > 0, pixelHeight > 0 else { return 1 }
-        return pixelWidth * pixelHeight >= 5_000_000
-            ? Int(negotiatedTilesPerFrame)
-            : 1
+        return Int(negotiatedTilesPerFrame)
     }
 }
 
@@ -99,8 +133,8 @@ struct AppleMediaNegotiationProfile: Sendable {
         /// not the current framebuffer dimensions; the server uses them while
         /// selecting its encoder and tiling profile.
         static let screenCodec = AspectRatio(
-            landscapeWidth: 16,
-            landscapeHeight: 9,
+            landscapeWidth: 8,
+            landscapeHeight: 5,
             portraitWidth: 5,
             portraitHeight: 8)
 
@@ -218,6 +252,9 @@ struct AppleMediaNegotiationProfile: Sendable {
         blob.varint(field: 13, ntpTimestamp)
         blob.varint(field: 14, 2) // VCMediaNegotiationBlob version
         blob.varint(field: 16, 0) // mediaControlInfoVersion
+        // Screen Sharing's runtime mode-7 configuration selects local-network
+        // access even when the bearer itself is discovered separately. This
+        // is distinct from the per-codec transport rule below.
         blob.varint(field: 18, Self.screenAccessNetworkType)
         return blob.data
     }
@@ -312,13 +349,13 @@ struct AppleMediaNegotiationProfile: Sendable {
         .init(legacyMode: 4_074, maximum: 0, extendedMode: 16_384),       // FaceTime 5G
         .init(legacyMode: 0, maximum: 6_000_000, extendedMode: 131_072), // multiway screen Wi-Fi
         .init(legacyMode: 0, maximum: 40_000_000, extendedMode: 12_288), // screen Wi-Fi
-        .init(legacyMode: 1, maximum: 299),                               // default Wi-Fi
         .init(legacyMode: 0, maximum: 75_000_000, extendedMode: 524_288), // immersive video Wi-Fi
         .init(legacyMode: 0, maximum: 20_000_000, extendedMode: 98_304),  // low-latency screen Wi-Fi
+        .init(legacyMode: 1, maximum: 299),                               // default Wi-Fi
         .init(legacyMode: 0, maximum: 60_000_000, extendedMode: 262_144), // low-latency screen wired
         .init(legacyMode: 16, maximum: 4_100),                            // legacy screen Wi-Fi
-        .init(legacyMode: 0, maximum: 100_000_000, extendedMode: 1_048_576), // immersive video wired
         .init(legacyMode: 4, maximum: 6_500),                             // FaceTime Wi-Fi
+        .init(legacyMode: 0, maximum: 100_000_000, extendedMode: 1_048_576), // immersive video wired
     ]
 
     private struct BandwidthSetting: Sendable {

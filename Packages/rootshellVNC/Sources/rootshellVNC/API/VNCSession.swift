@@ -1388,6 +1388,7 @@ public final class VNCSession {
             preferredPixelFormat: configuration.effectivePixelFormat,
             preferredEncodings: configuration.effectiveEncodings,
             preferFullQualityVideo: configuration.videoQualityMode == .fullQuality,
+            targetFrameRate: configuration.targetFrameRate,
             displayCount: configuration.displayCount,
             requestsVirtualDisplays:
                 configuration.displaySizingMode == .matchClient,
@@ -2212,10 +2213,9 @@ struct SendablePixelBuffer: @unchecked Sendable {
 }
 
 /// Diagnostic: saves periodic PNGs of decoded band buffers exactly as they are
-/// handed to the renderer. `ROOTSHELL_VNC_FRAME_OUT_DIR=<dir>` selects an
-/// explicit directory; Debug builds otherwise use this app's sandboxed Caches
-/// directory so a normal Xcode launch can capture without changing its network
-/// execution context.
+/// handed to the renderer. Capture is strictly opt-in through
+/// `ROOTSHELL_VNC_FRAME_OUT_DIR=<dir>`; ordinary Debug and Release sessions do
+/// not write screen contents to disk.
 /// Lets a live GUI session's decode output be compared against what the screen
 /// shows, isolating decode-path vs display-path corruption. PNG encoding runs
 /// on a background queue so the tap doesn't perturb delivery timing.
@@ -2230,20 +2230,7 @@ final class DiagnosticFrameDumper: @unchecked Sendable {
     static func fromEnvironment() -> DiagnosticFrameDumper? {
         let fileManager = FileManager.default
         let environment = ProcessInfo.processInfo.environment
-
-        let root: URL
-        if let explicit = environment["ROOTSHELL_VNC_FRAME_OUT_DIR"], !explicit.isEmpty {
-            root = URL(fileURLWithPath: explicit, isDirectory: true)
-        } else {
-            #if DEBUG
-            guard let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first else {
-                return nil
-            }
-            root = caches.appendingPathComponent("rootshellVNC/DecodedFrames", isDirectory: true)
-            #else
-            return nil
-            #endif
-        }
+        guard let root = configuredRoot(environment: environment) else { return nil }
 
         let sessionDirectory = root.appendingPathComponent(
             UUID().uuidString,
@@ -2260,6 +2247,14 @@ final class DiagnosticFrameDumper: @unchecked Sendable {
         VNCLogger(category: "FrameCapture").info(
             "Capturing decoded frames in \(sessionDirectory.path)")
         return DiagnosticFrameDumper(dir: sessionDirectory.path)
+    }
+
+    static func configuredRoot(environment: [String: String]) -> URL? {
+        guard let explicit = environment["ROOTSHELL_VNC_FRAME_OUT_DIR"],
+              !explicit.isEmpty else {
+            return nil
+        }
+        return URL(fileURLWithPath: explicit, isDirectory: true)
     }
 
     private init(dir: String) {
@@ -2471,8 +2466,8 @@ struct GatedRecoveryEscalator {
 
 /// Latest loss-affected SSRC handed from the media queue to the recovery
 /// supervisor. The recovery gate is global and the server sends its recovery
-/// IDR on the base SSRC, so the value is advisory: FIR falls back to the base
-/// video channel when no specific SSRC was recorded.
+/// IDR on the base SSRC, so the value is advisory: transport always routes FIR
+/// to the base video channel while retaining this value for diagnostics.
 final class LatestLossSSRC: @unchecked Sendable {
     private let lock = NSLock()
     private var value: UInt32?

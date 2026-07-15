@@ -35,29 +35,7 @@ public enum HEVCDecoderError: Error, Sendable, LocalizedError {
     }
 }
 
-/// Metadata that identifies one band inside Apple's compound HEVC screen
-/// frame. These keys accompany each sample passed to VideoToolbox.
-public struct HEVCTileMetadata: Sendable, Equatable {
-    public let tileID: UInt32
-    public let tileOrder: UInt32
-    public let decodingOrderBase: UInt32
-
-    public init(tileID: UInt32, tileOrder: UInt32, decodingOrderBase: UInt32) {
-        self.tileID = tileID
-        self.tileOrder = tileOrder
-        self.decodingOrderBase = decodingOrderBase
-    }
-
-    var sampleAttachments: [String: NSNumber] {
-        [
-            "TileID": NSNumber(value: tileID),
-            "TileOrder": NSNumber(value: tileOrder),
-            "decodingOrderBase": NSNumber(value: decodingOrderBase),
-        ]
-    }
-}
-
-/// Decodes HEVC (H.265) NAL units using VideoToolbox hardware decoder.
+/// Decodes HEVC (H.265) NAL units using the public VideoToolbox API.
 public final class HEVCDecoder: @unchecked Sendable {
 
     /// Delivers a decoded frame with its presentation time and the per-frame
@@ -79,18 +57,15 @@ public final class HEVCDecoder: @unchecked Sendable {
 
     private var decompressionSession: VTDecompressionSession?
     private var formatDescription: CMFormatDescription?
-    private let numberOfTiles: Int
     private let lock = NSLock()
     private var callbackStorage: UnsafeMutablePointer<CallbackBundle>?
 
     // MARK: - Init
 
     public init(
-        numberOfTiles: Int = 1,
         frameCallback: @escaping FrameCallback,
         failureCallback: FailureCallback? = nil
     ) {
-        self.numberOfTiles = max(1, numberOfTiles)
         // Allocate the callback trampoline storage once and keep it alive for
         // the decoder's whole lifetime. VideoToolbox may invoke the output
         // callback asynchronously *after* a session is invalidated (e.g. when a
@@ -105,8 +80,8 @@ public final class HEVCDecoder: @unchecked Sendable {
 
     deinit {
         if let session = decompressionSession {
-            VTDecompressionSessionWaitForAsynchronousFrames(session)
-            VTDecompressionSessionInvalidate(session)
+            _waitForAsynchronousFrames(session)
+            _invalidate(session)
         }
         _freeCallbackStorage()
     }
@@ -204,22 +179,35 @@ public final class HEVCDecoder: @unchecked Sendable {
         // callback fires against a torn-down session. The callback storage is
         // stable for the decoder's lifetime and is deliberately NOT freed here.
         if let existing = decompressionSession {
-            VTDecompressionSessionWaitForAsynchronousFrames(existing)
-            VTDecompressionSessionInvalidate(existing)
+            _waitForAsynchronousFrames(existing)
+            _invalidate(existing)
             decompressionSession = nil
         }
 
-        // Do NOT force a pixel format: requesting 32BGRA makes VideoToolbox run a
-        // CPU (NEON) 4:4:4-YUV → BGRA color conversion on every frame
-        // (vt_Copy_444vf_rgb_BGRA...), which dominated CPU. Let the decoder hand
-        // back its native surface and let the GPU convert it when the CALayer is
-        // composited — that's the zero-CPU display path. Only IOSurface backing
-        // is required so the layer can reference the buffer without a copy.
-        let pixelBufferAttributes: [String: Any] = [
+        // Apple's HEVC screen stream currently decodes to `444f` (full-range,
+        // bi-planar 4:4:4 YCbCr). Passing that native IOSurface through generic
+        // Core Animation/AVSampleBufferDisplayLayer presentation has produced
+        // persistent corruption in the later spatial bands, even though an
+        // explicit Core Image conversion of the same decoded buffers is clean.
+        // Request BGRA here so presentation receives an unambiguous packed
+        // public pixel format. This keeps HEVC decoding hardware accelerated;
+        // only the YCbCr-to-RGB conversion may cost additional CPU. A public
+        // Metal conversion can recover the native-output performance later,
+        // after the correctness path is visually established.
+        var pixelBufferAttributes: [String: Any] = [
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+            kCVPixelBufferPixelFormatTypeKey as String:
+                kCVPixelFormatType_32BGRA,
         ]
+        // Retain an opt-in diagnostic escape hatch for comparing the native
+        // decoder surface without changing production behavior.
+        let useNativeYUVOutput = ProcessInfo.processInfo.environment[
+            "ROOTSHELL_VNC_NATIVE_YUV_OUTPUT"] == "1"
+        if useNativeYUVOutput {
+            pixelBufferAttributes.removeValue(
+                forKey: kCVPixelBufferPixelFormatTypeKey as String)
+        }
 
-        // Create the output callback record
         var outputCallback = VTDecompressionOutputCallbackRecord(
             decompressionOutputCallback: {
                 (
@@ -246,29 +234,42 @@ public final class HEVCDecoder: @unchecked Sendable {
 
                 callbacks.frame(pixelBuffer, presentationTimeStamp, tag)
             },
-            decompressionOutputRefCon: nil
-        )
+            decompressionOutputRefCon: nil)
+        outputCallback.decompressionOutputRefCon = callbackStorage.map(
+            UnsafeMutableRawPointer.init)
 
-        // Reuse the lifetime-stable callback storage allocated in init.
-        outputCallback.decompressionOutputRefCon = callbackStorage.map(UnsafeMutableRawPointer.init)
-
+        let forceSoftware = ProcessInfo.processInfo.environment[
+            "ROOTSHELL_VNC_FORCE_SOFTWARE_HEVC"] == "1"
+        var decoderSpecification: [String: Any] = [:]
+        if forceSoftware {
+            decoderSpecification[
+                kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder
+                    as String] = false
+        }
+        let decoderSpecificationDictionary: CFDictionary? = decoderSpecification.isEmpty
+            ? nil
+            : decoderSpecification as CFDictionary
         var session: VTDecompressionSession?
-        let decoderSpecification: CFDictionary? = numberOfTiles > 1
-            ? ["NumberOfTiles": numberOfTiles] as CFDictionary
-            : nil
         let status = VTDecompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             formatDescription: formatDesc,
-            decoderSpecification: decoderSpecification,
+            decoderSpecification: decoderSpecificationDictionary,
             imageBufferAttributes: pixelBufferAttributes as CFDictionary,
             outputCallback: &outputCallback,
-            decompressionSessionOut: &session
-        )
+            decompressionSessionOut: &session)
 
         guard status == noErr, let newSession = session else {
             throw HEVCDecoderError.sessionCreationFailed(status)
         }
 
+        let realTimeStatus = VTSessionSetProperty(
+            newSession,
+            key: kVTDecompressionPropertyKey_RealTime,
+            value: kCFBooleanTrue)
+        guard realTimeStatus == noErr else {
+            VTDecompressionSessionInvalidate(newSession)
+            throw HEVCDecoderError.sessionCreationFailed(realTimeStatus)
+        }
         decompressionSession = newSession
 
         // Always report hardware vs software decode + the output format: if the
@@ -276,15 +277,18 @@ public final class HEVCDecoder: @unchecked Sendable {
         // hardware that only supports 4:2:0), VideoToolbox silently falls back to
         // a CPU decoder — which is the single biggest CPU cost to look for.
         var raw: CFTypeRef?
-        let s = VTSessionCopyProperty(
+        let propertyStatus = VTSessionCopyProperty(
             newSession,
             key: kVTDecompressionPropertyKey_UsingHardwareAcceleratedVideoDecoder,
             allocator: kCFAllocatorDefault,
             valueOut: &raw)
-        let hw = (s == noErr) ? (raw as? Bool) : nil
+        let hardware = propertyStatus == noErr ? raw as? Bool : nil
         let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
         Logger(subsystem: "com.rootshell.vnc", category: "HEVCDecoder").notice(
-            "VT session: \(dims.width, privacy: .public)x\(dims.height, privacy: .public) hardwareAccelerated=\(hw.map(String.init) ?? "unknown", privacy: .public)")
+            "VT session: \(dims.width, privacy: .public)x\(dims.height, privacy: .public) hardwareAccelerated=\(hardware.map(String.init) ?? "unknown", privacy: .public) requestedOutput=\(useNativeYUVOutput ? "native" : "BGRA", privacy: .public)")
+        if ProcessInfo.processInfo.environment["ROOTSHELL_VNC_TRACE_DECODE"] == "1" {
+            print("VT session: \(dims.width)x\(dims.height) hardwareAccelerated=\(hardware.map(String.init) ?? "unknown") requestedOutput=\(useNativeYUVOutput ? "native" : "BGRA")")
+        }
     }
 
     /// Whether the decoder can accept VCL NAL units (parameter sets seen and a
@@ -311,14 +315,12 @@ public final class HEVCDecoder: @unchecked Sendable {
     public func decode(
         nalUnit: Data,
         presentationTime: CMTime,
-        frameTag: UInt32 = 0,
-        tileMetadata: HEVCTileMetadata? = nil
+        frameTag: UInt32 = 0
     ) throws {
         try decode(
             nalUnits: [nalUnit],
             presentationTime: presentationTime,
-            frameTag: frameTag,
-            tileMetadata: tileMetadata)
+            frameTag: frameTag)
     }
 
     /// Feed a complete HEVC access unit for decoding. `frameTag` is handed back
@@ -327,8 +329,7 @@ public final class HEVCDecoder: @unchecked Sendable {
     public func decode(
         nalUnits: [Data],
         presentationTime: CMTime,
-        frameTag: UInt32 = 0,
-        tileMetadata: HEVCTileMetadata? = nil
+        frameTag: UInt32 = 0
     ) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -417,16 +418,6 @@ public final class HEVCDecoder: @unchecked Sendable {
             throw HEVCDecoderError.sampleBufferCreationFailed(status)
         }
 
-        if let tileMetadata {
-            for (key, value) in tileMetadata.sampleAttachments {
-                CMSetAttachment(
-                    sample,
-                    key: key as CFString,
-                    value: value,
-                    attachmentMode: kCMAttachmentMode_ShouldPropagate)
-            }
-        }
-
         // Decode
         let decodeFlags = VTDecodeFrameFlags._EnableAsynchronousDecompression
         var infoFlagsOut = VTDecodeInfoFlags()
@@ -435,8 +426,7 @@ public final class HEVCDecoder: @unchecked Sendable {
             sampleBuffer: sample,
             flags: decodeFlags,
             frameRefcon: UnsafeMutableRawPointer(bitPattern: UInt(frameTag)),
-            infoFlagsOut: &infoFlagsOut
-        )
+            infoFlagsOut: &infoFlagsOut)
 
         guard status == noErr else {
             throw HEVCDecoderError.decodeFailed(status)
@@ -451,7 +441,7 @@ public final class HEVCDecoder: @unchecked Sendable {
         defer { lock.unlock() }
 
         guard let session = decompressionSession else { return }
-        VTDecompressionSessionWaitForAsynchronousFrames(session)
+        _waitForAsynchronousFrames(session)
     }
 
     /// Reset the decoder (e.g., on stream restart).
@@ -462,13 +452,21 @@ public final class HEVCDecoder: @unchecked Sendable {
         defer { lock.unlock() }
 
         if let session = decompressionSession {
-            VTDecompressionSessionWaitForAsynchronousFrames(session)
-            VTDecompressionSessionInvalidate(session)
+            _waitForAsynchronousFrames(session)
+            _invalidate(session)
             decompressionSession = nil
         }
         // Callback storage is intentionally retained for the decoder's lifetime
         // (freed only in deinit) so late async callbacks never hit freed memory.
         formatDescription = nil
+    }
+
+    private func _waitForAsynchronousFrames(_ session: VTDecompressionSession) {
+        VTDecompressionSessionWaitForAsynchronousFrames(session)
+    }
+
+    private func _invalidate(_ session: VTDecompressionSession) {
+        VTDecompressionSessionInvalidate(session)
     }
 }
 

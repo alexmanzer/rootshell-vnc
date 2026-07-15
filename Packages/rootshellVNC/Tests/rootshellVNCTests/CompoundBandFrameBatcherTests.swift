@@ -24,6 +24,23 @@ final class AtomicBandFrameAccumulatorTests: XCTestCase {
         XCTAssertEqual(accumulator.takeSynchronizedFrame(), [10: "top", 11: "bottom"])
     }
 
+    func testFourBandNativeProfilePublishesOnlyCompleteFrames() {
+        var accumulator = AtomicBandFrameAccumulator<String>(expectedSourceCount: 4)
+
+        accumulator.submit(source: 10, value: "one")
+        accumulator.submit(source: 11, value: "two")
+        accumulator.submit(source: 12, value: "three")
+        XCTAssertNil(accumulator.takeSynchronizedFrame())
+
+        accumulator.submit(source: 13, value: "four")
+        XCTAssertEqual(accumulator.takeSynchronizedFrame(), [
+            10: "one",
+            11: "two",
+            12: "three",
+            13: "four",
+        ])
+    }
+
     func testNewestBandSupersedesOlderValueBeforeDrain() {
         var accumulator = AtomicBandFrameAccumulator<Int>(expectedSourceCount: 2)
 

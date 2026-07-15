@@ -91,15 +91,22 @@ struct VideoDecoderFailureLatch {
     }
 }
 
-/// Generates synthetic monotonic PTS values for the single HEVC decode order.
-/// Apple's tiled transport interleaves its bands on this same DON timeline;
-/// the SSRC identifies the output band, not a separate presentation timeline.
+/// Generates a unique, monotonic PTS for each access unit submitted on the
+/// compound HEVC decode timeline.
+///
+/// The four bands share RTP presentation timestamps. Those timestamps cannot
+/// identify one asynchronous VideoToolbox callback within a compound frame,
+/// so using them directly allows callbacks from adjacent frames to interleave.
+/// A unique submission PTS lets ``DecodedFrameOrderer`` restore global DON
+/// order before the spatial-band coalescer sees the buffers.
 struct HEVCPresentationTimeline {
-    private var sequentialCounter: Int64 = 0
+    static let timescale: CMTimeScale = 90_000
+    static let step: CMTimeValue = 3_000
+    private var sequentialCounter: CMTimeValue = 0
 
     mutating func next() -> CMTimeValue {
         defer { sequentialCounter += 1 }
-        return CMTimeValue(sequentialCounter * 3000)
+        return sequentialCounter * Self.step
     }
 
     mutating func reset() {
@@ -109,10 +116,10 @@ struct HEVCPresentationTimeline {
 
 /// Manages the accelerated HEVC video stream for high-performance VNC mode.
 ///
-/// Supports Apple's native multi-tile transport and the conventional one-tile
-/// fallback. Tiled mode round-robins one DON timeline across several SSRCs;
-/// those sources are one compound reference chain, so samples stay on a shared
-/// decoder and carry `NumberOfTiles`, `TileID`, and `TileOrder` metadata.
+/// Supports Apple's native multi-band transport and the conventional one-band
+/// fallback. The four SSRCs are one interleaved HEVC reference sequence: only
+/// the first band starts with an IDR, so global DON order must reach one public
+/// VideoToolbox session. The SSRC remains the spatial band identity.
 public final class VideoStreamManager: @unchecked Sendable {
 
     /// Delivers a decoded frame and the source SSRC (which screen band it is).
@@ -124,7 +131,7 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var frameCallback: FrameCallback?
     private var _isActive: Bool = false
     private var usesDecodingOrderNumbers = true
-    private var numberOfTiles = 2
+    private var numberOfTiles = 4
     private var streamID: UInt32 = 0
     private var streamGeneration: UInt64 = 0
     /// AVC negotiation generation inside the still-live RFB stream. Unlike
@@ -172,6 +179,11 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var lastVideoPacketArrivalNanos: [UInt32: UInt64] = [:]
     private var mediaInterruptionPendingSSRCs: Set<UInt32> = []
     private var lastLossNanos: UInt64 = 0
+    /// The non-gating path keeps decoding through Apple's gradual intra
+    /// refresh, but each distinct loss episode still needs a fresh recovery
+    /// request. Bound requests instead of permanently treating the first loss
+    /// in a media generation as the only recoverable episode.
+    private let lossRecoveryRequestCooldownNanos: UInt64 = 1_000_000_000
     /// Kill-switch for A/B testing: ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY=1.
     var lossRecoveryEnabled = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_DISABLE_LOSS_RECOVERY"] != "1"
     /// Drop-until-IDR gate. Opt-in only. The recovery exchange can provide an
@@ -296,7 +308,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         self.fullFrameWidth = width
         self.fullFrameHeight = height
         self.usesDecodingOrderNumbers = usesDecodingOrderNumbers
-        self.numberOfTiles = numberOfTiles ?? (usesDecodingOrderNumbers ? 2 : 1)
+        self.numberOfTiles = numberOfTiles ?? (usesDecodingOrderNumbers ? 4 : 1)
         self.donReorderBuffer = CompoundHEVCDONReorderBuffer(
             expectedSourceCount: self.numberOfTiles)
         self.frameCallback = frameCallback
@@ -311,11 +323,6 @@ public final class VideoStreamManager: @unchecked Sendable {
         self._isActive = true
         demuxer = RTPDemuxer(
             usesDecodingOrderNumbers: usesDecodingOrderNumbers)
-
-        // Both wire modes are one encoded reference timeline. In tiled mode,
-        // DON restores the interleaved SSRCs to that order before this shared
-        // public VideoToolbox session sees them. Splitting the SSRCs across
-        // decoder sessions loses sibling reference pictures after frame one.
         decoder = makeDecoder(
             streamGeneration: streamGeneration,
             mediaGeneration: mediaGeneration,
@@ -483,9 +490,6 @@ public final class VideoStreamManager: @unchecked Sendable {
                 switch nalType {
                 case 32...40: continue
                 default:
-                    let tileMetadata = compoundTileMetadata(
-                        ssrc: accessUnit.ssrc,
-                        don: accessUnit.don)
                     // One DON is one band access unit. Preserve all of its VCL
                     // NALs/slices in a single VideoToolbox sample; submitting
                     // slices separately renders partial pictures.
@@ -508,7 +512,8 @@ public final class VideoStreamManager: @unchecked Sendable {
                             bufferEarlyVCL(
                                 nals: nalUnits,
                                 ssrc: accessUnit.ssrc,
-                                tileMetadata: tileMetadata)
+                                timestamp: accessUnit.timestamp,
+                                don: accessUnit.don)
                         }
                         continue
                     }
@@ -516,12 +521,13 @@ public final class VideoStreamManager: @unchecked Sendable {
                         bufferEarlyVCL(
                             nals: nalUnits,
                             ssrc: accessUnit.ssrc,
-                            tileMetadata: tileMetadata)
+                            timestamp: accessUnit.timestamp,
+                            don: accessUnit.don)
                         continue
                     }
                     let pts = CMTime(
                         value: nextPresentationTimeValue(),
-                        timescale: 90000)
+                        timescale: HEVCPresentationTimeline.timescale)
                     let recoveryIDRArmed = armRecoveryIDRIfNeeded(
                         nalType: nalType,
                         presentationTime: pts)
@@ -529,8 +535,7 @@ public final class VideoStreamManager: @unchecked Sendable {
                         try decoderRef.decode(
                             nalUnits: nalUnits,
                             presentationTime: pts,
-                            frameTag: accessUnit.ssrc,
-                            tileMetadata: tileMetadata)
+                            frameTag: accessUnit.ssrc)
                     } catch HEVCDecoderError.decodeFailed(let status) {
                         if recoveryIDRArmed {
                             cancelRecoveryIDR(presentationTime: pts)
@@ -611,8 +616,11 @@ public final class VideoStreamManager: @unchecked Sendable {
     }
 
     /// Record a loss under `lock`; returns true when no recovery was in flight.
-    private func markLossLocked(affectedSSRC: UInt32?) -> Bool {
-        let now = DispatchTime.now().uptimeNanoseconds
+    private func markLossLocked(
+        affectedSSRC: UInt32?,
+        nowNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> Bool {
+        let now = nowNanos
         let fresh: Bool
         if irapGateEnabled {
             fresh = awaitingIRAP.isEmpty
@@ -623,9 +631,21 @@ public final class VideoStreamManager: @unchecked Sendable {
             if let affectedSSRC { awaitingIRAP.insert(affectedSSRC) }
         } else {
             fresh = lastLossNanos == 0
+                || now &- lastLossNanos >= lossRecoveryRequestCooldownNanos
         }
-        lastLossNanos = now
+        // Do not let a continuous cluster of per-band gaps postpone recovery
+        // forever. Once one request is sent, the next request becomes eligible
+        // after the fixed cooldown even if more gaps arrive in between.
+        if fresh { lastLossNanos = now }
         return fresh
+    }
+
+    /// Exercise the recovery-request limiter without manufacturing an RTP
+    /// packet or waiting on the wall clock.
+    func noteLossForTesting(nowNanos: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return markLossLocked(affectedSSRC: nil, nowNanos: nowNanos)
     }
 
     /// Whether a VCL NAL should reach the decoder. A recovery IDR is allowed
@@ -852,18 +872,20 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var earlyVCLBuffer: [(
         nals: [Data],
         ssrc: UInt32,
-        tileMetadata: HEVCTileMetadata?
+        timestamp: UInt32,
+        don: UInt16
     )] = []
 
     private func bufferEarlyVCL(
         nals: [Data],
         ssrc: UInt32,
-        tileMetadata: HEVCTileMetadata?
+        timestamp: UInt32,
+        don: UInt16
     ) {
         lock.lock()
         defer { lock.unlock() }
         if earlyVCLBuffer.count < 256 {
-            earlyVCLBuffer.append((nals, ssrc, tileMetadata))
+            earlyVCLBuffer.append((nals, ssrc, timestamp, don))
         }
     }
 
@@ -1048,7 +1070,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         do {
             try replacement.updateFormatDescription(sps: sps, pps: pps, vps: vps)
         } catch {
-            log.error("Could not rebuild HEVC decoder in session: \(error.localizedDescription)")
+            log.error("Could not rebuild HEVC decoder: \(error.localizedDescription)")
             replacement.reset()
             return false
         }
@@ -1082,15 +1104,15 @@ public final class VideoStreamManager: @unchecked Sendable {
             lock.unlock()
             return
         }
-        let decoderRefs = [decoder].compactMap { $0 }
+        let decoderRef = decoder
         let vps = pendingVPS
         lock.unlock()
 
         var codedDimensions: CMVideoDimensions?
-        for decoderRef in decoderRefs {
+        if let decoderRef {
             do {
                 try decoderRef.updateFormatDescription(sps: sps, pps: pps, vps: vps)
-                codedDimensions = codedDimensions ?? decoderRef.formatDimensions
+                codedDimensions = decoderRef.formatDimensions
             } catch {
                 log.warning("Failed to configure HEVC format: \(error.localizedDescription)")
             }
@@ -1189,12 +1211,13 @@ public final class VideoStreamManager: @unchecked Sendable {
                 bufferEarlyVCL(
                     nals: item.nals,
                     ssrc: item.ssrc,
-                    tileMetadata: item.tileMetadata)
+                    timestamp: item.timestamp,
+                    don: item.don)
                 continue
             }
             let pts = CMTime(
                 value: nextPresentationTimeValue(),
-                timescale: 90000)
+                timescale: HEVCPresentationTimeline.timescale)
             let nalType = item.nals.first.flatMap { nal -> UInt8? in
                 guard nal.count >= 2 else { return nil }
                 return (nal[nal.startIndex] >> 1) & 0x3f
@@ -1206,8 +1229,7 @@ public final class VideoStreamManager: @unchecked Sendable {
                 try decoderRef.decode(
                     nalUnits: item.nals,
                     presentationTime: pts,
-                    frameTag: item.ssrc,
-                    tileMetadata: item.tileMetadata)
+                    frameTag: item.ssrc)
                 recordDecodeSubmission()
             } catch {
                 if recoveryIDRArmed {
@@ -1218,8 +1240,9 @@ public final class VideoStreamManager: @unchecked Sendable {
         }
     }
 
-    /// All SSRCs belong to one ordered HEVC reference timeline. The source is
-    /// carried as a frame tag so decoded bands can still be composited.
+    /// The SSRCs are spatial labels on one global HEVC reference sequence, not
+    /// independently decodable streams. Route every source through the shared
+    /// session after the DON reorder stage.
     private func decoderForSource(_ ssrc: UInt32) -> HEVCDecoder? {
         _ = ssrc
         lock.lock()
@@ -1235,7 +1258,6 @@ public final class VideoStreamManager: @unchecked Sendable {
     ) -> HEVCDecoder {
         let orderer = DecodedFrameOrderer(callback: frameCallback)
         return HEVCDecoder(
-            numberOfTiles: numberOfTiles,
             frameCallback: { [weak self] pixelBuffer, pts, frameTag in
                 guard let result = self?.recordDecoderOutput(
                     streamGeneration: streamGeneration,
@@ -1261,31 +1283,6 @@ public final class VideoStreamManager: @unchecked Sendable {
                     presentationTime: pts,
                     ssrc: frameTag)
             })
-    }
-
-    /// Build the compound-frame metadata required by the decoder. SSRC order
-    /// is the stable top-to-bottom band identity; DON is
-    /// global, so subtracting the band order yields the frame's decode base.
-    private func compoundTileMetadata(
-        ssrc: UInt32,
-        don: UInt16
-    ) -> HEVCTileMetadata? {
-        lock.lock()
-        guard usesDecodingOrderNumbers else {
-            lock.unlock()
-            return nil
-        }
-        let orderedSources = seenVideoSSRCs.sorted()
-        let tileIndex = orderedSources.firstIndex(of: ssrc)
-        lock.unlock()
-        guard let tileIndex else { return nil }
-
-        let tileID = UInt32(tileIndex)
-        let base = don &- UInt16(truncatingIfNeeded: tileIndex)
-        return HEVCTileMetadata(
-            tileID: tileID,
-            tileOrder: tileID,
-            decodingOrderBase: UInt32(base))
     }
 
     private func logMultiNALAccessUnitIfNeeded(don: UInt16, count: Int) {
@@ -1342,13 +1339,15 @@ public final class VideoStreamManager: @unchecked Sendable {
         return result
     }
 
-    /// Releases decoded frames in strict presentation (submission) order.
+    /// Releases asynchronous VideoToolbox callbacks in the exact global order
+    /// in which compound access units were submitted.
     ///
-    /// PTS values are synthesized at decode submission as consecutive multiples
-    /// of 3000 (90 kHz ticks), so the expected sequence is exactly 0, 1, 2, …
-    /// in frame indices. Out-of-order hardware-decoder callbacks are held until
-    /// their turn; a frame the decoder swallowed is skipped once a few newer
-    /// frames have queued behind it, so one loss cannot stall the display.
+    /// A bottom band is often much larger than the upper bands. Hardware may
+    /// therefore finish it after callbacks from the next compound frame. If
+    /// those callbacks reach the renderer directly, the bottom of the screen
+    /// visibly regresses or flickers. The synthetic PTS is a unique submission
+    /// ordinal, so buffering a small window restores the DON order without any
+    /// private subframe API.
     final class DecodedFrameOrderer: @unchecked Sendable {
         private let lock = NSLock()
         private var pending: [Int64: (CVPixelBuffer, UInt32)] = [:]
@@ -1364,12 +1363,11 @@ public final class VideoStreamManager: @unchecked Sendable {
         }
 
         func submit(pixelBuffer: CVPixelBuffer, pts: CMTime, ssrc: UInt32) {
-            let index = Int64(pts.value) / 3000
+            let index = Int64(pts.value) / Int64(HEVCPresentationTimeline.step)
             var ready: [(CVPixelBuffer, UInt32)] = []
 
             lock.lock()
             if index < nextIndex {
-                // Stale duplicate (shouldn't happen) — drop.
                 lock.unlock()
                 return
             }
@@ -1383,10 +1381,6 @@ public final class VideoStreamManager: @unchecked Sendable {
             }
         }
 
-        /// A screen stream can be change-gated: if VideoToolbox swallows one
-        /// damaged picture and only one newer picture arrives, a count-only
-        /// reorder window would hold that newer picture forever. Bound the hold
-        /// by time as well as depth so sparse desktop updates cannot freeze.
         private func scheduleGapTimerLockedIfNeeded() {
             guard !pending.isEmpty, pending[nextIndex] == nil else {
                 if gapTimerScheduled {

@@ -1,7 +1,7 @@
 import Foundation
 
 /// The video-stream profile defines a low-precision echo timestamp by dropping
-/// the standard 90 kHz RTP timestamp's low byte.
+/// the screen stream's 24 kHz RTP timestamp low byte.
 func appleMediaRCTLLowPrecisionEchoTimestamp(_ timestamp: UInt32) -> UInt16 {
     UInt16(truncatingIfNeeded: timestamp >> 8)
 }
@@ -35,15 +35,16 @@ struct AppleMediaRCTLFeedback: Equatable {
 
     func serialized() -> Data {
         var data = Data(capacity: 20)
-        // Version 2 with VCRC, extended-feedback, and packet-count flags for
-        // the feedback-only video profile.
+        // Apple's feedback-only video source passes the format descriptor
+        // `{ version: 2, base: 1, vcrc: 1, rateControl: 1 }` to
+        // VCMediaControlInfoSerializeWithData. That serializer produces 0x85:
+        // version 2 (0x80), rate-control fields (0x04), and the base section
+        // (0x01). Bit 0x08 means an additional four-byte feedback section;
+        // setting it while still emitting the 20-byte base packet makes the
+        // peer parse fields under the wrong bitmap.
         let mediaControlVersion2: UInt8 = 2 << 6
         let vcrcFieldsPresent: UInt8 = 0x05
-        let extendedFeedbackFieldsPresent: UInt8 = 0x08
-        data.append(
-            mediaControlVersion2
-                | vcrcFieldsPresent
-                | extendedFeedbackFieldsPresent)
+        data.append(mediaControlVersion2 | vcrcFieldsPresent)
         data.append(lossPercent)
         appendUInt16BE(0x0004, to: &data)
         appendUInt16BE(echoTimestamp, to: &data)

@@ -31,6 +31,7 @@ final class RTPDemuxerTests: XCTestCase {
         XCTAssertEqual(result.map(\.nal), [nal1, nal2])
         // All aggregated units share the AP's DON (0xD410).
         XCTAssertEqual(result.map(\.don), [0xD410, 0xD410])
+        XCTAssertEqual(result.map(\.timestamp), [90000, 90000])
         XCTAssertEqual(result.map(\.endOfAccessUnit), [false, true])
     }
 
@@ -59,6 +60,7 @@ final class RTPDemuxerTests: XCTestCase {
         XCTAssertEqual(result.map(\.nal), [Data([0x26, 0x01, 0xAA, 0xBB, 0xCC, 0xDD])])
         // DON is taken from the start fragment's DONL (0xD410).
         XCTAssertEqual(result.first?.don, 0xD410)
+        XCTAssertEqual(result.first?.timestamp, 1234)
         XCTAssertEqual(result.first?.endOfAccessUnit, true)
     }
 
@@ -80,6 +82,7 @@ final class RTPDemuxerTests: XCTestCase {
         // DONL removed; NAL header + RBSP retained.
         XCTAssertEqual(result.map(\.nal), [Data([0x02, 0x01, 0xAA, 0xBB, 0xCC])])
         XCTAssertEqual(result.first?.don, 0xD414)
+        XCTAssertEqual(result.first?.timestamp, 1234)
         XCTAssertEqual(result.first?.endOfAccessUnit, true)
     }
 

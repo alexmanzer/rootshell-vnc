@@ -11,6 +11,11 @@ import Foundation
 /// link can sustain a higher motion bitrate. RCTL is advisory feedback; this
 /// class does not impose a second congestion controller.
 final class AppleMediaRateController {
+    /// Apple's screen-video RTP profile uses a 24 kHz media clock. Captured
+    /// native 60-fps traffic advances by 400 ticks per frame (`0x190`), not
+    /// the 1,500 ticks a conventional 90 kHz video clock would use.
+    static let screenRTPClockRate: Double = 24_000
+
     /// The negotiated screen profile uses a 20 Mbps minimum and 40/60 Mbps
     /// maxima. Receiver feedback may still report a lower path estimate, so the
     /// controller must not clamp its RCTL value to the media arbitration range.
@@ -135,6 +140,19 @@ final class AppleMediaRateController {
     private var recoveryEpisodeActive = false
     private(set) var recoveryAttemptCount = 0
 
+    // Apple's feedback-only receiver estimates one-way queue growth from the
+    // first packet of each forward-moving RTP timestamp. Send time is the
+    // 90 kHz RTP clock; receive time is truncated to a 1 kHz clock. OWRD is
+    // the positive difference between a 10% short EMA and a 0.01% long EMA
+    // of that clock drift. Keeping this state here reproduces the algorithm
+    // with ordinary RTP metadata and no private framework dependency.
+    private var owrdPreviousRTPTimestamp: UInt32?
+    private var owrdFirstSendTimestamp: UInt32?
+    private var owrdFirstReceiveTimestamp: UInt32?
+    private var owrdShortAverageLag: Double?
+    private var owrdLongAverageLag: Double?
+    private(set) var owrdSeconds: Double = 0
+
     init(maxTargetBps: Double, initialTargetBps: Double? = nil) {
         config = Config.fromEnvironment(
             maximumCapacity: maxTargetBps,
@@ -151,11 +169,6 @@ final class AppleMediaRateController {
         UInt32(clamping: Int64(capacityEstimate.rounded()))
     }
 
-    /// OWRD is deliberately unavailable for this stream. Screen-share RTP
-    /// timestamps do not provide a usable delay signal, so zero is safer than
-    /// manufacturing queue growth or a fake nominal delay.
-    var owrdSeconds: Double { 0 }
-
     func onVideoPacket(
         ssrc: UInt32,
         rtpTimestamp: UInt32,
@@ -165,9 +178,9 @@ final class AppleMediaRateController {
         now: Double
     ) {
         _ = ssrc
-        _ = rtpTimestamp
         _ = endOfFrame
         guard bytes > 0 else { return }
+        updateOWRD(rtpTimestamp: rtpTimestamp, arrivalTime: now)
         byteSamples.append(ByteSample(time: now, bytes: bytes))
         byteSampleTotal += bytes
         intervalReceived += 1
@@ -177,12 +190,82 @@ final class AppleMediaRateController {
         trimSamples(now: now)
     }
 
+    private func updateOWRD(rtpTimestamp: UInt32, arrivalTime: Double) {
+        guard let previous = owrdPreviousRTPTimestamp else {
+            owrdPreviousRTPTimestamp = rtpTimestamp
+            return
+        }
+        let forwardDistance = rtpTimestamp &- previous
+        guard forwardDistance != 0, forwardDistance < 0x8000_0000 else { return }
+        owrdPreviousRTPTimestamp = rtpTimestamp
+
+        // The native collector converts arrival seconds to an unsigned
+        // millisecond timestamp before feeding its OWRD estimator.
+        let receiveMilliseconds = UInt32(truncatingIfNeeded: UInt64(
+            max(0, (arrivalTime * 1_000).rounded(.towardZero))))
+        guard let firstSend = owrdFirstSendTimestamp,
+              let firstReceive = owrdFirstReceiveTimestamp else {
+            owrdFirstSendTimestamp = rtpTimestamp
+            owrdFirstReceiveTimestamp = receiveMilliseconds
+            return
+        }
+
+        let relativeSendTime = Double(rtpTimestamp &- firstSend)
+            / Self.screenRTPClockRate
+        let relativeReceiveTime = Double(receiveMilliseconds &- firstReceive) / 1_000
+        let lag = relativeReceiveTime - relativeSendTime
+
+        guard let short = owrdShortAverageLag,
+              let long = owrdLongAverageLag else {
+            owrdShortAverageLag = lag
+            owrdLongAverageLag = lag
+            owrdSeconds = 0
+            return
+        }
+
+        let nextShort = lag * 0.1 + short * 0.9
+        var nextLong = lag * 0.0001 + long * 0.9999
+        let difference = nextShort - nextLong
+        if difference < 0 {
+            // A new lower-delay baseline immediately resets the long average;
+            // only queue growth above that baseline is reported.
+            nextLong = nextShort
+            owrdSeconds = 0
+        } else {
+            owrdSeconds = difference
+        }
+        owrdShortAverageLag = nextShort
+        owrdLongAverageLag = nextLong
+    }
+
     func onConfirmedLoss(count: Int, now: Double) {
         guard count > 0 else { return }
         intervalLost += count
         confirmedLossPending = true
         lastCongestionTime = now
         cooldownUntil = max(cooldownUntil, now + config.cooldown)
+    }
+
+    /// A media reconfiguration installs a new RTP clock origin and new SSRCs
+    /// on the same network path. Preserve the learned path capacity, but reset
+    /// all receive-generation measurements so the random timestamp discontinuity
+    /// cannot be interpreted as seconds of queue growth.
+    func resetMediaGenerationMeasurements() {
+        byteSamples.removeAll(keepingCapacity: true)
+        byteSampleHead = 0
+        byteSampleTotal = 0
+        intervalReceived = 0
+        intervalLost = 0
+        confirmedLossPending = false
+        intervalMaximumQueueDelay = 0
+        lastMaximumQueueDelaySeconds = 0
+
+        owrdPreviousRTPTimestamp = nil
+        owrdFirstSendTimestamp = nil
+        owrdFirstReceiveTimestamp = nil
+        owrdShortAverageLag = nil
+        owrdLongAverageLag = nil
+        owrdSeconds = 0
     }
 
     func throughputBps(now: Double) -> Double {

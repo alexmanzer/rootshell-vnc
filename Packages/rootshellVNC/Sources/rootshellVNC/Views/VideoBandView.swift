@@ -1,22 +1,21 @@
 import SwiftUI
 import CoreVideo
+import CoreMedia
 import QuartzCore
+import AVFoundation
 import RFBTransport
 
 /// GPU renderer for Apple's high-performance HEVC screen bands.
 ///
 /// Each RTP SSRC is a horizontal band of the screen. This renderer shows each
-/// band's decoded `CVPixelBuffer` directly, via an `IOSurface`-backed
-/// `CALayer` positioned at the band's Y offset. That is a zero-copy path — the
-/// GPU composites the layers, and nothing pushes a full-screen image through
-/// the CPU or SwiftUI every frame (which is what pinned the CPU at 5K).
+/// band's decoded `CVPixelBuffer` through an `AVSampleBufferDisplayLayer`.
 @MainActor
 public final class VideoBandLayerRenderer {
 
     /// The layer the host view displays. Band sublayers are added here.
     public let containerLayer = CALayer()
 
-    private var bandLayers: [UInt32: CALayer] = [:]
+    private var bandLayers: [UInt32: AVSampleBufferDisplayLayer] = [:]
     private var bandBuffers: [UInt32: CVPixelBuffer] = [:] // retained so VideoToolbox can't recycle a displayed buffer
     private var previousBandBuffers: [UInt32: CVPixelBuffer] = [:] // retained one commit longer so presentation can finish before reuse
     private var bandHeight: CGFloat = 0
@@ -70,7 +69,12 @@ public final class VideoBandLayerRenderer {
     }
 
     public func reset() {
-        for layer in bandLayers.values { layer.removeFromSuperlayer() }
+        for layer in bandLayers.values {
+            layer.sampleBufferRenderer.flush(
+                removingDisplayedImage: true,
+                completionHandler: nil)
+            layer.removeFromSuperlayer()
+        }
         bandLayers.removeAll()
         bandBuffers.removeAll()
         previousBandBuffers.removeAll()
@@ -100,7 +104,12 @@ public final class VideoBandLayerRenderer {
         CATransaction.begin()
         CATransaction.setDisableActions(true) // no implicit animation — this is video
         if replaceLayersOnNextFrame {
-            for layer in bandLayers.values { layer.removeFromSuperlayer() }
+            for layer in bandLayers.values {
+                layer.sampleBufferRenderer.flush(
+                    removingDisplayedImage: true,
+                    completionHandler: nil)
+                layer.removeFromSuperlayer()
+            }
             bandLayers.removeAll()
             bandBuffers.removeAll()
             previousBandBuffers.removeAll()
@@ -115,38 +124,75 @@ public final class VideoBandLayerRenderer {
             bandBuffers[ssrc] = pixelBuffer
             bandHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
 
-            let layer: CALayer
+            let layer: AVSampleBufferDisplayLayer
             if let existing = bandLayers[ssrc] {
                 layer = existing
             } else {
-                layer = CALayer()
-                layer.contentsGravity = .resize
+                layer = AVSampleBufferDisplayLayer()
+                layer.videoGravity = .resize
                 layer.masksToBounds = true
                 layer.contentsScale = pixelScale
                 containerLayer.addSublayer(layer)
                 bandLayers[ssrc] = layer
-                needsLayout = true // a new band changes the tiling
+                needsLayout = true
             }
 
-            if let surface = CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue() {
-                // VideoToolbox recycles a small pool of buffers, so the SAME
-                // IOSurface object comes back every few frames. Core Animation
-                // only re-composites `contents` when the object IDENTITY
-                // changes — reassigning the identical surface is a no-op, and
-                // the layer keeps showing whatever mix of old and newly-decoded
-                // pixels the surface holds ("flicker" + shredded macroblocks
-                // under motion). Rebind via nil so every frame is composited.
-                if (layer.contents as AnyObject?) === surface {
-                    layer.contents = nil
-                }
-                layer.contents = surface
-            } else {
-                layer.contents = pixelBuffer
+            let videoRenderer = layer.sampleBufferRenderer
+            if videoRenderer.status == .failed {
+                videoRenderer.flush()
+            }
+            if let sampleBuffer = Self.makeDisplaySample(from: pixelBuffer) {
+                videoRenderer.enqueue(sampleBuffer)
             }
         }
         CATransaction.commit()
 
         if needsLayout { layout() }
+    }
+
+    /// Wrap an already-decoded image buffer without copying its pixels. The
+    /// display-immediately attachment lets the coalescer control cadence while
+    /// AVFoundation performs the correct YUV conversion and surface lifetime
+    /// management.
+    private static func makeDisplaySample(
+        from pixelBuffer: CVPixelBuffer
+    ) -> CMSampleBuffer? {
+        var formatDescription: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescriptionOut: &formatDescription) == noErr,
+              let formatDescription else {
+            return nil
+        }
+        var timing = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: .invalid,
+            decodeTimeStamp: .invalid)
+        var sampleBuffer: CMSampleBuffer?
+        guard CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescription: formatDescription,
+            sampleTiming: &timing,
+            sampleBufferOut: &sampleBuffer) == noErr,
+              let sampleBuffer else {
+            return nil
+        }
+        if let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer,
+            createIfNecessary: true),
+           CFArrayGetCount(attachments) > 0 {
+            let dictionary = unsafeBitCast(
+                CFArrayGetValueAtIndex(attachments, 0),
+                to: CFMutableDictionary.self)
+            CFDictionarySetValue(
+                dictionary,
+                Unmanaged.passUnretained(
+                    kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
+        }
+        return sampleBuffer
     }
 
     /// The host view's bounds. Drives aspect-fit layout.
@@ -181,11 +227,20 @@ public final class VideoBandLayerRenderer {
                 continue
             }
             entry.value.isHidden = false
-            // Show only the top `validNative` rows of the band (drop the padding).
-            let fraction = validNative / nativeBandHeight
-            entry.value.contentsRect = CGRect(x: 0, y: 0, width: 1, height: fraction)
+            // Keep every decoded band at its coded height. The last HEVC band
+            // often contains padding below the negotiated desktop (for
+            // example, 4 x 480 coded rows for a 1860-row screen). Shrinking
+            // that 480-row sample into the remaining 420 rows displays and
+            // resamples the padding, which shows up as a flickering bottom
+            // tile. The container already clips to the exact desktop height,
+            // so extend the final layer past its lower edge and let ordinary
+            // layer clipping discard the padded rows at 1:1 geometry.
+            entry.value.contentsRect = CGRect(x: 0, y: 0, width: 1, height: 1)
             entry.value.frame = CGRect(
-                x: 0, y: topNative * scale, width: fitWidth, height: validNative * scale)
+                x: 0,
+                y: topNative * scale,
+                width: fitWidth,
+                height: nativeBandHeight * scale)
         }
         CATransaction.commit()
     }

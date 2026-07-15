@@ -21,6 +21,7 @@ struct SequentialHEVCAccessUnitAssembler {
         guard pendingSSRC == ssrc, !pendingVCL.isEmpty else { return nil }
         let result = CompoundHEVCDONReorderBuffer.AccessUnit(
             don: nextIdentifier,
+            timestamp: pendingVCL[0].timestamp,
             ssrc: ssrc,
             nals: pendingVCL)
         nextIdentifier &+= 1

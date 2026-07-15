@@ -34,6 +34,7 @@ final class LiveVideoBenchmarkTests: XCTestCase {
         let port = UInt16(env["VNC_TEST_PORT"] ?? "5900") ?? 5900
         let benchSeconds = Int(env["VNC_BENCH_SECONDS"] ?? "45") ?? 45
         let idleSeconds = Int(env["VNC_BENCH_IDLE_SECONDS"] ?? "6") ?? 6
+        let targetFrameRate = Int(env["VNC_BENCH_TARGET_FPS"] ?? "60") ?? 60
 
         let hp: [Encoding] = [
             .appleH264, .appleMultiVariantScreenshare, .appleSubZlibThousands, .zlib, .zrle,
@@ -41,24 +42,21 @@ final class LiveVideoBenchmarkTests: XCTestCase {
         ]
         let session = TransportSession(
             host: host, port: port, password: pass, username: user,
-            preferredEncodings: hp)
+            preferredEncodings: hp,
+            targetFrameRate: targetFrameRate)
         let manager = VideoStreamManager()
         let bench = BenchState()
 
-        // Ungated FIR-on-loss (the IRAP gate is off, so hasGatedBands never
-        // latches): ask the server for a recovery keyframe when RTP loss is
-        // detected, mirroring what the app should do. The transport
-        // rate-limits repeated requests.
+        // Ask once per manager loss episode, mirroring VNCSession. An older
+        // version of this probe launched a 30-second FIR loop per loss, which
+        // turned the measurement itself into a keyframe stress test.
         manager.onLossDetected = { [weak session] ssrc in
             bench.note("LOSS detected ssrc=\(ssrc.map { String($0 & 0xffff) } ?? "nil"); requesting keyframe")
             guard let session else { return }
             Task {
-                for attempt in 1...30 {
-                    let ready = await session.isReadyForVideoKeyframeRecovery()
-                    bench.note("keyframe request attempt \(attempt) ready=\(ready)")
-                    await session.requestVideoKeyframe(ssrc: ssrc)
-                    try? await Task.sleep(for: .seconds(1))
-                }
+                let ready = await session.isReadyForVideoKeyframeRecovery()
+                bench.note("keyframe request ready=\(ready)")
+                await session.requestVideoKeyframe(ssrc: ssrc)
             }
         }
 
@@ -73,7 +71,10 @@ final class LiveVideoBenchmarkTests: XCTestCase {
                     }
                     bench.streamStarted = true
                     manager.startStream(
-                        streamID: offer.streamID, width: 2976, height: 1860
+                        streamID: offer.streamID,
+                        width: 2976,
+                        height: 1860,
+                        numberOfTiles: Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
                     ) { _, ssrc in
                         bench.recordDecodedFrame(ssrc: ssrc)
                     }

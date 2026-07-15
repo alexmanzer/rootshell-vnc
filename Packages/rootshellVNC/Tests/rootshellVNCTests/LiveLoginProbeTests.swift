@@ -36,6 +36,11 @@ final class LiveLoginProbeTests: XCTestCase {
         let doLogin = env["VNC_PROBE_LOGIN"] == "1"
         let outDir = env["ROOTSHELL_VNC_FRAME_OUT_DIR"] ?? NSTemporaryDirectory() + "/login_probe"
         try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
+        let resizeSize: (width: UInt16, height: UInt16)? = {
+            guard let spec = env["VNC_PROBE_RESIZE"] else { return nil }
+            let parts = spec.split(separator: "x").compactMap { UInt16($0) }
+            return parts.count == 2 ? (parts[0], parts[1]) : nil
+        }()
 
         let hp: [Encoding] = [
             .appleH264, .appleMultiVariantScreenshare, .appleSubZlibThousands, .zlib, .zrle,
@@ -45,17 +50,20 @@ final class LiveLoginProbeTests: XCTestCase {
         let manager = VideoStreamManager()
         let probe = ProbeState()
 
-        // Closed-loop keyframe recovery, mirroring VNCSession's wiring.
-        manager.onLossDetected = { [weak session, weak manager] _ in
-            probe.note("LOSS DETECTED -> starting keyframe retry loop")
+        // One immediate FIR per manager loss episode, matching VNCSession.
+        manager.onLossDetected = { [weak session] ssrc in
+            probe.note("LOSS DETECTED -> requesting keyframe")
             Task {
-                var attempts = 0
-                while let m = manager, let s = session, m.hasGatedBands, attempts < 40 {
-                    await s.requestVideoKeyframe()
-                    attempts += 1
-                    try? await Task.sleep(for: .milliseconds(250))
-                }
-                probe.note("keyframe retry loop ended after \(attempts) attempts")
+                await session?.requestVideoKeyframe(ssrc: ssrc)
+            }
+        }
+
+        if resizeSize != nil {
+            await session.setAppleMediaGenerationSink { generation, tiles in
+                probe.note("media generation \(generation) tiles=\(tiles)")
+                manager.prepareForStreamReconfiguration(
+                    mediaGeneration: generation,
+                    numberOfTiles: tiles)
             }
         }
 
@@ -66,7 +74,12 @@ final class LiveLoginProbeTests: XCTestCase {
                     probe.note("EVENT mediaStreamOffer stream=\(offer.streamID) payloadBytes=\(offer.rawPayload.count)")
                     if !probe.streamStarted {
                         probe.streamStarted = true
-                        manager.startStream(streamID: offer.streamID, width: 2976, height: 1860) { pb, ssrc in
+                        manager.startStream(
+                            streamID: offer.streamID,
+                            width: 2976,
+                            height: 1860,
+                            numberOfTiles: Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
+                        ) { pb, ssrc in
                             probe.recordFrame(ssrc: ssrc, pixelBuffer: pb)
                         }
                         await session.setAppleMediaRTPSink { packet in
@@ -90,6 +103,11 @@ final class LiveLoginProbeTests: XCTestCase {
                     probe.recordRawDatagram()
                 case .framebufferUpdate:
                     break
+                case .displayInfo(let display):
+                    manager.updateFrameGeometry(
+                        width: Int(display.width),
+                        height: Int(display.height))
+                    probe.note("EVENT displayInfo \(display.width)x\(display.height)")
                 default:
                     probe.note("EVENT \(String(describing: event).prefix(120))")
                 }
@@ -128,6 +146,16 @@ final class LiveLoginProbeTests: XCTestCase {
 
         try await Task.sleep(for: .seconds(6))
 
+        if let resizeSize {
+            probe.note("requesting virtual display \(resizeSize.width)x\(resizeSize.height)")
+            _ = try await session.requestRemoteDisplaySize(
+                pixelWidth: resizeSize.width,
+                pixelHeight: resizeSize.height,
+                pointWidth: resizeSize.width / 2,
+                pointHeight: resizeSize.height / 2)
+            try await Task.sleep(for: .seconds(5))
+        }
+
         if env["VNC_PROBE_FORCE_RECOVERY"] == "1" {
             let sources = Set(probe.frameCounts().keys)
             probe.note("forcing recovery gate for \(sources.count) live sources")
@@ -163,11 +191,13 @@ final class LiveLoginProbeTests: XCTestCase {
         // Sweep the pointer along the Dock: magnification animation = real
         // full-band motion, the condition macroblocks/tearing show under.
         let sweeps = Int(env["VNC_PROBE_SWEEPS"] ?? "24") ?? 24
+        let motionDelayMS = max(
+            1, Int(env["VNC_PROBE_MOTION_DELAY_MS"] ?? "1000") ?? 1000)
+        let motionY = UInt16(env["VNC_PROBE_MOTION_Y"] ?? "1780") ?? 1780
         for i in 0..<sweeps {
             let x = UInt16(400 + (i % 12) * 180)
-            let y = UInt16(1780)
-            try? await session.sendPointerEvent(buttonMask: 0, x: x, y: y)
-            try? await Task.sleep(for: .seconds(1))
+            try? await session.sendPointerEvent(buttonMask: 0, x: x, y: motionY)
+            try? await Task.sleep(for: .milliseconds(motionDelayMS))
         }
 
         statsTask.cancel()

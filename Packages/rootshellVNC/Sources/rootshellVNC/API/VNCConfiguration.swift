@@ -296,7 +296,7 @@ public struct VNCConfiguration: Sendable {
         displayCount: Int = 1,
         displayMode: DisplayMode? = nil,
         enableRemoteAudio: Bool = true,
-        targetFrameRate: Int = 30,
+        targetFrameRate: Int = 60,
         enableProtocolTrace: Bool = false,
         reconnectionPolicy: VNCReconnectionPolicy = VNCReconnectionPolicy(),
         transportProvider: VNCTransportProvider? = nil,

@@ -79,3 +79,21 @@ func appleMediaRTPMediaControlInfo(
         totalPacketsPerFrame: totalPacketsPerFrame,
         frameSequenceNumber: frameSequenceNumber)
 }
+
+/// Return the RTP timestamp that the native receiver acknowledges for a
+/// completed LTR-marked access unit. Only an RTP marker packet completes an
+/// access unit; acknowledging an earlier fragment could let the sender use a
+/// reference picture whose remaining packets never arrived.
+func appleMediaLTRAcknowledgementTimestamp(_ packet: Data) -> UInt32? {
+    let minimumRTPHeaderLength = 12
+    guard packet.count >= minimumRTPHeaderLength else { return nil }
+    let base = packet.startIndex
+    guard packet[base] >> 6 == 2,
+          packet[base + 1] & 0x80 != 0,
+          let mediaControl = appleMediaRTPMediaControlInfo(packet),
+          mediaControl.ltrBits != 0 else { return nil }
+    return UInt32(packet[base + 4]) << 24
+        | UInt32(packet[base + 5]) << 16
+        | UInt32(packet[base + 6]) << 8
+        | UInt32(packet[base + 7])
+}

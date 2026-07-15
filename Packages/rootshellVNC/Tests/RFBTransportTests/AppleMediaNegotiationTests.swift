@@ -4,20 +4,50 @@ import XCTest
 @testable import RFBTransport
 
 final class AppleMediaNegotiationTests: XCTestCase {
-    func testRetinaTileCountUsesCaptureAreaThreshold() {
+    func testNativeScreenSharingReceiverFlagsTrackSixtyFPSCapability() {
+        XCTAssertEqual(appleMediaReceiverFlags(displayCount: 1), 0x04)
+        XCTAssertEqual(appleMediaReceiverFlags(displayCount: 2), 0x04)
+        XCTAssertEqual(
+            appleMediaReceiverFlags(displayCount: 1, supports60FPS: true),
+            0x05)
+        XCTAssertEqual(
+            appleMediaReceiverFlags(displayCount: 2, supports60FPS: true),
+            0x07)
+    }
+
+    func testReceiverFlagsKeepAppleRemoteDesktopIdentityDistinct() {
+        XCTAssertEqual(
+            appleMediaReceiverFlags(
+                displayCount: 1,
+                supports60FPS: true,
+                client: .appleRemoteDesktop),
+            0x0d)
+        XCTAssertEqual(
+            appleMediaReceiverFlags(
+                displayCount: 1,
+                supports60FPS: false,
+                sendsCursor: true),
+            0)
+    }
+
+    func testActiveTileCountFollowsNegotiatedWireCapabilityAtEverySize() {
         XCTAssertEqual(
             AppleMediaVideoMode.activeTileCount(
                 pixelWidth: 2400, pixelHeight: 1680),
-            1)
+            4)
+        XCTAssertEqual(
+            AppleMediaVideoMode.activeTileCount(
+                pixelWidth: 3136, pixelHeight: 1584),
+            4)
         XCTAssertEqual(
             AppleMediaVideoMode.activeTileCount(
                 pixelWidth: 2048, pixelHeight: 2736),
-            2)
+            4)
         XCTAssertEqual(
             AppleMediaVideoMode.activeTileCount(
                 pixelWidth: 5536, pixelHeight: 1392),
-            2)
-        XCTAssertEqual(AppleMediaVideoMode.negotiatedTilesPerFrame, 2)
+            4)
+        XCTAssertEqual(AppleMediaVideoMode.negotiatedTilesPerFrame, 4)
     }
 
     func testMediaMessageOneAnswerCyclesCreateDistinctGenerations() {
@@ -56,13 +86,30 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertEqual(root.varint(13), timestamp)
         XCTAssertEqual(root.varint(14), 2)
         XCTAssertEqual(root.varint(16), 0)
-        XCTAssertEqual(root.varint(18), 1)
-        XCTAssertEqual(root.messages(9).count, 10)
+        XCTAssertEqual(root.varint(18), 1) // local screen access-network type
+        let bandwidthSettings = root.messages(9)
+        XCTAssertEqual(bandwidthSettings.count, 10)
+        XCTAssertEqual(
+            bandwidthSettings.map {
+                [$0.varint(1) ?? .max, $0.varint(2) ?? .max, $0.varint(3) ?? 0]
+            },
+            [
+                [4_074, 0, 16_384],
+                [0, 6_000_000, 131_072],
+                [0, 40_000_000, 12_288],
+                [0, 75_000_000, 524_288],
+                [0, 20_000_000, 98_304],
+                [1, 299, 0],
+                [0, 60_000_000, 262_144],
+                [16, 4_100, 0],
+                [4, 6_500, 0],
+                [0, 100_000_000, 1_048_576],
+            ])
 
         let screen = try XCTUnwrap(root.message(5))
         XCTAssertEqual(screen.varint(1), 0xa1b2_c3d4)
         XCTAssertEqual(screen.varint(2), 0)
-        XCTAssertEqual(screen.varint(6), 2)
+        XCTAssertEqual(screen.varint(6), 4)
         XCTAssertEqual(screen.varint(7), 1)
         XCTAssertEqual(screen.varint(8), 63)
         XCTAssertEqual(screen.varint(9), 1)
@@ -72,10 +119,57 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertEqual(payloads.count, 2)
         XCTAssertEqual(payloads[0].varint(1), 123)
         XCTAssertEqual(payloads[0].messages(2).count, 4)
-        XCTAssertTrue(payloads[0].string(3)?.contains("AR:16/9,5/8;") == true)
-        XCTAssertTrue(payloads[0].string(3)?.contains("XR:16/9,5/8;") == true)
+        XCTAssertTrue(payloads[0].string(3)?.contains("AR:8/5,5/8;") == true)
+        XCTAssertTrue(payloads[0].string(3)?.contains("XR:8/5,5/8;") == true)
         XCTAssertEqual(payloads[1].varint(1), 100)
         XCTAssertEqual(payloads[1].messages(2).count, 2)
+        XCTAssertTrue(payloads[1].string(3)?.contains("AR:8/5,5/8;") == true)
+        XCTAssertTrue(payloads[1].string(3)?.contains("XR:8/5,5/8;") == true)
+    }
+
+    func testScreenCodecCapabilitiesMatchNativeNegotiatorBytes() throws {
+        let profile = AppleMediaNegotiationProfile(
+            framebufferWidth: 2976,
+            framebufferHeight: 1860,
+            supportsHDR: false)
+        let root = try ProtoMessage(profile.mediaBlob(
+            kind: .screen,
+            ssrc: 0,
+            ntpTimestamp: 1))
+        let actual = try XCTUnwrap(root.bytes(5))
+
+        // Captured from AVCMediaStreamNegotiatorSettingsRemoteDesktopScreenSharing
+        // after removing only the session-specific SSRC field. The native
+        // bytes are identical for 2976x1860 and 5120x2880 configurations.
+        let nativeCapabilities = try XCTUnwrap(dataFromHex(
+            "10001a7d087b120a0801100118c387032000120a0801100218c387032000" +
+            "120a0801100118c387032000120a0801100218c3870320001a47464c533b" +
+            "4d533a2d313b4c463a2d313b4c54523b43414241433b504f533a303b45" +
+            "4f443a313b4854533a323b52523a333b41523a382f352c352f383b5852" +
+            "3a382f352c352f383b20011a5c0864120a0801100118c387032000120a" +
+            "0801100218c3870320001a3e464c533b4c463a2d313b504f533a353b45" +
+            "4f443a313b4854533a323b52523a333b504f53453a343b41523a382f35" +
+            "2c352f383b58523a382f352c352f383b200e30043801403f48016001"))
+        XCTAssertEqual(actual, Data([0x08, 0x00]) + nativeCapabilities)
+    }
+
+    func testSmallCaptureAdvertisesAndExpectsFourTileCapability() throws {
+        let profile = AppleMediaNegotiationProfile(
+            framebufferWidth: 2400,
+            framebufferHeight: 1680,
+            supportsHDR: false)
+        let screen = try XCTUnwrap(ProtoMessage(profile.mediaBlob(
+            kind: .screen,
+            ssrc: 1,
+            ntpTimestamp: 2
+        )).message(5))
+
+        XCTAssertEqual(screen.varint(6), 4)
+        XCTAssertEqual(
+            AppleMediaVideoMode.activeTileCount(
+                pixelWidth: 2400,
+                pixelHeight: 1680),
+            4)
     }
 
     func testHDRServerCapabilityChangesAdvertisedHDRBitmap() throws {
@@ -104,7 +198,7 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertEqual(hdrScreen.varint(9), 9)
     }
 
-    func testScreenNegotiationAlwaysAdvertisesLogicalLocalTransport() throws {
+    func testScreenNegotiationMatchesNativeRuntimeAccessAndVideoTransport() throws {
         let profile = AppleMediaNegotiationProfile(
             framebufferWidth: 2556,
             framebufferHeight: 1179,
@@ -158,7 +252,7 @@ final class AppleMediaNegotiationTests: XCTestCase {
                 isExpensive: false,
                 isConstrained: false),
             remoteHost: "192.168.46.111")
-        XCTAssertEqual(wired.initialCapacityBps, 40_000_000)
+        XCTAssertEqual(wired.initialCapacityBps, 60_000_000)
 
         let wifi = AppleMediaNetworkProfile.detect(
             from: NetworkPathCharacteristics(
@@ -251,7 +345,7 @@ final class AppleMediaNegotiationTests: XCTestCase {
 
         XCTAssertEqual(ipad.aspectRatio, .screenCodec)
         XCTAssertEqual(wide.aspectRatio, .screenCodec)
-        XCTAssertEqual(ipad.aspectRatio.featureListValue, "16/9,5/8")
+        XCTAssertEqual(ipad.aspectRatio.featureListValue, "8/5,5/8")
     }
 
     func testNTPConversion() {
@@ -304,6 +398,11 @@ private struct ProtoMessage {
         return String(data: value, encoding: .utf8)
     }
 
+    func bytes(_ field: UInt64) -> Data? {
+        guard case .bytes(let value)? = fields[field]?.first else { return nil }
+        return value
+    }
+
     func message(_ field: UInt64) throws -> ProtoMessage? {
         guard case .bytes(let value)? = fields[field]?.first else { return nil }
         return try ProtoMessage(value)
@@ -334,6 +433,19 @@ private enum ProtoError: Error {
     case truncated
     case unsupportedWireType
     case decompressionFailed
+}
+
+private func dataFromHex(_ value: String) -> Data? {
+    guard value.count.isMultiple(of: 2) else { return nil }
+    var result = Data(capacity: value.count / 2)
+    var index = value.startIndex
+    while index < value.endIndex {
+        let end = value.index(index, offsetBy: 2)
+        guard let byte = UInt8(value[index..<end], radix: 16) else { return nil }
+        result.append(byte)
+        index = end
+    }
+    return result
 }
 
 private func zlibDecompress(_ input: Data) throws -> Data {

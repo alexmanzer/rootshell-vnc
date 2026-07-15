@@ -4,6 +4,26 @@ import XCTest
 @testable import RFBRendering
 
 final class DecodedFrameOrdererTests: XCTestCase {
+    func testOutOfOrderCallbacksAreReleasedInSubmissionOrder() throws {
+        let received = LockedSources()
+        let orderer = VideoStreamManager.DecodedFrameOrderer { _, source in
+            received.append(source)
+        }
+        let pixelBuffer = try makePixelBuffer()
+
+        orderer.submit(
+            pixelBuffer: pixelBuffer,
+            pts: CMTime(value: 3_000, timescale: 90_000),
+            ssrc: 11)
+        XCTAssertEqual(received.values, [])
+
+        orderer.submit(
+            pixelBuffer: pixelBuffer,
+            pts: CMTime(value: 0, timescale: 90_000),
+            ssrc: 10)
+        XCTAssertEqual(received.values, [10, 11])
+    }
+
     func testSparseOutputSkipsMissingFrameAfterBoundedHold() throws {
         let deliveredSecond = expectation(description: "newer sparse frame delivered")
         let received = LockedSources()
@@ -17,9 +37,6 @@ final class DecodedFrameOrdererTests: XCTestCase {
             pixelBuffer: pixelBuffer,
             pts: CMTime(value: 0, timescale: 90_000),
             ssrc: 0)
-        // Submission index 1 is intentionally absent. A change-gated desktop
-        // may provide only this one newer output, so depth-based skipping alone
-        // would leave it pending forever.
         orderer.submit(
             pixelBuffer: pixelBuffer,
             pts: CMTime(value: 6_000, timescale: 90_000),

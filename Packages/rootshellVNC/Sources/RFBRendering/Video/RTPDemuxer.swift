@@ -58,12 +58,10 @@ public final class RTPDemuxer: @unchecked Sendable {
     }
 
     /// A reassembled NAL unit tagged with its decoding-order number (DON, the
-    /// low 16 bits / DONL) and source SSRC. Apple round-robins ONE HEVC
-    /// reference chain across several SSRCs and stamps the global decode order
-    /// in the DONL; callers must reorder by `don` before feeding the decoder, or
-    /// out-of-order (jittered) arrivals corrupt every referencing frame.
+    /// low 16 bits / DONL), RTP presentation timestamp, and source SSRC.
     public struct DemuxedNAL: Sendable, Equatable {
         public let don: UInt16
+        public let timestamp: UInt32
         public let ssrc: UInt32
         public let nal: Data
         /// True when this NAL ends the RTP access unit. HEVC pictures may
@@ -71,11 +69,13 @@ public final class RTPDemuxer: @unchecked Sendable {
         public let endOfAccessUnit: Bool
         public init(
             don: UInt16,
+            timestamp: UInt32 = 0,
             ssrc: UInt32,
             nal: Data,
             endOfAccessUnit: Bool = true
         ) {
             self.don = don
+            self.timestamp = timestamp
             self.ssrc = ssrc
             self.nal = nal
             self.endOfAccessUnit = endOfAccessUnit
@@ -100,9 +100,8 @@ public final class RTPDemuxer: @unchecked Sendable {
     private let lock = NSLock()
     private let usesDONL: Bool
     // Reassembly state is tracked per SSRC: Apple multiplexes several media
-    // streams (e.g. video PT 100 and PT 101) with independent sequence spaces,
-    // and all RTP timestamps are 0, so a single shared FU/sequence state would
-    // be scrambled by interleaving. Key everything by SSRC instead.
+    // streams (e.g. video PT 100 and PT 101) with independent sequence spaces.
+    // Key everything by SSRC so interleaving cannot scramble FU state.
     private var fuStates: [UInt32: FUState] = [:]
     private var lastSequenceNumbers: [UInt32: UInt16] = [:]
 
@@ -263,6 +262,7 @@ public final class RTPDemuxer: @unchecked Sendable {
             return handleAggregationPacket(
                 packet.payload,
                 ssrc: ssrc,
+                timestamp: packet.timestamp,
                 marker: packet.marker)
 
         case 49:
@@ -277,6 +277,7 @@ public final class RTPDemuxer: @unchecked Sendable {
             let don = usesDONL ? Self.donl(in: packet.payload) : 0
             return [DemuxedNAL(
                 don: don,
+                timestamp: packet.timestamp,
                 ssrc: ssrc,
                 nal: usesDONL ? stripSingleNALUnitDONL(packet.payload) : packet.payload,
                 endOfAccessUnit: packet.marker)]
@@ -367,6 +368,7 @@ public final class RTPDemuxer: @unchecked Sendable {
                 fuStates[packet.ssrc] = nil
                 return [DemuxedNAL(
                     don: don,
+                    timestamp: packet.timestamp,
                     ssrc: packet.ssrc,
                     nal: nalData,
                     endOfAccessUnit: packet.marker)]
@@ -384,10 +386,9 @@ public final class RTPDemuxer: @unchecked Sendable {
             return []
 
         } else if var state = fuStates[packet.ssrc] {
-            // Middle or end fragment. Apple sets every RTP timestamp to 0, so
-            // fragments are delimited purely by the FU Start/End bits (and the
-            // per-SSRC sequence continuity checked in feedPacket), not by
-            // timestamp.
+            // Fragments are delimited by the FU Start/End bits and per-SSRC
+            // sequence continuity. Preserve the timestamp from the start
+            // packet for the completed access unit.
             state.nalData.append(contentsOf: fragmentData)
             state.lastSequence = packet.sequenceNumber
 
@@ -396,6 +397,7 @@ public final class RTPDemuxer: @unchecked Sendable {
                 fuStates[packet.ssrc] = nil
                 return [DemuxedNAL(
                     don: state.don,
+                    timestamp: state.timestamp,
                     ssrc: packet.ssrc,
                     nal: state.nalData,
                     endOfAccessUnit: packet.marker)]
@@ -421,6 +423,7 @@ public final class RTPDemuxer: @unchecked Sendable {
     private func handleAggregationPacket(
         _ payload: Data,
         ssrc: UInt32,
+        timestamp: UInt32,
         marker: Bool
     ) -> [DemuxedNAL] {
         let base = payload.startIndex
@@ -441,6 +444,7 @@ public final class RTPDemuxer: @unchecked Sendable {
             // so grouping them under one DON keeps them ahead of that IDR.
             nalUnits.append(DemuxedNAL(
                 don: don,
+                timestamp: timestamp,
                 ssrc: ssrc,
                 nal: Data(payload[offset ..< offset + nalSize]),
                 endOfAccessUnit: false))
@@ -451,6 +455,7 @@ public final class RTPDemuxer: @unchecked Sendable {
             let unit = nalUnits[last]
             nalUnits[last] = DemuxedNAL(
                 don: unit.don,
+                timestamp: unit.timestamp,
                 ssrc: unit.ssrc,
                 nal: unit.nal,
                 endOfAccessUnit: true)

@@ -6,6 +6,7 @@ import Foundation
 struct CompoundHEVCDONReorderBuffer {
     struct AccessUnit: Equatable {
         let don: UInt16
+        let timestamp: UInt32
         let ssrc: UInt32
         let nals: [RTPDemuxer.DemuxedNAL]
     }
@@ -97,6 +98,7 @@ struct CompoundHEVCDONReorderBuffer {
                 pending.removeValue(forKey: expected)
                 result.orderedAccessUnits.append(.init(
                     don: expected,
+                    timestamp: first.timestamp,
                     ssrc: first.ssrc,
                     nals: accessUnit.nals))
                 nextDON = expected &+ 1

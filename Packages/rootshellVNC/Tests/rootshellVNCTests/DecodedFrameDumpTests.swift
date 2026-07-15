@@ -50,9 +50,9 @@ final class DecodedFrameDumpTests: XCTestCase {
         let saved = SavedCounter()
         let manager = VideoStreamManager()
         manager.startStream(streamID: 1, width: 5120, height: 720) { pixelBuffer, ssrc in
-            // Save a handful of frames spread across the capture.
+            // Save complete four-band groups spread across the capture.
             let n = saved.next()
-            guard n % 200 == 0, n / 200 < 6 else { return }
+            guard n % 200 < 4, n / 200 < 6 else { return }
             let w = CVPixelBufferGetWidth(pixelBuffer)
             let h = CVPixelBufferGetHeight(pixelBuffer)
             let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)

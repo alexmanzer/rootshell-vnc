@@ -87,7 +87,11 @@ struct AppleMediaNetworkProfile: Sendable, Equatable {
             return AppleMediaNetworkProfile(
                 name: path.interface == .loopback ? "loopback" : "wired Ethernet",
                 radioClass: .none,
-                initialCapacityBps: path.isConstrained ? 10_000_000 : 40_000_000)
+                // Native Screen Sharing starts an unconstrained local receiver
+                // at the negotiated 60 Mbps ceiling. Beginning at 40 Mbps made
+                // the server quantize a Retina desktop before our estimator had
+                // enough sustained motion to ramp.
+                initialCapacityBps: path.isConstrained ? 10_000_000 : 60_000_000)
         case .wifi:
             return AppleMediaNetworkProfile(
                 name: "Wi-Fi",

@@ -7,8 +7,8 @@ import Foundation
 struct AppleMediaFrameLossFeedback: Equatable, Sendable {
     /// RTP timestamp of the damaged frame.
     let frameRTPTimestamp: UInt32
-    /// Cumulative number of RTP packets accepted by this receiver, modulo 2^16.
-    let receivedPacketCount: UInt16
+    /// Sequence of the damaged frame from Apple's RTP media-control extension.
+    let frameSequenceNumber: UInt16
     /// Total packets belonging to the damaged frame, including missing packets.
     let framePacketCount: UInt8
     /// Packets missing from the damaged frame.
@@ -21,6 +21,17 @@ private enum AppleMediaResiliencyWire {
     static let payloadSpecificFeedbackType: UInt8 = 206
     static let frameLossApplicationType: UInt32 = 6
     static let frameLossLengthInWordsMinusOne: UInt16 = 5
+    /// AVConference's public RTCP APP wire identifier for an LTR decode
+    /// acknowledgement. This is a network-order integer, not a fourcc.
+    static let ltrAcknowledgementApplicationType: UInt32 = 5
+    static let ltrAcknowledgementLengthInWordsMinusOne: UInt16 = 3
+}
+
+/// Apple's compound screen stream assigns ascending SSRCs from the base band.
+/// FIR targets that base source because all bands share one HEVC reference
+/// timeline. Frame-loss feedback still identifies the band that lost RTP.
+func appleMediaCompoundBaseSSRC(_ ssrcs: [UInt32]) -> UInt32? {
+    ssrcs.min()
 }
 
 /// Serialize frame-loss feedback as one 24-byte RTCP PSFB packet.
@@ -42,7 +53,7 @@ func appleMediaFrameLossPacket(
     appendUInt32BE(mediaSSRC, to: &packet)
     appendUInt32BE(AppleMediaResiliencyWire.frameLossApplicationType, to: &packet)
     appendUInt32BE(feedback.frameRTPTimestamp, to: &packet)
-    appendUInt16BE(feedback.receivedPacketCount, to: &packet)
+    appendUInt16BE(feedback.frameSequenceNumber, to: &packet)
     packet.append(feedback.framePacketCount)
     packet.append(feedback.lostPacketCount)
     return packet
@@ -65,6 +76,49 @@ func appleMediaFullIntraRequestPacket(
     packet.append(sequenceNumber)
     packet.append(contentsOf: [0, 0, 0])
     return packet
+}
+
+/// Serialize the native 16-byte RTCP APP acknowledgement emitted after an
+/// LTR-marked video access unit is accepted by the receiver.
+///
+/// Wire layout: `80 CC 00 03 [sender SSRC] 00 00 00 05 [RTP timestamp]`.
+func appleMediaLTRAcknowledgementPacket(
+    senderSSRC: UInt32,
+    rtpTimestamp: UInt32
+) -> Data {
+    var packet = Data(capacity: 16)
+    packet.append(0x80) // V=2, P=0, APP subtype=0
+    packet.append(0xcc) // PT=204, APP
+    appendUInt16BE(
+        AppleMediaResiliencyWire.ltrAcknowledgementLengthInWordsMinusOne,
+        to: &packet)
+    appendUInt32BE(senderSSRC, to: &packet)
+    appendUInt32BE(
+        AppleMediaResiliencyWire.ltrAcknowledgementApplicationType,
+        to: &packet)
+    appendUInt32BE(rtpTimestamp, to: &packet)
+    return packet
+}
+
+/// Append the minimal SDES packet emitted by AVConference to an ordinary
+/// receiver report. Its CNAME item is present with a zero-length value, making
+/// the SDES packet exactly 12 bytes. After the 14-byte SRTCP trailer, a
+/// 32-byte one-source RR plus this SDES is the native capture's distinctive
+/// 58-byte UDP control payload.
+func appleMediaReceiverReportCompound(
+    receiverReport: Data,
+    senderSSRC: UInt32
+) -> Data {
+    var compound = receiverReport
+    compound.append(0x81) // V=2, one SDES chunk
+    compound.append(0xca) // PT=202 (SDES)
+    appendUInt16BE(2, to: &compound) // 12 bytes total
+    appendUInt32BE(senderSSRC, to: &compound)
+    compound.append(1) // CNAME item
+    compound.append(0) // zero-length CNAME, matching AVConference
+    compound.append(0) // END
+    compound.append(0) // 32-bit padding
+    return compound
 }
 
 private func appendUInt16BE(_ value: UInt16, to data: inout Data) {
