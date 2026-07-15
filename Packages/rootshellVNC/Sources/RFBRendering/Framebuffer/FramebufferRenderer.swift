@@ -125,7 +125,7 @@ public final class FramebufferRenderer: @unchecked Sendable {
                 resizedWidth = rect.width
                 resizedHeight = rect.height
 
-            case .cursor:
+            case .cursor, .xCursor:
                 // Cosmetic: the local system pointer adopts this shape.
                 // Never fail the update over a malformed cursor payload.
                 if let update = RemoteCursorDecoder.decode(

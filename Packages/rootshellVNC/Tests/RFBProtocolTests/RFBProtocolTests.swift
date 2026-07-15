@@ -1185,6 +1185,7 @@ final class EncodingTests: XCTestCase {
 
     func testPseudoEncodingRawValues() {
         XCTAssertEqual(Encoding.cursor.rawValue, -239)
+        XCTAssertEqual(Encoding.xCursor.rawValue, -240)
         XCTAssertEqual(Encoding.lastRect.rawValue, -224)
         XCTAssertEqual(Encoding.desktopSize.rawValue, -223)
         XCTAssertEqual(Encoding.extendedDesktopSize.rawValue, -308)
@@ -1207,6 +1208,7 @@ final class EncodingTests: XCTestCase {
         XCTAssertEqual(Encoding(rawValue: 1), .copyRect)
         XCTAssertEqual(Encoding(rawValue: 16), .zrle)
         XCTAssertEqual(Encoding(rawValue: -239), .cursor)
+        XCTAssertEqual(Encoding(rawValue: -240), .xCursor)
         XCTAssertEqual(Encoding(rawValue: -224), .lastRect)
         XCTAssertEqual(Encoding(rawValue: 1002), .appleSubZlibThousands)
         XCTAssertEqual(Encoding(rawValue: 1010), .appleH264)
@@ -1225,6 +1227,7 @@ final class EncodingTests: XCTestCase {
         XCTAssertFalse(Encoding.raw.isPseudo)
         XCTAssertFalse(Encoding.zrle.isPseudo)
         XCTAssertTrue(Encoding.cursor.isPseudo)
+        XCTAssertTrue(Encoding.xCursor.isPseudo)
         XCTAssertTrue(Encoding.desktopSize.isPseudo)
         XCTAssertFalse(Encoding.appleH264.isPseudo)
         XCTAssertTrue(Encoding.encryptionInfo.isPseudo)
@@ -1233,7 +1236,7 @@ final class EncodingTests: XCTestCase {
     func testRoundTripThroughRawValue() {
         let allKnown: [Encoding] = [
             .raw, .copyRect, .rre, .hextile, .zlib, .tight, .zlibhex, .zrle,
-            .cursor, .desktopSize, .extendedDesktopSize,
+            .cursor, .xCursor, .desktopSize, .extendedDesktopSize,
             .appleJPEG, .apple1, .appleSubZlibThousands, .appleH264, .appleMultiVariantScreenshare,
             .encryptionInfo, .serverDisplayInfo, .mediaStreamOffer, .mediaStreamAnswer,
         ]

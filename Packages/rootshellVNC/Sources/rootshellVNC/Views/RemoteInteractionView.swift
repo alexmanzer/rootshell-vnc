@@ -1,6 +1,9 @@
 #if canImport(UIKit)
 import SwiftUI
 import UIKit
+#if targetEnvironment(macCatalyst)
+import AppKit
+#endif
 import RFBProtocol
 import RFBRendering
 import GameController
@@ -169,6 +172,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         target: self,
         action: #selector(handleHover(_:)))
     private lazy var pointerInteraction = UIPointerInteraction(delegate: self)
+    #if targetEnvironment(macCatalyst)
+    private var catalystCursor: NSCursor?
+    private var catalystCursorScale: CGFloat = 0
+    #endif
 
     override var keyCommands: [UIKeyCommand]? {
         guard keyboardCapture.isCaptured else { return viewerCommandKeyCommands }
@@ -433,7 +440,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         isMultipleTouchEnabled = true
         accessibilityLabel = String(localized: "Remote desktop input", bundle: .module)
         configureRecognizers()
+        #if !targetEnvironment(macCatalyst)
         addInteraction(pointerInteraction)
+        #endif
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(applicationWillResignActive),
@@ -550,7 +559,15 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
         if self.remoteCursor?.image !== remoteCursor?.image {
             self.remoteCursor = remoteCursor
+            #if targetEnvironment(macCatalyst)
+            catalystCursor = nil
+            catalystCursorScale = 0
+            if hoverRecognizer.state == .began || hoverRecognizer.state == .changed {
+                applyCatalystCursor()
+            }
+            #else
             pointerInteraction.invalidate()
+            #endif
         }
 
         let keyboardModeChanged = keyboardActive != softwareKeyboardRequested
@@ -1859,6 +1876,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     @objc private func handleHover(_ recognizer: UIHoverGestureRecognizer) {
+        #if targetEnvironment(macCatalyst)
+        if recognizer.state == .ended || recognizer.state == .cancelled {
+            NSCursor.arrow.set()
+            return
+        }
+        if recognizer.state == .began || recognizer.state == .changed {
+            applyCatalystCursor()
+        }
+        #endif
+
         guard !directScrollPhaseActive,
               !momentumScrollPhaseActive,
               !pointerDragActive,
@@ -1872,6 +1899,44 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         focusForHardwareKeyboard()
         touchHandler.handleMove(x: point.x, y: point.y)
     }
+
+    #if targetEnvironment(macCatalyst)
+    /// Catalyst uses the macOS cursor compositor. Feeding the remote bitmap to
+    /// NSCursor preserves the server-selected resize/I-beam/hand cursor, its
+    /// colors, and its hotspot; UIPointerShape is an iPad pointer-morphing API
+    /// and is not reliably applied to the Mac arrow.
+    private func applyCatalystCursor() {
+        guard let remoteCursor,
+              framebufferSize.width > 0,
+              let frame = viewport.displayedFrame(
+                viewSize: bounds.size,
+                framebufferSize: framebufferSize),
+              frame.width > 0 else {
+            NSCursor.arrow.set()
+            return
+        }
+
+        let scale = frame.width / framebufferSize.width
+        guard scale > 0 else {
+            NSCursor.arrow.set()
+            return
+        }
+
+        if catalystCursor == nil || abs(catalystCursorScale - scale) > 0.001 {
+            let image = UIImage(
+                cgImage: remoteCursor.image,
+                scale: 1 / scale,
+                orientation: .up)
+            catalystCursor = NSCursor(
+                image: image,
+                hotSpot: CGPoint(
+                    x: CGFloat(remoteCursor.hotspotX) * scale,
+                    y: CGFloat(remoteCursor.hotspotY) * scale))
+            catalystCursorScale = scale
+        }
+        catalystCursor?.set()
+    }
+    #endif
 
     func pointerInteraction(
         _ interaction: UIPointerInteraction,

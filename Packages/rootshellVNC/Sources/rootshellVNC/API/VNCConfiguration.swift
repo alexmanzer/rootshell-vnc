@@ -436,6 +436,11 @@ public struct VNCConfiguration: Sendable {
         if !encodings.contains(.cursor) {
             encodings.append(.cursor)
         }
+        // TightVNC 1.x commonly uses its older two-color XCursor path even
+        // though newer servers support the standard full-color Cursor shape.
+        if !encodings.contains(.xCursor) {
+            encodings.append(.xCursor)
+        }
 
         // Ensure raw is present as ultimate fallback
         if !encodings.contains(.raw) {

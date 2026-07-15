@@ -1074,6 +1074,7 @@ public actor TransportSession {
         append(.copyRect)
         append(.raw)
         append(.cursor)
+        append(.xCursor)
         append(.desktopSize)
         append(.extendedDesktopSize)
         return result
@@ -1442,6 +1443,18 @@ public actor TransportSession {
                 let pixelBytes = Int(rect.width) * Int(rect.height) * pixelFormat.bytesPerPixel
                 let maskBytes = Int((Int(rect.width) + 7) / 8) * Int(rect.height)
                 let totalBytes = pixelBytes + maskBytes
+                if totalBytes > 0 {
+                    pixelData = try await tcp.read(exactly: totalBytes)
+                } else {
+                    pixelData = Data()
+                }
+
+            case .xCursor:
+                // TightVNC XCursor: foreground/background RGB triplets,
+                // followed by one source bitmap and one visibility bitmap.
+                let rowBytes = (Int(rect.width) + 7) / 8
+                let bitmapBytes = rowBytes * Int(rect.height)
+                let totalBytes = bitmapBytes == 0 ? 0 : 6 + bitmapBytes * 2
                 if totalBytes > 0 {
                     pixelData = try await tcp.read(exactly: totalBytes)
                 } else {
@@ -2696,6 +2709,10 @@ public actor TransportSession {
                 let pixelBytes = Int(rect.width) * Int(rect.height) * pixelFormat.bytesPerPixel
                 let maskBytes = Int((Int(rect.width) + 7) / 8) * Int(rect.height)
                 pixelDataLength = pixelBytes + maskBytes
+            case .xCursor:
+                let rowBytes = (Int(rect.width) + 7) / 8
+                let bitmapBytes = rowBytes * Int(rect.height)
+                pixelDataLength = bitmapBytes == 0 ? 0 : 6 + bitmapBytes * 2
             default:
                 return false
             }

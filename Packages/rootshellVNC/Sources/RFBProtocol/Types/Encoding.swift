@@ -20,6 +20,8 @@ public enum Encoding: Sendable, Equatable, Hashable {
     // MARK: - Standard pseudo-encodings
 
     case cursor
+    /// TightVNC's two-color X-style cursor pseudo-encoding.
+    case xCursor
     case lastRect
     case desktopSize
     case extendedDesktopSize
@@ -57,6 +59,7 @@ public enum Encoding: Sendable, Equatable, Hashable {
         case .zlibhex:              return 8
         case .zrle:                 return 16
         case .cursor:               return -239
+        case .xCursor:              return -240
         case .lastRect:             return -224
         case .desktopSize:          return -223
         case .extendedDesktopSize:  return -308
@@ -85,6 +88,7 @@ public enum Encoding: Sendable, Equatable, Hashable {
         case 8:     self = .zlibhex
         case 16:    self = .zrle
         case -239:  self = .cursor
+        case -240:  self = .xCursor
         case -224:  self = .lastRect
         case -223:  self = .desktopSize
         case -308:  self = .extendedDesktopSize

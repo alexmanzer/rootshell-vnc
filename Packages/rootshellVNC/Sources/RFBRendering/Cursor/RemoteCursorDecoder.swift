@@ -41,6 +41,10 @@ public enum RemoteCursorDecoder {
         let height = Int(rect.height)
         guard width > 0, height > 0 else { return .hidden }
 
+        if rect.encoding == .xCursor {
+            return decodeXCursor(rect: rect, data: data)
+        }
+
         let bytesPerPixel = pixelFormat.bytesPerPixel
         guard bytesPerPixel == 4 else { return nil }
         let pixelBytes = width * height * bytesPerPixel
@@ -121,6 +125,82 @@ public enum RemoteCursorDecoder {
                 shouldInterpolate: false,
                 intent: .defaultIntent)
         else { return nil }
+
+        return .shape(RemoteCursor(
+            image: image,
+            hotspotX: Int(rect.x),
+            hotspotY: Int(rect.y),
+            shapePath: shapePath.copy() ?? shapePath))
+    }
+
+    /// Decode TightVNC's XCursor (-240) payload. Its first six bytes are
+    /// foreground/background RGB triplets; source and mask bitmaps follow.
+    private static func decodeXCursor(
+        rect: FramebufferRect,
+        data: Data
+    ) -> RemoteCursorUpdate? {
+        let width = Int(rect.width)
+        let height = Int(rect.height)
+        let rowBytes = (width + 7) / 8
+        let bitmapBytes = rowBytes * height
+        guard data.count >= 6 + bitmapBytes * 2 else { return nil }
+
+        let foreground = (data[0], data[1], data[2])
+        let background = (data[3], data[4], data[5])
+        let sourceOffset = 6
+        let maskOffset = sourceOffset + bitmapBytes
+        var rgba = [UInt8](repeating: 0, count: width * height * 4)
+        let shapePath = CGMutablePath()
+
+        for y in 0..<height {
+            var runStart: Int?
+            func closeRun(at endX: Int) {
+                guard let start = runStart else { return }
+                runStart = nil
+                shapePath.addRect(CGRect(
+                    x: start - Int(rect.x),
+                    y: y - Int(rect.y),
+                    width: endX - start,
+                    height: 1))
+            }
+
+            for x in 0..<width {
+                let byteIndex = y * rowBytes + x / 8
+                let bit: UInt8 = 0x80 >> UInt8(x % 8)
+                let visible = data[maskOffset + byteIndex] & bit != 0
+                let usesForeground = data[sourceOffset + byteIndex] & bit != 0
+                let color = usesForeground ? foreground : background
+                let output = (y * width + x) * 4
+                rgba[output] = color.0
+                rgba[output + 1] = color.1
+                rgba[output + 2] = color.2
+                rgba[output + 3] = visible ? 0xFF : 0x00
+
+                if visible {
+                    if runStart == nil { runStart = x }
+                } else {
+                    closeRun(at: x)
+                }
+            }
+            closeRun(at: width)
+        }
+
+        guard !shapePath.isEmpty,
+              let provider = CGDataProvider(data: Data(rgba) as CFData),
+              let image = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(
+                    rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent)
+        else { return shapePath.isEmpty ? .hidden : nil }
 
         return .shape(RemoteCursor(
             image: image,

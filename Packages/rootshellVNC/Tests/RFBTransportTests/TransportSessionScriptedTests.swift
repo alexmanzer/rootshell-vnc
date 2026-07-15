@@ -33,7 +33,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expected.append(0x01) // ClientInit, immediately after the version.
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         expected.append(ClientMessage.setEncodings([
-            .copyRect, .raw, .zrle, .zlib, .cursor,
+            .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
             .desktopSize, .extendedDesktopSize,
         ]).serialize())
         expected.append(ClientMessage.framebufferUpdateRequest(
@@ -113,7 +113,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expected.append(0x01) // ClientInit, with no intervening result.
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         expected.append(ClientMessage.setEncodings([
-            .copyRect, .raw, .zrle, .zlib, .cursor,
+            .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
             .desktopSize, .extendedDesktopSize,
         ]).serialize())
         expected.append(ClientMessage.framebufferUpdateRequest(
@@ -158,7 +158,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expected.append(0x01) // ClientInit follows SecurityResult.
         expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
         expected.append(ClientMessage.setEncodings([
-            .copyRect, .raw, .zrle, .zlib, .cursor,
+            .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
             .desktopSize, .extendedDesktopSize,
         ]).serialize())
         expected.append(ClientMessage.framebufferUpdateRequest(
@@ -197,7 +197,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         expectedClientBytes.append(
             ClientMessage.setPixelFormat(.bgra8888).serialize())
         expectedClientBytes.append(ClientMessage.setEncodings([
-            .copyRect, .raw, .zrle, .zlib, .cursor,
+            .copyRect, .raw, .zrle, .zlib, .cursor, .xCursor,
             .desktopSize, .extendedDesktopSize,
         ]).serialize())
         expectedClientBytes.append(ClientMessage.framebufferUpdateRequest(

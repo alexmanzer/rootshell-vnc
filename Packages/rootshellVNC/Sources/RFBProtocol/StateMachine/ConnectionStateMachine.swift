@@ -43,7 +43,7 @@ public struct ConnectionStateMachine: Sendable {
         // configuration so tests and callers can choose their own risk profile.
         .copyRect, .raw,
         // Pseudo-encodings (informational, server-initiated).
-        .cursor, .desktopSize, .extendedDesktopSize,
+        .cursor, .xCursor, .desktopSize, .extendedDesktopSize,
         .encryptionInfo, .serverDisplayInfo,
         .mediaStreamOffer, .mediaStreamAnswer,
     ]

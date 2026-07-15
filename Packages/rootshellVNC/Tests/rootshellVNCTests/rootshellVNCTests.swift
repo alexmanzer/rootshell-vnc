@@ -5,6 +5,37 @@ import CoreVideo
 import RFBProtocol
 @testable import RFBRendering
 
+final class TightVNCCursorTests: XCTestCase {
+    func testDecodesXCursorShapeAndHotspot() throws {
+        let rect = FramebufferRect(
+            x: 1, y: 0, width: 8, height: 1, encoding: .xCursor)
+        // Foreground RGB, background RGB, source bits, visibility bits.
+        let payload = Data([255, 255, 255, 0, 0, 0, 0x80, 0xC0])
+
+        let update = try XCTUnwrap(RemoteCursorDecoder.decode(
+            rect: rect, data: payload, pixelFormat: .bgra8888))
+        guard case .shape(let cursor) = update else {
+            return XCTFail("Expected a visible XCursor shape")
+        }
+
+        XCTAssertEqual(cursor.width, 8)
+        XCTAssertEqual(cursor.height, 1)
+        XCTAssertEqual(cursor.hotspotX, 1)
+        XCTAssertEqual(cursor.hotspotY, 0)
+        XCTAssertEqual(cursor.shapePath.boundingBoxOfPath, CGRect(
+            x: -1, y: 0, width: 2, height: 1))
+    }
+
+    func testRejectsTruncatedXCursorPayload() {
+        let rect = FramebufferRect(
+            x: 0, y: 0, width: 8, height: 1, encoding: .xCursor)
+        XCTAssertNil(RemoteCursorDecoder.decode(
+            rect: rect,
+            data: Data([255, 255, 255, 0, 0, 0, 0x80]),
+            pixelFormat: .bgra8888))
+    }
+}
+
 final class StandardFramebufferPipelineTests: XCTestCase {
     func testAppleDCTBaseWaitsForEveryRefinementBand() {
         var tracker = AppleDCTRefinementTracker()
@@ -342,6 +373,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(effective.contains(.desktopSize))
         XCTAssertTrue(effective.contains(.extendedDesktopSize))
         XCTAssertTrue(effective.contains(.cursor))
+        XCTAssertTrue(effective.contains(.xCursor))
         XCTAssertTrue(effective.contains(.raw))
     }
 
@@ -359,6 +391,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(effective.contains(.desktopSize))
         XCTAssertTrue(effective.contains(.extendedDesktopSize))
         XCTAssertTrue(effective.contains(.cursor))
+        XCTAssertTrue(effective.contains(.xCursor))
         XCTAssertTrue(effective.contains(.raw))
     }
 
