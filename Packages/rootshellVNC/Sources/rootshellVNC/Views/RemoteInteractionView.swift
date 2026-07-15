@@ -1976,7 +1976,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
     private func logInputRoute(_ message: String) {
         #if DEBUG
-        guard inputLogBudget > 0 else { return }
+        guard VNCDiagnostics.isEnabled("ROOTSHELL_VNC_TRACE_INPUT"),
+              inputLogBudget > 0 else { return }
         inputLogBudget -= 1
         inputLog.info(message)
         #endif

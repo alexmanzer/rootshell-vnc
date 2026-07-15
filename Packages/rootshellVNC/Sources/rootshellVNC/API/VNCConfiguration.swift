@@ -270,8 +270,9 @@ public struct VNCConfiguration: Sendable {
 
     /// Whether to enable protocol tracing for debugging.
     ///
-    /// When `true`, all protocol messages are recorded with timestamps.
-    /// This is always enabled in DEBUG builds regardless of this setting.
+    /// When `true`, protocol message metadata is recorded with timestamps.
+    /// Debug builds may also include bounded raw-byte prefixes; tracing is
+    /// disabled by default in every build configuration.
     public var enableProtocolTrace: Bool
 
     /// Automatic retry behavior after an established TCP connection is lost.

@@ -226,6 +226,7 @@ struct ContentView: View {
     /// Debug/testing hook: auto-connect from environment variables so the app
     /// can be launched headlessly in the simulator against a test server.
     private func autoConnectIfRequested() async {
+        #if DEBUG
         guard case .idle = session.connectionState else { return }
         let env = ProcessInfo.processInfo.environment
         guard let host = env["VNC_AUTOCONNECT_HOST"], !host.isEmpty else { return }
@@ -236,6 +237,7 @@ struct ContentView: View {
             username: env["VNC_AUTOCONNECT_USER"].flatMap { $0.isEmpty ? nil : $0 }
         )
         try? await session.connect(credentials: credentials)
+        #endif
     }
 }
 

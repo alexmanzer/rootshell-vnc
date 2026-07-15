@@ -46,27 +46,27 @@ public struct VNCLogger: Sendable {
 
     /// Log at trace level (most verbose, for detailed protocol dumps).
     public func trace(_ message: String) {
-        logger.trace("\(message, privacy: .public)")
+        logger.trace("\(message, privacy: .private)")
     }
 
     /// Log at debug level (developer diagnostics).
     public func debug(_ message: String) {
-        logger.debug("\(message, privacy: .public)")
+        logger.debug("\(message, privacy: .private)")
     }
 
     /// Log at info level (general informational messages).
     public func info(_ message: String) {
-        logger.info("\(message, privacy: .public)")
+        logger.info("\(message, privacy: .private)")
     }
 
     /// Log at warning level (unexpected but recoverable conditions).
     public func warning(_ message: String) {
-        logger.warning("\(message, privacy: .public)")
+        logger.warning("\(message, privacy: .private)")
     }
 
     /// Log at error level (failures that affect operation).
     public func error(_ message: String) {
-        logger.error("\(message, privacy: .public)")
+        logger.error("\(message, privacy: .private)")
     }
 
     // MARK: - Hex dump (DEBUG builds only)
@@ -75,12 +75,13 @@ public struct VNCLogger: Sendable {
     /// In release builds this is a no-op.
     public func hexDump(_ label: String, data: Data, maxBytes: Int = 64) {
         #if DEBUG
+        guard VNCDiagnostics.isEnabled("ROOTSHELL_VNC_TRACE_PROTOCOL_BYTES") else { return }
         let count = min(data.count, maxBytes)
         let slice = data.prefix(count)
         let hex = slice.map { String(format: "%02x", $0) }.joined(separator: " ")
         let suffix = data.count > maxBytes ? " ... (\(data.count) bytes total)" : ""
         let msg = "\(label): \(hex)\(suffix)"
-        logger.debug("\(msg, privacy: .public)")
+        logger.debug("\(msg, privacy: .private)")
         #endif
     }
 }

@@ -4,7 +4,6 @@ import CoreVideo
 import CoreMedia
 import CoreImage
 import RFBProtocol
-import os
 
 /// Errors that can occur during HEVC decoding.
 public enum HEVCDecoderError: Error, Sendable, LocalizedError {
@@ -214,8 +213,10 @@ public final class HEVCDecoder: @unchecked Sendable {
                 let callbacks = refCon.assumingMemoryBound(to: CallbackBundle.self).pointee
 
                 if status != noErr {
-                    if ProcessInfo.processInfo.environment["ROOTSHELL_VNC_TRACE_DECODE"] == "1" {
-                        print("VT callback: status=\(status) flags=\(infoFlags.rawValue) hasImage=\(imageBuffer != nil)")
+                    if VNCDiagnostics.isEnabled("ROOTSHELL_VNC_TRACE_DECODE") {
+                        VNCLogger(category: "HEVCDecoder").debug(
+                            "VT callback: status=\(status) flags=\(infoFlags.rawValue) "
+                                + "hasImage=\(imageBuffer != nil)")
                     }
                     callbacks.failure?(status, presentationTimeStamp, tag)
                     return
@@ -279,10 +280,15 @@ public final class HEVCDecoder: @unchecked Sendable {
             valueOut: &raw)
         let hardware = propertyStatus == noErr ? raw as? Bool : nil
         let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
-        Logger(subsystem: "com.rootshell.vnc", category: "HEVCDecoder").notice(
-            "VT session: \(dims.width, privacy: .public)x\(dims.height, privacy: .public) hardwareAccelerated=\(hardware.map(String.init) ?? "unknown", privacy: .public) requestedOutput=native convertedOutput=BGRA")
-        if ProcessInfo.processInfo.environment["ROOTSHELL_VNC_TRACE_DECODE"] == "1" {
-            print("VT session: \(dims.width)x\(dims.height) hardwareAccelerated=\(hardware.map(String.init) ?? "unknown") requestedOutput=native convertedOutput=BGRA")
+        VNCLogger(category: "HEVCDecoder").info(
+            "VT session: \(dims.width)x\(dims.height) "
+                + "hardwareAccelerated=\(hardware.map(String.init) ?? "unknown") "
+                + "requestedOutput=native convertedOutput=BGRA")
+        if VNCDiagnostics.isEnabled("ROOTSHELL_VNC_TRACE_DECODE") {
+            VNCLogger(category: "HEVCDecoder").debug(
+                "VT session: \(dims.width)x\(dims.height) "
+                    + "hardwareAccelerated=\(hardware.map(String.init) ?? "unknown") "
+                    + "requestedOutput=native convertedOutput=BGRA")
         }
     }
 

@@ -362,7 +362,7 @@ public struct ConnectionView: View {
                     try LastConnectionCredentialStore.save(credentials)
                 } catch {
                     logger.error(
-                        "Could not save last connection in Keychain: \(error.localizedDescription, privacy: .public)")
+                        "Could not save last connection in Keychain: \(error.localizedDescription, privacy: .private)")
                 }
             } catch is CancellationError {
                 isConnecting = false
@@ -384,7 +384,7 @@ public struct ConnectionView: View {
             password = credentials.password
         } catch {
             logger.error(
-                "Could not restore last connection from Keychain: \(error.localizedDescription, privacy: .public)")
+                "Could not restore last connection from Keychain: \(error.localizedDescription, privacy: .private)")
         }
     }
 

@@ -500,11 +500,22 @@ public actor TransportSession {
         let environment = ProcessInfo.processInfo.environment
         self.runtimeEnvironment = environment
         self.appleMediaTilesPerFrameOverride = appleMediaTilesPerFrameOverride
-        self.appleMediaDecodedRTPDumpPath = environment["ROOTSHELL_VNC_DUMP_DECODED_RTP"]
+        #if DEBUG
+        self.appleMediaDecodedRTPDumpPath = VNCDiagnostics.value(
+            for: "ROOTSHELL_VNC_DUMP_DECODED_RTP", environment: environment)
         self.appleMediaDecodedRTPDumpIncludesTimestamps =
-            environment["ROOTSHELL_VNC_DUMP_RTP_TIMED"] == "1"
-        self.appleMediaUDPDatagramDumpPath = environment["ROOTSHELL_VNC_DUMP_MEDIA_UDP"]
-        self.appleMediaOutgoingRTCPDumpPath = environment["ROOTSHELL_VNC_DUMP_OUTGOING_RTCP"]
+            VNCDiagnostics.isEnabled(
+                "ROOTSHELL_VNC_DUMP_RTP_TIMED", environment: environment)
+        self.appleMediaUDPDatagramDumpPath = VNCDiagnostics.value(
+            for: "ROOTSHELL_VNC_DUMP_MEDIA_UDP", environment: environment)
+        self.appleMediaOutgoingRTCPDumpPath = VNCDiagnostics.value(
+            for: "ROOTSHELL_VNC_DUMP_OUTGOING_RTCP", environment: environment)
+        #else
+        self.appleMediaDecodedRTPDumpPath = nil
+        self.appleMediaDecodedRTPDumpIncludesTimestamps = false
+        self.appleMediaUDPDatagramDumpPath = nil
+        self.appleMediaOutgoingRTCPDumpPath = nil
+        #endif
         self.rctlEnabled = environment["ROOTSHELL_VNC_DISABLE_RCTL"] != "1"
         self.rateControlEnabled = !preferFullQualityVideo
             && environment["ROOTSHELL_VNC_DISABLE_RATE_CONTROL"] != "1"
@@ -2447,13 +2458,22 @@ public actor TransportSession {
     }
 
     private nonisolated func traceAppleMediaClientPayload(label: String, payload: Data) {
-        guard runtimeEnvironment["ROOTSHELL_VNC_TRACE_APPLE_MEDIA_SEND"] == "1" else { return }
-        print("Apple media send: \(label) payloadLength=\(payload.count) prefix=\(hexDump(payload.prefix(96)))")
+        guard VNCDiagnostics.isEnabled(
+            "ROOTSHELL_VNC_TRACE_APPLE_MEDIA_SEND",
+            environment: runtimeEnvironment) else { return }
+        VNCLogger(category: "AppleMediaTrace").debug(
+            "Apple media send: \(label) payloadLength=\(payload.count) "
+                + "prefix=\(hexDump(payload.prefix(96)))")
     }
 
     private nonisolated func traceAppleMediaClientFrame(label: String, payload: Data, framed: Data) {
-        guard runtimeEnvironment["ROOTSHELL_VNC_TRACE_APPLE_MEDIA_SEND"] == "1" else { return }
-        print("Apple media send: \(label) payloadLength=\(payload.count) frameLength=\(framed.count) payloadPrefix=\(hexDump(payload.prefix(96))) framePrefix=\(hexDump(framed.prefix(96)))")
+        guard VNCDiagnostics.isEnabled(
+            "ROOTSHELL_VNC_TRACE_APPLE_MEDIA_SEND",
+            environment: runtimeEnvironment) else { return }
+        VNCLogger(category: "AppleMediaTrace").debug(
+            "Apple media send: \(label) payloadLength=\(payload.count) "
+                + "frameLength=\(framed.count) payloadPrefix=\(hexDump(payload.prefix(96))) "
+                + "framePrefix=\(hexDump(framed.prefix(96)))")
     }
 
     private nonisolated func hexDump(_ data: some Collection<UInt8>) -> String {
@@ -2842,31 +2862,21 @@ public actor TransportSession {
     }
 
     private nonisolated func dumpAppleMediaTCPChunkIfRequested(_ chunk: Data) {
-        guard let path = runtimeEnvironment["ROOTSHELL_VNC_DUMP_MEDIA_TCP"] else {
-            return
-        }
-        if FileManager.default.fileExists(atPath: path),
-           let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: chunk)
-            try? handle.close()
-        } else {
-            try? chunk.write(to: URL(fileURLWithPath: path))
-        }
+        #if DEBUG
+        guard let path = VNCDiagnostics.value(
+            for: "ROOTSHELL_VNC_DUMP_MEDIA_TCP",
+            environment: runtimeEnvironment) else { return }
+        appendPrivateDiagnosticData(chunk, to: path)
+        #endif
     }
 
     private nonisolated func dumpAppleMediaPlaintextIfRequested(_ payload: Data) {
-        guard let path = runtimeEnvironment["ROOTSHELL_VNC_DUMP_MEDIA_PLAINTEXT"] else {
-            return
-        }
-        if FileManager.default.fileExists(atPath: path),
-           let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: payload)
-            try? handle.close()
-        } else {
-            try? payload.write(to: URL(fileURLWithPath: path))
-        }
+        #if DEBUG
+        guard let path = VNCDiagnostics.value(
+            for: "ROOTSHELL_VNC_DUMP_MEDIA_PLAINTEXT",
+            environment: runtimeEnvironment) else { return }
+        appendPrivateDiagnosticData(payload, to: path)
+        #endif
     }
 
     /// Append each decrypted server control record to a file, length-framed
@@ -2874,18 +2884,13 @@ public actor TransportSession {
     /// split back out. Use to capture the exact server->client media-config
     /// records (0x451/0x455/0x456 and the AVC media message) from a real server.
     private nonisolated func dumpAppleMediaServerRecordIfRequested(_ payload: Data) {
-        guard let path = runtimeEnvironment["ROOTSHELL_VNC_DUMP_SERVER_RECORDS"] else {
-            return
-        }
+        #if DEBUG
+        guard let path = VNCDiagnostics.value(
+            for: "ROOTSHELL_VNC_DUMP_SERVER_RECORDS",
+            environment: runtimeEnvironment) else { return }
         let framed = appleMediaDumpFrame(direction: 0x53 /* 'S' */, payload: payload)
-        if FileManager.default.fileExists(atPath: path),
-           let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: framed)
-            try? handle.close()
-        } else {
-            try? framed.write(to: URL(fileURLWithPath: path))
-        }
+        appendPrivateDiagnosticData(framed, to: path)
+        #endif
     }
 
     /// Frame a dumped media record: [dir:1][monotonic ns:8 BE][len:4 BE][payload].
@@ -2909,18 +2914,13 @@ public actor TransportSession {
     /// to a file, length-framed, so the full bidirectional media negotiation
     /// order can be reconstructed alongside the server-record dump.
     private nonisolated func dumpAppleMediaClientRecordIfRequested(_ payload: Data) {
-        guard let path = runtimeEnvironment["ROOTSHELL_VNC_DUMP_CLIENT_RECORDS"] else {
-            return
-        }
+        #if DEBUG
+        guard let path = VNCDiagnostics.value(
+            for: "ROOTSHELL_VNC_DUMP_CLIENT_RECORDS",
+            environment: runtimeEnvironment) else { return }
         let framed = appleMediaDumpFrame(direction: 0x43 /* 'C' */, payload: payload)
-        if FileManager.default.fileExists(atPath: path),
-           let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: framed)
-            try? handle.close()
-        } else {
-            try? framed.write(to: URL(fileURLWithPath: path))
-        }
+        appendPrivateDiagnosticData(framed, to: path)
+        #endif
     }
 
     private func tryAppleMediaBlockStreamDecrypt(
@@ -4255,22 +4255,18 @@ public actor TransportSession {
     }
 
     private nonisolated func dumpAppleMediaOutgoingRTCPIfRequested(plaintext: Data, protected: Data) {
+        #if DEBUG
         guard let path = appleMediaOutgoingRTCPDumpPath else { return }
         let line = "RTCP plaintext=\(plaintext.map { String(format: "%02x", $0) }.joined()) "
             + "protected=\(protected.map { String(format: "%02x", $0) }.joined())\n"
         if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: path),
-               let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
-                _ = try? handle.seekToEnd()
-                try? handle.write(contentsOf: data)
-                try? handle.close()
-            } else {
-                try? data.write(to: URL(fileURLWithPath: path))
-            }
+            appendPrivateDiagnosticData(data, to: path)
         }
+        #endif
     }
 
     private nonisolated func dumpAppleMediaDecodedRTPIfRequested(_ packet: Data) {
+        #if DEBUG
         guard let path = appleMediaDecodedRTPDumpPath else { return }
         var framed = Data()
         // Optional 8-byte big-endian nanosecond timestamp prefix for bitrate-over-
@@ -4284,14 +4280,8 @@ public actor TransportSession {
         framed.append(UInt8((packet.count >> 8) & 0xFF))
         framed.append(UInt8(packet.count & 0xFF))
         framed.append(packet)
-        if FileManager.default.fileExists(atPath: path),
-           let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: framed)
-            try? handle.close()
-        } else {
-            try? framed.write(to: URL(fileURLWithPath: path))
-        }
+        appendPrivateDiagnosticData(framed, to: path)
+        #endif
     }
 
     private func handleAppleMediaUDPDatagram(
@@ -5334,30 +5324,63 @@ public actor TransportSession {
     }
 
     private nonisolated func dumpAppleMediaSRTPKeysIfRequested(_ keys: [Data]) {
-        guard let path = runtimeEnvironment["ROOTSHELL_VNC_DUMP_SRTP_KEYS"] else { return }
+        #if DEBUG
+        guard let path = VNCDiagnostics.value(
+            for: "ROOTSHELL_VNC_DUMP_SRTP_KEYS",
+            environment: runtimeEnvironment) else { return }
         var blob = Data()
         for key in keys {
             blob.append(UInt8(key.count))
             blob.append(key)
         }
-        try? blob.write(to: URL(fileURLWithPath: path))
+        writePrivateDiagnosticData(blob, to: path)
+        #endif
     }
 
     private nonisolated func dumpAppleMediaUDPDatagramIfRequested(_ datagram: Data) {
+        #if DEBUG
         guard let path = appleMediaUDPDatagramDumpPath else { return }
         var framed = Data()
         framed.append(UInt8((datagram.count >> 8) & 0xFF))
         framed.append(UInt8(datagram.count & 0xFF))
         framed.append(datagram)
-        if FileManager.default.fileExists(atPath: path),
-           let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: framed)
-            try? handle.close()
-        } else {
-            try? framed.write(to: URL(fileURLWithPath: path))
-        }
+        appendPrivateDiagnosticData(framed, to: path)
+        #endif
     }
+
+    #if DEBUG
+    private nonisolated func appendPrivateDiagnosticData(_ data: Data, to path: String) {
+        let fileManager = FileManager.default
+        if !fileManager.fileExists(atPath: path) {
+            guard fileManager.createFile(
+                atPath: path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]) else { return }
+        }
+        guard let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) else {
+            return
+        }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: data)
+        try? handle.close()
+    }
+
+    private nonisolated func writePrivateDiagnosticData(_ data: Data, to path: String) {
+        let fileManager = FileManager.default
+        if !fileManager.fileExists(atPath: path) {
+            guard fileManager.createFile(
+                atPath: path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]) else { return }
+        }
+        guard let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) else {
+            return
+        }
+        try? handle.truncate(atOffset: 0)
+        try? handle.write(contentsOf: data)
+        try? handle.close()
+    }
+    #endif
 
     private nonisolated func isAppleMediaRTCPPacket(_ data: Data) -> Bool {
         guard data.count >= 2 else { return false }

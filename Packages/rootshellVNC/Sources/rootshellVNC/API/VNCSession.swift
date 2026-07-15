@@ -497,13 +497,7 @@ public final class VNCSession {
         remoteAudioPlayer?.stop()
         remoteAudioPlayer = nil
 
-        let traceEnabled: Bool
-        #if DEBUG
-        traceEnabled = true
-        #else
-        traceEnabled = configuration.enableProtocolTrace
-        #endif
-        if traceEnabled {
+        if configuration.enableProtocolTrace {
             diagnostics.protocolTrace = ProtocolTrace()
         }
 
@@ -796,8 +790,9 @@ public final class VNCSession {
                 "ROOTSHELL_VNC_DISABLE_MATCH_CLIENT"] != "1" else { return nil }
         let size = RemoteDisplaySize.matching(viewSize: viewSize)
         if RenderCommitStats.shared != nil, let size {
-            print("DISPLAYREQ pixels=\(size.pixelWidth)x\(size.pixelHeight) "
-                + "points=\(size.pointWidth)x\(size.pointHeight)")
+            VNCLogger(category: "RenderStats").debug(
+                "DISPLAYREQ pixels=\(size.pixelWidth)x\(size.pixelHeight) "
+                    + "points=\(size.pointWidth)x\(size.pointHeight)")
         }
         return size
     }
@@ -917,7 +912,6 @@ public final class VNCSession {
             }
 
         case .clipboardText(let text):
-            logger.debug("Server clipboard: \(text.prefix(100))")
             if isTraceEnabled {
                 diagnostics.protocolTrace.recordReceived(
                     type: "ServerCutText",
@@ -1791,11 +1785,7 @@ public final class VNCSession {
     #endif
 
     private var isTraceEnabled: Bool {
-        #if DEBUG
-        return true
-        #else
-        return configuration.enableProtocolTrace
-        #endif
+        configuration.enableProtocolTrace
     }
 
     private func startVideoStream(offer: AppleMediaStreamOffer) async {
@@ -2412,7 +2402,8 @@ final class DiagnosticFrameDumper: @unchecked Sendable {
         do {
             try fileManager.createDirectory(
                 at: sessionDirectory,
-                withIntermediateDirectories: true)
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700])
         } catch {
             VNCLogger(category: "FrameCapture").warning(
                 "Could not create decoded-frame capture directory: \(error.localizedDescription)")
@@ -2424,11 +2415,14 @@ final class DiagnosticFrameDumper: @unchecked Sendable {
     }
 
     static func configuredRoot(environment: [String: String]) -> URL? {
-        guard let explicit = environment["ROOTSHELL_VNC_FRAME_OUT_DIR"],
-              !explicit.isEmpty else {
-            return nil
-        }
+        #if DEBUG
+        guard let explicit = VNCDiagnostics.value(
+            for: "ROOTSHELL_VNC_FRAME_OUT_DIR",
+            environment: environment) else { return nil }
         return URL(fileURLWithPath: explicit, isDirectory: true)
+        #else
+        nil
+        #endif
     }
 
     private init(dir: String) {
@@ -2436,6 +2430,7 @@ final class DiagnosticFrameDumper: @unchecked Sendable {
     }
 
     func maybeDump(_ pixelBuffer: CVPixelBuffer, ssrc: UInt32) {
+        #if DEBUG
         lock.lock()
         let n = perBandCounter[ssrc, default: 0]
         perBandCounter[ssrc] = n + 1
@@ -2450,6 +2445,10 @@ final class DiagnosticFrameDumper: @unchecked Sendable {
         let box = SendablePixelBuffer(pixelBuffer)
         let path = "\(dir)/gui_n\(n)_band\(ssrc & 0xffff).png"
         queue.async { [ciContext] in
+            guard FileManager.default.createFile(
+                atPath: path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]) else { return }
             let ci = CIImage(cvPixelBuffer: box.buffer)
             guard let cg = ciContext.createCGImage(ci, from: ci.extent),
                   let dest = CGImageDestinationCreateWithURL(
@@ -2457,6 +2456,7 @@ final class DiagnosticFrameDumper: @unchecked Sendable {
             CGImageDestinationAddImage(dest, cg, nil)
             CGImageDestinationFinalize(dest)
         }
+        #endif
     }
 }
 
@@ -2729,7 +2729,7 @@ struct AtomicBandFrameAccumulator<Value> {
 /// that headless probes cannot observe.
 final class RenderCommitStats: @unchecked Sendable {
     static let shared: RenderCommitStats? =
-        ProcessInfo.processInfo.environment["ROOTSHELL_VNC_RENDER_STATS"] == "1"
+        VNCDiagnostics.isEnabled("ROOTSHELL_VNC_RENDER_STATS")
             ? RenderCommitStats()
             : nil
 
@@ -2810,7 +2810,7 @@ final class RenderCommitStats: @unchecked Sendable {
             let idx = min(sorted.count - 1, Int(Double(sorted.count) * p))
             return Double(sorted[idx]) / 1_000_000
         }
-        print(String(
+        VNCLogger(category: "RenderStats").debug(String(
             format: "RSTAT t=%03d pkts=%d kB=%d sub=%d in=%d commits=%d (imm=%d fb=%d) bands=%d "
                 + "hop p50=%.1fms p95=%.1fms max=%.1fms "
                 + "setBands p50=%.2fms max=%.2fms",

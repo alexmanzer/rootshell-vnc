@@ -10,10 +10,16 @@ final class DiagnosticFrameDumperTests: XCTestCase {
     }
 
     func testDecodedFrameCaptureUsesExplicitDirectory() {
+        #if DEBUG
         XCTAssertEqual(
             DiagnosticFrameDumper.configuredRoot(environment: [
                 "ROOTSHELL_VNC_FRAME_OUT_DIR": "/tmp/rootshell-frame-capture",
             ])?.path,
             "/tmp/rootshell-frame-capture")
+        #else
+        XCTAssertNil(DiagnosticFrameDumper.configuredRoot(environment: [
+            "ROOTSHELL_VNC_FRAME_OUT_DIR": "/tmp/rootshell-frame-capture",
+        ]))
+        #endif
     }
 }
