@@ -204,7 +204,16 @@ public final class VNCSession {
     // MARK: - Observable State
 
     /// The current state of the VNC connection.
-    public var connectionState: VNCConnectionState = .idle
+    public var connectionState: VNCConnectionState = .idle {
+        didSet {
+            guard oldValue != connectionState else { return }
+            // Snapshot so an observer can remove itself while handling the
+            // transition without mutating the dictionary being iterated.
+            for observer in Array(connectionStateObservers.values) {
+                observer(connectionState)
+            }
+        }
+    }
 
     /// Human-readable description of the current connection-establishment
     /// phase (dialing, negotiating security, authenticating, …). `nil` once
@@ -265,6 +274,14 @@ public final class VNCSession {
     /// (the default) keeps the log-only behavior.
     @ObservationIgnored
     public var onServerClipboardText: ((String) -> Void)?
+
+    /// Internal multicast used by package features such as shared clipboard.
+    /// The public single callback above remains source-compatible for hosts
+    /// that already consume raw ServerCutText events themselves.
+    @ObservationIgnored
+    private var serverClipboardObservers: [UUID: (String) -> Void] = [:]
+    @ObservationIgnored
+    private var connectionStateObservers: [UUID: (VNCConnectionState) -> Void] = [:]
 
     /// While `true`, Match Client display-size requests are deferred instead
     /// of sent. Container apps set this when the hosting view is occluded
@@ -718,6 +735,30 @@ public final class VNCSession {
         enqueueInput(.clipboard(text))
     }
 
+    func addServerClipboardObserver(
+        _ observer: @escaping (String) -> Void
+    ) -> UUID {
+        let id = UUID()
+        serverClipboardObservers[id] = observer
+        return id
+    }
+
+    func removeServerClipboardObserver(_ id: UUID) {
+        serverClipboardObservers.removeValue(forKey: id)
+    }
+
+    func addConnectionStateObserver(
+        _ observer: @escaping (VNCConnectionState) -> Void
+    ) -> UUID {
+        let id = UUID()
+        connectionStateObservers[id] = observer
+        return id
+    }
+
+    func removeConnectionStateObserver(_ id: UUID) {
+        connectionStateObservers.removeValue(forKey: id)
+    }
+
     /// Debounce viewport/rotation changes and request a matching remote display
     /// when the user selected Match Client. The transport capability-gates both
     /// Apple's virtual-display command and standard RFB SetDesktopSize.
@@ -853,6 +894,11 @@ public final class VNCSession {
                 )
             }
             onServerClipboardText?(text)
+            // Snapshot the callbacks so observers may invalidate themselves
+            // safely while handling an event.
+            for observer in Array(serverClipboardObservers.values) {
+                observer(text)
+            }
 
         case .bell:
             logger.debug("Server bell")

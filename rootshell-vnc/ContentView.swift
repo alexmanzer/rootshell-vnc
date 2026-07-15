@@ -14,11 +14,19 @@ import UIKit
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
-    @State private var session = VNCSession()
+    @State private var session: VNCSession
+    @State private var clipboardSynchronizer: VNCClipboardSynchronizer
     @State private var isFullScreen = false
     #if os(iOS) && !targetEnvironment(macCatalyst)
     @State private var backgroundTimeExtension = BackgroundTimeExtension()
     #endif
+
+    init() {
+        let session = VNCSession()
+        self._session = State(initialValue: session)
+        self._clipboardSynchronizer = State(
+            initialValue: VNCClipboardSynchronizer(session: session))
+    }
 
     var body: some View {
         Group {
@@ -166,7 +174,8 @@ struct ContentView: View {
         RemoteDesktopView(
             session: session,
             isFullScreen: isFullScreen,
-            toggleFullScreen: toggleFullScreen)
+            toggleFullScreen: toggleFullScreen,
+            clipboardSynchronizer: clipboardSynchronizer)
             // RemoteDesktopView applies its own dock-aware keyboard inset.
             // Ignore the system regions here so SwiftUI does not reserve a
             // full keyboard-sized area for a detached iPad keyboard.

@@ -57,13 +57,15 @@ public struct RemoteDesktopView: View {
     private let toggleFullScreen: (() -> Void)?
     private let hudMenuExtras: AnyView?
     private let keyboardAvoidanceMode: VNCKeyboardAvoidanceMode
+    private let clipboardSynchronizer: VNCClipboardSynchronizer?
 
     public init(
         session: VNCSession,
         keyboardCapture: VNCKeyboardCapture? = nil,
         isFullScreen: Bool = false,
         toggleFullScreen: (() -> Void)? = nil,
-        keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic
+        keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
+        clipboardSynchronizer: VNCClipboardSynchronizer? = nil
     ) {
         self.init(
             session: session,
@@ -71,6 +73,7 @@ public struct RemoteDesktopView: View {
             isFullScreen: isFullScreen,
             toggleFullScreen: toggleFullScreen,
             keyboardAvoidanceMode: keyboardAvoidanceMode,
+            clipboardSynchronizer: clipboardSynchronizer,
             hudMenuExtras: nil)
     }
 
@@ -86,6 +89,7 @@ public struct RemoteDesktopView: View {
         isFullScreen: Bool = false,
         toggleFullScreen: (() -> Void)? = nil,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
+        clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
     ) {
         self.init(
@@ -94,6 +98,7 @@ public struct RemoteDesktopView: View {
             isFullScreen: isFullScreen,
             toggleFullScreen: toggleFullScreen,
             keyboardAvoidanceMode: keyboardAvoidanceMode,
+            clipboardSynchronizer: clipboardSynchronizer,
             hudMenuExtras: AnyView(hudMenuExtras()))
     }
 
@@ -103,6 +108,7 @@ public struct RemoteDesktopView: View {
         isFullScreen: Bool,
         toggleFullScreen: (() -> Void)?,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode,
+        clipboardSynchronizer: VNCClipboardSynchronizer?,
         hudMenuExtras: AnyView?
     ) {
         self.session = session
@@ -112,6 +118,7 @@ public struct RemoteDesktopView: View {
         self.isFullScreen = isFullScreen
         self.toggleFullScreen = toggleFullScreen
         self.keyboardAvoidanceMode = keyboardAvoidanceMode
+        self.clipboardSynchronizer = clipboardSynchronizer
         self.touchHandler = TouchInputHandler(
             sendPointerEvent: { [session] buttonMask, x, y in
                 session.sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
@@ -417,6 +424,10 @@ public struct RemoteDesktopView: View {
                 }
             }
 
+            if let clipboardSynchronizer {
+                VNCClipboardMenu(synchronizer: clipboardSynchronizer)
+            }
+
             if let hudMenuExtras {
                 hudMenuExtras
             }
@@ -624,6 +635,37 @@ public struct RemoteDesktopView: View {
             UInt16(min(CGFloat(UInt16.max), mapped.y + framebufferOrigin.y)))
     }
     #endif
+}
+
+/// Shared HUD submenu used by both the package demo and container apps.
+private struct VNCClipboardMenu: View {
+    @Bindable var synchronizer: VNCClipboardSynchronizer
+
+    var body: some View {
+        Menu {
+            Button {
+                synchronizer.getClipboard()
+            } label: {
+                Label("Get Clipboard", systemImage: "arrow.down.doc")
+            }
+            .disabled(!synchronizer.hasRemoteClipboard)
+
+            Button {
+                synchronizer.sendClipboard()
+            } label: {
+                Label("Send Clipboard", systemImage: "arrow.up.doc")
+            }
+            .disabled(!synchronizer.canSendClipboard)
+
+            Divider()
+
+            Toggle(isOn: $synchronizer.sharedClipboardEnabled) {
+                Label("Shared Clipboard", systemImage: "arrow.triangle.2.circlepath")
+            }
+        } label: {
+            Label("Clipboard", systemImage: "doc.on.clipboard")
+        }
+    }
 }
 
 #if canImport(UIKit)
