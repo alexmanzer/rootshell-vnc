@@ -4,8 +4,8 @@ import Security
 
 /// Decode the stable display records in Apple's DisplayInfo2 (encoding 1105).
 /// The payload includes its two-byte length prefix. Version 5 stores the
-/// display count at byte 20 and places each 56-byte record's UInt16 display ID
-/// at byte 40. Rectangles are `(minY, minX, maxY, maxX)`; the second rectangle
+/// display count at byte 20 and places each 56-byte record's UInt32 display ID
+/// at byte 38. Rectangles are `(minY, minX, maxY, maxX)`; the second rectangle
 /// is in framebuffer pixels and is therefore used for rendering and input.
 func appleDisplayInfo2Records(_ payload: Data) -> [AppleDisplayInfo] {
     guard payload.count >= 40 else { return [] }
@@ -14,20 +14,29 @@ func appleDisplayInfo2Records(_ payload: Data) -> [AppleDisplayInfo] {
         UInt16(payload[start + offset]) << 8
             | UInt16(payload[start + offset + 1])
     }
+    func uint32(at offset: Int) -> UInt32 {
+        UInt32(payload[start + offset]) << 24
+            | UInt32(payload[start + offset + 1]) << 16
+            | UInt32(payload[start + offset + 2]) << 8
+            | UInt32(payload[start + offset + 3])
+    }
     let count = Int(uint16(at: 20))
     guard count > 0, count <= 16 else { return [] }
 
     return (0..<count).compactMap { index in
-        let idOffset = 40 + index * 56
-        guard idOffset + 21 < payload.count else { return nil }
-        let id = UInt32(uint16(at: idOffset))
-        let minY = Int(uint16(at: idOffset + 10))
-        let minX = Int(uint16(at: idOffset + 12))
-        let maxY = Int(uint16(at: idOffset + 14))
-        let maxX = Int(uint16(at: idOffset + 16))
+        // The two-byte payload length precedes a 20-byte desktop header.
+        // Each 56-byte display record stores its UInt32 display ID at +16
+        // and its absolute pixel bounds at +28.
+        let recordOffset = 22 + index * 56
+        let boundsOffset = recordOffset + 28
+        guard recordOffset + 39 < payload.count else { return nil }
+        let id = uint32(at: recordOffset + 16)
+        let minY = Int(uint16(at: boundsOffset))
+        let minX = Int(uint16(at: boundsOffset + 2))
+        let maxY = Int(uint16(at: boundsOffset + 4))
+        let maxX = Int(uint16(at: boundsOffset + 6))
         guard maxX > minX, maxY > minY else { return nil }
-        let flags = UInt32(uint16(at: idOffset + 18)) << 16
-            | UInt32(uint16(at: idOffset + 20))
+        let flags = uint32(at: recordOffset + 36)
         return AppleDisplayInfo(
             displayIndex: id,
             originX: Int32(minX),
@@ -84,6 +93,45 @@ public enum SessionEvent: Sendable {
 
     /// The connection was closed.
     case disconnected
+}
+
+private struct AppleDCTCoverageRegion {
+    let minX: Int
+    let minY: Int
+    let maxX: Int
+    let maxY: Int
+
+    func subtracting(_ covered: AppleDCTCoverageRegion) -> [AppleDCTCoverageRegion] {
+        let intersectionMinX = max(minX, covered.minX)
+        let intersectionMinY = max(minY, covered.minY)
+        let intersectionMaxX = min(maxX, covered.maxX)
+        let intersectionMaxY = min(maxY, covered.maxY)
+        guard intersectionMinX < intersectionMaxX,
+              intersectionMinY < intersectionMaxY else { return [self] }
+
+        var remainder: [AppleDCTCoverageRegion] = []
+        if minY < intersectionMinY {
+            remainder.append(.init(
+                minX: minX, minY: minY,
+                maxX: maxX, maxY: intersectionMinY))
+        }
+        if intersectionMaxY < maxY {
+            remainder.append(.init(
+                minX: minX, minY: intersectionMaxY,
+                maxX: maxX, maxY: maxY))
+        }
+        if minX < intersectionMinX {
+            remainder.append(.init(
+                minX: minX, minY: intersectionMinY,
+                maxX: intersectionMinX, maxY: intersectionMaxY))
+        }
+        if intersectionMaxX < maxX {
+            remainder.append(.init(
+                minX: intersectionMaxX, minY: intersectionMinY,
+                maxX: maxX, maxY: intersectionMaxY))
+        }
+        return remainder
+    }
 }
 
 /// How a client-sized remote display request was handled by the transport.
@@ -205,13 +253,15 @@ public actor TransportSession {
     /// Whether this connection negotiated Apple's adaptive DCT encoding.
     private let appleDCTRequested: Bool
     private let appleClassicAutoUpdateRequested: Bool
-    /// A control-only quantization update commonly precedes the initial DCT
-    /// image. Keep requesting a complete reference until that image arrives;
-    /// refinements and cache references are only valid after this boundary.
-    private var awaitingAppleDCTInitialReference: Bool
+    /// A full-screen type-2 quantization update commonly precedes the initial
+    /// DCT image. Treat that control rectangle, or complete type-0 coverage,
+    /// as the handoff from the full type-3 request to the type-9 stream.
+    private var awaitingAppleDCTBootstrap: Bool
+    private var appleDCTInitialUncoveredRegions: [AppleDCTCoverageRegion] = []
     private var pendingAppleDCTAutoUpdateActivation = false
-    private var appleDCTAutoUpdateActive = false
-    private var appleDCTAutoUpdateRefreshTask: Task<Void, Never>?
+    private var pendingAppleClassicAutoUpdateActivation = false
+    private var appleAutoUpdateActive = false
+    private var appleAutoUpdateRefreshTask: Task<Void, Never>?
     /// Auto-update delivery still retains exactly one decode credit. Pausing
     /// socket reads at this boundary applies TCP backpressure to the encoder,
     /// which both bounds stale-frame latency and gives the server an honest
@@ -555,7 +605,7 @@ public actor TransportSession {
         self.requestedAppleMediaStream = configuredEncodings.contains(.appleH264)
         self.appleDCTRequested = shouldUseAppleDCT
         self.appleClassicAutoUpdateRequested = shouldUseAppleClassicAutoUpdate
-        self.awaitingAppleDCTInitialReference = shouldUseAppleDCT
+        self.awaitingAppleDCTBootstrap = shouldUseAppleDCT
 
         var cont: AsyncStream<SessionEvent>.Continuation!
         self.events = AsyncStream<SessionEvent> { continuation in
@@ -796,12 +846,12 @@ public actor TransportSession {
 
     /// Request a framebuffer update from the server.
     public func requestFramebufferUpdate(incremental: Bool) async throws {
-        if appleDCTAutoUpdateActive {
+        if appleAutoUpdateActive {
             // A type-3 request competes with the active type-9 subscription and
             // can make the server enqueue a second reference frame. Renewing
             // the subscription requests current geometry without creating a
             // parallel polling loop.
-            try await sendAppleDCTAutoFrameUpdate()
+            try await sendAppleAutoFrameUpdate()
             return
         }
         let msg = ClientMessage.framebufferUpdateRequest(
@@ -826,21 +876,43 @@ public actor TransportSession {
 
         if pendingAppleDCTAutoUpdateActivation {
             pendingAppleDCTAutoUpdateActivation = false
-            appleDCTAutoUpdateActive = true
             deferredUpdateRequest = false
-            try await sendAppleDCTAutoFrameUpdate()
-            startAppleDCTAutoUpdateRefreshTask()
+            appleAutoUpdateActive = true
+            do {
+                try await sendAppleAutoFrameUpdate()
+            } catch {
+                appleAutoUpdateActive = false
+                pendingAppleDCTAutoUpdateActivation = true
+                throw error
+            }
+            startAppleAutoUpdateRefreshTask()
             log.info("Enabled Apple DCT adaptive auto updates")
             return
         }
 
-        if appleDCTAutoUpdateActive {
+        if pendingAppleClassicAutoUpdateActivation {
+            pendingAppleClassicAutoUpdateActivation = false
+            deferredUpdateRequest = false
+            appleAutoUpdateActive = true
+            do {
+                try await sendAppleAutoFrameUpdate()
+            } catch {
+                appleAutoUpdateActive = false
+                pendingAppleClassicAutoUpdateActivation = true
+                throw error
+            }
+            startAppleAutoUpdateRefreshTask()
+            log.info("Enabled Apple classic auto updates")
+            return
+        }
+
+        if appleAutoUpdateActive {
             deferredUpdateRequest = false
             return
         }
 
         if appleDCTRequested,
-           awaitingAppleDCTInitialReference,
+           awaitingAppleDCTBootstrap,
            stateMachine.negotiatedVersion?.isApple == true {
             deferredUpdateRequest = false
             try await requestFramebufferUpdate(incremental: false)
@@ -911,8 +983,8 @@ public actor TransportSession {
         terminalDisconnectHandled = true
         readTask?.cancel()
         readTask = nil
-        appleDCTAutoUpdateRefreshTask?.cancel()
-        appleDCTAutoUpdateRefreshTask = nil
+        appleAutoUpdateRefreshTask?.cancel()
+        appleAutoUpdateRefreshTask = nil
         framebufferCreditWaiter?.resume()
         framebufferCreditWaiter = nil
         appleMediaGenerationSink = nil
@@ -1203,6 +1275,7 @@ public actor TransportSession {
 
         self.fbWidth = width
         self.fbHeight = height
+        resetAppleDCTBootstrapCoverage()
         activeAppleMediaTilesPerFrame = selectedAppleMediaTilesPerFrame(
             pixelWidth: Int(width), pixelHeight: Int(height))
         self.pixelFormat = pf
@@ -1306,8 +1379,8 @@ public actor TransportSession {
         guard !isDisconnecting, !terminalDisconnectHandled else { return }
         terminalDisconnectHandled = true
         readTask?.cancel()
-        appleDCTAutoUpdateRefreshTask?.cancel()
-        appleDCTAutoUpdateRefreshTask = nil
+        appleAutoUpdateRefreshTask?.cancel()
+        appleAutoUpdateRefreshTask = nil
         framebufferCreditWaiter?.resume()
         framebufferCreditWaiter = nil
         _ = stateMachine.handle(event: .connectionLost(error))
@@ -1498,10 +1571,14 @@ public actor TransportSession {
                 if length > 0 {
                     payload.append(try await tcp.read(exactly: length))
                 }
-                for info in appleDisplayInfo2Records(payload) {
+                let displayInfos = appleDisplayInfo2Records(payload)
+                for info in displayInfos {
                     continuation?.yield(.displayInfo(info))
+                }
+                if let firstDisplay = displayInfos.first {
                     try await sendAppleStandardDisplaySelectionIfNeeded(
-                        displayID: info.displayIndex)
+                        displayID: firstDisplay.displayIndex,
+                        announcedDisplayCount: displayInfos.count)
                 }
                 pixelData = payload
 
@@ -1532,38 +1609,28 @@ public actor TransportSession {
         if appleClassicAutoUpdateRequested,
                   !appleDCTRequested,
                   stateMachine.negotiatedVersion?.isApple == true,
-                  !appleDCTAutoUpdateActive,
+                  !appleAutoUpdateActive,
                   receivedPortableFullFrame {
-            pendingAppleDCTAutoUpdateActivation = true
+            pendingAppleClassicAutoUpdateActivation = true
             log.debug("Received initial portable framebuffer for adaptive updates")
         }
 
-        // SetDisplay is independent of DCT stream activation in Apple's
-        // native client and Screens. A complete base in that same update is
-        // sufficient bootstrap; type 9 then requests the selected display's
-        // continuing stream.
-        if appleDCTRequested,
-           stateMachine.negotiatedVersion?.isApple == true,
-           !appleDCTAutoUpdateActive,
-           rectsWithData.contains(where: { rect, payload in
-               rect.encoding == .appleMultiVariantScreenshare
-                   && payload.count >= 5
-                   && payload[payload.startIndex + 4] == 0
-                   && rect.x == 0 && rect.y == 0
-                   && rect.width >= fbWidth && rect.height >= fbHeight
-           }) {
-            awaitingAppleDCTInitialReference = false
-            pendingAppleDCTAutoUpdateActivation = true
-            log.debug("Received complete initial Apple DCT reference image")
-        }
+        recordAppleDCTBootstrapCoverage(from: rectsWithData)
 
         let now = DispatchTime.now().uptimeNanoseconds
         if framebufferRequestSentNanos != 0 {
             let milliseconds = (now &- framebufferRequestSentNanos) / 1_000_000
             if milliseconds >= 100 {
                 let payloadBytes = rectsWithData.reduce(0) { $0 + $1.1.count }
-                let encodings = rectsWithData.map { String(describing: $0.0.encoding) }
-                    .joined(separator: ",")
+                let encodings = rectsWithData.map { rect, payload in
+                    var description = String(describing: rect.encoding)
+                    if rect.encoding == .appleMultiVariantScreenshare,
+                       payload.count >= 5 {
+                        description += "(type=\(payload[payload.startIndex + 4]) "
+                            + "\(rect.x),\(rect.y) \(rect.width)x\(rect.height))"
+                    }
+                    return description
+                }.joined(separator: ",")
                 log.info(
                     "Framebuffer server/network wait=\(milliseconds)ms "
                         + "rects=\(rectsWithData.count) payload=\(payloadBytes)B "
@@ -1599,7 +1666,9 @@ public actor TransportSession {
             try await executeAction(action)
         }
 
-        if appleDCTAutoUpdateActive || pendingAppleDCTAutoUpdateActivation {
+        if appleAutoUpdateActive
+            || pendingAppleDCTAutoUpdateActivation
+            || pendingAppleClassicAutoUpdateActivation {
             await waitForFramebufferCreditIfNeeded()
         }
     }
@@ -2153,25 +2222,77 @@ public actor TransportSession {
     }
 
     private func sendAppleStandardDisplaySelectionIfNeeded(
-        displayID: UInt32
+        displayID: UInt32,
+        announcedDisplayCount: Int? = nil
     ) async throws {
         guard !requestAppleMediaStream,
               requestedDisplayCount == 1,
               !sentAppleMediaInitialSetDisplay else { return }
         sentAppleMediaInitialSetDisplay = true
+        if announcedDisplayCount == 1 {
+            // Screens leaves activeDisplay unset when the server announces a
+            // sole display. Forcing SetDisplay here resets AppleVNCServer's
+            // caches while it is satisfying the initial full-frame request,
+            // which can leave it returning DisplayInfo2 indefinitely.
+            log.info("Using Apple server default for sole announced display ID \(displayID)")
+            return
+        }
+        resetAppleDCTBootstrapCoverage()
         // A non-global SetDisplay requires the server's real display ID. Zero
         // is not a portable synonym for the main monitor; the server validates
         // this UInt32 against its active display list.
         try await sendClientPayload(appleSetDisplayMessage(
             isGlobal: false,
             displayID: displayID))
+        log.info("Selected Apple display ID \(displayID)")
+    }
+
+    private func resetAppleDCTBootstrapCoverage() {
+        guard appleDCTRequested, fbWidth > 0, fbHeight > 0 else { return }
+        awaitingAppleDCTBootstrap = true
+        pendingAppleDCTAutoUpdateActivation = false
+        appleDCTInitialUncoveredRegions = [AppleDCTCoverageRegion(
+            minX: 0,
+            minY: 0,
+            maxX: Int(fbWidth),
+            maxY: Int(fbHeight))]
+    }
+
+    private func recordAppleDCTBootstrapCoverage(
+        from rectsWithData: [(FramebufferRect, Data)]
+    ) {
+        guard appleDCTRequested,
+              stateMachine.negotiatedVersion?.isApple == true,
+              awaitingAppleDCTBootstrap else { return }
+        if appleDCTInitialUncoveredRegions.isEmpty {
+            resetAppleDCTBootstrapCoverage()
+        }
+
+        for (rect, payload) in rectsWithData where
+            rect.encoding == .appleMultiVariantScreenshare
+                && payload.count >= 5
+                && (payload[payload.startIndex + 4] == 0
+                    || payload[payload.startIndex + 4] == 2) {
+            let covered = AppleDCTCoverageRegion(
+                minX: min(Int(rect.x), Int(fbWidth)),
+                minY: min(Int(rect.y), Int(fbHeight)),
+                maxX: min(Int(rect.x) + Int(rect.width), Int(fbWidth)),
+                maxY: min(Int(rect.y) + Int(rect.height), Int(fbHeight)))
+            appleDCTInitialUncoveredRegions = appleDCTInitialUncoveredRegions
+                .flatMap { $0.subtracting(covered) }
+        }
+
+        guard appleDCTInitialUncoveredRegions.isEmpty else { return }
+        awaitingAppleDCTBootstrap = false
+        pendingAppleDCTAutoUpdateActivation = true
+        log.debug("Received complete Apple DCT bootstrap coverage")
     }
 
     private func appleSetDisplayMessage(isGlobal: Bool, displayID: UInt32) -> Data {
         var data = Data(count: 8)
         data[0] = 0x0d
         data[1] = isGlobal ? 1 : 0
-        writeUInt32BE(displayID, into: &data, at: 4)
+        writeUInt32BE(isGlobal ? UInt32.max : displayID, into: &data, at: 4)
         return data
     }
 
@@ -2185,8 +2306,8 @@ public actor TransportSession {
         try await sendAppleEncryptedClientPayload(appleAutoFrameUpdateMessage(intervalMilliseconds: interval))
     }
 
-    private func sendAppleDCTAutoFrameUpdate() async throws {
-        guard appleClassicAutoUpdateRequested,
+    private func sendAppleAutoFrameUpdate() async throws {
+        guard appleDCTRequested || appleClassicAutoUpdateRequested,
               stateMachine.negotiatedVersion?.isApple == true else { return }
         try await sendClientPayload(
             appleAutoFrameUpdateMessage(
@@ -2194,32 +2315,32 @@ public actor TransportSession {
         framebufferRequestSentNanos = DispatchTime.now().uptimeNanoseconds
     }
 
-    private func startAppleDCTAutoUpdateRefreshTask() {
-        guard appleDCTAutoUpdateRefreshTask == nil else { return }
-        appleDCTAutoUpdateRefreshTask = Task { [weak self] in
+    private func startAppleAutoUpdateRefreshTask() {
+        guard appleAutoUpdateRefreshTask == nil else { return }
+        appleAutoUpdateRefreshTask = Task { [weak self] in
             while !Task.isCancelled {
                 do {
                     try await Task.sleep(for: .seconds(10))
                     guard !Task.isCancelled, let self else { return }
-                    try await self.refreshAppleDCTAutoUpdate()
+                    try await self.refreshAppleAutoUpdate()
                 } catch is CancellationError {
                     return
                 } catch {
                     guard let self else { return }
-                    await self.logAppleDCTAutoUpdateRefreshFailure(error)
+                    await self.logAppleAutoUpdateRefreshFailure(error)
                 }
             }
         }
     }
 
-    private func refreshAppleDCTAutoUpdate() async throws {
-        guard appleDCTAutoUpdateActive, !isDisconnecting else { return }
-        try await sendAppleDCTAutoFrameUpdate()
+    private func refreshAppleAutoUpdate() async throws {
+        guard appleAutoUpdateActive, !isDisconnecting else { return }
+        try await sendAppleAutoFrameUpdate()
     }
 
-    private func logAppleDCTAutoUpdateRefreshFailure(_ error: Error) {
+    private func logAppleAutoUpdateRefreshFailure(_ error: Error) {
         log.warning(
-            "Failed to renew Apple DCT auto updates: "
+            "Failed to renew Apple auto updates: "
                 + error.localizedDescription)
     }
 
@@ -2256,8 +2377,12 @@ public actor TransportSession {
         fbHeight = height
         log.info("Framebuffer resized \(oldWidth)x\(oldHeight) -> \(width)x\(height)")
 
-        if appleDCTAutoUpdateActive {
-            try await sendAppleDCTAutoFrameUpdate()
+        if awaitingAppleDCTBootstrap {
+            resetAppleDCTBootstrapCoverage()
+        }
+
+        if appleAutoUpdateActive {
+            try await sendAppleAutoFrameUpdate()
             log.debug("Updated Apple DCT frame subscription to \(width)x\(height)")
         }
 

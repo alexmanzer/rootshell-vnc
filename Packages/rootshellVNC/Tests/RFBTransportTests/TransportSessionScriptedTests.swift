@@ -289,19 +289,33 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
-    func testAppleStandardOneDisplayActivatesAutoUpdatesForEitherInitialRectangleOrder() async throws {
+    func testAppleStandardOneDisplayActivatesAutoUpdatesAfterEitherInitialRectangleOrder() async throws {
         let width: UInt16 = 2
         let height: UInt16 = 1
-        let displayID: UInt32 = 7
+        let displayID: UInt32 = 0x1234_0007
 
-        var displayInfo = Data()
-        for value in [displayID, 0, 0, UInt32(width), UInt32(height), 1] {
-            displayInfo.append(Self.uint32Bytes(value))
+        var displayInfo = Data(repeating: 0, count: 78)
+        func write16(_ value: UInt16, at offset: Int) {
+            displayInfo[offset] = UInt8(value >> 8)
+            displayInfo[offset + 1] = UInt8(value & 0xff)
         }
+        func write32(_ value: UInt32, at offset: Int) {
+            displayInfo[offset] = UInt8(value >> 24)
+            displayInfo[offset + 1] = UInt8((value >> 16) & 0xff)
+            displayInfo[offset + 2] = UInt8((value >> 8) & 0xff)
+            displayInfo[offset + 3] = UInt8(value & 0xff)
+        }
+        write16(76, at: 0)
+        write16(1, at: 20)
+        write32(displayID, at: 38)
+        write16(0, at: 50)
+        write16(0, at: 52)
+        write16(height, at: 54)
+        write16(width, at: 56)
         let displayRect = (
             Self.rectangleHeader(
                 x: 0, y: 0, width: 0, height: 0,
-                encoding: Encoding.serverDisplayInfo.rawValue),
+                encoding: 1105),
             displayInfo
         )
         let dctBaseRect = (
@@ -310,14 +324,13 @@ final class TransportSessionScriptedTests: XCTestCase {
                 encoding: Encoding.appleMultiVariantScreenshare.rawValue),
             Data([0, 0, 0, 1, 0])
         )
-        let setDisplay = Data([
-            0x0d, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, UInt8(displayID),
-        ])
+        var setDisplay = Data([0x0d, 0x00, 0x00, 0x00])
+        setDisplay.append(Self.uint32Bytes(displayID))
         let fullRequest = ClientMessage.framebufferUpdateRequest(
             incremental: false,
             x: 0, y: 0, width: width, height: height
         ).serialize()
+        let setEncodings = ClientMessage.setEncodings(Self.appleDCTEncodings).serialize()
         let autoUpdate = ClientMessage.appleAutoFramebufferUpdate(
             intervalMilliseconds: 0,
             x: 0, y: 0, width: width, height: height
@@ -357,7 +370,7 @@ final class TransportSessionScriptedTests: XCTestCase {
 
             let enabledAutoUpdates = await Self.waitUntil {
                 let sent = await connection.sentBytes()
-                return sent.suffix(autoUpdate.count) == autoUpdate
+                return Self.occurrenceCount(of: autoUpdate, in: sent) == 1
             }
             XCTAssertTrue(enabledAutoUpdates, ordering)
             let receivedUpdate = await updateTask.value
@@ -365,13 +378,13 @@ final class TransportSessionScriptedTests: XCTestCase {
 
             let sent = await connection.sentBytes()
             XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 1, ordering)
-            XCTAssertEqual(Self.occurrenceCount(of: setDisplay, in: sent), 1, ordering)
+            XCTAssertEqual(Self.occurrenceCount(of: setDisplay, in: sent), 0, ordering)
             XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 1, ordering)
-            if let fullRange = sent.range(of: fullRequest),
-               let displayRange = sent.range(of: setDisplay),
+            if let encodingsRange = sent.range(of: setEncodings),
+               let fullRange = sent.range(of: fullRequest),
                let autoRange = sent.range(of: autoUpdate) {
-                XCTAssertLessThan(fullRange.lowerBound, displayRange.lowerBound, ordering)
-                XCTAssertLessThan(displayRange.lowerBound, autoRange.lowerBound, ordering)
+                XCTAssertLessThan(encodingsRange.lowerBound, fullRange.lowerBound, ordering)
+                XCTAssertLessThan(fullRange.lowerBound, autoRange.lowerBound, ordering)
             } else {
                 XCTFail("Missing expected Apple bootstrap message: \(ordering)")
             }
@@ -379,7 +392,141 @@ final class TransportSessionScriptedTests: XCTestCase {
         }
     }
 
-    func testAppleStandardOneDisplayRetriesFullRequestUntilDCTBaseArrives() async throws {
+    func testAppleStandardSoleDisplayAnnouncementDoesNotResetBootstrapSelection() async throws {
+        let connection = ScriptedRFBConnection()
+        let width: UInt16 = 2
+        let height: UInt16 = 1
+
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: width, height: height, name: "apple-scripted"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: Self.appleDCTEncodings,
+            displayCount: 1,
+            connection: connection)
+        let updateTask = Task {
+            var updateCount = 0
+            for await event in session.events {
+                guard case .framebufferUpdate = event else { continue }
+                updateCount += 1
+                try? await session.finishFramebufferUpdate()
+                if updateCount == 2 { return updateCount }
+            }
+            return updateCount
+        }
+
+        try await session.connect()
+
+        var displayInfo = Data(repeating: 0, count: 78)
+        func write16(_ value: UInt16, at offset: Int) {
+            displayInfo[offset] = UInt8(value >> 8)
+            displayInfo[offset + 1] = UInt8(value & 0xff)
+        }
+        func write32(_ value: UInt32, at offset: Int) {
+            displayInfo[offset] = UInt8(value >> 24)
+            displayInfo[offset + 1] = UInt8((value >> 16) & 0xff)
+            displayInfo[offset + 2] = UInt8((value >> 8) & 0xff)
+            displayInfo[offset + 3] = UInt8(value & 0xff)
+        }
+        write16(76, at: 0)
+        write16(1, at: 20)
+        write32(3, at: 38)
+        write16(height, at: 54)
+        write16(width, at: 56)
+        await connection.enqueueServerBytes(Self.framebufferUpdate([
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: 0, height: 0,
+                    encoding: 1105),
+                displayInfo
+            ),
+        ]))
+
+        let fullRequest = ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+        let retriedBootstrap = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return Self.occurrenceCount(of: fullRequest, in: sent) == 2
+        }
+        XCTAssertTrue(retriedBootstrap)
+        var sent = await connection.sentBytes()
+        var setDisplay = Data([0x0d, 0x00, 0x00, 0x00])
+        setDisplay.append(Self.uint32Bytes(3))
+        XCTAssertEqual(Self.occurrenceCount(of: setDisplay, in: sent), 0)
+
+        var dctControl = Data([0, 0, 0, 129, 2])
+        dctControl.append(Data(repeating: 0, count: 128))
+        await connection.enqueueServerBytes(Self.framebufferUpdate([
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: width, height: height,
+                    encoding: Encoding.appleMultiVariantScreenshare.rawValue),
+                dctControl
+            ),
+        ]))
+
+        let autoUpdate = ClientMessage.appleAutoFramebufferUpdate(
+            intervalMilliseconds: 0,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+        let enabledAutoUpdates = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return Self.occurrenceCount(of: autoUpdate, in: sent) == 1
+        }
+        XCTAssertTrue(enabledAutoUpdates)
+        let updateCount = await updateTask.value
+        XCTAssertEqual(updateCount, 2)
+
+        sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 2)
+        XCTAssertEqual(Self.occurrenceCount(of: setDisplay, in: sent), 0)
+        XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 1)
+        await session.disconnect()
+    }
+
+    func testAppleDCTConfigurationUsesType3ForConventionalServer() async throws {
+        let connection = ScriptedRFBConnection()
+        let width: UInt16 = 2
+        let height: UInt16 = 1
+        var script = ProtocolVersion.v3_8.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: width, height: height, name: "portable-server"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: Self.appleDCTEncodings,
+            connection: connection)
+        try await session.connect()
+
+        let fullRequest = ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+        let autoUpdate = ClientMessage.appleAutoFramebufferUpdate(
+            intervalMilliseconds: 0,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 0)
+        await session.disconnect()
+    }
+
+    func testAppleStandardOneDisplayActivatesAutoUpdatesAfterFullDCTControlBootstrap() async throws {
         let connection = ScriptedRFBConnection()
         let width: UInt16 = 2
         let height: UInt16 = 1
@@ -394,6 +541,8 @@ final class TransportSessionScriptedTests: XCTestCase {
         script.append(contentsOf: [0, 0, 0, 0])
         script.append(Self.serverInitMessage(
             width: width, height: height, name: "apple-scripted"))
+        var dctControl = Data([0, 0, 0, 129, 2])
+        dctControl.append(Data(repeating: 0, count: 128))
         script.append(Self.framebufferUpdate([
             (
                 Self.rectangleHeader(
@@ -405,8 +554,9 @@ final class TransportSessionScriptedTests: XCTestCase {
                 Self.rectangleHeader(
                     x: 0, y: 0, width: width, height: height,
                     encoding: Encoding.appleMultiVariantScreenshare.rawValue),
-                // Type 2 updates quantization state but is not a reference image.
-                Data([0, 0, 0, 1, 2])
+                // Type 2 installs two quantization tables. Apple sends this
+                // full-screen control rectangle before type-9 image delivery.
+                dctControl
             ),
         ]))
         await connection.enqueueServerBytes(script)
@@ -439,13 +589,13 @@ final class TransportSessionScriptedTests: XCTestCase {
             intervalMilliseconds: 0,
             x: 0, y: 0, width: width, height: height
         ).serialize()
-        let requestedDCTBase = await Self.waitUntil {
+        let enabledAutoUpdates = await Self.waitUntil {
             let sent = await connection.sentBytes()
-            return Self.occurrenceCount(of: fullRequest, in: sent) == 2
+            return Self.occurrenceCount(of: autoUpdate, in: sent) == 1
         }
-        XCTAssertTrue(requestedDCTBase)
+        XCTAssertTrue(enabledAutoUpdates)
         var sent = await connection.sentBytes()
-        XCTAssertNil(sent.range(of: autoUpdate))
+        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 1)
 
         await connection.enqueueServerBytes(Self.framebufferUpdate([
             (
@@ -456,14 +606,87 @@ final class TransportSessionScriptedTests: XCTestCase {
             ),
         ]))
 
-        let enabledAutoUpdates = await Self.waitUntil {
-            let sent = await connection.sentBytes()
-            return sent.suffix(autoUpdate.count) == autoUpdate
-        }
-        XCTAssertTrue(enabledAutoUpdates)
         let updateCount = await updateTask.value
         XCTAssertEqual(updateCount, 2)
 
+        sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 1)
+        await session.disconnect()
+    }
+
+    func testAppleStandardAccumulatesPartialDCTBaseCoverageBeforeAutoUpdates() async throws {
+        let connection = ScriptedRFBConnection()
+        let width: UInt16 = 4
+        let height: UInt16 = 1
+
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: width, height: height, name: "apple-partial-base"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: Self.appleDCTEncodings,
+            displayCount: 2,
+            connection: connection)
+        let updateTask = Task {
+            var updateCount = 0
+            for await event in session.events {
+                guard case .framebufferUpdate = event else { continue }
+                updateCount += 1
+                try? await session.finishFramebufferUpdate()
+                if updateCount == 2 { return updateCount }
+            }
+            return updateCount
+        }
+        try await session.connect()
+
+        let fullRequest = ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+        let autoUpdate = ClientMessage.appleAutoFramebufferUpdate(
+            intervalMilliseconds: 0,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+        await connection.enqueueServerBytes(Self.framebufferUpdate([
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: 2, height: height,
+                    encoding: Encoding.appleMultiVariantScreenshare.rawValue),
+                Data([0, 0, 0, 1, 0])
+            ),
+        ]))
+
+        let requestedRemainder = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return Self.occurrenceCount(of: fullRequest, in: sent) == 2
+        }
+        XCTAssertTrue(requestedRemainder)
+        var sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 0)
+
+        await connection.enqueueServerBytes(Self.framebufferUpdate([
+            (
+                Self.rectangleHeader(
+                    x: 2, y: 0, width: 2, height: height,
+                    encoding: Encoding.appleMultiVariantScreenshare.rawValue),
+                Data([0, 0, 0, 1, 0])
+            ),
+        ]))
+
+        let updateCount = await updateTask.value
+        XCTAssertEqual(updateCount, 2)
+        let enabledAutoUpdates = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return Self.occurrenceCount(of: autoUpdate, in: sent) == 1
+        }
+        XCTAssertTrue(enabledAutoUpdates)
         sent = await connection.sentBytes()
         XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 2)
         XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 1)
@@ -515,8 +738,12 @@ final class TransportSessionScriptedTests: XCTestCase {
 
         let globalSetDisplay = Data([
             0x0d, 0x01, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff,
         ])
+        let fullRequest = ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
         let autoUpdate = ClientMessage.appleAutoFramebufferUpdate(
             intervalMilliseconds: 0,
             x: 0, y: 0, width: width, height: height
@@ -529,6 +756,83 @@ final class TransportSessionScriptedTests: XCTestCase {
         XCTAssertTrue(enabledAutoUpdates)
         let receivedUpdate = await updateTask.value
         XCTAssertTrue(receivedUpdate)
+
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 1)
+        if let displayRange = sent.range(of: globalSetDisplay),
+           let fullRange = sent.range(of: fullRequest),
+           let autoRange = sent.range(of: autoUpdate) {
+            XCTAssertLessThan(displayRange.lowerBound, fullRange.lowerBound)
+            XCTAssertLessThan(fullRange.lowerBound, autoRange.lowerBound)
+        } else {
+            XCTFail("Missing combined-display Apple bootstrap message")
+        }
+
+        await session.disconnect()
+    }
+
+    func testAppleClassicPortableFrameStillActivatesAutoUpdatesAfterFullFrame() async throws {
+        let connection = ScriptedRFBConnection()
+        let width: UInt16 = 2
+        let height: UInt16 = 1
+        let encodings: [Encoding] = [.unknown(1105), .unknown(1104), .raw]
+
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: width, height: height, name: "apple-portable"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: encodings,
+            displayCount: 1,
+            connection: connection)
+        try await session.connect()
+
+        let fullRequest = ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+        let autoUpdate = ClientMessage.appleAutoFramebufferUpdate(
+            intervalMilliseconds: 0,
+            x: 0, y: 0, width: width, height: height
+        ).serialize()
+        var sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 0)
+
+        let updateTask = Task {
+            for await event in session.events {
+                guard case .framebufferUpdate = event else { continue }
+                try? await session.finishFramebufferUpdate()
+                return true
+            }
+            return false
+        }
+        await connection.enqueueServerBytes(Self.framebufferUpdate([
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: width, height: height,
+                    encoding: Encoding.raw.rawValue),
+                Data(repeating: 0, count: Int(width) * Int(height) * 4)
+            ),
+        ]))
+
+        let receivedUpdate = await updateTask.value
+        XCTAssertTrue(receivedUpdate)
+        let enabledAutoUpdates = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return Self.occurrenceCount(of: autoUpdate, in: sent) == 1
+        }
+        XCTAssertTrue(enabledAutoUpdates)
+        sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 1)
 
         await session.disconnect()
     }
