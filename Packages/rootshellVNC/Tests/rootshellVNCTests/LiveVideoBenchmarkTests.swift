@@ -70,11 +70,13 @@ final class LiveVideoBenchmarkTests: XCTestCase {
                         continue
                     }
                     bench.streamStarted = true
+                    let tileCount = await session.currentAppleMediaTilesPerFrame
                     manager.startStream(
                         streamID: offer.streamID,
                         width: 2976,
                         height: 1860,
-                        numberOfTiles: Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
+                        usesDecodingOrderNumbers: tileCount > 1,
+                        numberOfTiles: tileCount
                     ) { _, ssrc in
                         bench.recordDecodedFrame(ssrc: ssrc)
                     }

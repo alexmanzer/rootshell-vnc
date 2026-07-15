@@ -147,6 +147,10 @@ public actor TransportSession {
     private let port: UInt16
     private let password: String
     private let username: String?
+    /// Optional reconnect-time profile choice. A server that declines the
+    /// conventional one-picture profile is retried with its native compound
+    /// capability without changing the application-wide negotiation policy.
+    private let appleMediaTilesPerFrameOverride: UInt64?
     private let certificateValidationHandler: VNCCertificateValidationHandler?
     /// Environment-backed diagnostics and experiment switches are launch-time
     /// configuration. Materializing ProcessInfo.environment copies and bridges
@@ -173,6 +177,11 @@ public actor TransportSession {
     /// Physical or virtual screen geometry announced by Apple's encrypted
     /// DisplayInfo2 control record, in the server's display order.
     private var appleMediaDisplayInfos: [AppleDisplayInfo] = []
+    /// Largest aggregate capture surface observed before or during display
+    /// reconfiguration. Keep the physical-display workload after a virtual
+    /// display replaces DisplayInfo2: attached displays still influence which
+    /// one-picture profile the server can encode reliably.
+    private var appleMediaMaximumObservedLumaSamples = 0
     /// Per-SSRC packet jitter buffer. UDP reordering is repaired here before an
     /// HEVC fragmentation unit reaches the decoder.
     private var appleMediaRTPReorderBuffer = AppleMediaRTPReorderBuffer()
@@ -287,8 +296,10 @@ public actor TransportSession {
     /// Video SSRCs seen on the media path and the channel each arrived on, so
     /// keyframe requests go back on the right connected socket.
     private var appleMediaVideoSSRCChannels: [UInt32: PosixUDPChannel] = [:]
-    /// Native primes each new video generation with one RR + empty-CNAME SDES
-    /// compound packet before its 20 Hz RCTL stream.
+    /// Native primes each new compound-video generation with one RR +
+    /// empty-CNAME SDES report for every dependent tile source. The base source
+    /// is covered by RCTL; the other three SSRCs need their own reception
+    /// bootstrap before the encoder starts ordinary inter prediction.
     private var appleMediaSentBootstrapVideoReceiverReport = false
     /// Apple carries tile-subframe completion in its RTP media-control
     /// extension rather than the ordinary RTP marker bit.
@@ -478,12 +489,14 @@ public actor TransportSession {
         targetFrameRate: Int = 60,
         displayCount: Int = 1,
         requestsVirtualDisplays: Bool = false,
+        appleMediaTilesPerFrameOverride: UInt64? = nil,
         connection: (any RFBConnection)? = nil,
         securityPolicy: VNCSecurityPolicy = .automatic,
         certificateValidationHandler: VNCCertificateValidationHandler? = nil
     ) {
         let environment = ProcessInfo.processInfo.environment
         self.runtimeEnvironment = environment
+        self.appleMediaTilesPerFrameOverride = appleMediaTilesPerFrameOverride
         self.appleMediaDecodedRTPDumpPath = environment["ROOTSHELL_VNC_DUMP_DECODED_RTP"]
         self.appleMediaDecodedRTPDumpIncludesTimestamps =
             environment["ROOTSHELL_VNC_DUMP_RTP_TIMED"] == "1"
@@ -1138,9 +1151,8 @@ public actor TransportSession {
 
         self.fbWidth = width
         self.fbHeight = height
-        activeAppleMediaTilesPerFrame = AppleMediaVideoMode.activeTileCount(
-            pixelWidth: Int(width),
-            pixelHeight: Int(height))
+        activeAppleMediaTilesPerFrame = selectedAppleMediaTilesPerFrame(
+            pixelWidth: Int(width), pixelHeight: Int(height))
         self.pixelFormat = pf
 
         log.info("ServerInit: \(width)x\(height) '\(name)'")
@@ -1942,6 +1954,24 @@ public actor TransportSession {
             let displays = appleDisplayInfo2Records(control.body)
             if !displays.isEmpty {
                 appleMediaDisplayInfos = displays
+                let aggregateLumaSamples = displays.reduce(into: 0) { total, display in
+                    let width = Int(display.width)
+                    let height = Int(display.height)
+                    guard width > 0, height > 0,
+                          width <= Int.max / height,
+                          total <= Int.max - width * height else {
+                        total = Int.max
+                        return
+                    }
+                    total += width * height
+                }
+                appleMediaMaximumObservedLumaSamples = max(
+                    appleMediaMaximumObservedLumaSamples,
+                    aggregateLumaSamples)
+                let first = displays[0]
+                activeAppleMediaTilesPerFrame = selectedAppleMediaTilesPerFrame(
+                    pixelWidth: Int(first.width),
+                    pixelHeight: Int(first.height))
                 appleMediaDisplayCount = requestsVirtualDisplays
                         && lastSentRemoteDisplaySize != nil
                     ? min(requestedDisplayCount, displays.count)
@@ -1952,7 +1982,10 @@ public actor TransportSession {
                 log.info(
                     "Apple media DisplayInfo2 announced \(displays.count) screens: "
                         + displays.map { "\($0.width)x\($0.height)" }
-                            .joined(separator: ", "))
+                            .joined(separator: ", ")
+                        + "; captureLuma=\(aggregateLumaSamples) "
+                        + "maxObservedLuma=\(appleMediaMaximumObservedLumaSamples) "
+                        + "tiles=\(activeAppleMediaTilesPerFrame)")
             }
         } else if control.encoding == 0x455 {
             try await sendAppleMediaInitialSetDisplayIfNeeded()
@@ -2186,7 +2219,7 @@ public actor TransportSession {
         // Keep decoder packetization aligned with the negotiated mode-7 wire
         // profile. The server can emit four DONL-bearing sources below the old
         // capture-area threshold as well.
-        activeAppleMediaTilesPerFrame = AppleMediaVideoMode.activeTileCount(
+        activeAppleMediaTilesPerFrame = selectedAppleMediaTilesPerFrame(
             pixelWidth: Int(requested.pixelWidth),
             pixelHeight: Int(requested.pixelHeight))
         let displays = (0..<requestedDisplayCount).map { index in
@@ -3473,17 +3506,16 @@ public actor TransportSession {
             framebufferWidth: profileWidth,
             framebufferHeight: profileHeight,
             supportsHDR: appleMediaSupportsHDR,
-            // Mode 7 advertises the native decoder capability independently
-            // of the capture's active source count. Small captures still use
-            // activeAppleMediaTilesPerFrame == 1 in the RTP/decode pipeline.
-            tilesPerFrame: AppleMediaNegotiationProfile.publicDecoderTilesPerFrame
+            tilesPerFrame: UInt64(selectedAppleMediaTilesPerFrame(
+                pixelWidth: Int(profileWidth),
+                pixelHeight: Int(profileHeight)))
         )
         log.debug(
             "Generated Apple media \(mode == 8 ? "audio" : "screen") offer "
                 + "ssrc=\(ssrc) aspect=\(profile.aspectRatio.landscapeWidth)/"
                 + "\(profile.aspectRatio.landscapeHeight) "
                 + "display=\(displayIndex.map { String($0 + 1) } ?? "audio") "
-                + "hdr=\(appleMediaSupportsHDR)"
+                + "hdr=\(appleMediaSupportsHDR) tiles=\(profile.tilesPerFrame)"
         )
         let data = try profile.makeOffer(
             kind: mode == 8 ? .audio : .screen,
@@ -3492,6 +3524,25 @@ public actor TransportSession {
             ntpTimestamp: AppleMediaNegotiationProfile.ntpTimestamp()
         )
         return GeneratedAppleMediaOffer(data: data, ssrc: ssrc)
+    }
+
+    private func selectedAppleMediaTilesPerFrame(
+        pixelWidth: Int,
+        pixelHeight: Int
+    ) -> Int {
+        if let override = appleMediaTilesPerFrameOverride,
+           (1...4).contains(override) {
+            return Int(override)
+        }
+        if pixelWidth > 0, pixelHeight > 0,
+           pixelWidth <= Int.max / pixelHeight {
+            let selectedDisplayLumaSamples = pixelWidth * pixelHeight
+            return Int(AppleMediaVideoMode.negotiatedTilesPerFrame(
+                totalLumaSamples: max(
+                    selectedDisplayLumaSamples,
+                    appleMediaMaximumObservedLumaSamples)))
+        }
+        return 4
     }
 
     private func randomBytes(count: Int) throws -> Data {
@@ -4284,14 +4335,6 @@ public actor TransportSession {
             ssrc: header.ssrc,
             sequence: header.sequenceNumber)
         if unique {
-            if !appleMediaSentBootstrapVideoReceiverReport {
-                appleMediaSentBootstrapVideoReceiverReport = true
-                Task { [weak self] in
-                    await self?.sendAppleMediaBootstrapReceiverReport(
-                        mediaSSRC: header.ssrc,
-                        on: channel)
-                }
-            }
             appleRCTLTotalPacketsReceived &+= 1
             appleRCTLTotalBytesReceived &+= UInt64(max(0, wireByteCount))
             appleRCTLMaximumQueueDelayNanos = max(
@@ -4319,6 +4362,30 @@ public actor TransportSession {
                     queueDelaySeconds: Double(ingressQueueDelayNanos) / 1_000_000_000,
                     now: now)
                 controller.update(now: now)
+            }
+
+            // Wait until the complete compound source set is known. Apple's
+            // client then emits three 58-byte RR+SDES packets for a four-tile
+            // display: one for each source after the base (lowest) SSRC. Our
+            // previous first-packet shortcut reported only the base tile,
+            // leaving all dependent bands without their native bootstrap.
+            if !appleMediaSentBootstrapVideoReceiverReport,
+               appleMediaVideoSSRCChannels.count >= requiredInitialSources {
+                appleMediaSentBootstrapVideoReceiverReport = true
+                let sourcesByStream = Dictionary(grouping:
+                    appleMediaVideoSSRCChannels.keys.compactMap { remoteSSRC in
+                        appleMediaFeedbackRouteByRemoteSSRC[remoteSSRC].map {
+                            ($0.streamIndex, remoteSSRC)
+                        }
+                    },
+                    by: { $0.0 })
+                let dependentSources = sourcesByStream.values.flatMap { sources in
+                    sources.map(\.1).sorted().dropFirst()
+                }
+                Task { [weak self] in
+                    await self?.sendAppleMediaBootstrapReceiverReports(
+                        mediaSSRCs: dependentSources)
+                }
             }
         }
 
@@ -4993,31 +5060,33 @@ public actor TransportSession {
         }
     }
 
-    /// Match AVConference's generation bootstrap: one one-source Receiver
-    /// Report followed by its 12-byte empty-CNAME SDES packet. Native sends
-    /// this on the video socket once, then uses standalone RCTL at 20 Hz.
-    private func sendAppleMediaBootstrapReceiverReport(
-        mediaSSRC: UInt32,
-        on channel: PosixUDPChannel
+    /// Match AVConference's compound generation bootstrap: each dependent
+    /// source gets a one-source Receiver Report followed by the 12-byte
+    /// empty-CNAME SDES packet. Standalone aggregate RCTL then runs at 20 Hz.
+    private func sendAppleMediaBootstrapReceiverReports(
+        mediaSSRCs: [UInt32]
     ) async {
-        guard let route = appleMediaFeedbackRoute(forRemoteSSRC: mediaSSRC),
-              let rr = buildAppleMediaReceiverReport(
-                senderSSRC: route.localSSRC,
-                mediaSSRC: mediaSSRC) else { return }
-        let compound = appleMediaReceiverReportCompound(
-            receiverReport: rr,
-            senderSSRC: route.localSSRC)
-        guard let protected = try? route.sendRTCPContext.protect(
-            compound,
-            senderSSRC: route.localSSRC) else { return }
-        dumpAppleMediaOutgoingRTCPIfRequested(
-            plaintext: compound,
-            protected: protected)
-        try? await channel.send(protected)
-        log.debug(
-            "Sent Apple media bootstrap RR+SDES ssrc=0x"
-                + "\(String(mediaSSRC, radix: 16)) feedbackStream="
-                + "\(route.streamIndex)")
+        for mediaSSRC in mediaSSRCs {
+            guard let route = appleMediaFeedbackRoute(forRemoteSSRC: mediaSSRC),
+                  let channel = appleMediaVideoSSRCChannels[mediaSSRC],
+                  let rr = buildAppleMediaReceiverReport(
+                    senderSSRC: route.localSSRC,
+                    mediaSSRC: mediaSSRC) else { continue }
+            let compound = appleMediaReceiverReportCompound(
+                receiverReport: rr,
+                senderSSRC: route.localSSRC)
+            guard let protected = try? route.sendRTCPContext.protect(
+                compound,
+                senderSSRC: route.localSSRC) else { continue }
+            dumpAppleMediaOutgoingRTCPIfRequested(
+                plaintext: compound,
+                protected: protected)
+            try? await channel.send(protected)
+            log.debug(
+                "Sent Apple media dependent-tile bootstrap RR+SDES ssrc=0x"
+                    + "\(String(mediaSSRC, radix: 16)) feedbackStream="
+                    + "\(route.streamIndex)")
+        }
     }
 
     /// Build an RTCP Receiver Report (RFC 3550) reporting reception quality for

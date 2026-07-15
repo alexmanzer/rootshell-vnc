@@ -2,6 +2,7 @@ import Foundation
 import VideoToolbox
 import CoreVideo
 import CoreMedia
+import CoreImage
 import RFBProtocol
 import os
 
@@ -51,6 +52,7 @@ public final class HEVCDecoder: @unchecked Sendable {
     private struct CallbackBundle {
         let frame: FrameCallback
         let failure: FailureCallback?
+        let outputConverter: HEVCBandOutputConverter
     }
 
     // MARK: - Private state
@@ -74,7 +76,8 @@ public final class HEVCDecoder: @unchecked Sendable {
         let storage = UnsafeMutablePointer<CallbackBundle>.allocate(capacity: 1)
         storage.initialize(to: CallbackBundle(
             frame: frameCallback,
-            failure: failureCallback))
+            failure: failureCallback,
+            outputConverter: HEVCBandOutputConverter()))
         self.callbackStorage = storage
     }
 
@@ -182,31 +185,18 @@ public final class HEVCDecoder: @unchecked Sendable {
             _waitForAsynchronousFrames(existing)
             _invalidate(existing)
             decompressionSession = nil
+            callbackStorage?.pointee.outputConverter.reset()
         }
 
-        // Apple's HEVC screen stream currently decodes to `444f` (full-range,
-        // bi-planar 4:4:4 YCbCr). Passing that native IOSurface through generic
-        // Core Animation/AVSampleBufferDisplayLayer presentation has produced
-        // persistent corruption in the later spatial bands, even though an
-        // explicit Core Image conversion of the same decoded buffers is clean.
-        // Request BGRA here so presentation receives an unambiguous packed
-        // public pixel format. This keeps HEVC decoding hardware accelerated;
-        // only the YCbCr-to-RGB conversion may cost additional CPU. A public
-        // Metal conversion can recover the native-output performance later,
-        // after the correctness path is visually established.
-        var pixelBufferAttributes: [String: Any] = [
+        // The native decoder returns `444f` (full-range bi-planar 4:4:4). Asking
+        // VideoToolbox to return BGRA corrupts dependent compound subframes on
+        // Apple silicon even though the native decoded surfaces are clean.
+        // Preserve the native decode surface here; the callback performs an
+        // explicit public Core Image conversion into an IOSurface-backed BGRA
+        // buffer before the frame reaches presentation.
+        let pixelBufferAttributes: [String: Any] = [
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
-            kCVPixelBufferPixelFormatTypeKey as String:
-                kCVPixelFormatType_32BGRA,
         ]
-        // Retain an opt-in diagnostic escape hatch for comparing the native
-        // decoder surface without changing production behavior.
-        let useNativeYUVOutput = ProcessInfo.processInfo.environment[
-            "ROOTSHELL_VNC_NATIVE_YUV_OUTPUT"] == "1"
-        if useNativeYUVOutput {
-            pixelBufferAttributes.removeValue(
-                forKey: kCVPixelBufferPixelFormatTypeKey as String)
-        }
 
         var outputCallback = VTDecompressionOutputCallbackRecord(
             decompressionOutputCallback: {
@@ -232,7 +222,12 @@ public final class HEVCDecoder: @unchecked Sendable {
                 }
                 guard let pixelBuffer = imageBuffer else { return }
 
-                callbacks.frame(pixelBuffer, presentationTimeStamp, tag)
+                guard let presentationBuffer = callbacks.outputConverter.convert(pixelBuffer)
+                else {
+                    callbacks.failure?(kCVReturnError, presentationTimeStamp, tag)
+                    return
+                }
+                callbacks.frame(presentationBuffer, presentationTimeStamp, tag)
             },
             decompressionOutputRefCon: nil)
         outputCallback.decompressionOutputRefCon = callbackStorage.map(
@@ -285,9 +280,9 @@ public final class HEVCDecoder: @unchecked Sendable {
         let hardware = propertyStatus == noErr ? raw as? Bool : nil
         let dims = CMVideoFormatDescriptionGetDimensions(formatDesc)
         Logger(subsystem: "com.rootshell.vnc", category: "HEVCDecoder").notice(
-            "VT session: \(dims.width, privacy: .public)x\(dims.height, privacy: .public) hardwareAccelerated=\(hardware.map(String.init) ?? "unknown", privacy: .public) requestedOutput=\(useNativeYUVOutput ? "native" : "BGRA", privacy: .public)")
+            "VT session: \(dims.width, privacy: .public)x\(dims.height, privacy: .public) hardwareAccelerated=\(hardware.map(String.init) ?? "unknown", privacy: .public) requestedOutput=native convertedOutput=BGRA")
         if ProcessInfo.processInfo.environment["ROOTSHELL_VNC_TRACE_DECODE"] == "1" {
-            print("VT session: \(dims.width)x\(dims.height) hardwareAccelerated=\(hardware.map(String.init) ?? "unknown") requestedOutput=\(useNativeYUVOutput ? "native" : "BGRA")")
+            print("VT session: \(dims.width)x\(dims.height) hardwareAccelerated=\(hardware.map(String.init) ?? "unknown") requestedOutput=native convertedOutput=BGRA")
         }
     }
 
@@ -467,6 +462,83 @@ public final class HEVCDecoder: @unchecked Sendable {
 
     private func _invalidate(_ session: VTDecompressionSession) {
         VTDecompressionSessionInvalidate(session)
+    }
+}
+
+/// Converts VideoToolbox's clean native 4:4:4 decode surface into the packed
+/// BGRA surface consumed by the public presentation path. This conversion must
+/// remain outside VideoToolbox: its requested-output conversion corrupts the
+/// dependent bands in Apple's compound screen-share stream.
+private final class HEVCBandOutputConverter: @unchecked Sendable {
+    private let context = CIContext(options: [.cacheIntermediates: false])
+    private let outputColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+    private let lock = NSLock()
+    private var pool: CVPixelBufferPool?
+    private var poolWidth = 0
+    private var poolHeight = 0
+
+    func reset() {
+        lock.lock()
+        pool = nil
+        poolWidth = 0
+        poolHeight = 0
+        lock.unlock()
+    }
+
+    func convert(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+        if CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_32BGRA {
+            return source
+        }
+
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        guard let destination = makeDestination(width: width, height: height) else {
+            return nil
+        }
+
+        CVBufferPropagateAttachments(source, destination)
+        let image = CIImage(cvPixelBuffer: source)
+        context.render(
+            image,
+            to: destination,
+            bounds: CGRect(x: 0, y: 0, width: width, height: height),
+            colorSpace: outputColorSpace)
+        return destination
+    }
+
+    private func makeDestination(width: Int, height: Int) -> CVPixelBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if pool == nil || poolWidth != width || poolHeight != height {
+            let poolAttributes: [String: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey as String: 12,
+            ]
+            let pixelAttributes: [String: Any] = [
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            var newPool: CVPixelBufferPool?
+            let status = CVPixelBufferPoolCreate(
+                kCFAllocatorDefault,
+                poolAttributes as CFDictionary,
+                pixelAttributes as CFDictionary,
+                &newPool)
+            guard status == kCVReturnSuccess, let newPool else { return nil }
+            pool = newPool
+            poolWidth = width
+            poolHeight = height
+        }
+
+        guard let pool else { return nil }
+        var destination: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(
+            kCFAllocatorDefault, pool, &destination)
+        guard status == kCVReturnSuccess else { return nil }
+        return destination
     }
 }
 

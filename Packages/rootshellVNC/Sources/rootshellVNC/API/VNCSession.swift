@@ -373,6 +373,11 @@ public final class VNCSession {
     private var intentionallyDisconnected = false
     @ObservationIgnored
     private var hasEstablishedConnection = false
+    /// Sticky across automatic reconnects for this connection attempt. If a
+    /// server accepts a one-picture offer but never starts a video source, the
+    /// replacement transport retries its known native four-source profile.
+    @ObservationIgnored
+    private var appleMediaTilesPerFrameOverride: UInt64?
     #if canImport(UIKit)
     @ObservationIgnored
     private var backgroundLifecycleTask: Task<Void, Never>?
@@ -433,6 +438,7 @@ public final class VNCSession {
         hasEstablishedConnection = false
         connectionState = .connecting
         activeCredentials = credentials
+        appleMediaTilesPerFrameOverride = nil
         lastError = nil
         currentImage = nil
         remoteCursor = nil
@@ -1353,7 +1359,10 @@ public final class VNCSession {
         // point for future per-connection learning.
     }
 
-    private func forceMediaBootstrapReconnect(reason: String) {
+    private func forceMediaBootstrapReconnect(
+        reason: String,
+        retryTilesPerFrame: UInt64? = nil
+    ) {
         guard connectionState.isConnected,
               reconnectTask == nil,
               activeCredentials != nil,
@@ -1363,6 +1372,11 @@ public final class VNCSession {
                 "Video bootstrap failed (\(reason)) but automatic reconnection "
                     + "is unavailable; leaving the session as-is")
             return
+        }
+        if let retryTilesPerFrame {
+            appleMediaTilesPerFrameOverride = retryTilesPerFrame
+            logger.warning(
+                "Retrying Apple media with tilesPerFrame=\(retryTilesPerFrame)")
         }
         logger.error("Video bootstrap failed (\(reason)); reconnecting")
         let transport = transportSession
@@ -1392,6 +1406,8 @@ public final class VNCSession {
             displayCount: configuration.displayCount,
             requestsVirtualDisplays:
                 configuration.displaySizingMode == .matchClient,
+            appleMediaTilesPerFrameOverride:
+                appleMediaTilesPerFrameOverride,
             connection: customConnection,
             securityPolicy: configuration.securityPolicy,
             certificateValidationHandler: configuration.certificateValidationHandler)
@@ -1821,6 +1837,17 @@ public final class VNCSession {
                         self?.noteMediaBootstrapHealthy()
                         return
                     }
+                    // Some servers accept tilesPerFrame=1 in message 2 but
+                    // never instantiate a video RTP source for it. This is a
+                    // profile rejection, not packet loss, so FIR cannot help.
+                    // Retry quickly with the native compound capability.
+                    if sources == 1, decoded == 0, tick >= 3,
+                       await transport.videoSourceCount == 0 {
+                        self?.forceMediaBootstrapReconnect(
+                            reason: "one-picture profile produced no video source",
+                            retryTilesPerFrame: 4)
+                        return
+                    }
                     guard firAttempts < 3,
                           await transport.isReadyForVideoKeyframeRecovery() || tick >= 6,
                           await recoveryCoordinator.begin() else {
@@ -1837,7 +1864,9 @@ public final class VNCSession {
                       m.decodeProgress.streamGeneration == streamGeneration else { return }
                 self.forceMediaBootstrapReconnect(
                     reason: "\(lastStatus.decoded)/\(lastStatus.sources) bands decoding "
-                        + "after \(firAttempts) FIR attempts")
+                        + "after \(firAttempts) FIR attempts",
+                    retryTilesPerFrame:
+                        lastStatus.sources == 1 && lastStatus.decoded == 0 ? 4 : nil)
             }
         }
 
@@ -2123,6 +2152,15 @@ public final class VNCSession {
                                 }
                                 return
                             }
+                            if numberOfTiles == 1, decoded == 0, attempt >= 3,
+                               await transport.videoSourceCount == 0 {
+                                await MainActor.run { [weak self] in
+                                    self?.forceMediaBootstrapReconnect(
+                                        reason: "one-picture reconfiguration produced no video source",
+                                        retryTilesPerFrame: 4)
+                                }
+                                return
+                            }
                             let ready = await transport.isReadyForVideoKeyframeRecovery()
                             guard (ready || attempt >= 4),
                                   await recoveryCoordinator.begin() else { continue }
@@ -2144,7 +2182,9 @@ public final class VNCSession {
                         await MainActor.run { [weak self] in
                             self?.forceMediaBootstrapReconnect(
                                 reason: "generation \(generation): \(decoded)/"
-                                    + "\(numberOfTiles) tiles decoding")
+                                    + "\(numberOfTiles) tiles decoding",
+                                retryTilesPerFrame:
+                                    numberOfTiles == 1 && decoded == 0 ? 4 : nil)
                         }
                     }
                 }

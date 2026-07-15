@@ -1,24 +1,30 @@
 import SwiftUI
 import CoreVideo
 import CoreMedia
+import CoreImage
 import QuartzCore
 import AVFoundation
 import RFBTransport
 
 /// GPU renderer for Apple's high-performance HEVC screen bands.
 ///
-/// Each RTP SSRC is a horizontal band of the screen. This renderer shows each
-/// band's decoded `CVPixelBuffer` through an `AVSampleBufferDisplayLayer`.
+/// Each RTP SSRC is a horizontal band of the screen. The bands are stitched
+/// into one IOSurface-backed frame before presentation. Apple follows the same
+/// single-surface model for compound HEVC; independent display layers can
+/// consume the change-gated bands at different times and expose seams or
+/// transiently incomplete surfaces even when every decoded band is clean.
 @MainActor
 public final class VideoBandLayerRenderer {
 
-    /// The layer the host view displays. Band sublayers are added here.
+    /// The layer the host view displays. It contains one atomic display layer.
     public let containerLayer = CALayer()
 
-    private var bandLayers: [UInt32: AVSampleBufferDisplayLayer] = [:]
-    private var bandBuffers: [UInt32: CVPixelBuffer] = [:] // retained so VideoToolbox can't recycle a displayed buffer
-    private var previousBandBuffers: [UInt32: CVPixelBuffer] = [:] // retained one commit longer so presentation can finish before reuse
-    private var bandHeight: CGFloat = 0
+    private let displayLayer = AVSampleBufferDisplayLayer()
+    private let compositor = CompoundBandSurfaceCompositor()
+    private var bandBuffers: [UInt32: CVPixelBuffer] = [:]
+    private var previousBandBuffers: [UInt32: CVPixelBuffer] = [:]
+    private var displayedBuffer: CVPixelBuffer?
+    private var previousDisplayedBuffer: CVPixelBuffer?
     private var screenWidth: CGFloat = 0
     private var screenHeight: CGFloat = 0
     private var viewBounds: CGRect = .zero
@@ -47,6 +53,10 @@ public final class VideoBandLayerRenderer {
     public init() {
         containerLayer.masksToBounds = true
         containerLayer.contentsScale = pixelScale
+        displayLayer.videoGravity = .resize
+        displayLayer.masksToBounds = true
+        displayLayer.contentsScale = pixelScale
+        containerLayer.addSublayer(displayLayer)
     }
 
     /// Set the backing scale to the host display's scale so the decoded frames
@@ -55,7 +65,7 @@ public final class VideoBandLayerRenderer {
         guard scale > 0, scale != pixelScale else { return }
         pixelScale = scale
         containerLayer.contentsScale = scale
-        for layer in bandLayers.values { layer.contentsScale = scale }
+        displayLayer.contentsScale = scale
     }
 
     public func setScreenSize(width: Int, height: Int) {
@@ -69,15 +79,14 @@ public final class VideoBandLayerRenderer {
     }
 
     public func reset() {
-        for layer in bandLayers.values {
-            layer.sampleBufferRenderer.flush(
-                removingDisplayedImage: true,
-                completionHandler: nil)
-            layer.removeFromSuperlayer()
-        }
-        bandLayers.removeAll()
+        displayLayer.sampleBufferRenderer.flush(
+            removingDisplayedImage: true,
+            completionHandler: nil)
         bandBuffers.removeAll()
         previousBandBuffers.removeAll()
+        displayedBuffer = nil
+        previousDisplayedBuffer = nil
+        compositor.reset()
         replaceLayersOnNextFrame = false
     }
 
@@ -89,9 +98,9 @@ public final class VideoBandLayerRenderer {
         replaceLayersOnNextFrame = true
     }
 
-    /// Push a synchronized screen-band set in one Core Animation transaction.
-    /// `BandFrameCoalescer` freezes a set after every active band advances, with
-    /// a short bounded fallback for a genuinely static/change-gated band.
+    /// Push a synchronized screen-band set as one stitched display surface.
+    /// `BandFrameCoalescer` freezes the inputs; the compositor then copies the
+    /// retained static bands and dirty bands into a single atomic frame.
     public func setBands(_ buffers: [UInt32: CVPixelBuffer]) {
         guard !buffers.isEmpty else { return }
         frameCommitCount &+= 1
@@ -99,55 +108,43 @@ public final class VideoBandLayerRenderer {
         if buffers.count != expectedBandCount {
             partialCommitCount &+= 1
         }
-        var needsLayout = false
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true) // no implicit animation — this is video
         if replaceLayersOnNextFrame {
-            for layer in bandLayers.values {
-                layer.sampleBufferRenderer.flush(
-                    removingDisplayedImage: true,
-                    completionHandler: nil)
-                layer.removeFromSuperlayer()
-            }
-            bandLayers.removeAll()
+            displayLayer.sampleBufferRenderer.flush(
+                removingDisplayedImage: true,
+                completionHandler: nil)
             bandBuffers.removeAll()
             previousBandBuffers.removeAll()
-            bandHeight = 0
+            displayedBuffer = nil
+            previousDisplayedBuffer = nil
+            compositor.reset()
             replaceLayersOnNextFrame = false
-            needsLayout = true
         }
         for (ssrc, pixelBuffer) in buffers {
-            // Keep the just-replaced buffer alive for one extra commit so
-            // presentation finishes before it returns to the decoder pool.
             previousBandBuffers[ssrc] = bandBuffers[ssrc]
             bandBuffers[ssrc] = pixelBuffer
-            bandHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
-
-            let layer: AVSampleBufferDisplayLayer
-            if let existing = bandLayers[ssrc] {
-                layer = existing
-            } else {
-                layer = AVSampleBufferDisplayLayer()
-                layer.videoGravity = .resize
-                layer.masksToBounds = true
-                layer.contentsScale = pixelScale
-                containerLayer.addSublayer(layer)
-                bandLayers[ssrc] = layer
-                needsLayout = true
-            }
-
-            let videoRenderer = layer.sampleBufferRenderer
-            if videoRenderer.status == .failed {
-                videoRenderer.flush()
-            }
-            if let sampleBuffer = Self.makeDisplaySample(from: pixelBuffer) {
-                videoRenderer.enqueue(sampleBuffer)
-            }
         }
-        CATransaction.commit()
 
-        if needsLayout { layout() }
+        let width = Int(screenWidth)
+        let height = Int(screenHeight)
+        guard width > 0, height > 0,
+              let frame = compositor.compose(
+                bands: bandBuffers,
+                width: width,
+                height: height) else { return }
+
+        // The display renderer can retain an enqueued sample beyond this call.
+        // Keep two explicit generations as well so neither Core Animation nor
+        // Core Image can observe a pool surface after it has been recycled.
+        previousDisplayedBuffer = displayedBuffer
+        displayedBuffer = frame
+
+        let videoRenderer = displayLayer.sampleBufferRenderer
+        if videoRenderer.status == .failed {
+            videoRenderer.flush()
+        }
+        if let sampleBuffer = Self.makeDisplaySample(from: frame) {
+            videoRenderer.enqueue(sampleBuffer)
+        }
     }
 
     /// Wrap an already-decoded image buffer without copying its pixels. The
@@ -201,13 +198,10 @@ public final class VideoBandLayerRenderer {
         layout()
     }
 
-    /// Position the bands. The coded band height need not divide the negotiated
-    /// framebuffer height, so the final coded band can extend below the desktop.
-    /// Clip it by geometry to the negotiated height; no pixel inspection is
-    /// involved.
+    /// Position the one stitched desktop surface. Coded band padding has
+    /// already been clipped by `CompoundBandSurfaceCompositor`.
     public func layout() {
         guard screenWidth > 0, screenHeight > 0, viewBounds.width > 0, viewBounds.height > 0 else { return }
-        let nativeBandHeight = bandHeight > 0 ? bandHeight : screenHeight
 
         // Aspect-fit the native screen into the view.
         let scale = min(viewBounds.width / screenWidth, viewBounds.height / screenHeight)
@@ -219,30 +213,106 @@ public final class VideoBandLayerRenderer {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         containerLayer.frame = CGRect(x: originX, y: originY, width: fitWidth, height: fitHeight)
-        for (rank, entry) in bandLayers.sorted(by: { $0.key < $1.key }).enumerated() {
-            let topNative = CGFloat(rank) * nativeBandHeight
-            let validNative = min(nativeBandHeight, screenHeight - topNative)
-            if validNative <= 0 {
-                entry.value.isHidden = true
-                continue
-            }
-            entry.value.isHidden = false
-            // Keep every decoded band at its coded height. The last HEVC band
-            // often contains padding below the negotiated desktop (for
-            // example, 4 x 480 coded rows for a 1860-row screen). Shrinking
-            // that 480-row sample into the remaining 420 rows displays and
-            // resamples the padding, which shows up as a flickering bottom
-            // tile. The container already clips to the exact desktop height,
-            // so extend the final layer past its lower edge and let ordinary
-            // layer clipping discard the padded rows at 1:1 geometry.
-            entry.value.contentsRect = CGRect(x: 0, y: 0, width: 1, height: 1)
-            entry.value.frame = CGRect(
-                x: 0,
-                y: topNative * scale,
-                width: fitWidth,
-                height: nativeBandHeight * scale)
-        }
+        displayLayer.frame = containerLayer.bounds
         CATransaction.commit()
+    }
+}
+
+/// Public replacement for the private stitched-output stage used by Apple's
+/// compound HEVC pipeline. Input buffers are ordered by their monotonically
+/// assigned SSRCs, placed top-to-bottom, and cropped to the negotiated desktop
+/// height. Core Image performs both YCbCr/RGB conversion (when needed) and the
+/// GPU copy into one IOSurface-backed BGRA frame.
+private final class CompoundBandSurfaceCompositor {
+    private let context = CIContext(options: [.cacheIntermediates: false])
+    private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+    private var pool: CVPixelBufferPool?
+    private var poolWidth = 0
+    private var poolHeight = 0
+
+    func reset() {
+        pool = nil
+        poolWidth = 0
+        poolHeight = 0
+    }
+
+    func compose(
+        bands: [UInt32: CVPixelBuffer],
+        width: Int,
+        height: Int
+    ) -> CVPixelBuffer? {
+        guard !bands.isEmpty,
+              let destination = makeDestination(width: width, height: height)
+        else { return nil }
+
+        let outputBounds = CGRect(x: 0, y: 0, width: width, height: height)
+        var frame = CIImage(color: .black).cropped(to: outputBounds)
+        var top = 0
+
+        for (_, pixelBuffer) in bands.sorted(by: { $0.key < $1.key }) {
+            guard top < height else { break }
+            let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
+            let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
+            let validHeight = min(sourceHeight, height - top)
+            guard sourceWidth > 0, validHeight > 0 else { continue }
+
+            // CIImage uses a bottom-left origin. The server's coded padding is
+            // at the bottom of the last band, so retain the top valid rows.
+            let source = CIImage(cvPixelBuffer: pixelBuffer)
+            let crop = CGRect(
+                x: source.extent.minX,
+                y: source.extent.maxY - CGFloat(validHeight),
+                width: min(CGFloat(width), source.extent.width),
+                height: CGFloat(validHeight))
+            let destinationBottom = height - top - validHeight
+            let placed = source
+                .cropped(to: crop)
+                .transformed(by: CGAffineTransform(
+                    translationX: -crop.minX,
+                    y: CGFloat(destinationBottom) - crop.minY))
+            frame = placed.composited(over: frame)
+            top += sourceHeight
+        }
+
+        context.render(
+            frame,
+            to: destination,
+            bounds: outputBounds,
+            colorSpace: colorSpace)
+        return destination
+    }
+
+    private func makeDestination(width: Int, height: Int) -> CVPixelBuffer? {
+        if pool == nil || poolWidth != width || poolHeight != height {
+            let poolAttributes: [String: Any] = [
+                kCVPixelBufferPoolMinimumBufferCountKey as String: 4,
+            ]
+            let pixelAttributes: [String: Any] = [
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+                kCVPixelBufferMetalCompatibilityKey as String: true,
+            ]
+            var newPool: CVPixelBufferPool?
+            guard CVPixelBufferPoolCreate(
+                kCFAllocatorDefault,
+                poolAttributes as CFDictionary,
+                pixelAttributes as CFDictionary,
+                &newPool) == kCVReturnSuccess,
+                  let newPool else { return nil }
+            pool = newPool
+            poolWidth = width
+            poolHeight = height
+        }
+
+        guard let pool else { return nil }
+        var destination: CVPixelBuffer?
+        guard CVPixelBufferPoolCreatePixelBuffer(
+            kCFAllocatorDefault,
+            pool,
+            &destination) == kCVReturnSuccess else { return nil }
+        return destination
     }
 }
 

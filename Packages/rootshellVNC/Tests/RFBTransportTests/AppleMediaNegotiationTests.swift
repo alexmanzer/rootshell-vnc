@@ -30,24 +30,76 @@ final class AppleMediaNegotiationTests: XCTestCase {
             0)
     }
 
-    func testActiveTileCountFollowsNegotiatedWireCapabilityAtEverySize() {
+    func testPublicDecoderUsesConventionalHEVCWithinLevel51FrameBudget() {
         XCTAssertEqual(
             AppleMediaVideoMode.activeTileCount(
                 pixelWidth: 2400, pixelHeight: 1680),
-            4)
+            1)
         XCTAssertEqual(
             AppleMediaVideoMode.activeTileCount(
                 pixelWidth: 3136, pixelHeight: 1584),
-            4)
+            1)
         XCTAssertEqual(
             AppleMediaVideoMode.activeTileCount(
                 pixelWidth: 2048, pixelHeight: 2736),
-            4)
+            1)
         XCTAssertEqual(
             AppleMediaVideoMode.activeTileCount(
                 pixelWidth: 5536, pixelHeight: 1392),
+            1)
+        XCTAssertEqual(
+            AppleMediaVideoMode.activeTileCount(
+                pixelWidth: 4096, pixelHeight: 2176),
+            1)
+        XCTAssertEqual(
+            AppleMediaVideoMode.activeTileCount(
+                pixelWidth: 5120, pixelHeight: 2880),
+            4)
+        XCTAssertEqual(
+            AppleMediaNegotiationProfile.publicDecoderTilesPerFrame(
+                pixelWidth: 3664, pixelHeight: 2176),
+            1)
+        XCTAssertEqual(
+            AppleMediaNegotiationProfile.publicDecoderTilesPerFrame(
+                pixelWidth: 5120, pixelHeight: 2880),
             4)
         XCTAssertEqual(AppleMediaVideoMode.negotiatedTilesPerFrame, 4)
+    }
+
+    func testAggregateDisplayAreaSelectsCompoundProfile() {
+        let airPanel = 2976 * 1860
+        let scaledExternalDisplay = 3008 * 1692
+
+        XCTAssertEqual(
+            AppleMediaVideoMode.negotiatedTilesPerFrame(
+                totalLumaSamples: airPanel),
+            1)
+        XCTAssertEqual(
+            AppleMediaVideoMode.negotiatedTilesPerFrame(
+                totalLumaSamples: scaledExternalDisplay),
+            1)
+        XCTAssertEqual(
+            AppleMediaVideoMode.negotiatedTilesPerFrame(
+                totalLumaSamples: airPanel + scaledExternalDisplay),
+            4)
+    }
+
+    func testPublicAirSizedOfferRequestsConventionalSinglePictureHEVC() throws {
+        let tiles = AppleMediaNegotiationProfile.publicDecoderTilesPerFrame(
+            pixelWidth: 3664,
+            pixelHeight: 2176)
+        let profile = AppleMediaNegotiationProfile(
+            framebufferWidth: 3664,
+            framebufferHeight: 2176,
+            supportsHDR: false,
+            tilesPerFrame: tiles)
+        let screen = try XCTUnwrap(ProtoMessage(profile.mediaBlob(
+            kind: .screen,
+            ssrc: 1,
+            ntpTimestamp: 2
+        )).message(5))
+
+        XCTAssertEqual(screen.varint(6), 1)
     }
 
     func testMediaMessageOneAnswerCyclesCreateDistinctGenerations() {
@@ -155,7 +207,7 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertEqual(actual, Data([0x08, 0x00]) + nativeCapabilities)
     }
 
-    func testSmallCaptureAdvertisesAndExpectsFourTileCapability() throws {
+    func testSmallCaptureCanExplicitlyAdvertiseNativeFourTileCapability() throws {
         let profile = AppleMediaNegotiationProfile(
             framebufferWidth: 2400,
             framebufferHeight: 1680,
@@ -171,7 +223,7 @@ final class AppleMediaNegotiationTests: XCTestCase {
             AppleMediaVideoMode.activeTileCount(
                 pixelWidth: 2400,
                 pixelHeight: 1680),
-            4)
+            1)
     }
 
     func testHDRServerCapabilityChangesAdvertisedHDRBitmap() throws {

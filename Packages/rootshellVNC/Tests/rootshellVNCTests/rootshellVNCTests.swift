@@ -1802,7 +1802,7 @@ final class VideoBandGeometryTests: XCTestCase {
     }
 
     @MainActor
-    func testPartialFinalBandKeepsCodedHeightAndIsClippedByDesktop() throws {
+    func testPartialFinalBandIsStitchedAndClippedToDesktop() throws {
         let renderer = VideoBandLayerRenderer()
         renderer.setViewBounds(CGRect(x: 0, y: 0, width: 100, height: 110))
         renderer.setScreenSize(width: 100, height: 110)
@@ -1813,13 +1813,14 @@ final class VideoBandGeometryTests: XCTestCase {
             13: try makePixelBuffer(width: 100, height: 30),
         ])
 
-        let frames = try XCTUnwrap(renderer.containerLayer.sublayers)
-            .map(\.frame)
-            .sorted { $0.minY < $1.minY }
-        XCTAssertEqual(frames.count, 4)
-        let finalFrame = try XCTUnwrap(frames.last)
-        XCTAssertEqual(finalFrame.height, 30, accuracy: 0.001)
-        XCTAssertEqual(finalFrame.maxY, 120, accuracy: 0.001)
+        let frames = try XCTUnwrap(renderer.containerLayer.sublayers).map(\.frame)
+        XCTAssertEqual(
+            frames.count,
+            1,
+            "Compound bands must be presented through one atomic display layer")
+        let stitchedFrame = try XCTUnwrap(frames.first)
+        XCTAssertEqual(stitchedFrame.height, 110, accuracy: 0.001)
+        XCTAssertEqual(stitchedFrame.maxY, 110, accuracy: 0.001)
         XCTAssertEqual(renderer.containerLayer.bounds.height, 110, accuracy: 0.001)
         XCTAssertTrue(renderer.containerLayer.masksToBounds)
     }

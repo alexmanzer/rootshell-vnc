@@ -74,11 +74,13 @@ final class LiveLoginProbeTests: XCTestCase {
                     probe.note("EVENT mediaStreamOffer stream=\(offer.streamID) payloadBytes=\(offer.rawPayload.count)")
                     if !probe.streamStarted {
                         probe.streamStarted = true
+                        let tileCount = await session.currentAppleMediaTilesPerFrame
                         manager.startStream(
                             streamID: offer.streamID,
                             width: 2976,
                             height: 1860,
-                            numberOfTiles: Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
+                            usesDecodingOrderNumbers: tileCount > 1,
+                            numberOfTiles: tileCount
                         ) { pb, ssrc in
                             probe.recordFrame(ssrc: ssrc, pixelBuffer: pb)
                         }

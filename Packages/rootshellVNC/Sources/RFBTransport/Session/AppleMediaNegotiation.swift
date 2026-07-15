@@ -67,6 +67,11 @@ func appleMediaReceiverFlags(
 public enum AppleMediaVideoMode {
     public static var usesTiledHEVC: Bool { true }
 
+    /// HEVC level 5.1's maximum luma-picture size. At or below this limit the
+    /// server can provide one ordinary full-frame 60-fps picture. Larger
+    /// Retina desktops need Apple's four-source subframe profile.
+    private static let level51MaximumLumaSamples = 8_912_896
+
     @available(*, deprecated, renamed: "usesTiledHEVC")
     public static var usesExperimentalTiledHEVC: Bool {
         usesTiledHEVC
@@ -84,15 +89,46 @@ public enum AppleMediaVideoMode {
         return 4
     }
 
-    /// Number of sources expected from the negotiated compound HEVC profile.
+    /// Choose the public-decoder profile for the active capture geometry.
     ///
-    /// This must follow the wire capability, not a capture-area heuristic. A
-    /// 3136x1584 server generation (just below the old five-megapixel cutoff)
-    /// still emits four DONL-bearing SSRCs; treating it as one conventional
-    /// RTP stream prevents its parameter sets from being parsed at all.
+    /// Apple's four-source mode is not four independent HEVC pictures: later
+    /// subframes reference intermediate updates to a persistent stitched
+    /// canvas. Apple's private decoder understands that contract, while the
+    /// public VideoToolbox API does not expose its TileID/TileOrder semantics.
+    /// Request one source whenever a 60-fps full frame fits level 5.1; this
+    /// makes the server emit conventional HEVC that public VideoToolbox can
+    /// decode without corruption. Preserve four sources for displays (notably
+    /// 5K) that exceed the full-frame level-5.1 budget.
+    public static func negotiatedTilesPerFrame(
+        pixelWidth: Int,
+        pixelHeight: Int
+    ) -> UInt64 {
+        guard pixelWidth > 0, pixelHeight > 0,
+              pixelWidth <= Int.max / pixelHeight else {
+            return 4
+        }
+        return negotiatedTilesPerFrame(
+            totalLumaSamples: pixelWidth * pixelHeight)
+    }
+
+    /// Choose from the complete active capture surface. Apple's server can
+    /// retain work for every attached display even when the viewer selects a
+    /// single output, so using only display zero underestimates the one-picture
+    /// encoder budget on multi-display Macs.
+    static func negotiatedTilesPerFrame(totalLumaSamples: Int) -> UInt64 {
+        if ProcessInfo.processInfo.environment[
+            "ROOTSHELL_VNC_TILES_PER_FRAME"] != nil {
+            return negotiatedTilesPerFrame
+        }
+        guard totalLumaSamples > 0 else { return 4 }
+        return totalLumaSamples <= level51MaximumLumaSamples ? 1 : 4
+    }
+
+    /// Number of sources requested from and expected from the server.
     public static func activeTileCount(pixelWidth: Int, pixelHeight: Int) -> Int {
-        guard pixelWidth > 0, pixelHeight > 0 else { return 1 }
-        return Int(negotiatedTilesPerFrame)
+        Int(negotiatedTilesPerFrame(
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight))
     }
 }
 
@@ -111,11 +147,16 @@ struct AppleMediaNegotiationProfile: Sendable {
     private static let screenAccessNetworkType: UInt64 = 1
     private static let screenVideoTransportType: UInt64 = 1
 
-    /// Viceroy negotiates the minimum of the peers' values. Four matches the
-    /// compound screen profile and preserves full-resolution Retina
-    /// capture instead of downscaling into the one-tile encoder budget.
-    static var publicDecoderTilesPerFrame: UInt64 {
-        AppleMediaVideoMode.negotiatedTilesPerFrame
+    /// Viceroy negotiates the minimum of the peers' values. Prefer its ordinary
+    /// one-picture profile when that picture fits a 60-fps level-5.1 stream;
+    /// retain four-source capture for larger desktops.
+    static func publicDecoderTilesPerFrame(
+        pixelWidth: Int,
+        pixelHeight: Int
+    ) -> UInt64 {
+        AppleMediaVideoMode.negotiatedTilesPerFrame(
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight)
     }
 
     enum MediaKind: Sendable {
