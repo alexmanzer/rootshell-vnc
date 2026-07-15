@@ -2270,9 +2270,21 @@ public actor TransportSession {
 
         for (rect, payload) in rectsWithData where
             rect.encoding == .appleMultiVariantScreenshare
-                && payload.count >= 5
-                && (payload[payload.startIndex + 4] == 0
-                    || payload[payload.startIndex + 4] == 2) {
+                && payload.count >= 5 {
+            let messageType = payload[payload.startIndex + 4]
+            if messageType == 2, payload.count == 133 {
+                // Type 2 only installs the connection-wide luma and chroma
+                // quantization tables. Apple legitimately sends this control
+                // record as a 0x0 rectangle after waking a display. Its
+                // geometry carries no coverage information; receipt of the
+                // complete table record means the codec is ready for the
+                // type-9 image subscription.
+                awaitingAppleDCTBootstrap = false
+                pendingAppleDCTAutoUpdateActivation = true
+                log.debug("Received Apple DCT bootstrap quantization tables")
+                return
+            }
+            guard messageType == 0 else { continue }
             let covered = AppleDCTCoverageRegion(
                 minX: min(Int(rect.x), Int(fbWidth)),
                 minY: min(Int(rect.y), Int(fbHeight)),

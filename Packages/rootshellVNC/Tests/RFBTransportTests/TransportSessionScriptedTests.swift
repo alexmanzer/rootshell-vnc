@@ -468,7 +468,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         await connection.enqueueServerBytes(Self.framebufferUpdate([
             (
                 Self.rectangleHeader(
-                    x: 0, y: 0, width: width, height: height,
+                    x: 0, y: 0, width: 0, height: 0,
                     encoding: Encoding.appleMultiVariantScreenshare.rawValue),
                 dctControl
             ),
@@ -526,7 +526,7 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
-    func testAppleStandardOneDisplayActivatesAutoUpdatesAfterFullDCTControlBootstrap() async throws {
+    func testAppleStandardOneDisplayActivatesAutoUpdatesAfterZeroSizedDCTControlBootstrap() async throws {
         let connection = ScriptedRFBConnection()
         let width: UInt16 = 2
         let height: UInt16 = 1
@@ -552,10 +552,11 @@ final class TransportSessionScriptedTests: XCTestCase {
             ),
             (
                 Self.rectangleHeader(
-                    x: 0, y: 0, width: width, height: height,
+                    x: 0, y: 0, width: 0, height: 0,
                     encoding: Encoding.appleMultiVariantScreenshare.rawValue),
-                // Type 2 installs two quantization tables. Apple sends this
-                // full-screen control rectangle before type-9 image delivery.
+                // Type 2 installs two connection-wide quantization tables.
+                // Its rectangle is a zero-sized control record, as observed
+                // after the server wakes a sleeping display.
                 dctControl
             ),
         ]))
