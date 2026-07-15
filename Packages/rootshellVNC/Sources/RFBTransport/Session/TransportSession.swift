@@ -177,11 +177,12 @@ public actor TransportSession {
     /// Physical or virtual screen geometry announced by Apple's encrypted
     /// DisplayInfo2 control record, in the server's display order.
     private var appleMediaDisplayInfos: [AppleDisplayInfo] = []
-    /// Largest aggregate capture surface observed before or during display
-    /// reconfiguration. Keep the physical-display workload after a virtual
-    /// display replaces DisplayInfo2: attached displays still influence which
-    /// one-picture profile the server can encode reliably.
-    private var appleMediaMaximumObservedLumaSamples = 0
+    /// Aggregate surface of the capture graph currently being negotiated.
+    /// Initial media setup uses every physical display announced by
+    /// DisplayInfo2. Command 29 replaces that graph with the requested virtual
+    /// display surface, so its area must replace—not accumulate with—the
+    /// physical workload for the following media generation.
+    private var appleMediaActiveCaptureLumaSamples = 0
     /// Per-SSRC packet jitter buffer. UDP reordering is repaired here before an
     /// HEVC fragmentation unit reaches the decoder.
     private var appleMediaRTPReorderBuffer = AppleMediaRTPReorderBuffer()
@@ -1965,9 +1966,7 @@ public actor TransportSession {
                     }
                     total += width * height
                 }
-                appleMediaMaximumObservedLumaSamples = max(
-                    appleMediaMaximumObservedLumaSamples,
-                    aggregateLumaSamples)
+                appleMediaActiveCaptureLumaSamples = aggregateLumaSamples
                 let first = displays[0]
                 activeAppleMediaTilesPerFrame = selectedAppleMediaTilesPerFrame(
                     pixelWidth: Int(first.width),
@@ -1984,7 +1983,6 @@ public actor TransportSession {
                         + displays.map { "\($0.width)x\($0.height)" }
                             .joined(separator: ", ")
                         + "; captureLuma=\(aggregateLumaSamples) "
-                        + "maxObservedLuma=\(appleMediaMaximumObservedLumaSamples) "
                         + "tiles=\(activeAppleMediaTilesPerFrame)")
             }
         } else if control.encoding == 0x455 {
@@ -2216,12 +2214,6 @@ public actor TransportSession {
             pointHeight: UInt32(requested.pointHeight))
         // These are fixed capability maxima, not the active mode or an active
         // resolution cap. The requested pixel/point pair below selects 2×.
-        // Keep decoder packetization aligned with the negotiated mode-7 wire
-        // profile. The server can emit four DONL-bearing sources below the old
-        // capture-area threshold as well.
-        activeAppleMediaTilesPerFrame = selectedAppleMediaTilesPerFrame(
-            pixelWidth: Int(requested.pixelWidth),
-            pixelHeight: Int(requested.pixelHeight))
         let displays = (0..<requestedDisplayCount).map { index in
             AppleVirtualDisplay(
                 name: requestedDisplayCount == 1
@@ -2235,6 +2227,17 @@ public actor TransportSession {
                 identifier: UInt32(7 + index),
                 modes: [mode])
         }
+        let previousCaptureLumaSamples = appleMediaActiveCaptureLumaSamples
+        let previousTilesPerFrame = activeAppleMediaTilesPerFrame
+        let requestedDisplayLumaSamples = Int(requested.pixelWidth)
+            * Int(requested.pixelHeight)
+        appleMediaActiveCaptureLumaSamples = requestedDisplayLumaSamples
+            * displays.count
+        // Keep decoder packetization aligned with the replacement capture
+        // graph, not the physical topology that generation one is retiring.
+        activeAppleMediaTilesPerFrame = selectedAppleMediaTilesPerFrame(
+            pixelWidth: Int(requested.pixelWidth),
+            pixelHeight: Int(requested.pixelHeight))
         let message = ClientMessage.appleDisplayConfiguration(
             AppleDisplayConfiguration(displays: displays))
         // The Apple media re-offer that follows command 29 is generated from
@@ -2258,6 +2261,8 @@ public actor TransportSession {
             fbWidth = previousWidth
             fbHeight = previousHeight
             appleMediaDisplayCount = previousDisplayCount
+            appleMediaActiveCaptureLumaSamples = previousCaptureLumaSamples
+            activeAppleMediaTilesPerFrame = previousTilesPerFrame
             appleDisplayReconfigurationGeneration = nil
             throw error
         }
@@ -2272,7 +2277,9 @@ public actor TransportSession {
         log.info(
             "Requested Apple dynamic virtual display \(requested.pixelWidth)x"
                 + "\(requested.pixelHeight) pixels (\(requested.pointWidth)x"
-                + "\(requested.pointHeight) points), count=\(displays.count)")
+                + "\(requested.pointHeight) points), count=\(displays.count) "
+                + "captureLuma=\(appleMediaActiveCaptureLumaSamples) "
+                + "tiles=\(activeAppleMediaTilesPerFrame)")
     }
 
     private nonisolated func appleMediaServerControl(_ payload: Data) -> (encoding: UInt16, body: Data)? {
@@ -3540,7 +3547,7 @@ public actor TransportSession {
             return Int(AppleMediaVideoMode.negotiatedTilesPerFrame(
                 totalLumaSamples: max(
                     selectedDisplayLumaSamples,
-                    appleMediaMaximumObservedLumaSamples)))
+                    appleMediaActiveCaptureLumaSamples)))
         }
         return 4
     }
