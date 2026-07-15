@@ -2,15 +2,22 @@ import SwiftUI
 import RFBProtocol
 #if canImport(UIKit)
 import UIKit
+#endif
 
-private struct DockedKeyboardViewportMetrics: Equatable {
+struct DockedKeyboardViewportMetrics: Equatable {
     var containerSize: CGSize = .zero
     var keyboardInset: CGFloat = 0
 
-    var availableSize: CGSize {
-        CGSize(
+    func effectiveInset(reservingObstruction: Bool) -> CGFloat {
+        reservingObstruction ? keyboardInset : 0
+    }
+
+    func availableSize(reservingObstruction: Bool) -> CGSize {
+        let effectiveInset = effectiveInset(
+            reservingObstruction: reservingObstruction)
+        return CGSize(
             width: containerSize.width,
-            height: max(0, containerSize.height - keyboardInset))
+            height: max(0, containerSize.height - effectiveInset))
     }
 
     func isApproximatelyEqual(
@@ -21,7 +28,6 @@ private struct DockedKeyboardViewportMetrics: Equatable {
             && abs(keyboardInset - other.keyboardInset) <= 0.5
     }
 }
-#endif
 
 /// Chooses which layer owns keyboard and accessory clearance for the remote
 /// viewport. Container apps with a shared pane layout can opt out of the
@@ -58,6 +64,15 @@ public struct RemoteDesktopView: View {
     private let hudMenuExtras: AnyView?
     private let keyboardAvoidanceMode: VNCKeyboardAvoidanceMode
     private let clipboardSynchronizer: VNCClipboardSynchronizer?
+
+    #if canImport(UIKit)
+    /// A host-provided accessory can remain visible without the software
+    /// keyboard, so it must keep its measured clearance. When neither is
+    /// active, any nonzero layout-guide value is stale and must be ignored.
+    private var shouldReserveKeyboardInset: Bool {
+        keyboardActive || keyboardCapture.inputViews.accessory != nil
+    }
+    #endif
 
     public init(
         session: VNCSession,
@@ -223,7 +238,11 @@ public struct RemoteDesktopView: View {
             #if canImport(UIKit)
             if keyboardAvoidanceMode == .automatic {
                 Color.clear
-                    .frame(height: keyboardViewportMetrics.keyboardInset)
+                    // Keyboard layout-guide callbacks can arrive out of order
+                    // during dismissal/reparenting. Once neither the software
+                    // keyboard nor an accessory is active, ignore stale data.
+                    .frame(height: keyboardViewportMetrics.effectiveInset(
+                        reservingObstruction: shouldReserveKeyboardInset))
                     .accessibilityHidden(true)
             }
             #endif
@@ -235,6 +254,9 @@ public struct RemoteDesktopView: View {
             if keyboardCapture.softwareKeyboardRequested != active {
                 keyboardCapture.softwareKeyboardRequested = active
             }
+            #if canImport(UIKit)
+            updateRemoteDisplaySizeFromMeasuredContainer()
+            #endif
         }
         .onChange(of: keyboardCapture.softwareKeyboardRequested) { _, requested in
             if keyboardActive != requested {
@@ -249,6 +271,12 @@ public struct RemoteDesktopView: View {
         // floating and split keyboards; SwiftUI's safe area does not.
         .ignoresSafeArea(.keyboard)
         .onChange(of: keyboardViewportMetrics) { _, _ in
+            updateRemoteDisplaySizeFromMeasuredContainer()
+        }
+        .onChange(of: keyboardAvoidanceMode) { _, _ in
+            updateRemoteDisplaySizeFromMeasuredContainer()
+        }
+        .onChange(of: keyboardCapture.inputViewsGeneration) { _, _ in
             updateRemoteDisplaySizeFromMeasuredContainer()
         }
         #endif
@@ -320,7 +348,6 @@ public struct RemoteDesktopView: View {
         #if canImport(UIKit)
         DraggableHUDOverlay {
             hudMenu
-                .padding(12)
         }
         #else
         VStack {
@@ -451,7 +478,7 @@ public struct RemoteDesktopView: View {
         } label: {
             Image(systemName: "ellipsis")
                 .font(.body.weight(.bold))
-                .frame(width: 42, height: 42)
+                .frame(width: 46, height: 46)
                 .background(.ultraThinMaterial, in: Circle())
         }
         .buttonStyle(.plain)
@@ -547,7 +574,8 @@ public struct RemoteDesktopView: View {
     #if canImport(UIKit)
     private func updateRemoteDisplaySizeFromMeasuredContainer() {
         let size = keyboardAvoidanceMode == .automatic
-            ? keyboardViewportMetrics.availableSize
+            ? keyboardViewportMetrics.availableSize(
+                reservingObstruction: shouldReserveKeyboardInset)
             : keyboardViewportMetrics.containerSize
         guard size.width > 0, size.height > 0 else { return }
         updateRemoteDisplaySize(for: size)
