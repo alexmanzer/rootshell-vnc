@@ -105,20 +105,23 @@ final class AppleMediaFeedbackTests: XCTestCase {
 
     func testRCTLWireLayoutMatchesNegotiatedMediaFields() {
         let data = AppleMediaRCTLFeedback(
-            lossPercent: 7,
+            receiveQueueTargetMilliseconds: 100,
             echoTimestamp: 0x1234,
-            measurementAgeMilliseconds: 0x5678,
-            localTimestampQ10: 0x9abc,
+            totalReceivedKBytes: 0x2345,
+            audioBurstyLoss: 3,
+            cumulativeAudioReceivedPacketCount: 0x456,
+            queuingDelayMilliseconds: 0x5678,
+            sendTimestampQ10: 0x9abc,
             owrdQ13: 0xdef0,
-            burstyLoss: 5,
-            cumulativeReceivedPacketCount: 0x234,
+            videoBurstyLoss: 5,
+            cumulativeVideoReceivedPacketCount: 0x234,
             bandwidthEstimateKbps: 0x3456
         ).serialized()
 
         XCTAssertEqual(data, Data([
-            0x85, 0x07, 0x00, 0x04,
-            0x12, 0x34, 0x00, 0x00,
-            0x00, 0x00, 0x56, 0x78,
+            0x85, 0x05, 0x00, 0x04,
+            0x12, 0x34, 0x23, 0x45,
+            0x34, 0x56, 0x56, 0x78,
             0x9a, 0xbc, 0xde, 0xf0,
             0x52, 0x34, 0x34, 0x56,
         ]))
@@ -126,16 +129,22 @@ final class AppleMediaFeedbackTests: XCTestCase {
 
     func testRCTLClampsPackedReceiveStatistics() {
         let data = AppleMediaRCTLFeedback(
-            lossPercent: 0,
+            receiveQueueTargetMilliseconds: .max,
             echoTimestamp: 0,
-            measurementAgeMilliseconds: 0,
-            localTimestampQ10: 0,
+            totalReceivedKBytes: .max,
+            audioBurstyLoss: .max,
+            cumulativeAudioReceivedPacketCount: .max,
+            queuingDelayMilliseconds: 0,
+            sendTimestampQ10: 0,
             owrdQ13: 0,
-            burstyLoss: .max,
-            cumulativeReceivedPacketCount: .max,
+            videoBurstyLoss: .max,
+            cumulativeVideoReceivedPacketCount: .max,
             bandwidthEstimateKbps: .max
         ).serialized()
 
+        XCTAssertEqual(data[1], .max)
+        XCTAssertEqual(data[8], .max)
+        XCTAssertEqual(data[9], .max)
         XCTAssertEqual(data[16], 0xff)
         XCTAssertEqual(data[17], 0xff)
     }
@@ -148,13 +157,16 @@ final class AppleMediaFeedbackTests: XCTestCase {
 
     func testRCTLPacketIsStandaloneRTCPAPPReport() {
         let feedback = AppleMediaRCTLFeedback(
-            lossPercent: 0,
+            receiveQueueTargetMilliseconds: 100,
             echoTimestamp: 0,
-            measurementAgeMilliseconds: 50,
-            localTimestampQ10: 1,
+            totalReceivedKBytes: 0,
+            audioBurstyLoss: 0,
+            cumulativeAudioReceivedPacketCount: 0,
+            queuingDelayMilliseconds: 0,
+            sendTimestampQ10: 1,
             owrdQ13: 0,
-            burstyLoss: 0,
-            cumulativeReceivedPacketCount: 0,
+            videoBurstyLoss: 0,
+            cumulativeVideoReceivedPacketCount: 0,
             bandwidthEstimateKbps: 60_000)
         let packet = appleMediaRCTLPacket(
             senderSSRC: 0x1234_5678,
@@ -167,14 +179,6 @@ final class AppleMediaFeedbackTests: XCTestCase {
             0x52, 0x43, 0x54, 0x4c,
         ]))
         XCTAssertEqual(packet.suffix(20), feedback.serialized())
-    }
-
-    func testRCTLIntervalLossIncludesMissingPacketsInExpectedTotal() {
-        XCTAssertEqual(appleMediaRCTLIntervalLossPercent(received: 0, lost: 0), 0)
-        XCTAssertEqual(appleMediaRCTLIntervalLossPercent(received: 90, lost: 10), 10)
-        XCTAssertEqual(appleMediaRCTLIntervalLossPercent(received: 1, lost: 1), 50)
-        XCTAssertEqual(appleMediaRCTLIntervalLossPercent(received: 0, lost: 10), 100)
-        XCTAssertEqual(appleMediaRCTLIntervalLossPercent(received: -1, lost: -1), 0)
     }
 
     func testAppleMediaRTPFrameExtensionMatchesCapturedScreenPacket() {
@@ -196,26 +200,70 @@ final class AppleMediaFeedbackTests: XCTestCase {
                 ltrTimestamp: nil,
                 totalPacketsPerFrame: 60,
                 frameSequenceNumber: 0x77c0))
-        XCTAssertNil(appleMediaLTRAcknowledgementTimestamp(packet))
-
-        var completedPacket = packet
-        completedPacket[1] |= 0x80
-        completedPacket[4] = 0x55
-        completedPacket[5] = 0x66
-        completedPacket[6] = 0x77
-        completedPacket[7] = 0x88
-        XCTAssertEqual(
-            appleMediaLTRAcknowledgementTimestamp(completedPacket),
-            0x5566_7788)
     }
 
-    func testLTRAccessUnitWithoutLTRBitsIsNotAcknowledged() {
-        let packet = Data([
-            0x90, 0xe4, 0x30, 0x9f, 0x55, 0x66, 0x77, 0x88,
-            0x07, 0x0d, 0xfa, 0x0e,
-            0x93, 0x01, 0x00, 0x01, 0x00, 0x3c, 0x77, 0xc0,
-        ])
-        XCTAssertNil(appleMediaLTRAcknowledgementTimestamp(packet))
+    func testLTRFrameCompletionUsesApplePacketCountWithoutRTPMarker() {
+        var tracker = AppleMediaLTRFrameCompletionTracker()
+        let first = makeAppleMediaFramePacket(
+            rtpSequence: 100,
+            rtpTimestamp: 0x5566_7788,
+            ssrc: 0x070d_fa0e,
+            frameSequence: 0x77c0,
+            totalPackets: 3,
+            ltrBits: 1)
+        let second = makeAppleMediaFramePacket(
+            rtpSequence: 101,
+            rtpTimestamp: 0x5566_7788,
+            ssrc: 0x070d_fa0e,
+            frameSequence: 0x77c0,
+            totalPackets: 3,
+            ltrBits: 1)
+        let third = makeAppleMediaFramePacket(
+            rtpSequence: 102,
+            rtpTimestamp: 0x5566_7788,
+            ssrc: 0x070d_fa0e,
+            frameSequence: 0x77c0,
+            totalPackets: 3,
+            ltrBits: 1)
+
+        XCTAssertEqual(first[1] & 0x80, 0)
+        XCTAssertNil(tracker.insert(first))
+        XCTAssertNil(tracker.insert(second))
+        XCTAssertEqual(
+            tracker.insert(third),
+            AppleMediaLTRFrameAcknowledgement(
+                ssrc: 0x070d_fa0e,
+                rtpTimestamp: 0x5566_7788))
+    }
+
+    func testLTRFrameCompletionDoesNotCountDuplicatePackets() {
+        var tracker = AppleMediaLTRFrameCompletionTracker()
+        let first = makeAppleMediaFramePacket(
+            rtpSequence: 100,
+            frameSequence: 7,
+            totalPackets: 2,
+            ltrBits: 1)
+        let second = makeAppleMediaFramePacket(
+            rtpSequence: 101,
+            frameSequence: 7,
+            totalPackets: 2,
+            ltrBits: 1)
+
+        XCTAssertNil(tracker.insert(first))
+        XCTAssertNil(tracker.insert(first))
+        XCTAssertNotNil(tracker.insert(second))
+        XCTAssertNil(tracker.insert(second))
+    }
+
+    func testNonLTRFrameIsNotAcknowledged() {
+        var tracker = AppleMediaLTRFrameCompletionTracker()
+        let packet = makeAppleMediaFramePacket(
+            rtpSequence: 100,
+            frameSequence: 7,
+            totalPackets: 1,
+            ltrBits: 0)
+
+        XCTAssertNil(tracker.insert(packet))
     }
 
     func testAppleMediaRTPMediaControlParsesLTRTimestampAndFrameFields() {
@@ -246,6 +294,27 @@ final class AppleMediaFeedbackTests: XCTestCase {
             0x78, 0x56, 0x34, 0x12,
         ])
         XCTAssertNil(appleMediaRTPMediaControlInfo(packet))
+    }
+
+    private func makeAppleMediaFramePacket(
+        rtpSequence: UInt16,
+        rtpTimestamp: UInt32 = 0x0102_0304,
+        ssrc: UInt32 = 0x1122_3344,
+        frameSequence: UInt16,
+        totalPackets: UInt16,
+        ltrBits: UInt8
+    ) -> Data {
+        Data([
+            0x90, 0x64,
+            UInt8(rtpSequence >> 8), UInt8(rtpSequence & 0xff),
+            UInt8(rtpTimestamp >> 24), UInt8((rtpTimestamp >> 16) & 0xff),
+            UInt8((rtpTimestamp >> 8) & 0xff), UInt8(rtpTimestamp & 0xff),
+            UInt8(ssrc >> 24), UInt8((ssrc >> 16) & 0xff),
+            UInt8((ssrc >> 8) & 0xff), UInt8(ssrc & 0xff),
+            0x93, ltrBits << 4 | 0x01, 0x00, 0x01,
+            UInt8(totalPackets >> 8), UInt8(totalPackets & 0xff),
+            UInt8(frameSequence >> 8), UInt8(frameSequence & 0xff),
+        ])
     }
 
     func testRateControllerStartsAtAvailableCeilingAndHoldsWithoutLoss() {

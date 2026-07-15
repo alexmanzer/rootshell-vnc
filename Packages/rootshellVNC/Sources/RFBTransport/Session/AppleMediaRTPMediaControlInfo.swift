@@ -80,20 +80,96 @@ func appleMediaRTPMediaControlInfo(
         frameSequenceNumber: frameSequenceNumber)
 }
 
-/// Return the RTP timestamp that the native receiver acknowledges for a
-/// completed LTR-marked access unit. Only an RTP marker packet completes an
-/// access unit; acknowledging an earlier fragment could let the sender use a
-/// reference picture whose remaining packets never arrived.
-func appleMediaLTRAcknowledgementTimestamp(_ packet: Data) -> UInt32? {
-    let minimumRTPHeaderLength = 12
-    guard packet.count >= minimumRTPHeaderLength else { return nil }
-    let base = packet.startIndex
-    guard packet[base] >> 6 == 2,
-          packet[base + 1] & 0x80 != 0,
-          let mediaControl = appleMediaRTPMediaControlInfo(packet),
-          mediaControl.ltrBits != 0 else { return nil }
-    return UInt32(packet[base + 4]) << 24
-        | UInt32(packet[base + 5]) << 16
-        | UInt32(packet[base + 6]) << 8
-        | UInt32(packet[base + 7])
+struct AppleMediaLTRFrameAcknowledgement: Equatable {
+    let ssrc: UInt32
+    let rtpTimestamp: UInt32
+}
+
+/// Tracks complete LTR-marked Apple video subframes.
+///
+/// Apple's screen profile never sets the ordinary RTP marker bit. Instead,
+/// every packet carries a media-control extension containing the total packet
+/// count and frame sequence number. Native emits APP type-5 feedback once all
+/// packets belonging to an LTR-marked tile subframe have arrived. Tracking by
+/// SSRC is necessary because the four compound-HEVC bands advance in parallel.
+struct AppleMediaLTRFrameCompletionTracker {
+    private struct Frame {
+        let frameSequenceNumber: UInt16
+        let rtpTimestamp: UInt32
+        let expectedPacketCount: Int
+        var rtpSequences: Set<UInt16>
+    }
+
+    private struct CompletedFrame {
+        let frameSequenceNumber: UInt16
+        let rtpTimestamp: UInt32
+    }
+
+    private var activeFramesBySSRC: [UInt32: Frame] = [:]
+    private var completedFramesBySSRC: [UInt32: CompletedFrame] = [:]
+
+    mutating func insert(
+        _ packet: Data
+    ) -> AppleMediaLTRFrameAcknowledgement? {
+        let minimumRTPHeaderLength = 12
+        guard packet.count >= minimumRTPHeaderLength else { return nil }
+        let base = packet.startIndex
+        guard packet[base] >> 6 == 2,
+              let mediaControl = appleMediaRTPMediaControlInfo(packet),
+              mediaControl.ltrBits != 0,
+              let totalPackets = mediaControl.totalPacketsPerFrame,
+              totalPackets > 0,
+              let frameSequence = mediaControl.frameSequenceNumber else {
+            return nil
+        }
+
+        let rtpSequence = UInt16(packet[base + 2]) << 8
+            | UInt16(packet[base + 3])
+        let rtpTimestamp = UInt32(packet[base + 4]) << 24
+            | UInt32(packet[base + 5]) << 16
+            | UInt32(packet[base + 6]) << 8
+            | UInt32(packet[base + 7])
+        let ssrc = UInt32(packet[base + 8]) << 24
+            | UInt32(packet[base + 9]) << 16
+            | UInt32(packet[base + 10]) << 8
+            | UInt32(packet[base + 11])
+
+        if let completed = completedFramesBySSRC[ssrc],
+           completed.frameSequenceNumber == frameSequence,
+           completed.rtpTimestamp == rtpTimestamp {
+            return nil
+        }
+
+        var frame: Frame
+        if let active = activeFramesBySSRC[ssrc],
+           active.frameSequenceNumber == frameSequence,
+           active.rtpTimestamp == rtpTimestamp {
+            frame = active
+        } else {
+            frame = Frame(
+                frameSequenceNumber: frameSequence,
+                rtpTimestamp: rtpTimestamp,
+                expectedPacketCount: Int(totalPackets),
+                rtpSequences: [])
+        }
+        frame.rtpSequences.insert(rtpSequence)
+
+        guard frame.rtpSequences.count >= frame.expectedPacketCount else {
+            activeFramesBySSRC[ssrc] = frame
+            return nil
+        }
+
+        activeFramesBySSRC.removeValue(forKey: ssrc)
+        completedFramesBySSRC[ssrc] = CompletedFrame(
+            frameSequenceNumber: frameSequence,
+            rtpTimestamp: rtpTimestamp)
+        return AppleMediaLTRFrameAcknowledgement(
+            ssrc: ssrc,
+            rtpTimestamp: rtpTimestamp)
+    }
+
+    mutating func reset() {
+        activeFramesBySSRC.removeAll(keepingCapacity: true)
+        completedFramesBySSRC.removeAll(keepingCapacity: true)
+    }
 }

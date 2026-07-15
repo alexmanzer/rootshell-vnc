@@ -1,6 +1,7 @@
 import XCTest
 import Foundation
 import CoreMedia
+import CoreVideo
 @testable import RFBRendering
 
 /// Replays a decrypted-RTP fixture through the compound interleaved-band path.
@@ -218,11 +219,113 @@ final class ReorderRecoveryTests: XCTestCase {
         XCTAssertGreaterThan(counter.value, 0)
     }
 
+    /// No-write hardware/software decoder comparison for an approved decoded-
+    /// RTP diagnostic capture. The digest is intentionally computed in memory:
+    /// it proves whether public VideoToolbox produced identical pixels without
+    /// retaining another copy of the remote screen on disk.
+    ///
+    /// Set ROOTSHELL_VNC_HASH_DECODED_RTP=1 and optionally
+    /// ROOTSHELL_VNC_REPLAY_PACKET_LIMIT to stop before a known packet loss.
+    func testHashCapturedCompoundDecodeWhenRequested() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["ROOTSHELL_VNC_HASH_DECODED_RTP"] == "1",
+              let path = env["ROOTSHELL_VNC_DECODED_RTP"],
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
+            throw XCTSkip(
+                "Set ROOTSHELL_VNC_HASH_DECODED_RTP=1 and ROOTSHELL_VNC_DECODED_RTP")
+        }
+        let packetLimit = Int(env["ROOTSHELL_VNC_REPLAY_PACKET_LIMIT"] ?? "")
+
+        var packets: [Data] = []
+        var offset = data.startIndex
+        while offset + 2 <= data.endIndex,
+              packetLimit.map({ packets.count < $0 }) ?? true {
+            let count = Int(data[offset]) << 8 | Int(data[offset + 1])
+            offset += 2
+            guard offset + count <= data.endIndex else { break }
+            packets.append(Data(data[offset ..< offset + count]))
+            offset += count
+        }
+        XCTAssertGreaterThan(packets.count, 100)
+
+        let digest = PixelDigest()
+        let manager = VideoStreamManager()
+        manager.startStream(streamID: 1, width: 2976, height: 1860) {
+            buffer, ssrc in
+            digest.append(buffer, ssrc: ssrc)
+        }
+        for packet in packets { _ = manager.feedRTPData(packet) }
+        manager.stopStream()
+        Thread.sleep(forTimeInterval: 0.8)
+
+        let result = digest.snapshot
+        print(
+            "pixel digest frames=\(result.frameCount) value="
+                + String(result.value, radix: 16))
+        XCTAssertGreaterThan(result.frameCount, 0)
+    }
+
     private final class Counter: @unchecked Sendable {
         private let lock = NSLock()
         private var count = 0
         var value: Int { lock.lock(); defer { lock.unlock() }; return count }
         func increment() { lock.lock(); count += 1; lock.unlock() }
+    }
+
+    private final class PixelDigest: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: UInt64 = 0xcbf2_9ce4_8422_2325
+        private var frameCount = 0
+
+        var snapshot: (value: UInt64, frameCount: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (value, frameCount)
+        }
+
+        func append(_ buffer: CVPixelBuffer, ssrc: UInt32) {
+            CVPixelBufferLockBaseAddress(buffer, .readOnly)
+            defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+
+            var frameHash: UInt64 = 0xcbf2_9ce4_8422_2325
+            func mix(_ byte: UInt8) {
+                frameHash ^= UInt64(byte)
+                frameHash &*= 0x0000_0100_0000_01b3
+            }
+            for shift in stride(from: 24, through: 0, by: -8) {
+                mix(UInt8((ssrc >> UInt32(shift)) & 0xff))
+            }
+            let planes = max(1, CVPixelBufferGetPlaneCount(buffer))
+            for plane in 0 ..< planes {
+                let base: UnsafeMutableRawPointer?
+                let byteCount: Int
+                if CVPixelBufferGetPlaneCount(buffer) == 0 {
+                    base = CVPixelBufferGetBaseAddress(buffer)
+                    byteCount = CVPixelBufferGetBytesPerRow(buffer)
+                        * CVPixelBufferGetHeight(buffer)
+                } else {
+                    base = CVPixelBufferGetBaseAddressOfPlane(buffer, plane)
+                    byteCount = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane)
+                        * CVPixelBufferGetHeightOfPlane(buffer, plane)
+                }
+                guard let base else { continue }
+                let bytes = base.assumingMemoryBound(to: UInt8.self)
+                // Sample one cache line at a time. This remains deterministic
+                // and catches spatial corruption across the complete surface,
+                // while avoiding a minute of scalar hashing for a short 4K
+                // capture replay.
+                for index in stride(from: 0, to: byteCount, by: 64) {
+                    mix(bytes[index])
+                }
+                if byteCount > 0 { mix(bytes[byteCount - 1]) }
+            }
+
+            lock.lock()
+            value ^= frameHash
+            value &*= 0x0000_0100_0000_01b3
+            frameCount += 1
+            lock.unlock()
+        }
     }
 }
 

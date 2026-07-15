@@ -104,10 +104,10 @@ public enum AppleMediaVideoMode {
 /// Reusing an SSRC or creation time can be interpreted as a colliding or stale
 /// media session.
 struct AppleMediaNegotiationProfile: Sendable {
-    /// The Viceroy screen stream is negotiated as a logical local-network
-    /// transport even when the device reaches that network through cellular
-    /// and a VPN. Advertising cellular-only screen rules completes the control
-    /// handshake but leaves the peers without a compatible video source.
+    /// Screen Sharing supplies this app-specific access-network override when
+    /// constructing its mode-7 negotiator. A bare AVCMediaStreamNegotiator
+    /// defaults to zero, but the resulting native server-side video config is
+    /// consistently one for real Screen Sharing sessions.
     private static let screenAccessNetworkType: UInt64 = 1
     private static let screenVideoTransportType: UInt64 = 1
 
@@ -133,8 +133,8 @@ struct AppleMediaNegotiationProfile: Sendable {
         /// not the current framebuffer dimensions; the server uses them while
         /// selecting its encoder and tiling profile.
         static let screenCodec = AspectRatio(
-            landscapeWidth: 8,
-            landscapeHeight: 5,
+            landscapeWidth: 16,
+            landscapeHeight: 9,
             portraitWidth: 5,
             portraitHeight: 8)
 
@@ -252,9 +252,6 @@ struct AppleMediaNegotiationProfile: Sendable {
         blob.varint(field: 13, ntpTimestamp)
         blob.varint(field: 14, 2) // VCMediaNegotiationBlob version
         blob.varint(field: 16, 0) // mediaControlInfoVersion
-        // Screen Sharing's runtime mode-7 configuration selects local-network
-        // access even when the bearer itself is discovered separately. This
-        // is distinct from the per-codec transport rule below.
         blob.varint(field: 18, Self.screenAccessNetworkType)
         return blob.data
     }
@@ -345,17 +342,21 @@ struct AppleMediaNegotiationProfile: Sendable {
     /// Both legacy and extended bandwidth modes are included because the peer
     /// selects one according to its connection/profile type. Legacy maxima are
     /// in kbps; extended maxima are in bps.
+    /// Preserve AVConference's wire order. These are repeated protobuf values,
+    /// not a dictionary: Viceroy walks the ordered capability list while
+    /// selecting the active bandwidth mode. Reordering an equivalent set can
+    /// select a different screen rate-controller profile on the peer.
     private static let bandwidthSettings: [BandwidthSetting] = [
-        .init(legacyMode: 4_074, maximum: 0, extendedMode: 16_384),       // FaceTime 5G
-        .init(legacyMode: 0, maximum: 6_000_000, extendedMode: 131_072), // multiway screen Wi-Fi
-        .init(legacyMode: 0, maximum: 40_000_000, extendedMode: 12_288), // screen Wi-Fi
-        .init(legacyMode: 0, maximum: 75_000_000, extendedMode: 524_288), // immersive video Wi-Fi
-        .init(legacyMode: 0, maximum: 20_000_000, extendedMode: 98_304),  // low-latency screen Wi-Fi
-        .init(legacyMode: 1, maximum: 299),                               // default Wi-Fi
-        .init(legacyMode: 0, maximum: 60_000_000, extendedMode: 262_144), // low-latency screen wired
-        .init(legacyMode: 16, maximum: 4_100),                            // legacy screen Wi-Fi
-        .init(legacyMode: 4, maximum: 6_500),                             // FaceTime Wi-Fi
+        .init(legacyMode: 4_074, maximum: 0, extendedMode: 16_384),          // FaceTime 5G
+        .init(legacyMode: 4, maximum: 6_500),                                // FaceTime Wi-Fi
+        .init(legacyMode: 0, maximum: 40_000_000, extendedMode: 12_288),     // screen Wi-Fi
+        .init(legacyMode: 0, maximum: 60_000_000, extendedMode: 262_144),    // low-latency screen wired
+        .init(legacyMode: 0, maximum: 20_000_000, extendedMode: 98_304),     // low-latency screen Wi-Fi
         .init(legacyMode: 0, maximum: 100_000_000, extendedMode: 1_048_576), // immersive video wired
+        .init(legacyMode: 0, maximum: 6_000_000, extendedMode: 131_072),     // multiway screen Wi-Fi
+        .init(legacyMode: 0, maximum: 75_000_000, extendedMode: 524_288),    // immersive video Wi-Fi
+        .init(legacyMode: 16, maximum: 4_100),                               // legacy screen Wi-Fi
+        .init(legacyMode: 1, maximum: 299),                                  // default Wi-Fi
     ]
 
     private struct BandwidthSetting: Sendable {

@@ -86,7 +86,7 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertEqual(root.varint(13), timestamp)
         XCTAssertEqual(root.varint(14), 2)
         XCTAssertEqual(root.varint(16), 0)
-        XCTAssertEqual(root.varint(18), 1) // local screen access-network type
+        XCTAssertEqual(root.varint(18), 1)
         let bandwidthSettings = root.messages(9)
         XCTAssertEqual(bandwidthSettings.count, 10)
         XCTAssertEqual(
@@ -95,15 +95,15 @@ final class AppleMediaNegotiationTests: XCTestCase {
             },
             [
                 [4_074, 0, 16_384],
-                [0, 6_000_000, 131_072],
-                [0, 40_000_000, 12_288],
-                [0, 75_000_000, 524_288],
-                [0, 20_000_000, 98_304],
-                [1, 299, 0],
-                [0, 60_000_000, 262_144],
-                [16, 4_100, 0],
                 [4, 6_500, 0],
+                [0, 40_000_000, 12_288],
+                [0, 60_000_000, 262_144],
+                [0, 20_000_000, 98_304],
                 [0, 100_000_000, 1_048_576],
+                [0, 6_000_000, 131_072],
+                [0, 75_000_000, 524_288],
+                [16, 4_100, 0],
+                [1, 299, 0],
             ])
 
         let screen = try XCTUnwrap(root.message(5))
@@ -119,12 +119,12 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertEqual(payloads.count, 2)
         XCTAssertEqual(payloads[0].varint(1), 123)
         XCTAssertEqual(payloads[0].messages(2).count, 4)
-        XCTAssertTrue(payloads[0].string(3)?.contains("AR:8/5,5/8;") == true)
-        XCTAssertTrue(payloads[0].string(3)?.contains("XR:8/5,5/8;") == true)
+        XCTAssertTrue(payloads[0].string(3)?.contains("AR:16/9,5/8;") == true)
+        XCTAssertTrue(payloads[0].string(3)?.contains("XR:16/9,5/8;") == true)
         XCTAssertEqual(payloads[1].varint(1), 100)
         XCTAssertEqual(payloads[1].messages(2).count, 2)
-        XCTAssertTrue(payloads[1].string(3)?.contains("AR:8/5,5/8;") == true)
-        XCTAssertTrue(payloads[1].string(3)?.contains("XR:8/5,5/8;") == true)
+        XCTAssertTrue(payloads[1].string(3)?.contains("AR:16/9,5/8;") == true)
+        XCTAssertTrue(payloads[1].string(3)?.contains("XR:16/9,5/8;") == true)
     }
 
     func testScreenCodecCapabilitiesMatchNativeNegotiatorBytes() throws {
@@ -138,18 +138,20 @@ final class AppleMediaNegotiationTests: XCTestCase {
             ntpTimestamp: 1))
         let actual = try XCTUnwrap(root.bytes(5))
 
-        // Captured from AVCMediaStreamNegotiatorSettingsRemoteDesktopScreenSharing
-        // after removing only the session-specific SSRC field. The native
-        // bytes are identical for 2976x1860 and 5120x2880 configurations.
+        // Captured from the app-configured native Screen Sharing negotiation
+        // after removing only the session-specific SSRC field. A bare private
+        // negotiator uses 8:5, but real sessions produce 16:9 here and in the
+        // server's resulting VCVideoStreamConfig.
         let nativeCapabilities = try XCTUnwrap(dataFromHex(
-            "10001a7d087b120a0801100118c387032000120a0801100218c387032000" +
-            "120a0801100118c387032000120a0801100218c3870320001a47464c533b" +
+            "10001a7f087b120a0801100118c387032000120a0801100218c387032000" +
+            "120a0801100118c387032000120a0801100218c3870320001a49464c533b" +
             "4d533a2d313b4c463a2d313b4c54523b43414241433b504f533a303b45" +
-            "4f443a313b4854533a323b52523a333b41523a382f352c352f383b5852" +
-            "3a382f352c352f383b20011a5c0864120a0801100118c387032000120a" +
-            "0801100218c3870320001a3e464c533b4c463a2d313b504f533a353b45" +
-            "4f443a313b4854533a323b52523a333b504f53453a343b41523a382f35" +
-            "2c352f383b58523a382f352c352f383b200e30043801403f48016001"))
+            "4f443a313b4854533a323b52523a333b41523a31362f392c352f383b58" +
+            "523a31362f392c352f383b20011a5e0864120a0801100118c387032000" +
+            "120a0801100218c3870320001a40464c533b4c463a2d313b504f533a35" +
+            "3b454f443a313b4854533a323b52523a333b504f53453a343b41523a31" +
+            "362f392c352f383b58523a31362f392c352f383b200e30043801403f48" +
+            "016001"))
         XCTAssertEqual(actual, Data([0x08, 0x00]) + nativeCapabilities)
     }
 
@@ -198,7 +200,7 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertEqual(hdrScreen.varint(9), 9)
     }
 
-    func testScreenNegotiationMatchesNativeRuntimeAccessAndVideoTransport() throws {
+    func testScreenNegotiationMatchesNativeAppAccessAndVideoTransport() throws {
         let profile = AppleMediaNegotiationProfile(
             framebufferWidth: 2556,
             framebufferHeight: 1179,
@@ -345,7 +347,7 @@ final class AppleMediaNegotiationTests: XCTestCase {
 
         XCTAssertEqual(ipad.aspectRatio, .screenCodec)
         XCTAssertEqual(wide.aspectRatio, .screenCodec)
-        XCTAssertEqual(ipad.aspectRatio.featureListValue, "8/5,5/8")
+        XCTAssertEqual(ipad.aspectRatio.featureListValue, "16/9,5/8")
     }
 
     func testNTPConversion() {

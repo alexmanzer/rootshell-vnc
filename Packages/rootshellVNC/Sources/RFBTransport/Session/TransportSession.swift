@@ -269,6 +269,14 @@ public actor TransportSession {
     /// incoming source so feedback uses that display's matching send context.
     private var appleMediaFeedbackRoutes: [AppleMediaFeedbackRoute] = []
     private var appleMediaFeedbackRouteByRemoteSSRC: [UInt32: AppleMediaFeedbackRoute] = [:]
+    /// Audio uses its own SRTP keys and sends the native one-second RR+SDES
+    /// heartbeat on the audio socket. It must not be mixed into the 20 Hz
+    /// screen-video RCTL route.
+    private var appleMediaAudioFeedbackRoute: AppleMediaFeedbackRoute?
+    private var appleMediaAudioLocalSSRC: UInt32 = 0
+    private var appleMediaAudioRemoteSSRC: UInt32?
+    private var appleMediaAudioChannel: PosixUDPChannel?
+    private var appleMediaAudioRTCPTask: Task<Void, Never>?
     private var appleMediaVideoLocalSSRCs: [UInt32] = []
     /// Audio, video-one, and video-two offer lengths returned by the most
     /// recent native AVC message two. Kept as a live-probe diagnostic so a
@@ -282,9 +290,11 @@ public actor TransportSession {
     /// Native primes each new video generation with one RR + empty-CNAME SDES
     /// compound packet before its 20 Hz RCTL stream.
     private var appleMediaSentBootstrapVideoReceiverReport = false
-    /// Last completed LTR access unit acknowledged on each remote source.
-    /// Retransmitted marker packets must not create duplicate acknowledgements.
-    private var appleMediaLastLTRAcknowledgementTimestampBySSRC: [UInt32: UInt32] = [:]
+    /// Apple carries tile-subframe completion in its RTP media-control
+    /// extension rather than the ordinary RTP marker bit.
+    private var appleMediaLTRFrameCompletionTracker =
+        AppleMediaLTRFrameCompletionTracker()
+    private var appleMediaLTRAcknowledgementsSinceDiagnostic = 0
     private var appleLastKeyframeRequestNanos: UInt64 = 0
     /// Most recent native frame-loss report for each source. This lets the
     /// decoder confirm that its gated source corresponds to observed RTP loss.
@@ -308,14 +318,10 @@ public actor TransportSession {
     /// This is unrelated to the RTP media-control extension and RTCP LSR.
     private var appleMediaLastRTPEchoTimestampQ10: UInt16 = 0
     private var appleRCTLPreviousRTPTimestamp: UInt32?
-    /// Cumulative receive count captured at the same instant as the echoed RTP
-    /// timestamp. AVConference publishes both values when the first packet of
-    /// a new timestamp arrives; allowing the count to advance through the rest
-    /// of that access unit makes the sender compare values from different
-    /// points in its packet history and manufacture uplink loss.
-    private var appleRCTLReceivedPacketCountAtEcho: UInt32 = 0
-    private var appleRCTLEchoTimestampArrivalNanos: UInt64 = 0
     private var appleRCTLTotalPacketsReceived: UInt32 = 0
+    private var appleRCTLAudioPacketsReceived: UInt32 = 0
+    private var appleRCTLTotalBytesReceived: UInt64 = 0
+    private var appleRCTLMaximumQueueDelayNanos: UInt64 = 0
     /// RTCP APP "RCTL" rate-control feedback (drives the server's adaptive
     /// encoder bitrate). This profile sends it at approximately 20 Hz; without
     /// it the server encodes at a constant maximum bitrate. The burst-loss
@@ -339,7 +345,12 @@ public actor TransportSession {
         var cycles: UInt32 = 0
         var received: UInt32 = 0
         var expectedPrior: UInt32 = 0
-        var receivedPrior: UInt32 = 0
+        /// Loss is not reported to the sender until the reorder window has
+        /// expired. Computing RR loss from the newest sequence seen turns an
+        /// ordinary out-of-order burst into hundreds of packets of apparent
+        /// loss while those packets are still queued locally.
+        var confirmedLost: UInt32 = 0
+        var confirmedLostPrior: UInt32 = 0
         var recentSequences = BoundedRTPSequenceHistory(capacity: 256)
         var initialized = false
     }
@@ -3346,6 +3357,7 @@ public actor TransportSession {
         // The FIR sender field uses the receiver's negotiated local RTP SSRC.
         // Using an unrelated random SSRC produces a valid
         // SRTCP packet that the server does not associate with this receiver.
+        appleMediaAudioLocalSSRC = generatedAudioOffer.ssrc
         appleMediaVideoLocalSSRCs = [generatedVideoOffer.ssrc]
         if let generatedVideo2Offer {
             appleMediaVideoLocalSSRCs.append(generatedVideo2Offer.ssrc)
@@ -3505,12 +3517,6 @@ public actor TransportSession {
         data[offset + 3] = UInt8(value & 0xff)
     }
 
-    /// A minimal RTCP receiver-report used to prime the server's symmetric-RTP
-    /// destination latch. PT=201 (RTCP RR) so it is never confused with video.
-    private nonisolated func appleMediaUDPPrimer() -> Data {
-        Data([0x80, 0xc9, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00])
-    }
-
     /// Server-offered media ports override, e.g. `ROOTSHELL_VNC_MEDIA_PORTS=5900,5901`.
     private nonisolated func configuredAppleMediaPortOverride() -> [UInt16]? {
         guard let value = runtimeEnvironment["ROOTSHELL_VNC_MEDIA_PORTS"] else {
@@ -3584,6 +3590,10 @@ public actor TransportSession {
         appleMediaSRTPContextBySSRC.removeAll(keepingCapacity: true)
         appleMediaFeedbackRoutes.removeAll(keepingCapacity: true)
         appleMediaFeedbackRouteByRemoteSSRC.removeAll(keepingCapacity: true)
+        appleMediaAudioFeedbackRoute = nil
+        appleMediaAudioRemoteSSRC = nil
+        appleMediaAudioChannel = nil
+        appleMediaAudioLocalSSRC = 0
         appleMediaVideoLocalSSRCs.removeAll(keepingCapacity: true)
         appleMediaExpectsSRTP = true
         appleMediaPreKeyDatagrams.removeAll(keepingCapacity: true)
@@ -3591,7 +3601,8 @@ public actor TransportSession {
 
         appleMediaVideoSSRCChannels.removeAll(keepingCapacity: true)
         appleMediaSentBootstrapVideoReceiverReport = false
-        appleMediaLastLTRAcknowledgementTimestampBySSRC.removeAll(keepingCapacity: true)
+        appleMediaLTRFrameCompletionTracker.reset()
+        appleMediaLTRAcknowledgementsSinceDiagnostic = 0
         appleMediaReceptionStats.removeAll(keepingCapacity: true)
         appleMediaLastFrameLossFeedback.removeAll(keepingCapacity: true)
         appleMediaMostRecentFrameLossSSRC = nil
@@ -3599,9 +3610,10 @@ public actor TransportSession {
         appleMediaLastSRArrivalNanos = 0
         appleMediaLastRTPEchoTimestampQ10 = 0
         appleRCTLPreviousRTPTimestamp = nil
-        appleRCTLReceivedPacketCountAtEcho = 0
-        appleRCTLEchoTimestampArrivalNanos = 0
         appleRCTLTotalPacketsReceived = 0
+        appleRCTLAudioPacketsReceived = 0
+        appleRCTLTotalBytesReceived = 0
+        appleRCTLMaximumQueueDelayNanos = 0
         appleRCTLPacketsInterval = 0
         appleRCTLLostInterval = 0
         appleRCTLBurstLostInterval = 0
@@ -3720,15 +3732,8 @@ public actor TransportSession {
         // machine). Network.framework does not reliably expose SO_REUSEPORT,
         // which is why the previous unconnected listener never received on
         // loopback.
-        // On loopback the symmetric scheme (local==remote==same port)
-        // self-delivers: server and client share an identical 4-tuple, so
-        // SO_REUSEPORT hashing sends the server's packets to its own socket.
-        // Ephemeral mode binds a distinct local port and relies on the server
-        // latching our source (from the primer) — which gives clean loopback
-        // delivery. Toggle with ROOTSHELL_VNC_MEDIA_UDP_EPHEMERAL=1.
-        let ephemeral = runtimeEnvironment["ROOTSHELL_VNC_MEDIA_UDP_EPHEMERAL"] == "1"
         let channel = PosixUDPChannel(
-            localPort: ephemeral ? nil : binding.localPort,
+            localPort: binding.localPort,
             remoteHost: dialHost,
             remotePort: binding.remotePort,
             enableReusePort: true
@@ -3738,13 +3743,6 @@ public actor TransportSession {
         let actualPort = await channel.localPort ?? binding.localPort ?? 0
         continuation?.yield(.appleMediaUDPStarted(localPort: actualPort))
         log.debug("Started Apple media UDP localPort=\(actualPort) remotePort=\(binding.remotePort)")
-
-        // Symmetric RTP: send a zero-length / RTCP primer so the server latches
-        // our source endpoint and (on loopback) so the connected 4-tuple is
-        // established in both directions. Opt-in for experimentation.
-        if runtimeEnvironment["ROOTSHELL_VNC_MEDIA_UDP_PRIME"] == "1" {
-            try? await channel.send(appleMediaUDPPrimer())
-        }
 
         let readTask = Task { [weak self, channel] in
             while !Task.isCancelled {
@@ -3800,6 +3798,8 @@ public actor TransportSession {
         appleKeyframeRequestTask = nil
         appleRTCPReportTask?.cancel()
         appleRTCPReportTask = nil
+        appleMediaAudioRTCPTask?.cancel()
+        appleMediaAudioRTCPTask = nil
         appleRCTLFeedbackTask?.cancel()
         appleRCTLFeedbackTask = nil
         appleRCTLPacketsInterval = 0
@@ -3812,12 +3812,14 @@ public actor TransportSession {
         appleMediaRateController = nil
         appleMediaLastRTPEchoTimestampQ10 = 0
         appleRCTLPreviousRTPTimestamp = nil
-        appleRCTLReceivedPacketCountAtEcho = 0
-        appleRCTLEchoTimestampArrivalNanos = 0
         appleRCTLTotalPacketsReceived = 0
+        appleRCTLAudioPacketsReceived = 0
+        appleRCTLTotalBytesReceived = 0
+        appleRCTLMaximumQueueDelayNanos = 0
         appleMediaVideoSSRCChannels.removeAll()
         appleMediaSentBootstrapVideoReceiverReport = false
-        appleMediaLastLTRAcknowledgementTimestampBySSRC.removeAll()
+        appleMediaLTRFrameCompletionTracker.reset()
+        appleMediaLTRAcknowledgementsSinceDiagnostic = 0
         appleMediaReceptionStats.removeAll()
         appleMediaLastFrameLossFeedback.removeAll()
         appleMediaMostRecentFrameLossSSRC = nil
@@ -3827,6 +3829,10 @@ public actor TransportSession {
         appleMediaSRTPContextBySSRC.removeAll()
         appleMediaFeedbackRoutes.removeAll()
         appleMediaFeedbackRouteByRemoteSSRC.removeAll()
+        appleMediaAudioFeedbackRoute = nil
+        appleMediaAudioLocalSSRC = 0
+        appleMediaAudioRemoteSSRC = nil
+        appleMediaAudioChannel = nil
         appleMediaVideoLocalSSRCs.removeAll()
         appleMediaLocalSSRC = 0
         appleLastKeyframeRequestNanos = 0
@@ -3890,8 +3896,20 @@ public actor TransportSession {
                 : nil)
 
         if keys.audioServerToViewer.count >= 46,
-           let audioContext = try? AppleSRTPContext(mediaKey: keys.audioServerToViewer) {
+           keys.audioViewerToServer.count >= 46,
+           appleMediaAudioLocalSSRC != 0,
+           let audioContext = try? AppleSRTPContext(mediaKey: keys.audioServerToViewer),
+           let sendRTCPContext = try? AppleSRTCPContext(
+                mediaKey: keys.audioViewerToServer),
+           let receiveRTCPContext = try? AppleSRTCPContext(
+                mediaKey: keys.audioServerToViewer) {
             appleMediaSRTPContexts.append(audioContext)
+            appleMediaAudioFeedbackRoute = AppleMediaFeedbackRoute(
+                receiveContext: audioContext,
+                sendRTCPContext: sendRTCPContext,
+                receiveRTCPContext: receiveRTCPContext,
+                localSSRC: appleMediaAudioLocalSSRC,
+                streamIndex: 0)
         }
         if appleMediaLocalSSRC == 0 {
             appleMediaLocalSSRC = generateAppleMediaLocalSSRC()
@@ -3932,29 +3950,22 @@ public actor TransportSession {
 
     private var appleMediaFIRSeq: UInt8 = 0
 
-    /// No-video-displayed recovery uses RR + PSFB FIR, followed by a reset of
-    /// expected decoding order. Do not layer PLI and legacy FIR variants into
-    /// the same compound packet; this profile uses the RFC 5104 FIR form.
+    /// No-video-displayed recovery uses reduced-size PSFB FIR, followed by a
+    /// reset of expected decoding order. Do not layer PLI and legacy FIR
+    /// variants into the same packet; this profile uses RFC 5104 FIR.
     private func sendAppleMediaKeyframeRequest(mediaSSRC: UInt32, on channel: PosixUDPChannel) async {
         guard let route = appleMediaFeedbackRoute(forRemoteSSRC: mediaSSRC) else { return }
         let sender = route.localSSRC
-        var compound = Data()
-        if let rr = buildAppleMediaReceiverReport(
-            senderSSRC: sender,
-            mediaSSRC: mediaSSRC) {
-            compound.append(rr)
-        }
-
         appleMediaFIRSeq &+= 1
-        compound.append(appleMediaFullIntraRequestPacket(
+        let packet = appleMediaFullIntraRequestPacket(
             senderSSRC: sender,
             mediaSSRC: mediaSSRC,
-            sequenceNumber: appleMediaFIRSeq))
+            sequenceNumber: appleMediaFIRSeq)
 
         guard let protected = try? route.sendRTCPContext.protect(
-            compound,
+            packet,
             senderSSRC: sender) else { return }
-        dumpAppleMediaOutgoingRTCPIfRequested(plaintext: compound, protected: protected)
+        dumpAppleMediaOutgoingRTCPIfRequested(plaintext: packet, protected: protected)
         try? await channel.send(protected)
         log.warning("Sent native no-video-displayed FIR media ssrc=0x\(String(mediaSSRC, radix: 16)) "
             + "feedbackStream=\(route.streamIndex) sequence=\(self.appleMediaFIRSeq)")
@@ -4207,6 +4218,19 @@ public actor TransportSession {
     ) {
         guard let header = parseAppleMediaRTPHeader(packet) else { return }
         guard header.payloadType == 100 else {
+            // The only non-video RTP source in this profile is remote audio.
+            // Native acknowledges it with a one-source RR+empty-CNAME SDES
+            // compound packet every second; without that heartbeat the sender
+            // logs an RTCP timeout with a NaN last-receive timestamp.
+            appleMediaAudioRemoteSSRC = header.ssrc
+            appleMediaAudioChannel = channel
+            if updateAppleMediaReceptionStats(
+                ssrc: header.ssrc,
+                sequence: header.sequenceNumber) {
+                appleRCTLAudioPacketsReceived &+= 1
+                appleRCTLTotalBytesReceived &+= UInt64(max(0, wireByteCount))
+                startAppleMediaAudioRTCPFeedbackLoop()
+            }
             emitAppleMediaRTPPacket(packet)
             return
         }
@@ -4269,10 +4293,12 @@ public actor TransportSession {
                 }
             }
             appleRCTLTotalPacketsReceived &+= 1
+            appleRCTLTotalBytesReceived &+= UInt64(max(0, wireByteCount))
+            appleRCTLMaximumQueueDelayNanos = max(
+                appleRCTLMaximumQueueDelayNanos,
+                ingressQueueDelayNanos)
             appleRCTLPacketsInterval += 1
-            updateAppleRCTLEchoTimestamp(
-                header.timestamp,
-                arrivalNanos: nowNanos)
+            updateAppleRCTLEchoTimestamp(header.timestamp)
             startAppleTestFIRLoopIfRequested()
             startAppleRCTLFeedbackLoop()
 
@@ -4328,6 +4354,10 @@ public actor TransportSession {
             appleRCTLBurstLostInterval = max(
                 appleRCTLBurstLostInterval,
                 gap.missingPacketCount)
+            if var stats = appleMediaReceptionStats[gap.ssrc] {
+                stats.confirmedLost &+= UInt32(clamping: gap.missingPacketCount)
+                appleMediaReceptionStats[gap.ssrc] = stats
+            }
 
             if rateControlEnabled {
                 let controller = appleMediaRateController ?? {
@@ -4374,22 +4404,20 @@ public actor TransportSession {
         }
     }
 
-    /// Acknowledge only a fully received, ordered marker packet carrying the
-    /// native media-control LTR flag. This mirrors AVConference's per-access-
-    /// unit APP type-5 feedback without relying on the private framework.
+    /// Acknowledge a fully received, ordered LTR-marked tile subframe. Apple
+    /// does not set RTP's marker bit for this profile; packet count and frame
+    /// sequence in its public wire extension define completion instead.
     private func acknowledgeAppleMediaLTRIfNeeded(_ packet: Data) {
-        guard let timestamp = appleMediaLTRAcknowledgementTimestamp(packet),
-              let mediaSSRC = appleMediaRTPSSRC(packet),
-              appleMediaLastLTRAcknowledgementTimestampBySSRC[mediaSSRC]
-                != timestamp,
-              let channel = appleMediaVideoSSRCChannels[mediaSSRC] else {
+        guard let acknowledgement =
+                appleMediaLTRFrameCompletionTracker.insert(packet),
+              let channel = appleMediaVideoSSRCChannels[acknowledgement.ssrc]
+        else {
             return
         }
-        appleMediaLastLTRAcknowledgementTimestampBySSRC[mediaSSRC] = timestamp
         Task { [weak self] in
             await self?.sendAppleMediaLTRAcknowledgement(
-                rtpTimestamp: timestamp,
-                mediaSSRC: mediaSSRC,
+                rtpTimestamp: acknowledgement.rtpTimestamp,
+                mediaSSRC: acknowledgement.ssrc,
                 on: channel)
         }
     }
@@ -4410,7 +4438,12 @@ public actor TransportSession {
         dumpAppleMediaOutgoingRTCPIfRequested(
             plaintext: app,
             protected: protected)
-        try? await channel.send(protected)
+        do {
+            try await channel.send(protected)
+            appleMediaLTRAcknowledgementsSinceDiagnostic += 1
+        } catch {
+            return
+        }
     }
 
     /// Send negotiated frame-loss feedback (PSFB AFB type 6). This identifies
@@ -4423,21 +4456,15 @@ public actor TransportSession {
     ) async {
         guard let route = appleMediaFeedbackRoute(forRemoteSSRC: mediaSSRC) else { return }
         let sender = route.localSSRC
-        var compound = Data()
-        if let rr = buildAppleMediaReceiverReport(
-            senderSSRC: sender,
-            mediaSSRC: mediaSSRC) {
-            compound.append(rr)
-        }
-        compound.append(appleMediaFrameLossPacket(
+        let packet = appleMediaFrameLossPacket(
             senderSSRC: sender,
             mediaSSRC: mediaSSRC,
-            feedback: feedback))
+            feedback: feedback)
 
         guard let protected = try? route.sendRTCPContext.protect(
-            compound,
+            packet,
             senderSSRC: sender) else { return }
-        dumpAppleMediaOutgoingRTCPIfRequested(plaintext: compound, protected: protected)
+        dumpAppleMediaOutgoingRTCPIfRequested(plaintext: packet, protected: protected)
         try? await channel.send(protected)
         log.warning("Sent media frame-loss feedback ssrc=0x\(String(mediaSSRC, radix: 16)) "
             + "frameSequence=\(feedback.frameSequenceNumber) "
@@ -4503,31 +4530,25 @@ public actor TransportSession {
         guard !entries.isEmpty else { return }
 
         let sender = route.localSSRC
-        var compound = Data()
-        if let rr = buildAppleMediaReceiverReport(
-            senderSSRC: sender,
-            mediaSSRC: mediaSSRC) {
-            compound.append(rr)
-        }
-
-        compound.append(0x81) // V=2, P=0, FMT=1 (Generic NACK)
-        compound.append(0xcd) // PT=205 (RTPFB)
+        var packet = Data()
+        packet.append(0x81) // V=2, P=0, FMT=1 (Generic NACK)
+        packet.append(0xcd) // PT=205 (RTPFB)
         let length = UInt16(2 + entries.count)
-        compound.append(UInt8(length >> 8))
-        compound.append(UInt8(length & 0xff))
-        appendUInt32BE(sender, to: &compound)
-        appendUInt32BE(mediaSSRC, to: &compound)
+        packet.append(UInt8(length >> 8))
+        packet.append(UInt8(length & 0xff))
+        appendUInt32BE(sender, to: &packet)
+        appendUInt32BE(mediaSSRC, to: &packet)
         for entry in entries {
-            compound.append(UInt8(entry.packetID >> 8))
-            compound.append(UInt8(entry.packetID & 0xff))
-            compound.append(UInt8(entry.bitmask >> 8))
-            compound.append(UInt8(entry.bitmask & 0xff))
+            packet.append(UInt8(entry.packetID >> 8))
+            packet.append(UInt8(entry.packetID & 0xff))
+            packet.append(UInt8(entry.bitmask >> 8))
+            packet.append(UInt8(entry.bitmask & 0xff))
         }
 
         guard let protected = try? route.sendRTCPContext.protect(
-            compound,
+            packet,
             senderSSRC: sender) else { return }
-        dumpAppleMediaOutgoingRTCPIfRequested(plaintext: compound, protected: protected)
+        dumpAppleMediaOutgoingRTCPIfRequested(plaintext: packet, protected: protected)
         try? await channel.send(protected)
         log.debug("Requested RTP retransmission ssrc=0x\(String(mediaSSRC, radix: 16)) "
             + "missing=\(missingSequences.count) feedbackStream=\(route.streamIndex)")
@@ -4695,12 +4716,28 @@ public actor TransportSession {
             50,
             runtimeEnvironment["ROOTSHELL_VNC_RCTL_INTERVAL_MS"]
                 .flatMap(Int.init) ?? 50)
+        let intervalNanos = UInt64(intervalMilliseconds) * 1_000_000
         appleRCTLFeedbackTask = Task { [weak self] in
+            var nextDeadline = DispatchTime.now().uptimeNanoseconds &+ intervalNanos
             while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(intervalMilliseconds))
+                let beforeSleep = DispatchTime.now().uptimeNanoseconds
+                if nextDeadline > beforeSleep {
+                    try? await Task.sleep(
+                        nanoseconds: nextDeadline - beforeSleep)
+                }
                 if Task.isCancelled { return }
                 await self?.recoverWedgedAppleMediaReorderBufferIfNeeded()
                 await self?.sendAppleMediaRCTLFeedback()
+
+                // Keep the native timer's absolute 20 Hz phase instead of
+                // adding actor/serialization time to every 50 ms sleep. If a
+                // large RTP burst made us miss slots, skip those deadlines;
+                // emitting a catch-up feedback burst would itself perturb the
+                // encoder's rate controller.
+                let afterSend = DispatchTime.now().uptimeNanoseconds
+                repeat {
+                    nextDeadline &+= intervalNanos
+                } while nextDeadline <= afterSend
             }
         }
     }
@@ -4735,10 +4772,7 @@ public actor TransportSession {
     /// Apply the feedback-only RTP receive-accounting rules. Update the echo
     /// only when a forward-moving RTP timestamp begins, then send the
     /// low-precision form selected by Apple's video-stream configuration.
-    private func updateAppleRCTLEchoTimestamp(
-        _ timestamp: UInt32,
-        arrivalNanos: UInt64
-    ) {
+    private func updateAppleRCTLEchoTimestamp(_ timestamp: UInt32) {
         guard let previous = appleRCTLPreviousRTPTimestamp else {
             appleRCTLPreviousRTPTimestamp = timestamp
             return
@@ -4748,8 +4782,6 @@ public actor TransportSession {
         appleRCTLPreviousRTPTimestamp = timestamp
         appleMediaLastRTPEchoTimestampQ10 =
             appleMediaRCTLLowPrecisionEchoTimestamp(timestamp)
-        appleRCTLReceivedPacketCountAtEcho = appleRCTLTotalPacketsReceived
-        appleRCTLEchoTimestampArrivalNanos = arrivalNanos
     }
 
     /// Build and send one RTCP APP "RCTL" rate-control feedback packet:
@@ -4795,21 +4827,15 @@ public actor TransportSession {
 
         // RCTL carries estimated receive capacity. It is the feedback input to
         // the peer's encoder controller, not an observed activity bitrate.
-        // Native keeps LocalBWE at the negotiated ~60 Mbps ceiling on an
-        // unconstrained local Ethernet session and reports packet loss in the
-        // separate loss fields. Feeding one missing packet back into both loss
-        // and BWE permanently softened the server's Retina encode after an
-        // otherwise recovered frame. Preserve adaptive estimates for paths
-        // whose bearer prior starts below the ceiling, but match native LAN
-        // behavior when path discovery already established full capacity.
-        let usesNativeLANCapacity =
-            appleMediaNetworkProfile.initialCapacityBps
-                >= appleMediaRateControllerMaxBps
+        // Start a healthy LAN at the native 60 Mbps ceiling, but continue to
+        // advertise the controller's loss-backed estimate. Pinning LAN RCTL at
+        // 60 Mbps after confirmed loss let a Retina intra-refresh burst exceed
+        // 150 Mbps while the receiver was already dropping packets. Apple's
+        // clean 60 Mbps sessions stay at the ceiling because they remain
+        // lossless; the ceiling is a prior, not an override of measured loss.
         let estimatedKbps: Double
         if !rateControlEnabled {
             estimatedKbps = 65_535
-        } else if usesNativeLANCapacity {
-            estimatedKbps = appleMediaRateControllerMaxBps / 1_000
         } else {
             estimatedKbps = Double(appleMediaRateController?.bandwidthEstimateBps
                 ?? UInt32(appleMediaRateControllerMaxBps)) / 1_000
@@ -4819,27 +4845,39 @@ public actor TransportSession {
         let bwe = UInt16(min(65_535, max(0, bweKbps.rounded())))
 
         let burstyLoss = UInt8(min(15, burst))
-        let lossPercent = appleMediaRCTLIntervalLossPercent(
-            received: intervalPackets,
-            lost: intervalLost)
-        let cumulativeReceivedPacketCount = UInt16(
-            truncatingIfNeeded: appleRCTLReceivedPacketCountAtEcho)
+        let expectedPackets = max(0, intervalPackets) + max(0, intervalLost)
+        let lossPercent: UInt8 = expectedPackets == 0
+            ? 0
+            : UInt8(min(100, Int((Double(max(0, intervalLost)) * 100
+                / Double(expectedPackets)).rounded())))
+        // These counts are sampled at serialization time. Latching a count at
+        // the first packet of an RTP timestamp leaves the rest of a large HEVC
+        // access unit unreported and makes VCRC infer loss that never occurred.
+        let cumulativeVideoReceivedPacketCount = UInt16(
+            truncatingIfNeeded: appleRCTLTotalPacketsReceived)
+        let cumulativeAudioReceivedPacketCount = UInt16(
+            truncatingIfNeeded: appleRCTLAudioPacketsReceived)
+        let totalReceivedKBytes = UInt16(
+            truncatingIfNeeded: appleRCTLTotalBytesReceived / 1_024)
         let owrdSeconds = appleMediaRateController?.owrdSeconds ?? 0
         let owrd = UInt16(min(65535, (owrdSeconds * 8192).rounded()))
         let ts = UInt16(truncatingIfNeeded: Int(nowSeconds * 1024))          // Q10 s
         let echo = appleMediaLastRTPEchoTimestampQ10
-        let ageMilliseconds = appleRCTLEchoTimestampArrivalNanos == 0
-            ? 0
-            : (now &- appleRCTLEchoTimestampArrivalNanos) / 1_000_000
-        let age = UInt16(min(UInt64(UInt16.max), ageMilliseconds))
+        let queuingDelayMilliseconds = UInt16(min(
+            UInt64(UInt16.max),
+            appleRCTLMaximumQueueDelayNanos / 1_000_000))
+        appleRCTLMaximumQueueDelayNanos = 0
         let feedback = AppleMediaRCTLFeedback(
-            lossPercent: lossPercent,
+            receiveQueueTargetMilliseconds: 100,
             echoTimestamp: echo,
-            measurementAgeMilliseconds: age,
-            localTimestampQ10: ts,
+            totalReceivedKBytes: totalReceivedKBytes,
+            audioBurstyLoss: 0,
+            cumulativeAudioReceivedPacketCount: cumulativeAudioReceivedPacketCount,
+            queuingDelayMilliseconds: queuingDelayMilliseconds,
+            sendTimestampQ10: ts,
             owrdQ13: owrd,
-            burstyLoss: burstyLoss,
-            cumulativeReceivedPacketCount: cumulativeReceivedPacketCount,
+            videoBurstyLoss: burstyLoss,
+            cumulativeVideoReceivedPacketCount: cumulativeVideoReceivedPacketCount,
             bandwidthEstimateKbps: bwe)
 
         if intervalLost > 0 {
@@ -4860,17 +4898,21 @@ public actor TransportSession {
             let ingressProcessingMilliseconds =
                 appleMediaIngressProcessingNanosSinceDiagnostic / 1_000_000
             let ingressMaximumBatch = appleMediaIngressMaximumBatchSinceDiagnostic
+            let ltrAcknowledgements = appleMediaLTRAcknowledgementsSinceDiagnostic
             appleMediaIngressPacketsSinceDiagnostic = 0
             appleMediaIngressProcessingNanosSinceDiagnostic = 0
             appleMediaIngressMaximumBatchSinceDiagnostic = 0
+            appleMediaLTRAcknowledgementsSinceDiagnostic = 0
             log.info(
                 "RCTL bwe=\(bwe)kbps received=\(receivedKbps)kbps "
-                    + "echoQ10=\(echo) age=\(age)ms loss=\(lossPercent)% "
+                    + "echoQ10=\(echo) queue=\(queuingDelayMilliseconds)ms "
+                    + "loss=\(lossPercent)% "
                     + "burst=\(burstyLoss) "
-                    + "packetCount=\(cumulativeReceivedPacketCount & 0x0fff) "
+                    + "packetCount=\(cumulativeVideoReceivedPacketCount & 0x0fff) "
                     + "ingressQueuePeak=\(queuePeakMilliseconds)ms "
                     + "ingressPackets=\(ingressPackets) ingressCPU="
                     + "\(ingressProcessingMilliseconds)ms maxBatch=\(ingressMaximumBatch) "
+                    + "ltrACKs=\(ltrAcknowledgements) "
                     + "reorderQueued=\(appleMediaRTPReorderBuffer.queuedPacketCount)")
         }
 
@@ -4903,6 +4945,39 @@ public actor TransportSession {
     /// encode as the same saturated value.
     private var appleMediaRateControllerMaxBps: Double {
         AppleMediaRateController.nativeScreenMaximumBitrateBps
+    }
+
+    private func startAppleMediaAudioRTCPFeedbackLoop() {
+        guard appleMediaAudioRTCPTask == nil else { return }
+        appleMediaAudioRTCPTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard !Task.isCancelled else { return }
+                await self?.sendAppleMediaAudioReceiverReport()
+            }
+        }
+    }
+
+    /// Audio retains ordinary RTCP liveness even though screen video uses
+    /// standalone RCTL. This is the native 58-byte protected UDP packet:
+    /// 32-byte RR + 12-byte empty-CNAME SDES + 14-byte SRTCP trailer.
+    private func sendAppleMediaAudioReceiverReport() async {
+        guard let route = appleMediaAudioFeedbackRoute,
+              let remoteSSRC = appleMediaAudioRemoteSSRC,
+              let channel = appleMediaAudioChannel,
+              let rr = buildAppleMediaReceiverReport(
+                senderSSRC: route.localSSRC,
+                mediaSSRC: remoteSSRC) else { return }
+        let compound = appleMediaReceiverReportCompound(
+            receiverReport: rr,
+            senderSSRC: route.localSSRC)
+        guard let protected = try? route.sendRTCPContext.protect(
+            compound,
+            senderSSRC: route.localSSRC) else { return }
+        dumpAppleMediaOutgoingRTCPIfRequested(
+            plaintext: compound,
+            protected: protected)
+        try? await channel.send(protected)
     }
 
     private func sendAppleMediaReceiverReport() async {
@@ -4981,18 +5056,17 @@ public actor TransportSession {
             let extendedMax = stats.cycles | UInt32(stats.maxSeq)
             let expected = extendedMax &- stats.baseSeq &+ 1
             let expectedInterval = expected &- stats.expectedPrior
-            let receivedInterval = stats.received &- stats.receivedPrior
-            let lostInterval = Int64(expectedInterval) - Int64(receivedInterval)
+            let confirmedLostInterval = stats.confirmedLost &- stats.confirmedLostPrior
             var fraction: UInt8 = 0
-            if expectedInterval != 0 && lostInterval > 0 {
-                let ratio: Int64 = (lostInterval << 8) / Int64(expectedInterval)
-                fraction = UInt8(min(Int64(255), ratio))
+            if expectedInterval != 0 && confirmedLostInterval > 0 {
+                let ratio = (UInt64(confirmedLostInterval) << 8)
+                    / UInt64(expectedInterval)
+                fraction = UInt8(min(UInt64(255), ratio))
             }
-            let cumulativeSigned: Int64 = Int64(expected) - Int64(stats.received)
-            let cumulativeLost = UInt32(max(Int64(0), min(cumulativeSigned, Int64(0xff_ffff))))
+            let cumulativeLost = min(stats.confirmedLost, 0xff_ffff)
 
             stats.expectedPrior = expected
-            stats.receivedPrior = stats.received
+            stats.confirmedLostPrior = stats.confirmedLost
             appleMediaReceptionStats[ssrc] = stats
 
             appendUInt32BE(ssrc, to: &rr)

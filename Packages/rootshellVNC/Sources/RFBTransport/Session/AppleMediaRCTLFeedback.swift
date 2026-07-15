@@ -6,31 +6,24 @@ func appleMediaRCTLLowPrecisionEchoTimestamp(_ timestamp: UInt32) -> UInt16 {
     UInt16(truncatingIfNeeded: timestamp >> 8)
 }
 
-/// Convert one feedback interval's RTP reception statistics to the whole-
-/// percent field used by VCRC. Confirmed missing packets count in the expected
-/// total; intervals without traffic report zero rather than stale loss.
-func appleMediaRCTLIntervalLossPercent(received: Int, lost: Int) -> UInt8 {
-    let safeReceived = max(0, received)
-    let safeLost = max(0, lost)
-    let expected = safeReceived + safeLost
-    guard expected > 0 else { return 0 }
-    return UInt8(min(
-        100,
-        Int((Double(safeLost) * 100 / Double(expected)).rounded())))
-}
-
 /// Twenty-byte payload used by the RTCP APP `RCTL` packet.
-/// The packed word at bytes 16...17 is bursty-loss (high nibble) plus the low
-/// 12 bits of the cumulative received-packet count. It is not jitter depth or
-/// a second packet-loss fraction.
+///
+/// These are the public-code equivalents of the fields Apple serializes from
+/// its media-control feedback structure. In particular, byte 1 is the receive
+/// queue target in 20 ms units -- it is not a loss percentage. The two packed
+/// receive-statistic words use their high nibble for burst loss and their low
+/// 12 bits for cumulative packet counts.
 struct AppleMediaRCTLFeedback: Equatable {
-    let lossPercent: UInt8
+    let receiveQueueTargetMilliseconds: UInt16
     let echoTimestamp: UInt16
-    let measurementAgeMilliseconds: UInt16
-    let localTimestampQ10: UInt16
+    let totalReceivedKBytes: UInt16
+    let audioBurstyLoss: UInt8
+    let cumulativeAudioReceivedPacketCount: UInt16
+    let queuingDelayMilliseconds: UInt16
+    let sendTimestampQ10: UInt16
     let owrdQ13: UInt16
-    let burstyLoss: UInt8
-    let cumulativeReceivedPacketCount: UInt16
+    let videoBurstyLoss: UInt8
+    let cumulativeVideoReceivedPacketCount: UInt16
     let bandwidthEstimateKbps: UInt16
 
     func serialized() -> Data {
@@ -45,17 +38,21 @@ struct AppleMediaRCTLFeedback: Equatable {
         let mediaControlVersion2: UInt8 = 2 << 6
         let vcrcFieldsPresent: UInt8 = 0x05
         data.append(mediaControlVersion2 | vcrcFieldsPresent)
-        data.append(lossPercent)
+        data.append(UInt8(min(255, receiveQueueTargetMilliseconds / 20)))
         appendUInt16BE(0x0004, to: &data)
         appendUInt16BE(echoTimestamp, to: &data)
-        appendUInt16BE(0, to: &data)
-        appendUInt16BE(0, to: &data)
-        appendUInt16BE(measurementAgeMilliseconds, to: &data)
-        appendUInt16BE(localTimestampQ10, to: &data)
+        appendUInt16BE(totalReceivedKBytes, to: &data)
+        let packedAudioReceiveStatistics =
+            (UInt16(min(15, audioBurstyLoss)) << 12)
+            | (cumulativeAudioReceivedPacketCount & 0x0fff)
+        appendUInt16BE(packedAudioReceiveStatistics, to: &data)
+        appendUInt16BE(queuingDelayMilliseconds, to: &data)
+        appendUInt16BE(sendTimestampQ10, to: &data)
         appendUInt16BE(owrdQ13, to: &data)
-        let packedReceiveStatistics = (UInt16(min(15, burstyLoss)) << 12)
-            | (cumulativeReceivedPacketCount & 0x0fff)
-        appendUInt16BE(packedReceiveStatistics, to: &data)
+        let packedVideoReceiveStatistics =
+            (UInt16(min(15, videoBurstyLoss)) << 12)
+            | (cumulativeVideoReceivedPacketCount & 0x0fff)
+        appendUInt16BE(packedVideoReceiveStatistics, to: &data)
         appendUInt16BE(bandwidthEstimateKbps, to: &data)
         return data
     }
