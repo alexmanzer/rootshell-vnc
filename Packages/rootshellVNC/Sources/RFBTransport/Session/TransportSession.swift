@@ -1315,12 +1315,6 @@ public actor TransportSession {
         var rectsWithData: [(FramebufferRect, Data)] = []
         rectsWithData.reserveCapacity(Int(rectCount))
         var pendingResize: FramebufferRect?
-        // Apple's one-display Standard bootstrap learns the real display ID
-        // from this update, then sends SetDisplay while the update is still
-        // being parsed. Any pixels in the same update were encoded before
-        // that selection took effect and cannot establish the selected
-        // display's reference framebuffer.
-        var selectedStandardDisplay = false
 
         for _ in 0..<rectCount {
             let rectData = try await tcp.read(exactly: FramebufferRect.wireSize)
@@ -1420,10 +1414,8 @@ public actor TransportSession {
                 var diReader = MessageReader(data: diData)
                 let info = try AppleDisplayInfo(reader: &diReader)
                 continuation?.yield(.displayInfo(info))
-                if try await sendAppleStandardDisplaySelectionIfNeeded(
-                    displayID: info.displayIndex) {
-                    selectedStandardDisplay = true
-                }
+                try await sendAppleStandardDisplaySelectionIfNeeded(
+                    displayID: info.displayIndex)
                 // Feed to state machine (informational, no response)
                 let _ = stateMachine.handle(event: .receivedAppleDisplayInfo(info))
                 pixelData = Data()
@@ -1484,10 +1476,8 @@ public actor TransportSession {
                 }
                 for info in appleDisplayInfo2Records(payload) {
                     continuation?.yield(.displayInfo(info))
-                    if try await sendAppleStandardDisplaySelectionIfNeeded(
-                        displayID: info.displayIndex) {
-                        selectedStandardDisplay = true
-                    }
+                    try await sendAppleStandardDisplaySelectionIfNeeded(
+                        displayID: info.displayIndex)
                 }
                 pixelData = payload
 
@@ -1524,10 +1514,13 @@ public actor TransportSession {
             log.debug("Received initial portable framebuffer for adaptive updates")
         }
 
+        // SetDisplay is independent of DCT stream activation in Apple's
+        // native client and Screens. A complete base in that same update is
+        // sufficient bootstrap; type 9 then requests the selected display's
+        // continuing stream.
         if appleDCTRequested,
            stateMachine.negotiatedVersion?.isApple == true,
            !appleDCTAutoUpdateActive,
-           !selectedStandardDisplay,
            rectsWithData.contains(where: { rect, payload in
                rect.encoding == .appleMultiVariantScreenshare
                    && payload.count >= 5
@@ -2137,10 +2130,10 @@ public actor TransportSession {
 
     private func sendAppleStandardDisplaySelectionIfNeeded(
         displayID: UInt32
-    ) async throws -> Bool {
+    ) async throws {
         guard !requestAppleMediaStream,
               requestedDisplayCount == 1,
-              !sentAppleMediaInitialSetDisplay else { return false }
+              !sentAppleMediaInitialSetDisplay else { return }
         sentAppleMediaInitialSetDisplay = true
         // A non-global SetDisplay requires the server's real display ID. Zero
         // is not a portable synonym for the main monitor; the server validates
@@ -2148,7 +2141,6 @@ public actor TransportSession {
         try await sendClientPayload(appleSetDisplayMessage(
             isGlobal: false,
             displayID: displayID))
-        return true
     }
 
     private func appleSetDisplayMessage(isGlobal: Bool, displayID: UInt32) -> Data {
