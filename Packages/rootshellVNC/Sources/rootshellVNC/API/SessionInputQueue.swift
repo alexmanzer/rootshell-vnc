@@ -14,6 +14,8 @@ enum SessionInputEvent: Sendable, Equatable {
     case scroll(AppleScrollEvent)
     case gesture(AppleGestureEvent)
     case clipboard(String)
+    case clipboardRequest
+    case sharedClipboard(Bool)
 }
 
 struct SessionInputQueue: Sendable {

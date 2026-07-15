@@ -648,7 +648,7 @@ private struct VNCClipboardMenu: View {
             } label: {
                 Label("Get Clipboard", systemImage: "arrow.down.doc")
             }
-            .disabled(!synchronizer.hasRemoteClipboard)
+            .disabled(!synchronizer.canGetClipboard)
 
             Button {
                 synchronizer.sendClipboard()

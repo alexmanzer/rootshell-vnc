@@ -243,6 +243,10 @@ public final class VNCSession {
     /// Whether the server is using high-performance (HEVC/H.264) mode.
     public var isHighPerformanceMode: Bool = false
 
+    /// Native Apple clipboard controls negotiated for this connection.
+    public private(set) var supportsRemoteClipboardRequest = false
+    public private(set) var supportsRemoteSharedClipboardControl = false
+
     /// Number of independently decoded Apple video displays in the current
     /// media generation.
     public private(set) var activeVideoDisplayCount: Int = 1
@@ -268,8 +272,9 @@ public final class VNCSession {
 
     // MARK: - Host Hooks
 
-    /// Invoked on the main actor when the server publishes clipboard text
-    /// (RFB ServerCutText). Container applications set this to route the
+    /// Invoked on the main actor when the server publishes clipboard text via
+    /// RFB ServerCutText or Apple's packed pasteboard extension. Container
+    /// applications set this to route the
     /// remote clipboard into their own pasteboard handling; leaving it `nil`
     /// (the default) keeps the log-only behavior.
     @ObservationIgnored
@@ -471,6 +476,8 @@ public final class VNCSession {
         currentImage = nil
         remoteCursor = nil
         isHighPerformanceMode = false
+        supportsRemoteClipboardRequest = false
+        supportsRemoteSharedClipboardControl = false
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []
         remoteDisplayRegionByID = [:]
@@ -563,6 +570,8 @@ public final class VNCSession {
         currentImage = nil
         remoteCursor = nil
         isHighPerformanceMode = false
+        supportsRemoteClipboardRequest = false
+        supportsRemoteSharedClipboardControl = false
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []
         remoteDisplayRegionByID = [:]
@@ -735,6 +744,22 @@ public final class VNCSession {
         enqueueInput(.clipboard(text))
     }
 
+    /// Request the current remote clipboard from a capable Apple server.
+    public func requestRemoteClipboard() {
+        guard connectionState.isConnected,
+              transportSession != nil,
+              supportsRemoteClipboardRequest else { return }
+        enqueueInput(.clipboardRequest)
+    }
+
+    /// Control Apple's server-side automatic pasteboard notifications.
+    public func setRemoteSharedClipboardEnabled(_ enabled: Bool) {
+        guard connectionState.isConnected,
+              transportSession != nil,
+              supportsRemoteSharedClipboardControl else { return }
+        enqueueInput(.sharedClipboard(enabled))
+    }
+
     func addServerClipboardObserver(
         _ observer: @escaping (String) -> Void
     ) -> UUID {
@@ -854,17 +879,24 @@ public final class VNCSession {
             for await event in transport.events {
                 guard let self, !Task.isCancelled,
                       self.transportSession === transport else { break }
-                await self.handleSessionEvent(event)
+                await self.handleSessionEvent(event, from: transport)
             }
         }
     }
 
-    private func handleSessionEvent(_ event: SessionEvent) async {
+    private func handleSessionEvent(
+        _ event: SessionEvent,
+        from transport: TransportSession
+    ) async {
         switch event {
         case .stateChanged(let protocolState):
             handleStateChanged(protocolState)
 
         case .serverInit(let serverInit):
+            supportsRemoteClipboardRequest =
+                await transport.supportsRemoteClipboardRequest
+            supportsRemoteSharedClipboardControl =
+                await transport.supportsRemoteSharedClipboardControl
             handleServerInit(serverInit)
 
         case .framebufferUpdate(let rects):
@@ -1415,6 +1447,8 @@ public final class VNCSession {
         // leave SwiftUI rendering the High Performance video path after the
         // replacement connection has negotiated Standard framebuffer mode.
         isHighPerformanceMode = false
+        supportsRemoteClipboardRequest = false
+        supportsRemoteSharedClipboardControl = false
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []
         remoteDisplayRegionByID = [:]
@@ -1594,6 +1628,10 @@ public final class VNCSession {
               let transport = transportSession else { return }
 
         inputQueue.enqueue(event)
+        startInputPumpIfNeeded(transport: transport)
+    }
+
+    private func startInputPumpIfNeeded(transport: TransportSession) {
         guard inputTask == nil else { return }
 
         let generation = inputGeneration
@@ -1623,10 +1661,23 @@ public final class VNCSession {
                     try? await transport.sendGestureEvent(event)
                 case .clipboard(let text):
                     try? await transport.sendClipboardText(text)
+                case .clipboardRequest:
+                    try? await transport.requestRemoteClipboard()
+                case .sharedClipboard(let enabled):
+                    try? await transport.setSharedClipboardEnabled(enabled)
                 }
             }
             if self.inputGeneration == generation {
                 self.inputTask = nil
+                // An event can be enqueued after the loop observes an empty
+                // queue but before this task clears itself. Close that lost-
+                // wakeup window so clipboard control messages cannot remain
+                // stranded until the next pointer or keyboard event.
+                if !self.inputQueue.isEmpty,
+                   self.transportSession === transport,
+                   self.connectionState.isConnected {
+                    self.startInputPumpIfNeeded(transport: transport)
+                }
             }
         }
     }
@@ -1671,7 +1722,7 @@ public final class VNCSession {
             return .key(downFlag: downFlag, key: keysym)
         case .pointer(let buttonMask, let x, let y):
             return .pointer(buttonMask: buttonMask, x: x, y: y)
-        case .scroll, .gesture, .clipboard:
+        case .scroll, .gesture, .clipboard, .clipboardRequest, .sharedClipboard:
             return nil
         }
     }

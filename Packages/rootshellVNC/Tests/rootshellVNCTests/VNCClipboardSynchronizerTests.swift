@@ -26,12 +26,20 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         clipboard: FakeClipboard,
         connected: @escaping () -> Bool = { true },
         automaticallyMonitors: Bool = false,
+        canRequestRemoteClipboard: @escaping () -> Bool = { false },
+        requestRemoteClipboard: @escaping () -> Void = {},
+        canControlRemoteSharedClipboard: @escaping () -> Bool = { false },
+        setRemoteSharedClipboard: @escaping (Bool) -> Void = { _ in },
         send: @escaping (String) -> Void
     ) -> VNCClipboardSynchronizer {
         VNCClipboardSynchronizer(
             clipboard: clipboard,
             canSend: connected,
             send: send,
+            canRequestRemoteClipboard: canRequestRemoteClipboard,
+            requestRemoteClipboard: requestRemoteClipboard,
+            canControlRemoteSharedClipboard: canControlRemoteSharedClipboard,
+            setRemoteSharedClipboard: setRemoteSharedClipboard,
             notificationCenter: NotificationCenter(),
             observesApplicationLifecycle: false,
             automaticallyMonitors: automaticallyMonitors)
@@ -62,6 +70,50 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         synchronizer.getClipboard()
 
         XCTAssertEqual(clipboard.text, "")
+    }
+
+    func testAppleManualGetRequestsCurrentClipboardAndAppliesResponse() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("local value")
+        var requestCount = 0
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            canRequestRemoteClipboard: { true },
+            requestRemoteClipboard: { requestCount += 1 }
+        ) { _ in }
+
+        XCTAssertTrue(synchronizer.canGetClipboard)
+        synchronizer.getClipboard()
+
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(clipboard.text, "local value")
+
+        synchronizer.receiveRemoteClipboardText("current remote value")
+        XCTAssertEqual(clipboard.text, "current remote value")
+    }
+
+    func testStandardServerGetRequiresPublishedClipboard() {
+        let clipboard = FakeClipboard()
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { _ in }
+
+        XCTAssertFalse(synchronizer.canGetClipboard)
+        synchronizer.receiveRemoteClipboardText("published remote value")
+        XCTAssertTrue(synchronizer.canGetClipboard)
+    }
+
+    func testSharedModeControlsCapableAppleServer() {
+        let clipboard = FakeClipboard()
+        var remoteStates: [Bool] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            canControlRemoteSharedClipboard: { true },
+            setRemoteSharedClipboard: { remoteStates.append($0) }
+        ) { _ in }
+
+        synchronizer.sharedClipboardEnabled = true
+        synchronizer.sharedClipboardEnabled = false
+
+        XCTAssertEqual(remoteStates, [true, false])
     }
 
     func testManualSendRequiresConnectionAndClipboardContent() {

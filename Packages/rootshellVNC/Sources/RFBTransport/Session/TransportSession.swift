@@ -429,6 +429,8 @@ public actor TransportSession {
     /// This remains nil for regular RFB servers, which therefore use standard
     /// wheel-button input.
     private var appleServerCapabilities: AppleServerCapabilities?
+    private var appleClipboardRequestID: UInt32 = 0
+    private var appleSharedClipboardEnabled = false
     /// A regular RFB server may receive SetDesktopSize only after it sends an
     /// ExtendedDesktopSize rectangle. Retain that screen identity and any
     /// early client-size request until the announcement arrives.
@@ -701,8 +703,44 @@ public actor TransportSession {
 
     /// Send clipboard text to the server.
     public func sendClipboardText(_ text: String) async throws {
+        // AppleVNCServer still implements ordinary ClientCutText for text.
+        // Keep this interoperable path instead of emitting Apple's private
+        // packed-scrap send format, whose rich-flavor schema is not public.
         let msg = ClientMessage.clientCutText(text)
         try await sendClientPayload(msg.serialize())
+    }
+
+    public var supportsRemoteClipboardRequest: Bool {
+        // These legacy pasteboard commands are part of Apple's RFB 3.889
+        // dialect in both Standard and High Performance sessions. The newer
+        // command bitmap is not authoritative for them and may omit them.
+        stateMachine.negotiatedVersion?.isApple == true
+    }
+
+    public var supportsRemoteSharedClipboardControl: Bool {
+        stateMachine.negotiatedVersion?.isApple == true
+    }
+
+    /// Ask a capable Apple Screen Sharing server for its current pasteboard.
+    public func requestRemoteClipboard() async throws {
+        guard supportsRemoteClipboardRequest else { return }
+        appleClipboardRequestID &+= 1
+        try await sendClientPayload(AppleClipboardProtocol.requestMessage(
+            requestID: appleClipboardRequestID))
+    }
+
+    /// Enable or disable Apple's automatic remote-pasteboard notifications.
+    public func setSharedClipboardEnabled(_ enabled: Bool) async throws {
+        guard supportsRemoteSharedClipboardControl else { return }
+        let previousValue = appleSharedClipboardEnabled
+        appleSharedClipboardEnabled = enabled
+        do {
+            try await sendClientPayload(
+                AppleClipboardProtocol.autoPasteboardMessage(enabled: enabled))
+        } catch {
+            appleSharedClipboardEnabled = previousValue
+            throw error
+        }
     }
 
     /// Number of distinct video RTP sources (screen bands) seen this session.
@@ -1214,13 +1252,10 @@ public actor TransportSession {
                     await handleBell()
                 case 3: // ServerCutText
                     try await handleServerCutText()
+                case AppleClipboardProtocol.packedScrapMessageType:
+                    try await handleApplePackedClipboard()
                 case 0x14:
-                    // Apple media short control (8 bytes total). The server can
-                    // emit these on the clear channel before the media stream is
-                    // accepted; consume the remaining 7 bytes so a race in that
-                    // timing doesn't desync the whole stream (which cascades into
-                    // garbage framebuffer rects and a dead connection).
-                    _ = try await tcp.read(exactly: 7)
+                    try await handleAppleAutoPasteboardInfo()
                 default:
                     log.warning("Unknown server message type: \(messageType)")
                     throw VNCProtocolError.protocolViolation(
@@ -1661,6 +1696,67 @@ public actor TransportSession {
 
         let actions = stateMachine.handle(event: .receivedServerCutText(text))
         for action in actions { await executeActionNoThrow(action) }
+    }
+
+    private func handleApplePackedClipboard() async throws {
+        // readLoop already consumed the type byte.
+        let header = try await tcp.read(
+            exactly: AppleClipboardProtocol.packedScrapHeaderSize - 1)
+        let uncompressedLength = Int(
+            AppleClipboardProtocol.uint32BE(
+                header, at: header.startIndex + 7) ?? 0)
+        let compressedLength = Int(
+            AppleClipboardProtocol.uint32BE(
+                header, at: header.startIndex + 11) ?? 0)
+        guard uncompressedLength <= AppleClipboardProtocol.maximumClipboardSize,
+              compressedLength <= AppleClipboardProtocol.maximumClipboardSize else {
+            throw VNCProtocolError.protocolViolation(
+                "Apple clipboard size is out of range")
+        }
+
+        let compressed = try await tcp.read(exactly: compressedLength)
+        decodeApplePackedClipboard(
+            compressed,
+            uncompressedLength: uncompressedLength)
+    }
+
+    private func handleAppleAutoPasteboardInfo() async throws {
+        // Apple sends this fixed eight-byte notification after command 21 has
+        // enabled automatic pasteboard updates. It announces a change; the
+        // viewer must still issue command 11 to fetch the packed scrap.
+        _ = try await tcp.read(exactly: 7)
+        guard appleSharedClipboardEnabled else { return }
+        do {
+            try await requestRemoteClipboard()
+        } catch {
+            // Clipboard synchronization is auxiliary. A failed automatic
+            // request must not terminate an otherwise healthy display session.
+            log.warning(
+                "Unable to request changed Apple clipboard: "
+                    + error.localizedDescription)
+        }
+    }
+
+    /// Packed scrap contents are optional auxiliary data. Once their framing
+    /// has been consumed, a malformed or unsupported flavor must not terminate
+    /// the screen-sharing connection.
+    private func decodeApplePackedClipboard(
+        _ compressed: Data,
+        uncompressedLength: Int
+    ) {
+        do {
+            if let text = try AppleClipboardProtocol.unpackText(
+                compressed: compressed,
+                uncompressedSize: uncompressedLength) {
+                continuation?.yield(.clipboardText(text))
+            } else {
+                log.debug("Apple clipboard contained no supported text flavor")
+            }
+        } catch {
+            log.warning(
+                "Ignoring unsupported Apple clipboard payload: "
+                    + error.localizedDescription)
+        }
     }
 
     // MARK: - Action execution
@@ -2405,9 +2501,10 @@ public actor TransportSession {
                             in: record.payload) != nil
                         _ = try await handleAppleAVCServerMediaMessageIfPresent(record.payload)
                         try await sendAppleMediaPostAnswerViewerInfoIfNeeded(for: record.payload)
-                        let isRFBRecord = record.payload.first.map { first in
-                            first == 0 || first == 2 || first == 3
-                        } ?? false
+                        let startsRFBRecord = record.payload.first.map(
+                            isAppleRFBServerMessageType) ?? false
+                        let isRFBRecord = !appleDecryptedRFBBuffer.isEmpty
+                            || startsRFBRecord
                         if !isAVCMediaRecord, isRFBRecord {
                             appleDecryptedRFBBuffer.append(record.payload)
                             try await drainAppleDecryptedRFBBuffer()
@@ -2435,8 +2532,18 @@ public actor TransportSession {
                         if try await handleAppleMediaServerControlIfPresent(plaintext) {
                             continue
                         }
+                        let isAVCMediaRecord = findAppleAVCMediaMessage(
+                            in: plaintext) != nil
                         _ = try await handleAppleAVCServerMediaMessageIfPresent(plaintext)
                         try await sendAppleMediaPostAnswerViewerInfoIfNeeded(for: plaintext)
+                        let startsRFBRecord = plaintext.first.map(
+                            isAppleRFBServerMessageType) ?? false
+                        let isRFBRecord = !appleDecryptedRFBBuffer.isEmpty
+                            || startsRFBRecord
+                        if !isAVCMediaRecord, isRFBRecord {
+                            appleDecryptedRFBBuffer.append(plaintext)
+                            try await drainAppleDecryptedRFBBuffer()
+                        }
                         let candidatePackets = extractAppleMediaRTPPackets(from: plaintext)
                         for packet in confirmedAppleMediaRTPPackets(from: candidatePackets) {
                             emitAppleMediaRTPPacket(packet)
@@ -2497,9 +2604,37 @@ public actor TransportSession {
                 continuation?.yield(.bell)
             case 3:
                 guard try drainAppleDecryptedServerCutText() else { return }
+            case AppleClipboardProtocol.packedScrapMessageType:
+                guard try drainAppleDecryptedPackedClipboard() else { return }
+            case 0x14:
+                guard base + 8 <= appleDecryptedRFBBuffer.endIndex else {
+                    return
+                }
+                appleDecryptedRFBBuffer.removeSubrange(base..<base + 8)
+                if appleSharedClipboardEnabled {
+                    do {
+                        try await requestRemoteClipboard()
+                    } catch {
+                        log.warning(
+                            "Unable to request changed Apple clipboard: "
+                                + error.localizedDescription)
+                    }
+                }
             default:
                 return
             }
+        }
+    }
+
+    private nonisolated func isAppleRFBServerMessageType(
+        _ messageType: UInt8
+    ) -> Bool {
+        switch messageType {
+        case 0, 2, 3, 0x14,
+             AppleClipboardProtocol.packedScrapMessageType:
+            return true
+        default:
+            return false
         }
     }
 
@@ -2614,6 +2749,38 @@ public actor TransportSession {
             ?? ""
         appleDecryptedRFBBuffer.removeSubrange(base..<base + 8 + length)
         continuation?.yield(.clipboardText(text))
+        return true
+    }
+
+    private func drainAppleDecryptedPackedClipboard() throws -> Bool {
+        let base = appleDecryptedRFBBuffer.startIndex
+        let headerSize = AppleClipboardProtocol.packedScrapHeaderSize
+        guard base + headerSize <= appleDecryptedRFBBuffer.endIndex else {
+            return false
+        }
+
+        let uncompressedLength = Int(
+            AppleClipboardProtocol.uint32BE(
+                appleDecryptedRFBBuffer, at: base + 8) ?? 0)
+        let compressedLength = Int(
+            AppleClipboardProtocol.uint32BE(
+                appleDecryptedRFBBuffer, at: base + 12) ?? 0)
+        guard uncompressedLength <= AppleClipboardProtocol.maximumClipboardSize,
+              compressedLength <= AppleClipboardProtocol.maximumClipboardSize else {
+            throw VNCProtocolError.protocolViolation(
+                "Apple clipboard size is out of range")
+        }
+
+        let messageEnd = base + headerSize + compressedLength
+        guard messageEnd <= appleDecryptedRFBBuffer.endIndex else {
+            return false
+        }
+        let compressed = Data(appleDecryptedRFBBuffer[
+            base + headerSize..<messageEnd])
+        appleDecryptedRFBBuffer.removeSubrange(base..<messageEnd)
+        decodeApplePackedClipboard(
+            compressed,
+            uncompressedLength: uncompressedLength)
         return true
     }
 

@@ -96,6 +96,9 @@ public final class VNCClipboardSynchronizer {
                 monitoringTask?.cancel()
                 monitoringTask = nil
             }
+            if canControlRemoteSharedClipboard() {
+                setRemoteSharedClipboard(sharedClipboardEnabled)
+            }
         }
     }
 
@@ -107,6 +110,12 @@ public final class VNCClipboardSynchronizer {
 
     public var hasRemoteClipboard: Bool { latestRemoteText != nil }
 
+    /// Whether Get Clipboard can either request the current value from an
+    /// Apple server or apply a value already published by a standard server.
+    public var canGetClipboard: Bool {
+        latestRemoteText != nil || (canSend() && canRequestRemoteClipboard())
+    }
+
     public var canSendClipboard: Bool {
         canSend() && clipboard.hasTransferableContent
     }
@@ -117,6 +126,14 @@ public final class VNCClipboardSynchronizer {
     private let canSend: () -> Bool
     @ObservationIgnored
     private let send: (String) -> Void
+    @ObservationIgnored
+    private let canRequestRemoteClipboard: () -> Bool
+    @ObservationIgnored
+    private let requestRemoteClipboard: () -> Void
+    @ObservationIgnored
+    private let canControlRemoteSharedClipboard: () -> Bool
+    @ObservationIgnored
+    private let setRemoteSharedClipboard: (Bool) -> Void
     @ObservationIgnored
     private let notificationCenter: NotificationCenter
     @ObservationIgnored
@@ -134,6 +151,8 @@ public final class VNCClipboardSynchronizer {
     private var monitoringTask: Task<Void, Never>?
 
     private var latestRemoteText: String?
+    @ObservationIgnored
+    private var pendingManualGet = false
     @ObservationIgnored
     private var remoteGeneration: UInt64 = 0
     @ObservationIgnored
@@ -167,6 +186,20 @@ public final class VNCClipboardSynchronizer {
             send: { [weak session] text in
                 session?.sendClipboardText(text)
             },
+            canRequestRemoteClipboard: { [weak session] in
+                session?.connectionState.isConnected == true
+                    && session?.supportsRemoteClipboardRequest == true
+            },
+            requestRemoteClipboard: { [weak session] in
+                session?.requestRemoteClipboard()
+            },
+            canControlRemoteSharedClipboard: { [weak session] in
+                session?.connectionState.isConnected == true
+                    && session?.supportsRemoteSharedClipboardControl == true
+            },
+            setRemoteSharedClipboard: { [weak session] enabled in
+                session?.setRemoteSharedClipboardEnabled(enabled)
+            },
             notificationCenter: .default,
             observesApplicationLifecycle: true,
             automaticallyMonitors: true
@@ -185,6 +218,10 @@ public final class VNCClipboardSynchronizer {
         clipboard: any VNCClipboardProviding,
         canSend: @escaping () -> Bool,
         send: @escaping (String) -> Void,
+        canRequestRemoteClipboard: @escaping () -> Bool = { false },
+        requestRemoteClipboard: @escaping () -> Void = {},
+        canControlRemoteSharedClipboard: @escaping () -> Bool = { false },
+        setRemoteSharedClipboard: @escaping (Bool) -> Void = { _ in },
         notificationCenter: NotificationCenter = .default,
         observesApplicationLifecycle: Bool,
         automaticallyMonitors: Bool
@@ -192,6 +229,10 @@ public final class VNCClipboardSynchronizer {
         self.clipboard = clipboard
         self.canSend = canSend
         self.send = send
+        self.canRequestRemoteClipboard = canRequestRemoteClipboard
+        self.requestRemoteClipboard = requestRemoteClipboard
+        self.canControlRemoteSharedClipboard = canControlRemoteSharedClipboard
+        self.setRemoteSharedClipboard = setRemoteSharedClipboard
         self.notificationCenter = notificationCenter
         self.automaticallyMonitors = automaticallyMonitors
         self.observedLocalChangeCount = clipboard.changeCount
@@ -225,10 +266,16 @@ public final class VNCClipboardSynchronizer {
         onTransfer?(.deviceToRemote, text)
     }
 
-    /// Put the most recently published remote clipboard value on the device.
+    /// Request the current clipboard from an Apple server, or put the most
+    /// recently published value from a standard VNC server on the device.
     public func getClipboard() {
-        guard !invalidated, let latestRemoteText else { return }
-        applyRemoteText(latestRemoteText)
+        guard !invalidated else { return }
+        if canSend(), canRequestRemoteClipboard() {
+            pendingManualGet = true
+            requestRemoteClipboard()
+        } else if let latestRemoteText {
+            applyRemoteText(latestRemoteText)
+        }
     }
 
     /// Focus participation is separate from application activity: switching
@@ -284,6 +331,12 @@ public final class VNCClipboardSynchronizer {
         latestRemoteText = text
         remoteGeneration &+= 1
 
+        if pendingManualGet {
+            pendingManualGet = false
+            applyRemoteText(text)
+            return
+        }
+
         guard sharedClipboardEnabled, isEligible else { return }
         applyRemoteText(text)
     }
@@ -320,6 +373,9 @@ public final class VNCClipboardSynchronizer {
 
         switch state {
         case .connected:
+            if sharedClipboardEnabled, canControlRemoteSharedClipboard() {
+                setRemoteSharedClipboard(true)
+            }
             // Flush a local change retained during automatic reconnect.
             localClipboardDidChange()
         case .reconnecting:
@@ -403,6 +459,7 @@ public final class VNCClipboardSynchronizer {
 
     private func clearRemoteCache() {
         latestRemoteText = nil
+        pendingManualGet = false
         // Treat the boundary as a generation change so pending foreground
         // reconciliation cannot apply clipboard data from the prior server.
         remoteGeneration &+= 1
