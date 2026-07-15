@@ -206,6 +206,16 @@ public final class VNCSession {
     /// The current state of the VNC connection.
     public var connectionState: VNCConnectionState = .idle
 
+    /// Human-readable description of the current connection-establishment
+    /// phase (dialing, negotiating security, authenticating, …). `nil` once
+    /// operational or when no attempt is in flight. Drives the connecting
+    /// status overlay, which needs more granularity than the collapsed
+    /// `.connecting` state.
+    public private(set) var connectionPhaseDescription: String?
+
+    /// Host label for status UI while a connection attempt is in flight.
+    public var connectingHostLabel: String? { activeCredentials?.host }
+
     /// The name of the remote desktop as reported by the server.
     public var serverName: String = ""
 
@@ -437,6 +447,7 @@ public final class VNCSession {
         intentionallyDisconnected = false
         hasEstablishedConnection = false
         connectionState = .connecting
+        connectionPhaseDescription = "Opening connection…"
         activeCredentials = credentials
         appleMediaTilesPerFrameOverride = nil
         lastError = nil
@@ -552,6 +563,7 @@ public final class VNCSession {
         remoteAudioPlayer?.stop()
         remoteAudioPlayer = nil
 
+        connectionPhaseDescription = nil
         connectionState = .disconnected
     }
 
@@ -899,6 +911,10 @@ public final class VNCSession {
 
     private func handleStateChanged(_ protocolState: RFBProtocol.ConnectionState) {
         let newState = VNCConnectionState(from: protocolState)
+        // Track the phase before the guards below: reconnect keeps the public
+        // state pinned to .reconnecting while the replacement handshake
+        // advances, but the overlay still wants the live phase text.
+        connectionPhaseDescription = Self.phaseDescription(for: protocolState)
         // Keep the richer retry state visible while a replacement transport
         // progresses through its internal handshake states.
         if reconnectTask != nil {
@@ -912,6 +928,27 @@ public final class VNCSession {
         // (internal handshake states all map to .connecting)
         if newState != connectionState {
             connectionState = newState
+        }
+    }
+
+    private static func phaseDescription(
+        for protocolState: RFBProtocol.ConnectionState
+    ) -> String? {
+        switch protocolState {
+        case .connecting:
+            return "Opening connection…"
+        case .waitingForProtocolVersion:
+            return "Negotiating protocol…"
+        case .waitingForSecurityTypes:
+            return "Negotiating security…"
+        case .authenticating:
+            return "Authenticating…"
+        case .waitingForAuthResult:
+            return "Verifying credentials…"
+        case .waitingForServerInit:
+            return "Starting remote session…"
+        case .idle, .operational, .disconnecting, .disconnected, .failed:
+            return nil
         }
     }
 

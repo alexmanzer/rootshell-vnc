@@ -96,13 +96,26 @@ public actor TCPConnection: RFBConnection {
         // Retry briefly so the tunnel warmed by a failed attempt gets used,
         // instead of surfacing the failure and making the user reconnect.
         for attempt in 1...maxDialAttempts {
+            let attemptStart = DispatchTime.now().uptimeNanoseconds
             do {
                 try await dialOnce()
                 return
             } catch {
-                guard attempt < maxDialAttempts, !isClosing else { throw error }
+                // Elapsed time discriminates failure modes: ~instant means
+                // refused/unroutable, ~connectTimeout means the dial sat in
+                // Network.framework's .waiting (cold DNS or path not ready).
+                let elapsedMilliseconds =
+                    (DispatchTime.now().uptimeNanoseconds &- attemptStart) / 1_000_000
+                guard attempt < maxDialAttempts, !isClosing else {
+                    log.error(
+                        "Connect attempt \(attempt)/\(maxDialAttempts) to \(host):\(port) "
+                            + "failed after \(elapsedMilliseconds)ms "
+                            + "(\(error.localizedDescription)); giving up")
+                    throw error
+                }
                 log.warning(
-                    "Connect attempt \(attempt)/\(maxDialAttempts) to \(host):\(port) failed "
+                    "Connect attempt \(attempt)/\(maxDialAttempts) to \(host):\(port) "
+                        + "failed after \(elapsedMilliseconds)ms "
                         + "(\(error.localizedDescription)); retrying")
                 try await Task.sleep(nanoseconds: UInt64(attempt) * dialRetryBackoffNanos)
                 guard !isClosing else { throw error }

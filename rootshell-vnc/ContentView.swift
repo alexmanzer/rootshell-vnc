@@ -107,10 +107,13 @@ struct ContentView: View {
         case .idle, .disconnected:
             ConnectionView(session: session)
         case .connecting:
-            VStack(spacing: 16) {
-                ProgressView()
-                Text("Connecting...")
-                    .foregroundStyle(.secondary)
+            // Black backdrop so the transition into the remote desktop (also
+            // black until the first frame) is seamless; the glass card carries
+            // live handshake-phase text and a cancel escape hatch.
+            ZStack {
+                Color.black
+                    .ignoresSafeArea()
+                ConnectionStatusOverlay(session: session)
             }
         case .connected, .reconnecting:
             remoteDesktop

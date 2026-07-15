@@ -499,24 +499,8 @@ public struct RemoteDesktopView: View {
     @ViewBuilder
     private var recoveryOverlay: some View {
         switch session.connectionState {
-        case .reconnecting(let attempt, let delay):
-            VStack(spacing: 10) {
-                ProgressView()
-                Text("Connection interrupted").font(.headline)
-                Text(
-                    delay > 0
-                        ? "Retry \(attempt) starts in about \(Int(ceil(delay))) seconds."
-                        : "Reconnecting now…")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Button("Stop Reconnecting", role: .destructive) {
-                    session.disconnect()
-                }
-            }
-            .padding(20)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
-            .padding()
-            .accessibilityElement(children: .combine)
+        case .reconnecting:
+            ConnectionStatusOverlay(session: session)
 
         case .failed(let reason):
             VStack(spacing: 10) {
@@ -803,12 +787,15 @@ private struct StandardFramebufferContent: View {
                 .interpolation(.high)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-        } else {
-            VStack(spacing: 16) {
-                ProgressView().controlSize(.large)
-                Text("Waiting for framebuffer...")
-                    .foregroundStyle(.secondary)
-            }
+        } else if session.connectionState.isConnected {
+            // Handshake finished but no framebuffer content has been
+            // published. The reconnect/failure overlays own the other states.
+            ConnectionStatusCard(
+                title: "Waiting for first screen update…",
+                detail: session.connectingHostLabel,
+                actionLabel: "Cancel",
+                actionRole: .cancel
+            ) { session.disconnect() }
         }
     }
 
