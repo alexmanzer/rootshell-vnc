@@ -81,9 +81,16 @@ struct ConnectionStatusCard: View {
 }
 
 private struct GlassStatusCardModifier: ViewModifier {
+    @Environment(\.vncChromeGlassTint) private var glassTint
+
     func body(content: Content) -> some View {
         if #available(iOS 26.0, macOS 26.0, macCatalyst 26.0, *) {
-            content.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 28))
+            // A host tint switches to clear glass: the tint restores the
+            // contrast floor that regular's frost otherwise provides, and
+            // the card takes on the host's theme instead of neutral gray.
+            content.glassEffect(
+                glassTint.map { Glass.clear.tint($0) } ?? .regular,
+                in: RoundedRectangle(cornerRadius: 28))
         } else {
             content.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 28))
         }
@@ -93,5 +100,19 @@ private struct GlassStatusCardModifier: ViewModifier {
 extension View {
     func glassStatusCard() -> some View {
         modifier(GlassStatusCardModifier())
+    }
+}
+
+/// Optional glass tint a host app injects so the chrome the package still
+/// owns (status cards, the HUD menu button) matches the host's theme.
+/// `nil` keeps the package's standalone appearance.
+private struct VNCChromeGlassTintKey: EnvironmentKey {
+    static let defaultValue: Color? = nil
+}
+
+public extension EnvironmentValues {
+    var vncChromeGlassTint: Color? {
+        get { self[VNCChromeGlassTintKey.self] }
+        set { self[VNCChromeGlassTintKey.self] = newValue }
     }
 }

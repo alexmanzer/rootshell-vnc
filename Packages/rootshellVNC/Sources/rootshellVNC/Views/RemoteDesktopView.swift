@@ -64,6 +64,7 @@ public struct RemoteDesktopView: View {
     private let hudMenuExtras: AnyView?
     private let keyboardAvoidanceMode: VNCKeyboardAvoidanceMode
     private let clipboardSynchronizer: VNCClipboardSynchronizer?
+    private let hostOwnsRecoveryChrome: Bool
 
     #if canImport(UIKit)
     /// A host-provided accessory can remain visible without the software
@@ -80,7 +81,8 @@ public struct RemoteDesktopView: View {
         isFullScreen: Bool = false,
         toggleFullScreen: (() -> Void)? = nil,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
-        clipboardSynchronizer: VNCClipboardSynchronizer? = nil
+        clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
+        hostOwnsRecoveryChrome: Bool = false
     ) {
         self.init(
             session: session,
@@ -89,6 +91,7 @@ public struct RemoteDesktopView: View {
             toggleFullScreen: toggleFullScreen,
             keyboardAvoidanceMode: keyboardAvoidanceMode,
             clipboardSynchronizer: clipboardSynchronizer,
+            hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             hudMenuExtras: nil)
     }
 
@@ -105,6 +108,7 @@ public struct RemoteDesktopView: View {
         toggleFullScreen: (() -> Void)? = nil,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
         clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
+        hostOwnsRecoveryChrome: Bool = false,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
     ) {
         self.init(
@@ -114,6 +118,7 @@ public struct RemoteDesktopView: View {
             toggleFullScreen: toggleFullScreen,
             keyboardAvoidanceMode: keyboardAvoidanceMode,
             clipboardSynchronizer: clipboardSynchronizer,
+            hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             hudMenuExtras: AnyView(hudMenuExtras()))
     }
 
@@ -124,9 +129,11 @@ public struct RemoteDesktopView: View {
         toggleFullScreen: (() -> Void)?,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode,
         clipboardSynchronizer: VNCClipboardSynchronizer?,
+        hostOwnsRecoveryChrome: Bool,
         hudMenuExtras: AnyView?
     ) {
         self.session = session
+        self.hostOwnsRecoveryChrome = hostOwnsRecoveryChrome
         self.hudMenuExtras = hudMenuExtras
         self._keyboardCapture = State(
             initialValue: keyboardCapture ?? VNCKeyboardCapture())
@@ -175,7 +182,12 @@ public struct RemoteDesktopView: View {
 
                     viewportControls
 
-                    recoveryOverlay
+                    // Hosts that render their own reconnect/failure prompts
+                    // suppress these; drawing both would stack duplicate
+                    // cards now that the chrome is translucent.
+                    if !hostOwnsRecoveryChrome {
+                        recoveryOverlay
+                    }
                 }
                 .clipped()
                 .confirmationDialog(
@@ -296,7 +308,9 @@ public struct RemoteDesktopView: View {
                 .frame(width: viewSize.width, height: viewSize.height)
             #endif
         } else {
-            StandardFramebufferContent(session: session)
+            StandardFramebufferContent(
+                session: session,
+                showsWaitingCard: !hostOwnsRecoveryChrome)
                 .frame(width: viewSize.width, height: viewSize.height)
         }
     }
@@ -484,7 +498,7 @@ public struct RemoteDesktopView: View {
             Image(systemName: "ellipsis")
                 .font(.body.weight(.bold))
                 .frame(width: 46, height: 46)
-                .background(.ultraThinMaterial, in: Circle())
+                .modifier(HUDButtonChromeModifier())
         }
         .buttonStyle(.plain)
         .foregroundStyle(.primary)
@@ -850,10 +864,26 @@ private final class DockedKeyboardInsetView: UIView {
 }
 #endif
 
+/// Circle chrome for the HUD menu button: Liquid Glass on current OS
+/// releases and a material fallback where the glass API is unavailable.
+/// Deliberately not host-tinted — the button floats over live desktop
+/// content, where adaptive glass fits better than theme colors.
+private struct HUDButtonChromeModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, macOS 26.0, macCatalyst 26.0, *) {
+            content.glassEffect(.regular, in: Circle())
+        } else {
+            content.background(.ultraThinMaterial, in: Circle())
+        }
+    }
+}
+
 /// Owns the hot standard-framebuffer observation so publishing a new image
 /// does not invalidate the parent view that owns the HUD Menu.
 private struct StandardFramebufferContent: View {
     @Bindable var session: VNCSession
+    /// False when the host renders its own connected-but-no-frame prompt.
+    let showsWaitingCard: Bool
 
     var body: some View {
         if let image = session.currentImage {
@@ -862,7 +892,7 @@ private struct StandardFramebufferContent: View {
                 .interpolation(.high)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-        } else if session.connectionState.isConnected {
+        } else if showsWaitingCard, session.connectionState.isConnected {
             // Handshake finished but no framebuffer content has been
             // published. The reconnect/failure overlays own the other states.
             ConnectionStatusCard(
