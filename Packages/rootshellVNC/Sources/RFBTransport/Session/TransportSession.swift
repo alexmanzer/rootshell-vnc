@@ -139,7 +139,7 @@ public actor TransportSession {
     private let usesCustomTransport: Bool
     private var stateMachine: ConnectionStateMachine
     /// Address used for direct TCP and Apple UDP media. `localhost` is pinned
-    /// to IPv4 because the Apple media socket is IPv4-only.
+    /// to IPv4 so TCP and the UDP media socket agree on one loopback family.
     private let dialHost: String
     /// Original endpoint identity used for TLS certificate validation. This
     /// must not inherit address-family rewrites applied to `dialHost`.
@@ -508,9 +508,10 @@ public actor TransportSession {
             && environment["ROOTSHELL_VNC_DISABLE_RATE_CONTROL"] != "1"
         // Force IPv4 for "localhost": it resolves to both ::1 and 127.0.0.1, and
         // if TCP connects over IPv6 the server sends UDP media to ::1 while our
-        // media socket is IPv4-only — so no video arrives. Pin both to 127.0.0.1.
-        // A custom transport dials the host itself, so the pin only applies to
-        // the default direct path.
+        // media socket prefers IPv4 — so no video arrives. Pin both to
+        // 127.0.0.1 so they always agree on one loopback family. A custom
+        // transport dials the host itself, so the pin only applies to the
+        // default direct path.
         let resolvedHost = (host == "localhost") ? "127.0.0.1" : host
         self.usesCustomTransport = connection != nil
         self.tcp = connection ?? TCPConnection(host: resolvedHost, port: port)
@@ -3782,9 +3783,10 @@ public actor TransportSession {
     }
 
     private func startAppleMediaUDPChannel(binding: AppleMediaUDPBinding) async throws {
-        // Configure the symmetric-port media socket:
-        //   socket(AF_INET, DGRAM) + SO_REUSEADDR + SO_REUSEPORT
-        //   + bind(INADDR_ANY:port) + connect(serverIP:port)
+        // Configure the symmetric-port media socket (address family follows
+        // the resolved dialHost — IPv4 preferred, IPv6 when that's all there is):
+        //   socket(family, DGRAM) + SO_REUSEADDR + SO_REUSEPORT
+        //   + bind(wildcard:port) + connect(serverIP:port)
         // Symmetric RTP uses the same port both ends; SO_REUSEPORT is what lets
         // the viewer bind a UDP port the server already holds (loopback / same
         // machine). Network.framework does not reliably expose SO_REUSEPORT,

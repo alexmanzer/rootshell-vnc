@@ -83,12 +83,17 @@ struct BoundedDatagramFIFO {
 /// follows:
 ///
 /// ```
-/// fd = socket(AF_INET, SOCK_DGRAM, 0)
+/// fd = socket(family, SOCK_DGRAM, 0)   // family follows the resolved peer
 /// setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, 1)
 /// setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, 1)
-/// bind(fd, INADDR_ANY : port)
+/// bind(fd, wildcard : port)
 /// connect(fd, serverIP : port)     // symmetric RTP: same port both ends
 /// ```
+///
+/// The socket's address family is chosen from the resolved remote: IPv4 is
+/// preferred when a host offers both families (matching the historical
+/// behavior and the loopback pin in `TransportSession`), and IPv6 is used
+/// when it is the only family available (e.g. Tailscale ULA destinations).
 ///
 /// `Network.framework` (`NWListener`/`NWConnection`) does not reliably expose
 /// `SO_REUSEPORT`, which this transport requires so the viewer can bind the
@@ -160,7 +165,19 @@ public actor PosixUDPChannel {
     // MARK: - Lifecycle
 
     public func start() async throws {
-        let sock = socket(AF_INET, SOCK_DGRAM, 0)
+        // Resolve the remote first (when connecting) so socket, bind, and
+        // connect all use the peer's address family.
+        var remoteStorage: sockaddr_storage?
+        if let remoteHost, let remotePort {
+            guard var storage = Self.resolveHost(remoteHost) else {
+                throw VNCProtocolError.ioError("UDP connect: cannot resolve remote host \(remoteHost)")
+            }
+            Self.setPort(remotePort, in: &storage)
+            remoteStorage = storage
+        }
+        let family = remoteStorage.map { Int32($0.ss_family) } ?? AF_INET
+
+        let sock = socket(family, SOCK_DGRAM, 0)
         guard sock >= 0 else {
             throw VNCProtocolError.ioError("UDP socket() failed: \(errnoString())")
         }
@@ -176,16 +193,29 @@ public actor PosixUDPChannel {
         // large keyframes. Request a much larger buffer (macOS may cap it).
         setIntOption(SO_RCVBUF, value: 8 * 1024 * 1024)
 
-        // bind(INADDR_ANY : localPort)
-        var localAddr = sockaddr_in()
-        localAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        localAddr.sin_family = sa_family_t(AF_INET)
-        localAddr.sin_port = (requestedLocalPort ?? 0).bigEndian
-        localAddr.sin_addr = in_addr(s_addr: INADDR_ANY)
-
-        let bindResult = withUnsafePointer(to: &localAddr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+        // bind(wildcard : localPort) in the peer's family
+        let bindResult: Int32
+        if family == AF_INET6 {
+            var localAddr = sockaddr_in6()
+            localAddr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            localAddr.sin6_family = sa_family_t(AF_INET6)
+            localAddr.sin6_port = (requestedLocalPort ?? 0).bigEndian
+            localAddr.sin6_addr = in6addr_any
+            bindResult = withUnsafePointer(to: &localAddr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in6>.size))
+                }
+            }
+        } else {
+            var localAddr = sockaddr_in()
+            localAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            localAddr.sin_family = sa_family_t(AF_INET)
+            localAddr.sin_port = (requestedLocalPort ?? 0).bigEndian
+            localAddr.sin_addr = in_addr(s_addr: INADDR_ANY)
+            bindResult = withUnsafePointer(to: &localAddr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    bind(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
             }
         }
         guard bindResult == 0 else {
@@ -195,19 +225,11 @@ public actor PosixUDPChannel {
         }
 
         // connect(remoteIP : remotePort) — native always connects (symmetric).
-        if let remoteHost, let remotePort {
-            var remoteAddr = sockaddr_in()
-            remoteAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-            remoteAddr.sin_family = sa_family_t(AF_INET)
-            remoteAddr.sin_port = remotePort.bigEndian
-            guard let resolved = Self.resolveIPv4(remoteHost) else {
-                closeFD()
-                throw VNCProtocolError.ioError("UDP connect: cannot resolve remote host \(remoteHost)")
-            }
-            remoteAddr.sin_addr = resolved
+        if var remoteAddr = remoteStorage, let remoteHost, let remotePort {
+            let addrLen = socklen_t(remoteAddr.ss_len)
             let connectResult = withUnsafePointer(to: &remoteAddr) { ptr in
                 ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    connect(fd, sa, addrLen)
                 }
             }
             guard connectResult == 0 else {
@@ -218,15 +240,15 @@ public actor PosixUDPChannel {
         }
 
         // Resolve the actually-bound local port.
-        var boundAddr = sockaddr_in()
-        var boundLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+        var boundAddr = sockaddr_storage()
+        var boundLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
         let nameResult = withUnsafeMutablePointer(to: &boundAddr) { ptr in
             ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
                 getsockname(fd, sa, &boundLen)
             }
         }
-        if nameResult == 0 {
-            boundPort = UInt16(bigEndian: boundAddr.sin_port)
+        if nameResult == 0, let port = Self.port(of: boundAddr) {
+            boundPort = port
         } else {
             boundPort = requestedLocalPort
         }
@@ -417,19 +439,72 @@ public actor PosixUDPChannel {
         String(cString: strerror(errno))
     }
 
-    /// Resolve a host (numeric IP or hostname like "localhost") to an IPv4
-    /// address. `inet_pton` only accepts numeric IPs, so hostnames need DNS.
-    private static func resolveIPv4(_ host: String) -> in_addr? {
-        var addr = in_addr()
-        if inet_pton(AF_INET, host, &addr) == 1 { return addr }
-
+    /// Resolve a host (numeric IPv4/IPv6 literal — brackets and scope IDs
+    /// accepted — or a hostname) to a socket address. IPv4 is preferred when a
+    /// host resolves to both families so dual-stack destinations keep the
+    /// historical behavior; IPv6 is used when it is the only family available.
+    private static func resolveHost(_ host: String) -> sockaddr_storage? {
+        var name = host
+        if name.hasPrefix("["), name.hasSuffix("]") {
+            name = String(name.dropFirst().dropLast())
+        }
         var hints = addrinfo()
-        hints.ai_family = AF_INET
+        hints.ai_family = AF_UNSPEC
         hints.ai_socktype = SOCK_DGRAM
         var result: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, nil, &hints, &result) == 0, let info = result else { return nil }
+        guard getaddrinfo(name, nil, &hints, &result) == 0 else { return nil }
         defer { freeaddrinfo(result) }
-        guard let sa = info.pointee.ai_addr else { return nil }
-        return sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
+
+        var v6Fallback: sockaddr_storage?
+        var node = result
+        while let info = node?.pointee {
+            if let sa = info.ai_addr {
+                var storage = sockaddr_storage()
+                let length = min(Int(info.ai_addrlen), MemoryLayout<sockaddr_storage>.size)
+                withUnsafeMutableBytes(of: &storage) { dest in
+                    dest.copyMemory(
+                        from: UnsafeRawBufferPointer(start: sa, count: length))
+                }
+                if info.ai_family == AF_INET { return storage }
+                if info.ai_family == AF_INET6, v6Fallback == nil { v6Fallback = storage }
+            }
+            node = info.ai_next
+        }
+        return v6Fallback
+    }
+
+    private static func setPort(_ port: UInt16, in storage: inout sockaddr_storage) {
+        withUnsafeMutablePointer(to: &storage) { ptr in
+            switch Int32(ptr.pointee.ss_family) {
+            case AF_INET:
+                ptr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                    $0.pointee.sin_port = port.bigEndian
+                }
+            case AF_INET6:
+                ptr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+                    $0.pointee.sin6_port = port.bigEndian
+                }
+            default:
+                break
+            }
+        }
+    }
+
+    private static func port(of storage: sockaddr_storage) -> UInt16? {
+        var copy = storage
+        return withUnsafeMutablePointer(to: &copy) { ptr -> UInt16? in
+            switch Int32(ptr.pointee.ss_family) {
+            case AF_INET:
+                return ptr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                    UInt16(bigEndian: $0.pointee.sin_port)
+                }
+            case AF_INET6:
+                return ptr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+                    UInt16(bigEndian: $0.pointee.sin6_port)
+                }
+            default:
+                return nil
+            }
+        }
     }
 }

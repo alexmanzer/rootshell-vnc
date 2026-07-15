@@ -58,9 +58,31 @@ public actor TCPConnection: RFBConnection {
     private var receiveOffset = 0
     private static let compactionThreshold = 64 * 1024
 
+    /// Dial retry tuning; injectable so tests don't sit through real backoffs.
+    private let maxDialAttempts: Int
+    private let dialRetryBackoffNanos: UInt64
+    private let connectTimeoutSeconds: Int
+
     public init(host: String, port: UInt16) {
+        self.init(
+            host: host, port: port,
+            maxDialAttempts: 3,
+            dialRetryBackoffNanos: 1_000_000_000,
+            connectTimeoutSeconds: 10)
+    }
+
+    init(
+        host: String,
+        port: UInt16,
+        maxDialAttempts: Int,
+        dialRetryBackoffNanos: UInt64,
+        connectTimeoutSeconds: Int
+    ) {
         self.host = host
         self.port = port
+        self.maxDialAttempts = max(1, maxDialAttempts)
+        self.dialRetryBackoffNanos = dialRetryBackoffNanos
+        self.connectTimeoutSeconds = max(1, connectTimeoutSeconds)
     }
 
     public func connect() async throws {
@@ -69,6 +91,26 @@ public actor TCPConnection: RFBConnection {
         receiveBuffer.removeAll(keepingCapacity: true)
         receiveOffset = 0
 
+        // On-demand VPNs (Tailscale and friends) bring their tunnel up in
+        // response to the first dial, which can fail before the route exists.
+        // Retry briefly so the tunnel warmed by a failed attempt gets used,
+        // instead of surfacing the failure and making the user reconnect.
+        for attempt in 1...maxDialAttempts {
+            do {
+                try await dialOnce()
+                return
+            } catch {
+                guard attempt < maxDialAttempts, !isClosing else { throw error }
+                log.warning(
+                    "Connect attempt \(attempt)/\(maxDialAttempts) to \(host):\(port) failed "
+                        + "(\(error.localizedDescription)); retrying")
+                try await Task.sleep(nanoseconds: UInt64(attempt) * dialRetryBackoffNanos)
+                guard !isClosing else { throw error }
+            }
+        }
+    }
+
+    private func dialOnce() async throws {
         let handler = InboundByteStreamHandler { [weak self] error in
             Task { await self?.notifyUnexpectedDisconnect(error) }
         }
@@ -78,10 +120,10 @@ public actor TCPConnection: RFBConnection {
         tcpOptions.keepaliveIdle = 15
         tcpOptions.keepaliveInterval = 5
         tcpOptions.keepaliveCount = 3
-        tcpOptions.connectionTimeout = 10
+        tcpOptions.connectionTimeout = connectTimeoutSeconds
 
         let bootstrap = NIOTSConnectionBootstrap(group: Self.eventLoopGroup)
-            .connectTimeout(.seconds(10))
+            .connectTimeout(.seconds(Int64(connectTimeoutSeconds)))
             .withQoS(.userInitiated)
             .tcpOptions(tcpOptions)
             // RFB framebuffer processing applies its own credit-based
