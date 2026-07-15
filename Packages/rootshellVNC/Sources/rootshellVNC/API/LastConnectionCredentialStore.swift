@@ -92,9 +92,11 @@ enum KeychainError: Error, LocalizedError {
         switch self {
         case .status(let status):
             let detail = SecCopyErrorMessageString(status, nil) as String?
-            return detail ?? "Keychain error \(status)"
+            return detail ?? String(localized: "Keychain error \(status)", bundle: .module)
         case .unexpectedResult:
-            return "The saved Keychain item did not contain credential data."
+            return String(
+                localized: "The saved Keychain item did not contain credential data.",
+                bundle: .module)
         }
     }
 }

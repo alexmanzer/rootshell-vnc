@@ -221,7 +221,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }()
 
     private lazy var commandCompatibilityKeyCommands: [UIKeyCommand] = {
-        [("h", "Command-H"), ("m", "Command-M")].map { input, title in
+        [
+            ("h", String(localized: "Command-H", bundle: .module)),
+            ("m", String(localized: "Command-M", bundle: .module)),
+        ].map { input, title in
             let command = UIKeyCommand(
                 input: input,
                 modifierFlags: [.control, .alternate],
@@ -274,22 +277,22 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
     private lazy var viewerCommandKeyCommands: [UIKeyCommand] = [
         makeViewerCommand(
-            title: "Type User Password",
+            title: String(localized: "Type User Password", bundle: .module),
             input: "p",
             modifiers: [.control, .shift],
             action: #selector(handlePasswordCommand(_:))),
         makeViewerCommand(
-            title: "Dictate",
+            title: String(localized: "Dictate", bundle: .module),
             input: "l",
             modifiers: [.control, .alternate],
             action: #selector(handleDictationCommand(_:))),
         makeViewerCommand(
-            title: "Toggle Full Screen",
+            title: String(localized: "Toggle Full Screen", bundle: .module),
             input: "f",
             modifiers: [.control, .shift],
             action: #selector(handleFullScreenCommand(_:))),
         makeViewerCommand(
-            title: "Close Connection",
+            title: String(localized: "Close Connection", bundle: .module),
             input: "q",
             modifiers: [.alternate, .command],
             action: #selector(handleDisconnectCommand(_:))),
@@ -428,7 +431,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         super.init(frame: .zero)
         backgroundColor = .clear
         isMultipleTouchEnabled = true
-        accessibilityLabel = "Remote desktop input"
+        accessibilityLabel = String(localized: "Remote desktop input", bundle: .module)
         configureRecognizers()
         addInteraction(pointerInteraction)
         NotificationCenter.default.addObserver(

@@ -31,19 +31,19 @@ public enum VNCError: Error, Sendable, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .notConnected:
-            "Not connected to a VNC server"
+            String(localized: "Not connected to a VNC server", bundle: .module)
         case .alreadyConnected:
-            "Already connected to a VNC server"
+            String(localized: "Already connected to a VNC server", bundle: .module)
         case .connectionFailed(let msg):
-            "Connection failed: \(msg)"
+            String(localized: "Connection failed: \(msg)", bundle: .module)
         case .authenticationFailed(let msg):
-            "Authentication failed: \(msg)"
+            String(localized: "Authentication failed: \(msg)", bundle: .module)
         case .protocolError(let err):
-            "Protocol error: \(err.localizedDescription)"
+            String(localized: "Protocol error: \(err.localizedDescription)", bundle: .module)
         case .framebufferError(let msg):
-            "Framebuffer error: \(msg)"
+            String(localized: "Framebuffer error: \(msg)", bundle: .module)
         case .unsupportedFeature(let msg):
-            "Unsupported feature: \(msg)"
+            String(localized: "Unsupported feature: \(msg)", bundle: .module)
         }
     }
 }

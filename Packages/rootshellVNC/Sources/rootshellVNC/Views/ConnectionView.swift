@@ -2,18 +2,36 @@ import SwiftUI
 import RFBProtocol
 import os
 
-private enum AppConnectionMode: String, CaseIterable, Identifiable {
-    case highPerformance = "High Performance"
-    case standard = "Standard"
+private enum AppConnectionMode: CaseIterable, Identifiable {
+    case highPerformance
+    case standard
 
     var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .highPerformance:
+            String(localized: "High Performance", bundle: .module, comment: "VNC connection mode")
+        case .standard:
+            String(localized: "Standard", bundle: .module, comment: "VNC connection mode")
+        }
+    }
 }
 
-private enum StandardQuality: String, CaseIterable, Identifiable {
-    case adaptive = "Adaptive"
-    case fullQuality = "Full Quality"
+private enum StandardQuality: CaseIterable, Identifiable {
+    case adaptive
+    case fullQuality
 
     var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .adaptive:
+            String(localized: "Adaptive", bundle: .module, comment: "VNC standard-mode quality")
+        case .fullQuality:
+            String(localized: "Full Quality", bundle: .module, comment: "VNC standard-mode quality")
+        }
+    }
 }
 
 /// A form view for entering VNC server connection details and initiating a connection.
@@ -97,7 +115,7 @@ public struct ConnectionView: View {
                         }
                 }
             }
-            .navigationTitle("Connect to VNC Server")
+            .navigationTitle(String(localized: "Connect to VNC Server", bundle: .module))
             #if os(iOS)
             .navigationBarTitleDisplayMode(.large)
             #endif
@@ -108,7 +126,7 @@ public struct ConnectionView: View {
                     #endif
                     .toolbar {
                         ToolbarItem(placement: .destructiveAction) {
-                            Button("Disconnect") {
+                            Button(String(localized: "Disconnect", bundle: .module)) {
                                 session.disconnect()
                                 showRemoteDesktop = false
                             }
@@ -140,11 +158,11 @@ public struct ConnectionView: View {
     // MARK: - Sections
 
     private var serverSection: some View {
-        Section("Server") {
+        Section(String(localized: "Server", bundle: .module)) {
             HStack {
-                Text("Host")
+                Text(String(localized: "Host", bundle: .module))
                     .frame(width: 80, alignment: .leading)
-                TextField("hostname or IP address", text: $host)
+                TextField(String(localized: "hostname or IP address", bundle: .module), text: $host)
                     .textContentType(.URL)
                     #if os(iOS)
                     .keyboardType(.URL)
@@ -155,7 +173,7 @@ public struct ConnectionView: View {
             }
 
             HStack {
-                Text("Port")
+                Text(String(localized: "Port", bundle: .module))
                     .frame(width: 80, alignment: .leading)
                 TextField("5900", text: $port)
                     #if os(iOS)
@@ -167,11 +185,11 @@ public struct ConnectionView: View {
     }
 
     private var authenticationSection: some View {
-        Section("Authentication") {
+        Section(String(localized: "Authentication", bundle: .module)) {
             HStack {
-                Text("Username")
+                Text(String(localized: "Username", bundle: .module))
                     .frame(width: 80, alignment: .leading)
-                TextField("optional", text: $username)
+                TextField(String(localized: "optional", bundle: .module), text: $username)
                     .textContentType(.username)
                     #if os(iOS)
                     .autocapitalization(.none)
@@ -181,9 +199,9 @@ public struct ConnectionView: View {
             }
 
             HStack {
-                Text("Password")
+                Text(String(localized: "Password", bundle: .module))
                     .frame(width: 80, alignment: .leading)
-                SecureField("required", text: $password)
+                SecureField(String(localized: "required", bundle: .module), text: $password)
                     .textContentType(.password)
                     .submitLabel(.go)
                     .onSubmit(initiateConnection)
@@ -192,27 +210,27 @@ public struct ConnectionView: View {
     }
 
     private var audioSection: some View {
-        Section("Audio") {
-            Toggle("Play Remote Audio", isOn: $session.configuration.enableRemoteAudio)
-            Text("Play the remote Mac's system audio when the server offers it.")
+        Section(String(localized: "Audio", bundle: .module)) {
+            Toggle(String(localized: "Play Remote Audio", bundle: .module), isOn: $session.configuration.enableRemoteAudio)
+            Text(String(localized: "Play the remote Mac's system audio when the server offers it.", bundle: .module))
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
     }
 
     private var qualitySection: some View {
-        Section("Display Quality") {
-            Picker("Connection Mode", selection: connectionMode) {
+        Section(String(localized: "Display Quality", bundle: .module)) {
+            Picker(String(localized: "Connection Mode", bundle: .module), selection: connectionMode) {
                 ForEach(AppConnectionMode.allCases) { mode in
-                    Text(mode.rawValue).tag(mode)
+                    Text(mode.title).tag(mode)
                 }
             }
             .pickerStyle(.menu)
 
             if connectionMode.wrappedValue == .standard {
-                Picker("Quality", selection: standardQuality) {
+                Picker(String(localized: "Quality", bundle: .module), selection: standardQuality) {
                     ForEach(StandardQuality.allCases) { quality in
-                        Text(quality.rawValue).tag(quality)
+                        Text(quality.title).tag(quality)
                     }
                 }
                 .pickerStyle(.menu)
@@ -255,15 +273,17 @@ public struct ConnectionView: View {
     }
 
     private var displaySizingSection: some View {
-        Section("Remote Display Size") {
+        Section(String(localized: "Remote Display Size", bundle: .module)) {
             if connectionMode.wrappedValue == .highPerformance,
                session.configuration.displaySizingMode == .matchClient {
-                LabeledContent("Display Mode", value: "One Virtual Display")
-                Text("Match Client currently creates one client-sized virtual display.")
+                LabeledContent(
+                    String(localized: "Display Mode", bundle: .module),
+                    value: String(localized: "One Virtual Display", bundle: .module))
+                Text(String(localized: "Match Client currently creates one client-sized virtual display.", bundle: .module))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else {
-                Picker("Display Mode", selection: $session.configuration.displayMode) {
+                Picker(String(localized: "Display Mode", bundle: .module), selection: $session.configuration.displayMode) {
                     Text(VNCConfiguration.DisplayMode.oneDisplay.title)
                         .tag(VNCConfiguration.DisplayMode.oneDisplay)
                     Text(VNCConfiguration.DisplayMode.allDisplaysCombined.title)
@@ -277,7 +297,7 @@ public struct ConnectionView: View {
             }
 
             if connectionMode.wrappedValue == .highPerformance {
-                Picker("Sizing", selection: $session.configuration.displaySizingMode) {
+                Picker(String(localized: "Sizing", bundle: .module), selection: $session.configuration.displaySizingMode) {
                     ForEach(VNCConfiguration.DisplaySizingMode.allCases) { mode in
                         Text(mode.title).tag(mode)
                     }
@@ -315,9 +335,9 @@ public struct ConnectionView: View {
                     if isConnecting {
                         ProgressView()
                             .padding(.trailing, 8)
-                        Text("Connecting...")
+                        Text(String(localized: "Connecting...", bundle: .module))
                     } else {
-                        Text("Connect")
+                        Text(String(localized: "Connect", bundle: .module))
                     }
                     Spacer()
                 }
@@ -342,7 +362,9 @@ public struct ConnectionView: View {
         isConnecting = true
 
         guard let portNumber = UInt16(port), portNumber > 0 else {
-            errorMessage = "Enter a valid port between 1 and 65535."
+            errorMessage = String(
+                localized: "Enter a valid port between 1 and 65535.",
+                bundle: .module)
             isConnecting = false
             return
         }

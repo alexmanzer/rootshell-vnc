@@ -45,17 +45,19 @@ public struct VNCConfiguration: Sendable {
 
         public var title: String {
             switch self {
-            case .remoteDisplay: "Remote Display"
-            case .matchClient: "Match Client"
+            case .remoteDisplay:
+                String(localized: "Remote Display", bundle: .module, comment: "VNC display sizing mode")
+            case .matchClient:
+                String(localized: "Match Client", bundle: .module, comment: "VNC display sizing mode")
             }
         }
 
         public var explanation: String {
             switch self {
             case .remoteDisplay:
-                "Keep the remote computer's existing display dimensions."
+                String(localized: "Keep the remote computer's existing display dimensions.", bundle: .module)
             case .matchClient:
-                "Match this window or iPad aspect ratio. Supported Macs use a separate virtual display; other VNC servers resize only when they advertise support."
+                String(localized: "Match this window or iPad aspect ratio. Supported Macs use a separate virtual display; other VNC servers resize only when they advertise support.", bundle: .module)
             }
         }
     }
@@ -74,20 +76,23 @@ public struct VNCConfiguration: Sendable {
 
         public var title: String {
             switch self {
-            case .oneDisplay: "One Display"
-            case .allDisplaysCombined: "All Displays (Combined)"
-            case .twoVirtualDisplays: "Two Virtual Displays"
+            case .oneDisplay:
+                String(localized: "One Display", bundle: .module, comment: "VNC display mode")
+            case .allDisplaysCombined:
+                String(localized: "All Displays (Combined)", bundle: .module, comment: "VNC display mode")
+            case .twoVirtualDisplays:
+                String(localized: "Two Virtual Displays", bundle: .module, comment: "VNC display mode")
             }
         }
 
         public var explanation: String {
             switch self {
             case .oneDisplay:
-                "Use one remote display for the lowest bandwidth and decoding load."
+                String(localized: "Use one remote display for the lowest bandwidth and decoding load.", bundle: .module)
             case .allDisplaysCombined:
-                "Show the remote Mac's physical displays in one combined desktop, matching Apple Screen Sharing."
+                String(localized: "Show the remote Mac's physical displays in one combined desktop, matching Apple Screen Sharing.", bundle: .module)
             case .twoVirtualDisplays:
-                "Ask a capable Mac for two client-sized virtual displays with independent High Performance video streams."
+                String(localized: "Ask a capable Mac for two client-sized virtual displays with independent High Performance video streams.", bundle: .module)
             }
         }
 
@@ -114,20 +119,23 @@ public struct VNCConfiguration: Sendable {
 
         public var title: String {
             switch self {
-            case .adaptive: "High Performance"
-            case .standard: "Standard"
-            case .fullQuality: "Full Quality"
+            case .adaptive:
+                String(localized: "High Performance", bundle: .module, comment: "VNC video quality mode")
+            case .standard:
+                String(localized: "Standard", bundle: .module, comment: "VNC video quality mode")
+            case .fullQuality:
+                String(localized: "Full Quality", bundle: .module, comment: "VNC video quality mode")
             }
         }
 
         public var explanation: String {
             switch self {
             case .adaptive:
-                "Low-latency HEVC over UDP for networks that can sustain the video stream."
+                String(localized: "Low-latency HEVC over UDP for networks that can sustain the video stream.", bundle: .module)
             case .standard:
-                "Reliable compressed RFB over TCP for constrained networks, VPNs, and non-Mac servers."
+                String(localized: "Reliable compressed RFB over TCP for constrained networks, VPNs, and non-Mac servers.", bundle: .module)
             case .fullQuality:
-                "Lossless framebuffer updates with higher bandwidth and CPU use."
+                String(localized: "Lossless framebuffer updates with higher bandwidth and CPU use.", bundle: .module)
             }
         }
     }

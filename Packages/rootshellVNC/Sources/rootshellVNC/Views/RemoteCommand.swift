@@ -35,16 +35,26 @@ enum RemoteCommand: String, CaseIterable, Identifiable, Sendable {
 
     var title: String {
         switch self {
-        case .missionControl: "Mission Control"
-        case .applicationWindows: "Application Windows"
-        case .moveLeftASpace: "Move Left a Space"
-        case .moveRightASpace: "Move Right a Space"
-        case .forceQuit: "Force Quit…"
-        case .lockScreen: "Lock Screen"
-        case .logOutUser: "Log Out User…"
-        case .controlAltDelete: "Ctrl-Alt-Delete"
-        case .backslash: "Backslash"
-        case .insert: "Insert"
+        case .missionControl:
+            String(localized: "Mission Control", bundle: .module, comment: "Remote keyboard command")
+        case .applicationWindows:
+            String(localized: "Application Windows", bundle: .module, comment: "Remote keyboard command")
+        case .moveLeftASpace:
+            String(localized: "Move Left a Space", bundle: .module, comment: "Remote keyboard command")
+        case .moveRightASpace:
+            String(localized: "Move Right a Space", bundle: .module, comment: "Remote keyboard command")
+        case .forceQuit:
+            String(localized: "Force Quit…", bundle: .module, comment: "Remote keyboard command")
+        case .lockScreen:
+            String(localized: "Lock Screen", bundle: .module, comment: "Remote keyboard command")
+        case .logOutUser:
+            String(localized: "Log Out User…", bundle: .module, comment: "Remote keyboard command")
+        case .controlAltDelete:
+            String(localized: "Ctrl-Alt-Delete", bundle: .module, comment: "Remote keyboard command")
+        case .backslash:
+            String(localized: "Backslash", bundle: .module, comment: "Remote keyboard command")
+        case .insert:
+            String(localized: "Insert", bundle: .module, comment: "Remote keyboard command")
         }
     }
 

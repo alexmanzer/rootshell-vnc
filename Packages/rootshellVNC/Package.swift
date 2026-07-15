@@ -4,6 +4,7 @@ import PackageDescription
 
 let package = Package(
     name: "rootshellVNC",
+    defaultLocalization: "en",
     platforms: [
         .iOS(.v18),
         .macOS(.v15),
@@ -73,6 +74,7 @@ let package = Package(
         .target(
             name: "rootshellVNC",
             dependencies: ["RFBProtocol", "RFBTransport", "RFBRendering"],
+            resources: [.process("Resources")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
 

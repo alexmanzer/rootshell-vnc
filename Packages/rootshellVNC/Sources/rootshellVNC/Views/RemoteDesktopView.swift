@@ -179,16 +179,16 @@ public struct RemoteDesktopView: View {
                 }
                 .clipped()
                 .confirmationDialog(
-                    "Type the saved password?",
+                    String(localized: "Type the saved password?", bundle: .module),
                     isPresented: $confirmPasswordSend,
                     titleVisibility: .visible
                 ) {
-                    Button("Type Password and Log In") {
+                    Button(String(localized: "Type Password and Log In", bundle: .module)) {
                         session.sendLoginPassword()
                     }
-                    Button("Cancel", role: .cancel) {}
+                    Button(String(localized: "Cancel", bundle: .module), role: .cancel) {}
                 } message: {
-                    Text("The password will be typed into the remote computer, followed by Return.")
+                    Text(String(localized: "The password will be typed into the remote computer, followed by Return.", bundle: .module))
                 }
                 .onChange(of: geometry.size) { _, newSize in
                     viewport.clampOffset(
@@ -372,7 +372,9 @@ public struct RemoteDesktopView: View {
                     keyboardActive.toggle()
                 } label: {
                     Label(
-                        keyboardActive ? "Hide Keyboard" : "Show Keyboard",
+                        keyboardActive
+                            ? String(localized: "Hide Keyboard", bundle: .module)
+                            : String(localized: "Show Keyboard", bundle: .module),
                         systemImage: keyboardActive
                             ? "keyboard.chevron.compact.down" : "keyboard")
                 }
@@ -387,7 +389,7 @@ public struct RemoteDesktopView: View {
                     get: { keyboardCapture.routesReservedHostShortcutsToVNC },
                     set: { keyboardCapture.routeReservedHostShortcutsToVNC($0) }
                 )) {
-                    Label("Route Reserved Shortcuts to VNC", systemImage: "keyboard.badge.ellipsis")
+                    Label(String(localized: "Route Reserved Shortcuts to VNC", bundle: .module), systemImage: "keyboard.badge.ellipsis")
                 }
             } else {
                 Button {
@@ -398,14 +400,15 @@ public struct RemoteDesktopView: View {
                 } label: {
                     Label(
                         keyboardCapture.isCaptured
-                            ? "Release Keyboard Capture" : "Capture Keyboard",
+                            ? String(localized: "Release Keyboard Capture", bundle: .module)
+                            : String(localized: "Capture Keyboard", bundle: .module),
                         systemImage: keyboardCapture.isCaptured
                             ? "keyboard.badge.ellipsis" : "keyboard")
                 }
             }
 
             Menu {
-                Section("Mac Specific") {
+                Section(String(localized: "Mac Specific", bundle: .module)) {
                     ForEach(RemoteCommand.macSpecific) { command in
                         Button(command.title) {
                             keyboardHandler.handleRemoteCommand(command)
@@ -413,8 +416,8 @@ public struct RemoteDesktopView: View {
                     }
                 }
 
-                Section("Other Commands") {
-                    Button("Dictate") {
+                Section(String(localized: "Other Commands", bundle: .module)) {
+                    Button(String(localized: "Dictate", bundle: .module)) {
                         requestDictation()
                     }
 
@@ -424,16 +427,16 @@ public struct RemoteDesktopView: View {
                         }
                     }
 
-                    Button("Command-H") {
+                    Button(String(localized: "Command-H", bundle: .module)) {
                         keyboardHandler.handleCommandTap("h")
                     }
-                    Button("Command-M") {
+                    Button(String(localized: "Command-M", bundle: .module)) {
                         keyboardHandler.handleCommandTap("m")
                     }
                 }
             } label: {
                 Label(
-                    "Commands",
+                    String(localized: "Commands", bundle: .module),
                     systemImage: "command")
             }
             #endif
@@ -441,14 +444,16 @@ public struct RemoteDesktopView: View {
             Button {
                 viewport.reset()
             } label: {
-                Label("Fit Screen", systemImage: "arrow.down.right.and.arrow.up.left")
+                Label(String(localized: "Fit Screen", bundle: .module), systemImage: "arrow.down.right.and.arrow.up.left")
             }
             .disabled(viewport.isIdentity)
 
             if let toggleFullScreen {
                 Button(action: toggleFullScreen) {
                     Label(
-                        isFullScreen ? "Exit Full Screen" : "Enter Full Screen",
+                        isFullScreen
+                            ? String(localized: "Exit Full Screen", bundle: .module)
+                            : String(localized: "Enter Full Screen", bundle: .module),
                         systemImage: isFullScreen
                             ? "arrow.down.right.and.arrow.up.left"
                             : "arrow.up.left.and.arrow.down.right")
@@ -464,7 +469,7 @@ public struct RemoteDesktopView: View {
             Button {
                 requestPasswordSend()
             } label: {
-                Label("Type User Password", systemImage: "key.fill")
+                Label(String(localized: "Type User Password", bundle: .module), systemImage: "key.fill")
             }
             .disabled(!session.canSendLoginPassword)
 
@@ -473,7 +478,7 @@ public struct RemoteDesktopView: View {
             Button(role: .destructive) {
                 session.disconnect()
             } label: {
-                Label("Close Connection", systemImage: "xmark.circle")
+                Label(String(localized: "Close Connection", bundle: .module), systemImage: "xmark.circle")
             }
         } label: {
             Image(systemName: "ellipsis")
@@ -483,8 +488,8 @@ public struct RemoteDesktopView: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(.primary)
-        .accessibilityLabel("Remote Desktop Controls")
-        .help("Remote Desktop Controls")
+        .accessibilityLabel(String(localized: "Remote Desktop Controls", bundle: .module))
+        .help(String(localized: "Remote Desktop Controls", bundle: .module))
     }
 
     private func requestPasswordSend() {
@@ -502,19 +507,19 @@ public struct RemoteDesktopView: View {
             switch session.connectionState {
             case .connecting:
                 ProgressView().controlSize(.large)
-                Text("Connecting...").foregroundStyle(.secondary)
+                Text(String(localized: "Connecting...", bundle: .module)).foregroundStyle(.secondary)
             case .connected:
                 ProgressView().controlSize(.large)
-                Text("Waiting for framebuffer...").foregroundStyle(.secondary)
+                Text(String(localized: "Waiting for framebuffer...", bundle: .module)).foregroundStyle(.secondary)
             case .reconnecting(let attempt, _):
                 ProgressView().controlSize(.large)
-                Text("Reconnecting (attempt \(attempt))...")
+                Text(String(localized: "Reconnecting (attempt \(attempt))...", bundle: .module))
                     .foregroundStyle(.secondary)
             case .failed(let reason):
                 Image(systemName: "exclamationmark.triangle")
                     .font(.largeTitle)
                     .foregroundStyle(.red)
-                Text("Connection Failed").font(.headline)
+                Text(String(localized: "Connection Failed", bundle: .module)).font(.headline)
                 Text(reason)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -524,12 +529,12 @@ public struct RemoteDesktopView: View {
                 Image(systemName: "rectangle.slash")
                     .font(.largeTitle)
                     .foregroundStyle(.secondary)
-                Text("Disconnected").foregroundStyle(.secondary)
+                Text(String(localized: "Disconnected", bundle: .module)).foregroundStyle(.secondary)
             case .idle, .disconnecting:
                 Image(systemName: "desktopcomputer")
                     .font(.largeTitle)
                     .foregroundStyle(.secondary)
-                Text("No Active Connection").foregroundStyle(.secondary)
+                Text(String(localized: "No Active Connection", bundle: .module)).foregroundStyle(.secondary)
             }
         }
     }
@@ -544,15 +549,15 @@ public struct RemoteDesktopView: View {
             VStack(spacing: 10) {
                 Image(systemName: "wifi.exclamationmark")
                     .font(.title)
-                Text("Unable to reconnect").font(.headline)
+                Text(String(localized: "Unable to reconnect", bundle: .module)).font(.headline)
                 Text(reason)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                 HStack {
-                    Button("Try Again") { session.retryConnection() }
+                    Button(String(localized: "Try Again", bundle: .module)) { session.retryConnection() }
                         .buttonStyle(.borderedProminent)
-                    Button("Disconnect", role: .destructive) { session.disconnect() }
+                    Button(String(localized: "Disconnect", bundle: .module), role: .destructive) { session.disconnect() }
                         .buttonStyle(.bordered)
                 }
             }
@@ -674,24 +679,24 @@ private struct VNCClipboardMenu: View {
             Button {
                 synchronizer.getClipboard()
             } label: {
-                Label("Get Clipboard", systemImage: "arrow.down.doc")
+                Label(String(localized: "Get Clipboard", bundle: .module), systemImage: "arrow.down.doc")
             }
             .disabled(!synchronizer.canGetClipboard)
 
             Button {
                 synchronizer.sendClipboard()
             } label: {
-                Label("Send Clipboard", systemImage: "arrow.up.doc")
+                Label(String(localized: "Send Clipboard", bundle: .module), systemImage: "arrow.up.doc")
             }
             .disabled(!synchronizer.canSendClipboard)
 
             Divider()
 
             Toggle(isOn: $synchronizer.sharedClipboardEnabled) {
-                Label("Shared Clipboard", systemImage: "arrow.triangle.2.circlepath")
+                Label(String(localized: "Shared Clipboard", bundle: .module), systemImage: "arrow.triangle.2.circlepath")
             }
         } label: {
-            Label("Clipboard", systemImage: "doc.on.clipboard")
+            Label(String(localized: "Clipboard", bundle: .module), systemImage: "doc.on.clipboard")
         }
     }
 }
@@ -861,9 +866,9 @@ private struct StandardFramebufferContent: View {
             // Handshake finished but no framebuffer content has been
             // published. The reconnect/failure overlays own the other states.
             ConnectionStatusCard(
-                title: "Waiting for first screen update…",
+                title: String(localized: "Waiting for first screen update…", bundle: .module),
                 detail: session.connectingHostLabel,
-                actionLabel: "Cancel",
+                actionLabel: String(localized: "Cancel", bundle: .module),
                 actionRole: .cancel
             ) { session.disconnect() }
         }

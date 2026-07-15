@@ -460,7 +460,7 @@ public final class VNCSession {
         if configuration.transportProvider != nil,
            configuration.videoQualityMode == .adaptive {
             throw VNCError.unsupportedFeature(
-                "High Performance mode requires a direct network connection and is unavailable over a tunneled transport.")
+                String(localized: "High Performance mode requires a direct network connection and is unavailable over a tunneled transport.", bundle: .module))
         }
 
         invalidateInputQueue()
@@ -469,7 +469,7 @@ public final class VNCSession {
         intentionallyDisconnected = false
         hasEstablishedConnection = false
         connectionState = .connecting
-        connectionPhaseDescription = "Opening connection…"
+        connectionPhaseDescription = String(localized: "Opening connection…", bundle: .module)
         activeCredentials = credentials
         appleMediaTilesPerFrameOverride = nil
         lastError = nil
@@ -1008,17 +1008,17 @@ public final class VNCSession {
     ) -> String? {
         switch protocolState {
         case .connecting:
-            return "Opening connection…"
+            return String(localized: "Opening connection…", bundle: .module)
         case .waitingForProtocolVersion:
-            return "Negotiating protocol…"
+            return String(localized: "Negotiating protocol…", bundle: .module)
         case .waitingForSecurityTypes:
-            return "Negotiating security…"
+            return String(localized: "Negotiating security…", bundle: .module)
         case .authenticating:
-            return "Authenticating…"
+            return String(localized: "Authenticating…", bundle: .module)
         case .waitingForAuthResult:
-            return "Verifying credentials…"
+            return String(localized: "Verifying credentials…", bundle: .module)
         case .waitingForServerInit:
-            return "Starting remote session…"
+            return String(localized: "Starting remote session…", bundle: .module)
         case .idle, .operational, .disconnecting, .disconnected, .failed:
             return nil
         }
@@ -1545,7 +1545,9 @@ public final class VNCSession {
         let policy = configuration.reconnectionPolicy
         let maximumAttempts = max(policy.maximumAttempts, minimumAttempts)
         guard maximumAttempts > 0 else {
-            connectionState = .failed("Reconnection is disabled for this session.")
+            connectionState = .failed(String(
+                localized: "Reconnection is disabled for this session.",
+                bundle: .module))
             return
         }
 
@@ -1600,7 +1602,9 @@ public final class VNCSession {
 
             self.cleanupTransport(clearCredentials: false)
             self.connectionState = .failed(
-                "Couldn’t reconnect after \(maximumAttempts) attempts. Check the network or server, then try again.")
+                String(
+                    localized: "Couldn’t reconnect after \(maximumAttempts) attempts. Check the network or server, then try again.",
+                    bundle: .module))
         }
     }
 
@@ -2353,15 +2357,15 @@ public final class VNCSession {
         case .authenticationFailed(let reason):
             return .authenticationFailed(reason)
         case .connectionClosed:
-            return .connectionFailed("Connection closed by server")
+            return .connectionFailed(String(localized: "Connection closed by server", bundle: .module))
         case .timeout:
-            return .connectionFailed("Connection timed out")
+            return .connectionFailed(String(localized: "Connection timed out", bundle: .module))
         case .ioError(let detail):
             return .connectionFailed(detail)
         case .unsupportedVersion:
-            return .unsupportedFeature("Server protocol version not supported")
+            return .unsupportedFeature(String(localized: "Server protocol version not supported", bundle: .module))
         case .unsupportedEncoding(let id):
-            return .unsupportedFeature("Encoding \(id) not supported")
+            return .unsupportedFeature(String(localized: "Encoding \(id) not supported", bundle: .module))
         default:
             return .protocolError(error)
         }

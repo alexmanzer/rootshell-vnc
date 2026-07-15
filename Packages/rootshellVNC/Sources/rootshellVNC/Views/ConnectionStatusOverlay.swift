@@ -16,17 +16,18 @@ public struct ConnectionStatusOverlay: View {
             ConnectionStatusCard(
                 title: connectingTitle,
                 detail: session.connectionPhaseDescription,
-                actionLabel: "Cancel",
+                actionLabel: String(localized: "Cancel", bundle: .module),
                 actionRole: .cancel
             ) { session.disconnect() }
 
         case .reconnecting(let attempt, let delay):
             ConnectionStatusCard(
-                title: "Connection interrupted",
+                title: String(localized: "Connection interrupted", bundle: .module),
                 detail: delay > 0
-                    ? "Retry \(attempt) starts in about \(Int(ceil(delay))) seconds."
-                    : (session.connectionPhaseDescription ?? "Reconnecting now…"),
-                actionLabel: "Stop Reconnecting",
+                    ? String(localized: "Retry \(attempt) starts in about \(Int(ceil(delay))) seconds.", bundle: .module)
+                    : (session.connectionPhaseDescription
+                        ?? String(localized: "Reconnecting now…", bundle: .module)),
+                actionLabel: String(localized: "Stop Reconnecting", bundle: .module),
                 actionRole: .destructive
             ) { session.disconnect() }
 
@@ -37,9 +38,9 @@ public struct ConnectionStatusOverlay: View {
 
     private var connectingTitle: String {
         if let host = session.connectingHostLabel, !host.isEmpty {
-            return "Connecting to \(host)"
+            return String(localized: "Connecting to \(host)", bundle: .module)
         }
-        return "Connecting"
+        return String(localized: "Connecting", bundle: .module)
     }
 }
 
