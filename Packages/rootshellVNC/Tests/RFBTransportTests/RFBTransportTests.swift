@@ -19,6 +19,27 @@ final class TCPConnectionTLSNameTests: XCTestCase {
     }
 }
 
+final class ApplePointerButtonMappingTests: XCTestCase {
+    func testAppleWireSwapsRightAndMiddleButtons() {
+        XCTAssertEqual(TransportSession.pointerButtonMaskForWire(
+            0x04, serverVersion: .apple), 0x02)
+        XCTAssertEqual(TransportSession.pointerButtonMaskForWire(
+            0x02, serverVersion: .apple), 0x04)
+    }
+
+    func testAppleWirePreservesOtherButtonBits() {
+        XCTAssertEqual(TransportSession.pointerButtonMaskForWire(
+            0x19, serverVersion: .apple), 0x19)
+    }
+
+    func testConventionalRFBKeepsStandardButtonOrder() {
+        XCTAssertEqual(TransportSession.pointerButtonMaskForWire(
+            0x04, serverVersion: .v3_8), 0x04)
+        XCTAssertEqual(TransportSession.pointerButtonMaskForWire(
+            0x02, serverVersion: nil), 0x02)
+    }
+}
+
 final class AppleScrollFallbackTests: XCTestCase {
     func testAppleStandardSessionUsesPreciseInputWithoutCapabilityBlock() {
         XCTAssertTrue(TransportSession.shouldUseApplePreciseInput(

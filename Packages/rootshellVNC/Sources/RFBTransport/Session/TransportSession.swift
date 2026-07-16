@@ -789,9 +789,12 @@ public actor TransportSession {
                 payload.append(ClientMessage.keyEvent(
                     downFlag: downFlag, key: key).serialize())
             case .pointer(let buttonMask, let x, let y):
+                let wireButtonMask = Self.pointerButtonMaskForWire(
+                    buttonMask,
+                    serverVersion: stateMachine.negotiatedVersion)
                 pointerButtonMask = buttonMask
                 payload.append(ClientMessage.pointerEvent(
-                    buttonMask: buttonMask, x: x, y: y).serialize())
+                    buttonMask: wireButtonMask, x: x, y: y).serialize())
             }
         }
         try await sendClientPayload(payload)
@@ -800,8 +803,27 @@ public actor TransportSession {
     /// Send a pointer (mouse/touch) event to the server.
     public func sendPointerEvent(buttonMask: UInt8, x: UInt16, y: UInt16) async throws {
         pointerButtonMask = buttonMask
-        let msg = ClientMessage.pointerEvent(buttonMask: buttonMask, x: x, y: y)
+        let msg = ClientMessage.pointerEvent(
+            buttonMask: Self.pointerButtonMaskForWire(
+                buttonMask,
+                serverVersion: stateMachine.negotiatedVersion),
+            x: x,
+            y: y)
         try await sendClientPayload(msg.serialize())
+    }
+
+    /// Apple RFB 3.889 uses native macOS button ordering: right is bit 1 and
+    /// middle is bit 2. Keep the public API in standard RFB semantics and
+    /// perform that adjustment only at the Apple wire boundary.
+    static func pointerButtonMaskForWire(
+        _ buttonMask: UInt8,
+        serverVersion: ProtocolVersion?
+    ) -> UInt8 {
+        guard serverVersion?.isApple == true else { return buttonMask }
+        let otherButtons = buttonMask & ~UInt8(0x06)
+        let middleAsApple = (buttonMask & 0x02) << 1
+        let rightAsApple = (buttonMask & 0x04) >> 1
+        return otherButtons | middleAsApple | rightAsApple
     }
 
     /// Send precise scrolling when the Apple server explicitly advertises the
@@ -840,11 +862,15 @@ public actor TransportSession {
         var payload = Data(capacity: wheelMasks.count * 12)
         for wheelMask in wheelMasks {
             payload.append(ClientMessage.pointerEvent(
-                buttonMask: pointerButtonMask | wheelMask,
+                buttonMask: Self.pointerButtonMaskForWire(
+                    pointerButtonMask | wheelMask,
+                    serverVersion: stateMachine.negotiatedVersion),
                 x: event.x,
                 y: event.y).serialize())
             payload.append(ClientMessage.pointerEvent(
-                buttonMask: pointerButtonMask,
+                buttonMask: Self.pointerButtonMaskForWire(
+                    pointerButtonMask,
+                    serverVersion: stateMachine.negotiatedVersion),
                 x: event.x,
                 y: event.y).serialize())
         }

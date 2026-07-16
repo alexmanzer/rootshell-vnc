@@ -89,7 +89,8 @@ struct RemoteInteractionView: UIViewRepresentable {
 }
 
 @MainActor
-final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, UIPointerInteractionDelegate {
+final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
+    UIPointerInteractionDelegate, UIContextMenuInteractionDelegate {
     var onViewportChange: ((RemoteViewportState) -> Void)?
     var onKeyboardActiveChange: ((Bool) -> Void)?
     var onHardwareKeyboardAttachedChange: ((Bool) -> Void)?
@@ -112,6 +113,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private var lastPointerPoint: (x: UInt16, y: UInt16)?
     private var remoteCursor: RemoteCursor?
     private var pointerDragActive = false
+    private var activeDirectTouches = Set<ObjectIdentifier>()
     private var touchHoldDragLastPoint: (x: UInt16, y: UInt16)?
     private var touchHoldDragActive = false
     private var lastKnownFramebufferPoint: (x: UInt16, y: UInt16)?
@@ -189,9 +191,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private lazy var doubleTapRecognizer = UITapGestureRecognizer(
         target: self,
         action: #selector(handleDoubleTap(_:)))
-    private lazy var secondaryClickRecognizer = UITapGestureRecognizer(
-        target: self,
-        action: #selector(handleRightTap(_:)))
     private lazy var rightTapRecognizer = UITapGestureRecognizer(
         target: self,
         action: #selector(handleRightTap(_:)))
@@ -199,6 +198,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         target: self,
         action: #selector(handleHover(_:)))
     private lazy var pointerInteraction = UIPointerInteraction(delegate: self)
+    private lazy var secondaryClickInteraction = UIContextMenuInteraction(delegate: self)
     #if targetEnvironment(macCatalyst)
     private var catalystCursor: NSCursor?
     private var catalystCursorDisplayScale: CGFloat = 0
@@ -481,6 +481,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         isMultipleTouchEnabled = true
         accessibilityLabel = String(localized: "Remote desktop input", bundle: .module)
         configureRecognizers()
+        addInteraction(secondaryClickInteraction)
         #if !targetEnvironment(macCatalyst)
         addInteraction(pointerInteraction)
         addSubview(remoteCursorImageView)
@@ -1607,6 +1608,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     /// Direct touches are left to the touch recognizer, whose catch also
     /// suppresses the accidental click.
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeDirectTouches.formUnion(touches.lazy
+            .filter { $0.type == .direct }
+            .map(ObjectIdentifier.init))
         if touches.contains(where: { $0.type == .direct }) {
             stopEdgeScrolling()
         }
@@ -1614,6 +1618,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             catchMomentumFlingIfActive()
         }
         super.touchesBegan(touches, with: event)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeDirectTouches.subtract(Set(touches.lazy.map(ObjectIdentifier.init)))
+        super.touchesEnded(touches, with: event)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        activeDirectTouches.subtract(Set(touches.lazy.map(ObjectIdentifier.init)))
+        super.touchesCancelled(touches, with: event)
     }
 
     private func cancelScrollInteraction() {
@@ -1789,14 +1803,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         doubleTapRecognizer.require(toFail: pointerDragRecognizer)
         tapRecognizer.require(toFail: doubleTapRecognizer)
 
-        // UITapGestureRecognizer defaults to requiring the primary button, so
-        // an indirect-pointer secondary click needs its own recognizer.
-        secondaryClickRecognizer.numberOfTapsRequired = 1
-        secondaryClickRecognizer.buttonMaskRequired = .secondary
-        secondaryClickRecognizer.allowedTouchTypes = pointerTypes
-        secondaryClickRecognizer.delegate = self
-        secondaryClickRecognizer.require(toFail: pointerDragRecognizer)
-
         rightTapRecognizer.numberOfTouchesRequired = 2
         rightTapRecognizer.allowedTouchTypes = directTouchTypes
         rightTapRecognizer.delegate = self
@@ -1812,7 +1818,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             pointerDragRecognizer,
             tapRecognizer,
             doubleTapRecognizer,
-            secondaryClickRecognizer,
             rightTapRecognizer,
             hoverRecognizer,
         ] {
@@ -2239,6 +2244,23 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         styleFor region: UIPointerRegion
     ) -> UIPointerStyle? {
         remoteCursor == nil ? nil : .hidden()
+    }
+
+    func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction,
+        configurationForMenuAtLocation location: CGPoint
+    ) -> UIContextMenuConfiguration? {
+        // UIContextMenuInteraction also recognizes a direct-touch long press.
+        // That gesture is already remote hold-to-drag, so only accept the
+        // context interaction when no finger is currently on the display.
+        guard activeDirectTouches.isEmpty,
+              let point = framebufferPoint(for: location) else { return nil }
+
+        catchMomentumFlingIfActive()
+        focusForHardwareKeyboard()
+        touchHandler.handleRightClick(x: point.x, y: point.y)
+        // The remote desktop owns the contextual action; suppress a local menu.
+        return nil
     }
 
     func gestureRecognizer(
