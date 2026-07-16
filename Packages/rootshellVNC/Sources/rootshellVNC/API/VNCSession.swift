@@ -356,9 +356,12 @@ public final class VNCSession {
     @ObservationIgnored
     private var appleLoginVisionRetryTask: Task<Void, Never>?
     @ObservationIgnored
+    private var appleLoginVisionStabilityTask: Task<Void, Never>?
+    @ObservationIgnored
     private var appleLoginVisionLatestFrame: (
         frame: AppleLoginVisionFrame,
-        source: String
+        source: String,
+        highPerformanceGeneration: UInt64?
     )?
     @ObservationIgnored
     private var appleLoginVisionAttemptCount = 0
@@ -370,6 +373,8 @@ public final class VNCSession {
     private var appleLoginVisionDetected = false
     @ObservationIgnored
     private var appleLoginVisionPromptOffered = false
+    @ObservationIgnored
+    private var appleLoginVisionHighPerformanceGeneration: UInt64?
     @ObservationIgnored
     private var appleServerProtocolObserved = false
     private var framebuffer: Framebuffer?
@@ -486,10 +491,12 @@ public final class VNCSession {
     /// - Parameter configuration: Session configuration. Defaults to sensible values.
     public init(configuration: VNCConfiguration = VNCConfiguration()) {
         self.configuration = configuration
-        videoBandRenderer.onFrameCommitted = { [weak self] pixelBuffer in
+        videoBandRenderer.onFrameCommitted = {
+            [weak self] pixelBuffer, streamGeneration in
             self?.considerAppleLoginVisionFrame(
                 .pixelBuffer(pixelBuffer),
-                source: "High Performance full frame")
+                source: "High Performance full frame",
+                highPerformanceGeneration: streamGeneration)
         }
         #if canImport(UIKit)
         observeApplicationLifecycle()
@@ -911,6 +918,10 @@ public final class VNCSession {
               let transport = transportSession,
               requested != lastRequestedClientDisplaySize else { return }
 
+        if isHighPerformanceMode {
+            restartAppleLoginVisionForDisplayTransition(
+                reason: "Match Client target changed")
+        }
         lastRequestedClientDisplaySize = requested
         remoteDisplayResizeTask?.cancel()
         remoteDisplayResizeTask = Task { [weak self, weak transport] in
@@ -1600,29 +1611,125 @@ public final class VNCSession {
         appleLoginVisionTask = nil
         appleLoginVisionRetryTask?.cancel()
         appleLoginVisionRetryTask = nil
+        appleLoginVisionStabilityTask?.cancel()
+        appleLoginVisionStabilityTask = nil
         appleLoginVisionLatestFrame = nil
         appleLoginVisionAttemptCount = 0
         appleLoginVisionLastAttemptNanos = 0
         appleLoginVisionGeneration &+= 1
         appleLoginVisionDetected = false
         appleLoginVisionPromptOffered = false
+        appleLoginVisionHighPerformanceGeneration = nil
         appleServerProtocolObserved = false
         loginPasswordPromptPending = false
     }
 
     private static let appleLoginVisionMaximumAttempts = 3
     private static let appleLoginVisionMinimumIntervalNanos: UInt64 = 700_000_000
+    private static let appleLoginVisionHighPerformanceStabilityDelay =
+        Duration.milliseconds(350)
 
     /// Inspect only a few initial, already-composited full frames. The cheap
     /// guards run on the main actor; Vision itself runs at utility priority.
     private func considerAppleLoginVisionFrame(
         _ frame: AppleLoginVisionFrame,
-        source: String
+        source: String,
+        highPerformanceGeneration: UInt64? = nil
     ) {
         guard configuration.promptForLoginPasswordAtLoginWindow,
               canSendLoginPassword,
               appleServerProtocolObserved else { return }
-        appleLoginVisionLatestFrame = (frame, source)
+
+        if let highPerformanceGeneration {
+            let previousGeneration = appleLoginVisionHighPerformanceGeneration
+            if previousGeneration != highPerformanceGeneration {
+                appleLoginVisionHighPerformanceGeneration =
+                    highPerformanceGeneration
+                if previousGeneration != nil {
+                    restartAppleLoginVisionForDisplayTransition(
+                        reason: "High Performance media generation changed")
+                }
+            }
+
+            guard case .pixelBuffer(let pixelBuffer) = frame,
+                  isEligibleHighPerformanceLoginVisionFrame(pixelBuffer)
+            else { return }
+
+            appleLoginVisionLatestFrame = (
+                frame, source, highPerformanceGeneration)
+            scheduleAppleLoginVisionAfterHighPerformanceStability(
+                mediaGeneration: highPerformanceGeneration)
+            return
+        }
+
+        appleLoginVisionLatestFrame = (frame, source, nil)
+        startAppleLoginVision(frame, source: source)
+    }
+
+    /// A Match Client resize can publish the old complete surface while a new
+    /// virtual display is being negotiated. Never spend OCR work on a surface
+    /// whose dimensions differ from the newest requested display.
+    func isEligibleHighPerformanceLoginVisionFrame(
+        _ pixelBuffer: CVPixelBuffer
+    ) -> Bool {
+        guard configuration.displaySizingMode == .matchClient,
+              let expected = lastRequestedClientDisplaySize
+                ?? preparedClientDisplaySize else { return true }
+        return CVPixelBufferGetWidth(pixelBuffer) == Int(expected.pixelWidth)
+            && CVPixelBufferGetHeight(pixelBuffer) == Int(expected.pixelHeight)
+    }
+
+    /// The first committed frame of a replacement generation is complete, but
+    /// Match Client may immediately supersede that generation during window or
+    /// display transitions. A short generation-scoped delay keeps Vision off
+    /// those transient surfaces without requiring a second video frame from a
+    /// static lock screen.
+    private func scheduleAppleLoginVisionAfterHighPerformanceStability(
+        mediaGeneration: UInt64
+    ) {
+        guard appleLoginVisionStabilityTask == nil,
+              appleLoginVisionTask == nil,
+              appleLoginVisionRetryTask == nil,
+              appleLoginVisionAttemptCount
+                < Self.appleLoginVisionMaximumAttempts else { return }
+        let generation = appleLoginVisionGeneration
+        appleLoginVisionStabilityTask = Task { [weak self] in
+            try? await Task.sleep(
+                for: Self.appleLoginVisionHighPerformanceStabilityDelay)
+            guard let self, !Task.isCancelled,
+                  generation == self.appleLoginVisionGeneration,
+                  mediaGeneration
+                    == self.appleLoginVisionHighPerformanceGeneration,
+                  let latest = self.appleLoginVisionLatestFrame,
+                  latest.highPerformanceGeneration == mediaGeneration else {
+                return
+            }
+            self.appleLoginVisionStabilityTask = nil
+            self.startAppleLoginVision(latest.frame, source: latest.source)
+        }
+    }
+
+    private func restartAppleLoginVisionForDisplayTransition(reason: String) {
+        guard !appleLoginPromptTracker.isLoginActive,
+              !appleLoginVisionDetected,
+              !appleLoginVisionPromptOffered else { return }
+        appleLoginVisionTask?.cancel()
+        appleLoginVisionTask = nil
+        appleLoginVisionRetryTask?.cancel()
+        appleLoginVisionRetryTask = nil
+        appleLoginVisionStabilityTask?.cancel()
+        appleLoginVisionStabilityTask = nil
+        appleLoginVisionLatestFrame = nil
+        appleLoginVisionAttemptCount = 0
+        appleLoginVisionLastAttemptNanos = 0
+        appleLoginVisionGeneration &+= 1
+        logger.debug("Restarting Apple login Vision after \(reason)")
+    }
+
+    private func startAppleLoginVision(
+        _ frame: AppleLoginVisionFrame,
+        source: String
+    ) {
 
         guard !appleLoginPromptTracker.isLoginActive,
               !appleLoginVisionDetected,
@@ -1723,9 +1830,8 @@ public final class VNCSession {
                   generation == self.appleLoginVisionGeneration,
                   let latest = self.appleLoginVisionLatestFrame else { return }
             self.appleLoginVisionRetryTask = nil
-            self.considerAppleLoginVisionFrame(
-                latest.frame,
-                source: latest.source + " retry")
+            self.startAppleLoginVision(
+                latest.frame, source: latest.source + " retry")
         }
     }
 

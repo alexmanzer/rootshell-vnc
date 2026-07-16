@@ -2023,7 +2023,7 @@ final class VideoBandGeometryTests: XCTestCase {
         let renderer = VideoBandLayerRenderer()
         renderer.setScreenSize(width: 100, height: 100)
         var committedSize: CGSize?
-        renderer.onFrameCommitted = { buffer in
+        renderer.onFrameCommitted = { buffer, _ in
             committedSize = CGSize(
                 width: CVPixelBufferGetWidth(buffer),
                 height: CVPixelBufferGetHeight(buffer))
@@ -2032,6 +2032,43 @@ final class VideoBandGeometryTests: XCTestCase {
         renderer.setBands([1: try makePixelBuffer(width: 100, height: 100)])
 
         XCTAssertEqual(committedSize, CGSize(width: 100, height: 100))
+    }
+
+    @MainActor
+    func testCommittedHighPerformanceFrameIdentifiesMediaGeneration() throws {
+        let renderer = VideoBandLayerRenderer()
+        renderer.setScreenSize(width: 100, height: 100)
+        var committedGenerations: [UInt64] = []
+        renderer.onFrameCommitted = { _, generation in
+            committedGenerations.append(generation)
+        }
+
+        renderer.setBands([1: try makePixelBuffer(width: 100, height: 100)])
+        renderer.beginStreamGeneration()
+        renderer.setBands([2: try makePixelBuffer(width: 100, height: 100)])
+
+        XCTAssertEqual(committedGenerations, [0, 1])
+    }
+
+    @MainActor
+    func testMatchClientVisionRejectsRetiredSizeFrame() throws {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .adaptive,
+            displaySizingMode: .matchClient))
+        let viewSize = CGSize(width: 1000, height: 700)
+        let expected = try XCTUnwrap(
+            RemoteDisplaySize.matching(viewSize: viewSize))
+        session.updateRemoteDisplaySize(viewSize: viewSize, displayScale: 2)
+
+        let matching = try makePixelBuffer(
+            width: Int(expected.pixelWidth),
+            height: Int(expected.pixelHeight))
+        let retired = try makePixelBuffer(width: 2976, height: 1860)
+
+        XCTAssertTrue(
+            session.isEligibleHighPerformanceLoginVisionFrame(matching))
+        XCTAssertFalse(
+            session.isEligibleHighPerformanceLoginVisionFrame(retired))
     }
 
     @MainActor

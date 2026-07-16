@@ -45,7 +45,7 @@ public final class VideoBandLayerRenderer {
     /// Called after a complete stitched surface has been committed. Consumers
     /// such as one-shot Vision analysis can inspect the exact full image
     /// without adding a second compositor or touching individual HEVC bands.
-    var onFrameCommitted: ((CVPixelBuffer) -> Void)?
+    var onFrameCommitted: ((CVPixelBuffer, UInt64) -> Void)?
 
     var renderedBandCount: Int { bandBuffers.count }
 
@@ -150,7 +150,7 @@ public final class VideoBandLayerRenderer {
         if let sampleBuffer = Self.makeDisplaySample(from: frame) {
             videoRenderer.enqueue(sampleBuffer)
         }
-        onFrameCommitted?(frame)
+        onFrameCommitted?(frame, streamGenerationCount)
     }
 
     /// Wrap an already-decoded image buffer without copying its pixels. The
