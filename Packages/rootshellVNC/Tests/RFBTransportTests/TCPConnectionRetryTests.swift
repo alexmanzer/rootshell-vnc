@@ -1,5 +1,6 @@
 import XCTest
 import Darwin
+import Network
 @testable import RFBTransport
 @testable import RFBProtocol
 
@@ -73,7 +74,20 @@ final class TCPConnectionRetryTests: XCTestCase {
         }
         let connected = await connection.isConnected
         XCTAssertTrue(connected)
+        let remoteHost = await connection.remoteEndpointHost()
+        XCTAssertEqual(remoteHost, "127.0.0.1")
         await connection.close()
+    }
+
+    func testNumericHostPreservesScopedIPv6Interface() throws {
+        let address = try XCTUnwrap(IPv6Address("fe80::1%lo0"))
+        let endpoint = NWEndpoint.hostPort(
+            host: .ipv6(address),
+            port: NWEndpoint.Port(rawValue: 5900)!)
+
+        XCTAssertEqual(
+            TCPConnection.numericHost(from: endpoint),
+            "fe80::1%lo0")
     }
 
     func testConnectFailsAfterExhaustingRetries() async throws {

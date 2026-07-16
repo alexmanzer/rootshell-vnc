@@ -290,6 +290,42 @@ public actor TCPConnection: RFBConnection {
             isConstrained: path.isConstrained)
     }
 
+    /// Return the concrete peer selected by Network.framework. In particular,
+    /// this preserves IPv6 for a dual-stack Bonjour name instead of asking the
+    /// UDP media path to perform a second, potentially different resolution.
+    public func remoteEndpointHost() async -> String? {
+        guard let channel,
+              let path = try? await channel
+                .getOption(NIOTSChannelOptions.currentPath)
+                .get()
+        else { return nil }
+
+        return Self.numericHost(from: path.remoteEndpoint)
+    }
+
+    static func numericHost(from endpoint: NWEndpoint?) -> String? {
+        guard case .hostPort(let host, _) = endpoint else { return nil }
+        switch host {
+        case .ipv4(let address):
+            return address.debugDescription
+        case .ipv6(let address):
+            let literal = address.debugDescription
+            // Link-local IPv6 is unusable without its zone. Network.framework
+            // normally includes it in debugDescription, but append the path's
+            // interface explicitly when needed.
+            if !literal.contains("%"), let interface = address.interface {
+                return "\(literal)%\(interface.name)"
+            }
+            return literal
+        case .name:
+            // A ready NWPath is expected to expose a numeric remote endpoint.
+            // Do not return another hostname and reintroduce split resolution.
+            return nil
+        @unknown default:
+            return nil
+        }
+    }
+
     public func supportsTLSUpgrade() async -> Bool { true }
 
     public func startTLS(configuration: RFBTLSConfiguration) async throws {

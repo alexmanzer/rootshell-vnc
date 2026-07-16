@@ -294,11 +294,13 @@ public actor TransportSession {
     /// reachability and is refused over a custom transport.
     private let usesCustomTransport: Bool
     private var stateMachine: ConnectionStateMachine
-    /// Address used for direct TCP and Apple UDP media. `localhost` is pinned
-    /// to IPv4 so TCP and the UDP media socket agree on one loopback family.
+    /// Address used to establish direct TCP.
     private let dialHost: String
-    /// Original endpoint identity used for TLS certificate validation. This
-    /// must not inherit address-family rewrites applied to `dialHost`.
+    /// Concrete numeric peer selected by TCP, used for Apple UDP media so both
+    /// transports always use the same address family and interface.
+    private var appleMediaRemoteHost: String
+    /// Original endpoint identity used for TLS certificate validation, even
+    /// when UDP media targets the TCP connection's resolved numeric peer.
     private let tlsIdentityHost: String
     private let port: UInt16
     private let password: String
@@ -677,15 +679,8 @@ public actor TransportSession {
         self.rctlEnabled = environment["ROOTSHELL_VNC_DISABLE_RCTL"] != "1"
         self.rateControlEnabled = !preferFullQualityVideo
             && environment["ROOTSHELL_VNC_DISABLE_RATE_CONTROL"] != "1"
-        // Force IPv4 for "localhost": it resolves to both ::1 and 127.0.0.1, and
-        // if TCP connects over IPv6 the server sends UDP media to ::1 while our
-        // media socket prefers IPv4 — so no video arrives. Pin both to
-        // 127.0.0.1 so they always agree on one loopback family. A custom
-        // transport dials the host itself, so the pin only applies to the
-        // default direct path.
-        let resolvedHost = (host == "localhost") ? "127.0.0.1" : host
         self.usesCustomTransport = connection != nil
-        self.tcp = connection ?? TCPConnection(host: resolvedHost, port: port)
+        self.tcp = connection ?? TCPConnection(host: host, port: port)
         let configuredEncodings =
             preferredEncodings ?? ConnectionStateMachine.defaultPreferredEncodings
         let shouldUseAppleDCT =
@@ -702,7 +697,8 @@ public actor TransportSession {
             securityPolicy: securityPolicy,
             hasUsername: username?.isEmpty == false
         )
-        self.dialHost = resolvedHost
+        self.dialHost = host
+        self.appleMediaRemoteHost = host
         self.tlsIdentityHost = host
         self.port = port
         self.password = password
@@ -745,6 +741,14 @@ public actor TransportSession {
 
         // Establish TCP
         try await tcp.connect()
+        if let connectedPeer = await tcp.remoteEndpointHost() {
+            appleMediaRemoteHost = connectedPeer
+            log.info("Apple media UDP peer matched to TCP peer \(connectedPeer)")
+        } else if !usesCustomTransport {
+            log.warning(
+                "TCP transport did not expose its numeric peer; Apple media UDP "
+                    + "will resolve \(dialHost) independently")
+        }
         appleMediaNetworkProfile = AppleMediaNetworkProfile.detect(
             from: await tcp.pathCharacteristics(),
             remoteHost: dialHost)
@@ -4351,7 +4355,7 @@ public actor TransportSession {
 
     private func startAppleMediaUDPChannel(binding: AppleMediaUDPBinding) async throws {
         // Configure the symmetric-port media socket (address family follows
-        // the resolved dialHost — IPv4 preferred, IPv6 when that's all there is):
+        // the exact numeric peer selected by TCP (including an IPv6 scope ID):
         //   socket(family, DGRAM) + SO_REUSEADDR + SO_REUSEPORT
         //   + bind(wildcard:port) + connect(serverIP:port)
         // Symmetric RTP uses the same port both ends; SO_REUSEPORT is what lets
@@ -4361,7 +4365,7 @@ public actor TransportSession {
         // loopback.
         let channel = PosixUDPChannel(
             localPort: binding.localPort,
-            remoteHost: dialHost,
+            remoteHost: appleMediaRemoteHost,
             remotePort: binding.remotePort,
             enableReusePort: true
         )

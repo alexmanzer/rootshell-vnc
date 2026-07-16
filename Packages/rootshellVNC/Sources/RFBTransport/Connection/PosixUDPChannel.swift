@@ -90,10 +90,12 @@ struct BoundedDatagramFIFO {
 /// connect(fd, serverIP : port)     // symmetric RTP: same port both ends
 /// ```
 ///
-/// The socket's address family is chosen from the resolved remote: IPv4 is
-/// preferred when a host offers both families (matching the historical
-/// behavior and the loopback pin in `TransportSession`), and IPv6 is used
-/// when it is the only family available (e.g. Tailscale ULA destinations).
+/// The socket's address family is chosen from the resolved remote.
+/// `TransportSession` normally supplies the exact numeric peer selected by
+/// TCP, so a dual-stack Bonjour hostname cannot split TCP and UDP across
+/// different families. Direct callers that supply a hostname retain the
+/// historical IPv4-first resolution, with IPv6 used when it is the only
+/// available family.
 ///
 /// `Network.framework` (`NWListener`/`NWConnection`) does not reliably expose
 /// `SO_REUSEPORT`, which this transport requires so the viewer can bind the

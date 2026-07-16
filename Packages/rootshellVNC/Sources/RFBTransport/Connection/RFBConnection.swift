@@ -97,6 +97,15 @@ public protocol RFBConnection: Sendable {
     /// and use the default `nil`.
     func pathCharacteristics() async -> NetworkPathCharacteristics?
 
+    /// Numeric address of the peer selected by the connected transport.
+    ///
+    /// Apple's UDP media sockets must target this exact address rather than
+    /// resolving the user-entered hostname again: a dual-stack hostname can
+    /// otherwise put TCP on IPv6 and UDP on IPv4. Implementations should keep
+    /// an IPv6 scope identifier (for example `%en0`) when one is present.
+    /// Tunneled transports normally use the default `nil`.
+    func remoteEndpointHost() async -> String?
+
     /// Whether this byte stream can install TLS after the plaintext RFB
     /// version/security exchange used by VeNCrypt.
     func supportsTLSUpgrade() async -> Bool
@@ -110,6 +119,8 @@ extension RFBConnection {
     public func pathCharacteristics() async -> NetworkPathCharacteristics? {
         nil
     }
+
+    public func remoteEndpointHost() async -> String? { nil }
 
     public func supportsTLSUpgrade() async -> Bool { false }
 
