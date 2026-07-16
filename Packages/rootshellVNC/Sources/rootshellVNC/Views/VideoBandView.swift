@@ -335,7 +335,11 @@ private final class BandHostView: UIView {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        #if os(visionOS)
+        let scale = traitCollection.displayScale
+        #else
         let scale = window?.screen.scale ?? traitCollection.displayScale
+        #endif
         if scale > 0 { renderer.setPixelScale(scale) }
         renderer.setViewBounds(bounds)
     }

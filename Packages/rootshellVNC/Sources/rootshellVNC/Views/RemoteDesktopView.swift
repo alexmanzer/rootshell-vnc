@@ -870,11 +870,15 @@ private final class DockedKeyboardInsetView: UIView {
 /// content, where adaptive glass fits better than theme colors.
 private struct HUDButtonChromeModifier: ViewModifier {
     func body(content: Content) -> some View {
+        #if os(visionOS)
+        content.background(.ultraThinMaterial, in: Circle())
+        #else
         if #available(iOS 26.0, macOS 26.0, macCatalyst 26.0, *) {
             content.glassEffect(.regular, in: Circle())
         } else {
             content.background(.ultraThinMaterial, in: Circle())
         }
+        #endif
     }
 }
 

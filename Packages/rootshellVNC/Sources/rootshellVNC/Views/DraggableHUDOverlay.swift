@@ -276,7 +276,9 @@ final class DraggableHUDOverlayHostView: UIView {
             bar.layer.removeAllAnimations()
             bar.center = nextCenter
             gesture.setTranslation(.zero, in: self)
+            #if !os(visionOS)
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            #endif
         case .changed:
             guard isDragging else { return }
             bar.center = nextCenter

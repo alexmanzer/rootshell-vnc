@@ -526,10 +526,13 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     }
 
     /// The container app supplies an optional keyboard toolbar in the same
-    /// atomic snapshot as the primary input view.
+    /// atomic snapshot as the primary input view. visionOS has no input
+    /// accessory to override, so a host toolbar there goes unshown.
+    #if !os(visionOS)
     override var inputAccessoryView: UIView? {
         keyboardCapture.inputViews.accessory
     }
+    #endif
 
     var hasText: Bool { true }
 

@@ -84,6 +84,11 @@ private struct GlassStatusCardModifier: ViewModifier {
     @Environment(\.vncChromeGlassTint) private var glassTint
 
     func body(content: Content) -> some View {
+        #if os(visionOS)
+        // No glass API here; material matches the pre-26 fallback and drops
+        // the host tint along with it.
+        content.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 28))
+        #else
         if #available(iOS 26.0, macOS 26.0, macCatalyst 26.0, *) {
             // A host tint switches to clear glass: the tint restores the
             // contrast floor that regular's frost otherwise provides, and
@@ -94,6 +99,7 @@ private struct GlassStatusCardModifier: ViewModifier {
         } else {
             content.background(.regularMaterial, in: RoundedRectangle(cornerRadius: 28))
         }
+        #endif
     }
 }
 
