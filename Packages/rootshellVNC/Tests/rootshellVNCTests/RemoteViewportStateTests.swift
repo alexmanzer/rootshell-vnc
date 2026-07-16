@@ -161,4 +161,135 @@ final class RemoteViewportStateTests: XCTestCase {
             framebufferSize: framebufferSize)
         XCTAssertEqual(viewport.scale, RemoteViewportState.minimumScale)
     }
+
+    func testEdgeScrollMovesTowardHiddenDesktop() {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        let right = viewport.edgeScrollTranslation(
+            for: CGPoint(x: 1_000, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            elapsedTime: 0.1)
+        XCTAssertEqual(right.width, -240, accuracy: 0.001)
+        XCTAssertEqual(right.height, 0, accuracy: 0.001)
+
+        let top = viewport.edgeScrollTranslation(
+            for: CGPoint(x: 500, y: 0),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            elapsedTime: 0.1)
+        XCTAssertEqual(top.width, 0, accuracy: 0.001)
+        XCTAssertEqual(top.height, 240, accuracy: 0.001)
+    }
+
+    func testEdgeScrollAcceleratesInsideActivationInset() {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        let halfway = viewport.edgeScrollTranslation(
+            for: CGPoint(x: 12, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            elapsedTime: 0.1)
+        XCTAssertEqual(halfway.width, 120, accuracy: 0.001)
+
+        let outsideInset = viewport.edgeScrollTranslation(
+            for: CGPoint(x: 25, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            elapsedTime: 0.1)
+        XCTAssertEqual(outsideInset, .zero)
+    }
+
+    func testEdgeScrollUsesSameOverscrollLimitAsTwoFingerPan() throws {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+        viewport.pan(
+            by: CGSize(width: -490, height: 0),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        let translation = viewport.edgeScrollTranslation(
+            for: CGPoint(x: 1_000, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            elapsedTime: 1)
+        XCTAssertEqual(translation.width, -510, accuracy: 0.001)
+        viewport.pan(
+            by: translation,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        let frame = try XCTUnwrap(viewport.displayedFrame(
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertEqual(frame.maxX, viewSize.width / 2, accuracy: 0.001)
+        XCTAssertEqual(viewport.edgeScrollTranslation(
+            for: CGPoint(x: 1_000, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            elapsedTime: 1), .zero)
+    }
+
+    func testEdgeScrollDoesNotApplyAtFittedScale() {
+        let viewport = RemoteViewportState()
+        let translation = viewport.edgeScrollTranslation(
+            for: CGPoint(x: 0, y: 100),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            elapsedTime: 1)
+        XCTAssertEqual(translation, .zero)
+    }
+
+    func testContinuousPanningMapsPointerAcrossOverscrollRange() throws {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        let pointer = CGPoint(x: 750, y: 250)
+        let translation = viewport.cursorFollowingTranslation(
+            for: pointer,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+        XCTAssertEqual(translation.width, -500, accuracy: 0.001)
+        XCTAssertEqual(translation.height, 281.25, accuracy: 0.001)
+
+        viewport.pan(
+            by: translation,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+        XCTAssertEqual(viewport.offset.width, -500, accuracy: 0.001)
+        XCTAssertEqual(viewport.offset.height, 281.25, accuracy: 0.001)
+        let remotePoint = try XCTUnwrap(viewport.framebufferPoint(
+            for: pointer,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertEqual(remotePoint.x, 1_400, accuracy: 0.001)
+        XCTAssertEqual(remotePoint.y, 50, accuracy: 0.001)
+    }
+
+    func testContinuousPanningDoesNotApplyAtFittedScale() {
+        let viewport = RemoteViewportState()
+        let translation = viewport.cursorFollowingTranslation(
+            for: CGPoint(x: 900, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+        XCTAssertEqual(translation, .zero)
+    }
 }

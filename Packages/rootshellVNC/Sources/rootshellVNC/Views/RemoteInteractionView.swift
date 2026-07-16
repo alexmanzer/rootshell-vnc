@@ -13,6 +13,7 @@ import GameController
 /// hover, scroll-wheel events, touch counts, or key-up events consistently.
 struct RemoteInteractionView: UIViewRepresentable {
     @Binding var viewport: RemoteViewportState
+    let viewportPanningMode: RemoteViewportPanningMode
     @Binding var keyboardActive: Bool
     @Binding var hardwareKeyboardAttached: Bool
 
@@ -65,6 +66,7 @@ struct RemoteInteractionView: UIViewRepresentable {
         uiView.update(
             framebufferSize: framebufferSize,
             viewport: viewport,
+            viewportPanningMode: viewportPanningMode,
             keyboardActive: keyboardActive,
             keyboardCaptured: keyboardCapture.isCaptured,
             inputViewsGeneration: keyboardCapture.inputViewsGeneration,
@@ -104,6 +106,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private var framebufferSize: CGSize = .zero
     private var framebufferOrigin: CGPoint = .zero
     private var viewport = RemoteViewportState()
+    private var viewportPanningMode = RemoteViewportPanningMode.edge
     private var softwareKeyboardRequested = false
     private var lastSeenInputViewsGeneration: UInt64 = 0
     private var lastPointerPoint: (x: UInt16, y: UInt16)?
@@ -126,6 +129,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private var syntheticMomentumVelocity = CGPoint.zero
     private var syntheticMomentumLastTimestamp: CFTimeInterval = 0
     private var momentumDisplayLink: CADisplayLink?
+    private var edgeScrollPointerLocation: CGPoint?
+    private var edgeScrollLastTimestamp: CFTimeInterval = 0
+    private var edgeScrollIsDragging = false
+    private var edgeScrollDisplayLink: CADisplayLink?
+    private var hoverUsesIndirectPointer = true
+    private var pointerDragUsesIndirectPointer = true
     /// A direct touch that lands during a fling catches it, exactly like
     /// touching a decelerating native scroll view: the fling stops and that
     /// touch must never click or hold-drag. Set at the catching touch-down,
@@ -180,6 +189,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private lazy var doubleTapRecognizer = UITapGestureRecognizer(
         target: self,
         action: #selector(handleDoubleTap(_:)))
+    private lazy var secondaryClickRecognizer = UITapGestureRecognizer(
+        target: self,
+        action: #selector(handleRightTap(_:)))
     private lazy var rightTapRecognizer = UITapGestureRecognizer(
         target: self,
         action: #selector(handleRightTap(_:)))
@@ -533,6 +545,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             releasePointerDrag()
             releaseAllPressedKeys()
             cancelScrollInteraction()
+            stopEdgeScrolling()
             #if !targetEnvironment(macCatalyst)
             remoteCursorHoverLocation = nil
             remoteCursorImageView.isHidden = true
@@ -573,6 +586,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     func update(
         framebufferSize: CGSize,
         viewport: RemoteViewportState,
+        viewportPanningMode: RemoteViewportPanningMode,
         keyboardActive: Bool,
         keyboardCaptured: Bool,
         inputViewsGeneration: UInt64,
@@ -586,6 +600,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         self.framebufferSize = framebufferSize
         self.framebufferOrigin = framebufferOrigin
         self.viewport = viewport
+        if self.viewportPanningMode != viewportPanningMode {
+            stopEdgeScrolling()
+            self.viewportPanningMode = viewportPanningMode
+        }
         self.requestPasswordSend = requestPasswordSend
         self.requestDictation = requestDictation
         self.toggleFullScreen = toggleFullScreen
@@ -1352,6 +1370,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         releaseAllPressedKeys()
         releasePointerDrag()
         releaseTouchHoldDrag()
+        stopEdgeScrolling()
         #if !targetEnvironment(macCatalyst)
         remoteCursorHoverLocation = nil
         remoteCursorImageView.isHidden = true
@@ -1363,6 +1382,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         releaseAllPressedKeys()
         releasePointerDrag()
         releaseTouchHoldDrag()
+        stopEdgeScrolling()
         #if !targetEnvironment(macCatalyst)
         remoteCursorHoverLocation = nil
         remoteCursorImageView.isHidden = true
@@ -1382,6 +1402,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     /// the momentum tail ourselves from displacement over the gesture's
     /// trailing window, the same way native scroll views derive a fling.
     @objc private func handleNativeScrollState(_ recognizer: UIPanGestureRecognizer) {
+        stopEdgeScrolling()
         logInputRoute(
             "scroll state=\(recognizer.state.rawValue) "
             + "translation=\(recognizer.translation(in: self))")
@@ -1586,6 +1607,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     /// Direct touches are left to the touch recognizer, whose catch also
     /// suppresses the accidental click.
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if touches.contains(where: { $0.type == .direct }) {
+            stopEdgeScrolling()
+        }
         if touches.contains(where: { $0.type != .direct }) {
             catchMomentumFlingIfActive()
         }
@@ -1765,6 +1789,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         doubleTapRecognizer.require(toFail: pointerDragRecognizer)
         tapRecognizer.require(toFail: doubleTapRecognizer)
 
+        // UITapGestureRecognizer defaults to requiring the primary button, so
+        // an indirect-pointer secondary click needs its own recognizer.
+        secondaryClickRecognizer.numberOfTapsRequired = 1
+        secondaryClickRecognizer.buttonMaskRequired = .secondary
+        secondaryClickRecognizer.allowedTouchTypes = pointerTypes
+        secondaryClickRecognizer.delegate = self
+        secondaryClickRecognizer.require(toFail: pointerDragRecognizer)
+
         rightTapRecognizer.numberOfTouchesRequired = 2
         rightTapRecognizer.allowedTouchTypes = directTouchTypes
         rightTapRecognizer.delegate = self
@@ -1780,6 +1812,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             pointerDragRecognizer,
             tapRecognizer,
             doubleTapRecognizer,
+            secondaryClickRecognizer,
             rightTapRecognizer,
             hoverRecognizer,
         ] {
@@ -1790,6 +1823,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
     @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
         guard recognizer.state == .began || recognizer.state == .changed else { return }
+        stopEdgeScrolling()
         viewport.zoom(
             by: recognizer.scale,
             around: visibleLocation(for: recognizer.location(in: self)),
@@ -1801,6 +1835,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
     @objc private func handleViewportPan(_ recognizer: UIPanGestureRecognizer) {
         guard recognizer.state == .began || recognizer.state == .changed else { return }
+        stopEdgeScrolling()
         let translation = recognizer.translation(in: self)
         viewport.pan(
             by: CGSize(width: translation.x, height: translation.y),
@@ -1815,12 +1850,18 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         switch recognizer.state {
         case .began, .changed:
             catchMomentumFlingIfActive()
-            guard let point = framebufferPoint(
-                for: recognizer.location(in: self)) else { return }
+            let location = recognizer.location(in: self)
+            if pointerDragUsesIndirectPointer {
+                updatePointerPanning(at: location, isDragging: true)
+            } else {
+                stopEdgeScrolling()
+            }
+            guard let point = framebufferPoint(for: location) else { return }
             lastPointerPoint = point
             pointerDragActive = true
             touchHandler.handleDrag(x: point.x, y: point.y)
         case .ended, .cancelled, .failed:
+            stopEdgeScrolling()
             releasePointerDrag()
         default:
             break
@@ -1969,6 +2010,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     @objc private func handleHover(_ recognizer: UIHoverGestureRecognizer) {
         #if targetEnvironment(macCatalyst)
         if recognizer.state == .ended || recognizer.state == .cancelled {
+            stopEdgeScrolling()
             NSCursor.arrow.set()
             return
         }
@@ -1977,6 +2019,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         }
         #else
         if recognizer.state == .ended || recognizer.state == .cancelled {
+            stopEdgeScrolling()
             remoteCursorHoverLocation = nil
             remoteCursorImageView.isHidden = true
             return
@@ -1985,6 +2028,17 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             updateRemoteCursorImage(at: recognizer.location(in: self))
         }
         #endif
+
+        if !hoverUsesIndirectPointer {
+            stopEdgeScrolling()
+        } else if !directScrollPhaseActive,
+                  !momentumScrollPhaseActive,
+                  !pointerDragActive,
+                  recognizer.state == .began || recognizer.state == .changed {
+            updatePointerPanning(
+                at: recognizer.location(in: self),
+                isDragging: false)
+        }
 
         guard !directScrollPhaseActive,
               !momentumScrollPhaseActive,
@@ -1998,6 +2052,102 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         logInputRoute("hover pos=(\(point.x),\(point.y))")
         focusForHardwareKeyboard()
         touchHandler.handleMove(x: point.x, y: point.y)
+    }
+
+    private func updatePointerPanning(
+        at location: CGPoint,
+        isDragging: Bool
+    ) {
+        switch viewportPanningMode {
+        case .edge:
+            updateEdgeScrolling(at: location, isDragging: isDragging)
+        case .continuous:
+            stopEdgeScrolling()
+            let translation = viewport.cursorFollowingTranslation(
+                for: location,
+                viewSize: bounds.size,
+                framebufferSize: framebufferSize)
+            guard translation != .zero else { return }
+            viewport.pan(
+                by: translation,
+                viewSize: bounds.size,
+                framebufferSize: framebufferSize)
+            onViewportChange?(viewport)
+        }
+    }
+
+    private func updateEdgeScrolling(
+        at location: CGPoint,
+        isDragging: Bool
+    ) {
+        edgeScrollPointerLocation = location
+        edgeScrollIsDragging = isDragging
+        let translation = viewport.edgeScrollTranslation(
+            for: location,
+            viewSize: bounds.size,
+            framebufferSize: framebufferSize,
+            elapsedTime: 1.0 / 60.0)
+        guard translation != .zero else {
+            stopEdgeScrolling()
+            return
+        }
+        guard edgeScrollDisplayLink == nil else { return }
+        edgeScrollLastTimestamp = 0
+        let link = CADisplayLink(
+            target: self,
+            selector: #selector(stepEdgeScrolling(_:)))
+        link.preferredFramesPerSecond = 60
+        link.add(to: .main, forMode: .common)
+        edgeScrollDisplayLink = link
+    }
+
+    @objc private func stepEdgeScrolling(_ displayLink: CADisplayLink) {
+        guard edgeScrollDisplayLink === displayLink,
+              let location = edgeScrollPointerLocation,
+              window != nil else {
+            stopEdgeScrolling()
+            return
+        }
+        let elapsed: CFTimeInterval
+        if edgeScrollLastTimestamp == 0 {
+            elapsed = displayLink.duration
+        } else {
+            elapsed = min(0.05, displayLink.timestamp - edgeScrollLastTimestamp)
+        }
+        edgeScrollLastTimestamp = displayLink.timestamp
+
+        let translation = viewport.edgeScrollTranslation(
+            for: location,
+            viewSize: bounds.size,
+            framebufferSize: framebufferSize,
+            elapsedTime: elapsed)
+        guard translation != .zero else {
+            stopEdgeScrolling()
+            return
+        }
+        viewport.pan(
+            by: translation,
+            viewSize: bounds.size,
+            framebufferSize: framebufferSize)
+        onViewportChange?(viewport)
+
+        guard let point = framebufferPoint(for: location),
+              lastPointerPoint?.x != point.x
+                || lastPointerPoint?.y != point.y else { return }
+        lastPointerPoint = point
+        if edgeScrollIsDragging {
+            touchHandler.handleDrag(x: point.x, y: point.y)
+        } else {
+            touchHandler.handleMove(x: point.x, y: point.y)
+        }
+    }
+
+    private func stopEdgeScrolling() {
+        edgeScrollDisplayLink?.invalidate()
+        edgeScrollDisplayLink = nil
+        edgeScrollPointerLocation = nil
+        edgeScrollLastTimestamp = 0
+        edgeScrollIsDragging = false
     }
 
     #if targetEnvironment(macCatalyst)
@@ -2110,10 +2260,25 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             }
             return accepted
         case .hover:
-            return gestureRecognizer === hoverRecognizer
+            guard gestureRecognizer === hoverRecognizer else { return false }
+            hoverUsesIndirectPointer = event.allTouches?.contains {
+                $0.type == .pencil
+            } != true
+            return true
         default:
             if gestureRecognizer === scrollRecognizer {
                 return false
+            }
+            if gestureRecognizer === pointerDragRecognizer {
+                if !event.buttonMask.isEmpty,
+                   !event.buttonMask.contains(.primary) {
+                    // Reject before recognition so a secondary click is not
+                    // consumed by the zero-delay primary drag recognizer.
+                    return false
+                }
+                pointerDragUsesIndirectPointer = event.allTouches?.contains {
+                    $0.type == .pencil
+                } != true
             }
             return true
         }

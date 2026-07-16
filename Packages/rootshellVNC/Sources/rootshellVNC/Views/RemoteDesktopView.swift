@@ -44,6 +44,7 @@ public struct RemoteDesktopView: View {
     @Environment(\.displayScale) private var displayScale
 
     @State private var viewport = RemoteViewportState()
+    @State private var viewportPanningMode = RemoteViewportPanningMode.edge
     @State private var keyboardActive = false
     @State private var confirmPasswordSend = false
     @State private var keyboardCapture: VNCKeyboardCapture
@@ -332,6 +333,7 @@ public struct RemoteDesktopView: View {
         #if canImport(UIKit)
         RemoteInteractionView(
             viewport: $viewport,
+            viewportPanningMode: viewportPanningMode,
             keyboardActive: $keyboardActive,
             hardwareKeyboardAttached: $hardwareKeyboardAttached,
             framebufferSize: framebufferSize,
@@ -463,6 +465,25 @@ public struct RemoteDesktopView: View {
             }
             #endif
 
+            Menu {
+                ForEach(RemoteViewportPanningMode.allCases, id: \.self) { mode in
+                    Button {
+                        viewportPanningMode = mode
+                    } label: {
+                        Label(
+                            viewportPanningModeTitle(mode),
+                            systemImage: viewportPanningMode == mode
+                                ? "checkmark"
+                                : viewportPanningModeImage(mode))
+                    }
+                    .disabled(viewportPanningMode == mode)
+                }
+            } label: {
+                Label(
+                    String(localized: "Screen Panning", bundle: .module),
+                    systemImage: "cursorarrow.motionlines")
+            }
+
             Button {
                 viewport.reset()
             } label: {
@@ -564,6 +585,32 @@ public struct RemoteDesktopView: View {
                     .foregroundStyle(.secondary)
                 Text(String(localized: "No Active Connection", bundle: .module)).foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private func viewportPanningModeTitle(
+        _ mode: RemoteViewportPanningMode
+    ) -> String {
+        switch mode {
+        case .edge:
+            return String(
+                localized: "When Pointer Reaches Edge",
+                bundle: .module)
+        case .continuous:
+            return String(
+                localized: "Continuously with Pointer",
+                bundle: .module)
+        }
+    }
+
+    private func viewportPanningModeImage(
+        _ mode: RemoteViewportPanningMode
+    ) -> String {
+        switch mode {
+        case .edge:
+            return "arrow.up.left.and.arrow.down.right"
+        case .continuous:
+            return "cursorarrow.rays"
         }
     }
 
