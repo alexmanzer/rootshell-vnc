@@ -296,9 +296,13 @@ public actor TransportSession {
     private var stateMachine: ConnectionStateMachine
     /// Address used to establish direct TCP.
     private let dialHost: String
-    /// Concrete numeric peer selected by TCP, used for Apple UDP media so both
-    /// transports always use the same address family and interface.
+    /// Remote used for Apple UDP media. This normally becomes the concrete TCP
+    /// peer. Tailscale names stay as hostnames so iOS Network Extension routing
+    /// retains the endpoint identity used to establish the cellular VPN path.
     private var appleMediaRemoteHost: String
+    /// When media keeps a Tailscale hostname, constrain its lookup to TCP's
+    /// selected family so DNS route setup cannot split TCP and UDP.
+    private var appleMediaRemoteAddressFamily: PosixUDPAddressFamily?
     /// Original endpoint identity used for TLS certificate validation, even
     /// when UDP media targets the TCP connection's resolved numeric peer.
     private let tlsIdentityHost: String
@@ -699,6 +703,7 @@ public actor TransportSession {
         )
         self.dialHost = host
         self.appleMediaRemoteHost = host
+        self.appleMediaRemoteAddressFamily = nil
         self.tlsIdentityHost = host
         self.port = port
         self.password = password
@@ -742,8 +747,19 @@ public actor TransportSession {
         // Establish TCP
         try await tcp.connect()
         if let connectedPeer = await tcp.remoteEndpointHost() {
-            appleMediaRemoteHost = connectedPeer
-            log.info("Apple media UDP peer matched to TCP peer \(connectedPeer)")
+            appleMediaRemoteHost = Self.selectAppleMediaRemoteHost(
+                dialHost: dialHost,
+                connectedPeer: connectedPeer)
+            appleMediaRemoteAddressFamily = Self.selectAppleMediaRemoteAddressFamily(
+                dialHost: dialHost,
+                connectedPeer: connectedPeer)
+            if appleMediaRemoteHost == connectedPeer {
+                log.info("Apple media UDP peer matched to TCP peer \(connectedPeer)")
+            } else {
+                log.info(
+                    "Apple media UDP retaining Tailscale hostname \(dialHost) "
+                        + "instead of numeric TCP peer \(connectedPeer)")
+            }
         } else if !usesCustomTransport {
             log.warning(
                 "TCP transport did not expose its numeric peer; Apple media UDP "
@@ -768,6 +784,33 @@ public actor TransportSession {
         readTask = Task { [weak self] in
             await self?.readLoop()
         }
+    }
+
+    /// Tailscale MagicDNS names deliberately keep the resolver in the UDP
+    /// path. Replacing that endpoint identity with TCP's numeric peer leaves
+    /// iOS cellular sessions connected but without symmetric high-performance
+    /// UDP media. `PosixUDPChannel` resolves the retained name in the exact
+    /// address family selected by TCP.
+    static func selectAppleMediaRemoteHost(
+        dialHost: String,
+        connectedPeer: String?
+    ) -> String {
+        guard let connectedPeer else { return dialHost }
+        if AppleMediaNetworkProfile.isTailscaleDNSHost(dialHost) {
+            return dialHost
+        }
+        return connectedPeer
+    }
+
+    static func selectAppleMediaRemoteAddressFamily(
+        dialHost: String,
+        connectedPeer: String?
+    ) -> PosixUDPAddressFamily? {
+        guard AppleMediaNetworkProfile.isTailscaleDNSHost(dialHost),
+              let connectedPeer else {
+            return nil
+        }
+        return PosixUDPAddressFamily(numericHost: connectedPeer)
     }
 
     /// Send a key event to the server.
@@ -4381,7 +4424,8 @@ public actor TransportSession {
 
     private func startAppleMediaUDPChannel(binding: AppleMediaUDPBinding) async throws {
         // Configure the symmetric-port media socket (address family follows
-        // the exact numeric peer selected by TCP (including an IPv6 scope ID):
+        // the selected media peer: normally TCP's exact numeric endpoint, or
+        // TCP-family-constrained resolution for a Tailscale hostname):
         //   socket(family, DGRAM) + SO_REUSEADDR + SO_REUSEPORT
         //   + bind(wildcard:port) + connect(serverIP:port)
         // Symmetric RTP uses the same port both ends; SO_REUSEPORT is what lets
@@ -4393,6 +4437,7 @@ public actor TransportSession {
             localPort: binding.localPort,
             remoteHost: appleMediaRemoteHost,
             remotePort: binding.remotePort,
+            remoteAddressFamily: appleMediaRemoteAddressFamily,
             enableReusePort: true
         )
         try await channel.start()

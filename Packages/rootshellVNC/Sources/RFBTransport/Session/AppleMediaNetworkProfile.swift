@@ -111,7 +111,7 @@ struct AppleMediaNetworkProfile: Sendable, Equatable {
     static func isPrivateOrOverlayHost(_ host: String) -> Bool {
         let lower = host.lowercased()
         if lower == "localhost" || lower.hasSuffix(".local")
-            || lower.hasSuffix(".ts.net") || lower.hasPrefix("fc")
+            || isTailscaleDNSHost(lower) || lower.hasPrefix("fc")
             || lower.hasPrefix("fd") {
             return true
         }
@@ -125,6 +125,14 @@ struct AppleMediaNetworkProfile: Sendable, Equatable {
         default:
             return false
         }
+    }
+
+    static func isTailscaleDNSHost(_ host: String) -> Bool {
+        var normalized = host.lowercased()
+        while normalized.hasSuffix(".") {
+            normalized.removeLast()
+        }
+        return normalized.hasSuffix(".ts.net")
     }
 
     private static func currentRadioClass() -> RadioClass {

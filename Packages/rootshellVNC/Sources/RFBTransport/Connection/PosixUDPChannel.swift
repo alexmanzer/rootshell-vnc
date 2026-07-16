@@ -77,6 +77,40 @@ struct BoundedDatagramFIFO {
     }
 }
 
+enum PosixUDPAddressFamily: Sendable, Equatable {
+    case ipv4
+    case ipv6
+
+    init?(numericHost: String) {
+        var name = numericHost
+        if name.hasPrefix("["), name.hasSuffix("]") {
+            name = String(name.dropFirst().dropLast())
+        }
+        if let scope = name.firstIndex(of: "%") {
+            name = String(name[..<scope])
+        }
+
+        var ipv4 = in_addr()
+        if inet_pton(AF_INET, name, &ipv4) == 1 {
+            self = .ipv4
+            return
+        }
+        var ipv6 = in6_addr()
+        if inet_pton(AF_INET6, name, &ipv6) == 1 {
+            self = .ipv6
+            return
+        }
+        return nil
+    }
+
+    var systemValue: Int32 {
+        switch self {
+        case .ipv4: AF_INET
+        case .ipv6: AF_INET6
+        }
+    }
+}
+
 /// A UDP channel backed directly by a POSIX socket.
 ///
 /// The media transport requires a symmetric-port UDP socket configured as
@@ -93,9 +127,10 @@ struct BoundedDatagramFIFO {
 /// The socket's address family is chosen from the resolved remote.
 /// `TransportSession` normally supplies the exact numeric peer selected by
 /// TCP, so a dual-stack Bonjour hostname cannot split TCP and UDP across
-/// different families. Direct callers that supply a hostname retain the
-/// historical IPv4-first resolution, with IPv6 used when it is the only
-/// available family.
+/// different families. Tailscale keeps its DNS endpoint identity but constrains
+/// resolution to TCP's selected family. Other callers that supply a hostname
+/// retain the historical IPv4-first resolution, with IPv6 used when it is the
+/// only available family.
 ///
 /// `Network.framework` (`NWListener`/`NWConnection`) does not reliably expose
 /// `SO_REUSEPORT`, which this transport requires so the viewer can bind the
@@ -109,6 +144,7 @@ public actor PosixUDPChannel {
     private let requestedLocalPort: UInt16?
     private let remoteHost: String?
     private let remotePort: UInt16?
+    private let remoteAddressFamily: PosixUDPAddressFamily?
     private let enableReusePort: Bool
 
     private var fd: Int32 = -1
@@ -161,6 +197,21 @@ public actor PosixUDPChannel {
         self.requestedLocalPort = localPort
         self.remoteHost = remoteHost
         self.remotePort = remotePort
+        self.remoteAddressFamily = nil
+        self.enableReusePort = enableReusePort
+    }
+
+    init(
+        localPort: UInt16?,
+        remoteHost: String?,
+        remotePort: UInt16?,
+        remoteAddressFamily: PosixUDPAddressFamily?,
+        enableReusePort: Bool
+    ) {
+        self.requestedLocalPort = localPort
+        self.remoteHost = remoteHost
+        self.remotePort = remotePort
+        self.remoteAddressFamily = remoteAddressFamily
         self.enableReusePort = enableReusePort
     }
 
@@ -171,7 +222,9 @@ public actor PosixUDPChannel {
         // connect all use the peer's address family.
         var remoteStorage: sockaddr_storage?
         if let remoteHost, let remotePort {
-            guard var storage = Self.resolveHost(remoteHost) else {
+            guard var storage = Self.resolveHost(
+                remoteHost,
+                requiredFamily: remoteAddressFamily) else {
                 throw VNCProtocolError.ioError("UDP connect: cannot resolve remote host \(remoteHost)")
             }
             Self.setPort(remotePort, in: &storage)
@@ -266,6 +319,7 @@ public actor PosixUDPChannel {
 
         log.info("POSIX UDP started local=\(boundPort.map(String.init) ?? "?") "
             + "remote=\(remoteHost ?? "-"):\(remotePort.map(String.init) ?? "-") "
+            + "family=\(family == AF_INET6 ? "IPv6" : "IPv4") "
             + "reusePort=\(enableReusePort)")
     }
 
@@ -442,16 +496,19 @@ public actor PosixUDPChannel {
     }
 
     /// Resolve a host (numeric IPv4/IPv6 literal — brackets and scope IDs
-    /// accepted — or a hostname) to a socket address. IPv4 is preferred when a
-    /// host resolves to both families so dual-stack destinations keep the
-    /// historical behavior; IPv6 is used when it is the only family available.
-    private static func resolveHost(_ host: String) -> sockaddr_storage? {
+    /// accepted — or a hostname) to a socket address. A required family keeps
+    /// DNS resolution aligned with TCP. Otherwise IPv4 is preferred when a host
+    /// resolves to both families, with IPv6 used when it is the only family.
+    private static func resolveHost(
+        _ host: String,
+        requiredFamily: PosixUDPAddressFamily? = nil
+    ) -> sockaddr_storage? {
         var name = host
         if name.hasPrefix("["), name.hasSuffix("]") {
             name = String(name.dropFirst().dropLast())
         }
         var hints = addrinfo()
-        hints.ai_family = AF_UNSPEC
+        hints.ai_family = requiredFamily?.systemValue ?? AF_UNSPEC
         hints.ai_socktype = SOCK_DGRAM
         var result: UnsafeMutablePointer<addrinfo>?
         guard getaddrinfo(name, nil, &hints, &result) == 0 else { return nil }

@@ -388,7 +388,63 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertTrue(AppleMediaNetworkProfile.isPrivateOrOverlayHost("192.168.58.66"))
         XCTAssertTrue(AppleMediaNetworkProfile.isPrivateOrOverlayHost("100.100.20.30"))
         XCTAssertTrue(AppleMediaNetworkProfile.isPrivateOrOverlayHost("mac.tail123.ts.net"))
+        XCTAssertTrue(AppleMediaNetworkProfile.isPrivateOrOverlayHost("MAC.TAIL123.TS.NET."))
         XCTAssertFalse(AppleMediaNetworkProfile.isPrivateOrOverlayHost("203.0.113.8"))
+    }
+
+    func testTailscaleTCPPeerKeepsHostnameForAdaptiveUDP() {
+        XCTAssertEqual(
+            TransportSession.selectAppleMediaRemoteHost(
+                dialHost: "mac.tail123.ts.net",
+                connectedPeer: "100.100.20.30"),
+            "mac.tail123.ts.net")
+        XCTAssertEqual(
+            TransportSession.selectAppleMediaRemoteHost(
+                dialHost: "mac.tail123.ts.net",
+                connectedPeer: "fd7a:115c:a1e0::1234"),
+            "mac.tail123.ts.net")
+        XCTAssertEqual(
+            TransportSession.selectAppleMediaRemoteHost(
+                dialHost: "MAC.TAIL123.TS.NET.",
+                connectedPeer: "fd7a:115c:a1e0::1234%utun4"),
+            "MAC.TAIL123.TS.NET.")
+
+        XCTAssertEqual(
+            TransportSession.selectAppleMediaRemoteAddressFamily(
+                dialHost: "mac.tail123.ts.net",
+                connectedPeer: "100.100.20.30"),
+            .ipv4)
+        XCTAssertEqual(
+            TransportSession.selectAppleMediaRemoteAddressFamily(
+                dialHost: "mac.tail123.ts.net",
+                connectedPeer: "fd7a:115c:a1e0::1234%utun4"),
+            .ipv6)
+    }
+
+    func testAdaptiveUDPKeepsExactPeerOutsideTailscaleException() {
+        XCTAssertEqual(
+            TransportSession.selectAppleMediaRemoteHost(
+                dialHost: "dual-stack-host.local",
+                connectedPeer: "fd00::1234"),
+            "fd00::1234")
+        XCTAssertEqual(
+            TransportSession.selectAppleMediaRemoteHost(
+                dialHost: "fd00::1234",
+                connectedPeer: "fd00::1234"),
+            "fd00::1234")
+        XCTAssertEqual(
+            TransportSession.selectAppleMediaRemoteHost(
+                dialHost: "fallback.example",
+                connectedPeer: nil),
+            "fallback.example")
+        XCTAssertNil(
+            TransportSession.selectAppleMediaRemoteAddressFamily(
+                dialHost: "dual-stack-host.local",
+                connectedPeer: "fd00::1234"))
+        XCTAssertNil(
+            TransportSession.selectAppleMediaRemoteAddressFamily(
+                dialHost: "mac.tail123.ts.net",
+                connectedPeer: nil))
     }
 
     func testCellularVPNUsesConservativeCapacityPriorWithoutChangingNegotiation() {

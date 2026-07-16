@@ -168,6 +168,31 @@ final class PosixUDPChannelDualStackTests: XCTestCase {
         try await assertRoundTrip(peerFamily: AF_INET, remoteHost: "localhost")
     }
 
+    func testDualStackHostnameCanBeConstrainedToIPv6() async throws {
+        guard let peer = UDPTestPeer(family: AF_INET6) else {
+            XCTFail("failed to create IPv6 test peer")
+            return
+        }
+        defer { peer.close() }
+
+        let channel = PosixUDPChannel(
+            localPort: nil,
+            remoteHost: "localhost",
+            remotePort: peer.port,
+            remoteAddressFamily: .ipv6,
+            enableReusePort: false)
+        try await channel.start()
+        defer { Task { await channel.close() } }
+
+        try await channel.send(Data("ping".utf8))
+        guard let (request, sender) = peer.receive() else {
+            XCTFail("peer never received the ping")
+            return
+        }
+        XCTAssertEqual(request, Data("ping".utf8))
+        XCTAssertEqual(Int32(sender.ss_family), AF_INET6)
+    }
+
     func testUnresolvableHostThrows() async throws {
         let channel = PosixUDPChannel(
             localPort: nil,

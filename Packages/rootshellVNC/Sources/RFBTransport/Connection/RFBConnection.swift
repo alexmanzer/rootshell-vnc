@@ -99,11 +99,13 @@ public protocol RFBConnection: Sendable {
 
     /// Numeric address of the peer selected by the connected transport.
     ///
-    /// Apple's UDP media sockets must target this exact address rather than
-    /// resolving the user-entered hostname again: a dual-stack hostname can
-    /// otherwise put TCP on IPv6 and UDP on IPv4. Implementations should keep
-    /// an IPv6 scope identifier (for example `%en0`) when one is present.
-    /// Tunneled transports normally use the default `nil`.
+    /// Apple's UDP media sockets normally target this exact address rather
+    /// than resolving the user-entered hostname again: a dual-stack hostname
+    /// can otherwise put TCP on IPv6 and UDP on IPv4. Implementations should
+    /// keep an IPv6 scope identifier (for example `%en0`) when one is present.
+    /// The session may retain an overlay hostname when its resolver has a
+    /// required media-family preference. Tunneled transports normally use the
+    /// default `nil`.
     func remoteEndpointHost() async -> String?
 
     /// Whether this byte stream can install TLS after the plaintext RFB
