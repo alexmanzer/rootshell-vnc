@@ -2066,8 +2066,10 @@ final class TouchInputHandlerTests: XCTestCase {
 
         XCTAssertEqual(scrollEvents.count, 1)
         let event = scrollEvents[0]
-        XCTAssertEqual(event.deltaX, 1)
-        XCTAssertEqual(event.deltaY, -1)
+        // Sub-wheel-unit motion must not round up to a whole wheel line;
+        // line-based scrollers read the coarse field at sample rate.
+        XCTAssertEqual(event.deltaX, 0)
+        XCTAssertEqual(event.deltaY, 0)
         XCTAssertEqual(event.pointDeltaX, 1)
         XCTAssertEqual(event.pointDeltaY, -4)
         XCTAssertEqual(event.fixedDeltaX, 6_553)
@@ -2113,6 +2115,159 @@ final class TouchInputHandlerTests: XCTestCase {
         XCTAssertEqual(scrollEvents[0].deltaY, .min)
         XCTAssertEqual(scrollEvents[0].fixedDeltaX, .max)
         XCTAssertEqual(scrollEvents[0].fixedDeltaY, .min)
+    }
+
+    @MainActor
+    func testPreciseScrollCarriesExplicitCoarseDeltas() {
+        var scrollEvents: [AppleScrollEvent] = []
+        let handler = TouchInputHandler(
+            sendPointerEvent: { _, _, _ in
+                XCTFail("Precise input should go through the scroll event path")
+            },
+            sendScrollEvent: { scrollEvents.append($0) })
+
+        handler.handleScroll(
+            x: 20,
+            y: 30,
+            pointDeltaX: 4,
+            pointDeltaY: -7,
+            coarseDeltaX: 0,
+            coarseDeltaY: -1,
+            scrollPhase: .changed)
+
+        XCTAssertEqual(scrollEvents.count, 1)
+        XCTAssertEqual(scrollEvents[0].deltaX, 0)
+        XCTAssertEqual(scrollEvents[0].deltaY, -1)
+        XCTAssertEqual(scrollEvents[0].pointDeltaX, 4)
+        XCTAssertEqual(scrollEvents[0].pointDeltaY, -7)
+    }
+
+    func testReleaseVelocityIgnoresLiftOffReversalWobble() {
+        var estimator = ScrollReleaseVelocityEstimator()
+
+        // A steady 120 Hz upward drag at 600 pt/s...
+        var position = CGPoint(x: 0, y: 0)
+        var timestamp: CFTimeInterval = 10
+        estimator.record(position: position, at: timestamp)
+        for _ in 0..<24 {
+            timestamp += 1.0 / 120.0
+            position.y -= 5
+            estimator.record(position: position, at: timestamp)
+        }
+        // ...followed by a tiny reversal wobble as the finger leaves the glass.
+        timestamp += 0.004
+        position.y += 1
+        estimator.record(position: position, at: timestamp)
+
+        let velocity = estimator.releaseVelocity(at: timestamp + 0.002)
+        // The single-sample estimate would be +250 pt/s (the wobble). The
+        // windowed estimate must remain close to the real drag velocity.
+        XCTAssertLessThan(velocity.y, -400)
+    }
+
+    func testReleaseVelocityIsZeroAfterRestingBeforeLift() {
+        var estimator = ScrollReleaseVelocityEstimator()
+
+        var position = CGPoint(x: 0, y: 0)
+        var timestamp: CFTimeInterval = 10
+        estimator.record(position: position, at: timestamp)
+        for _ in 0..<12 {
+            timestamp += 1.0 / 120.0
+            position.y += 8
+            estimator.record(position: position, at: timestamp)
+        }
+
+        // The finger rests for 300 ms, then lifts: no fling.
+        let velocity = estimator.releaseVelocity(at: timestamp + 0.3)
+        XCTAssertEqual(velocity.x, 0)
+        XCTAssertEqual(velocity.y, 0)
+    }
+
+    func testReleaseVelocityMatchesSteadyDrag() {
+        var estimator = ScrollReleaseVelocityEstimator()
+
+        var position = CGPoint(x: 0, y: 0)
+        var timestamp: CFTimeInterval = 5
+        estimator.record(position: position, at: timestamp)
+        for _ in 0..<60 {
+            timestamp += 1.0 / 60.0
+            position.y += 10
+            estimator.record(position: position, at: timestamp)
+        }
+
+        let velocity = estimator.releaseVelocity(at: timestamp)
+        XCTAssertEqual(velocity.y, 600, accuracy: 20)
+        XCTAssertEqual(velocity.x, 0)
+    }
+
+    func testReleaseVelocityClampsVeryShortGestures() {
+        var estimator = ScrollReleaseVelocityEstimator()
+
+        // Two samples one millisecond apart must not read as a 2000 pt/s
+        // fling; the minimum span damps the estimate.
+        estimator.record(position: CGPoint(x: 0, y: 0), at: 3)
+        estimator.record(position: CGPoint(x: 0, y: 2), at: 3.001)
+
+        let velocity = estimator.releaseVelocity(at: 3.001)
+        XCTAssertEqual(velocity.y, 100, accuracy: 0.001)
+    }
+
+    func testReleaseVelocityResetClearsHistory() {
+        var estimator = ScrollReleaseVelocityEstimator()
+
+        estimator.record(position: CGPoint(x: 0, y: 0), at: 1)
+        estimator.record(position: CGPoint(x: 0, y: 50), at: 1.05)
+        estimator.reset()
+
+        let velocity = estimator.releaseVelocity(at: 1.06)
+        XCTAssertEqual(velocity.x, 0)
+        XCTAssertEqual(velocity.y, 0)
+    }
+
+    func testWheelUnitAccumulatorAggregatesSlowDrag() {
+        var accumulator = ScrollWheelUnitAccumulator()
+
+        // A slow 120 Hz drag of 3 points per sample must produce one wheel
+        // unit per ten points of travel, not one per sample.
+        var totalY: Int = 0
+        for _ in 0..<30 {
+            totalY += Int(accumulator.consume(pointDeltaX: 0, pointDeltaY: 3).y)
+        }
+        XCTAssertEqual(totalY, 9)
+        XCTAssertEqual(accumulator.remainderY, 0)
+    }
+
+    func testWheelUnitAccumulatorPassesFlingSampleThrough() {
+        var accumulator = ScrollWheelUnitAccumulator()
+
+        let fling = accumulator.consume(pointDeltaX: 0, pointDeltaY: -200)
+        XCTAssertEqual(fling.y, -20)
+        XCTAssertEqual(accumulator.remainderY, 0)
+    }
+
+    func testWheelUnitAccumulatorHandlesReversalAndReset() {
+        var accumulator = ScrollWheelUnitAccumulator()
+
+        XCTAssertEqual(accumulator.consume(pointDeltaX: 6, pointDeltaY: 0).x, 0)
+        XCTAssertEqual(accumulator.consume(pointDeltaX: -9, pointDeltaY: 0).x, 0)
+        XCTAssertEqual(accumulator.remainderX, -3)
+        XCTAssertEqual(accumulator.consume(pointDeltaX: -8, pointDeltaY: 0).x, -1)
+
+        accumulator.reset()
+        XCTAssertEqual(accumulator.remainderX, 0)
+        let afterReset = accumulator.consume(pointDeltaX: 9, pointDeltaY: 9)
+        XCTAssertEqual(afterReset.x, 0)
+        XCTAssertEqual(afterReset.y, 0)
+    }
+
+    func testWheelUnitAccumulatorSaturatesSafely() {
+        var accumulator = ScrollWheelUnitAccumulator()
+
+        let saturated = accumulator.consume(pointDeltaX: .max, pointDeltaY: .min)
+        XCTAssertEqual(saturated.x, .max)
+        XCTAssertEqual(saturated.y, .min)
+        XCTAssertEqual(accumulator.remainderX, 0)
+        XCTAssertEqual(accumulator.remainderY, 0)
     }
 
     func testScrollPointAccumulatorPreservesSubpointMovement() {

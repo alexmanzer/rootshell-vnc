@@ -181,9 +181,35 @@ public struct TouchInputHandler {
         scrollPhase: AppleScrollEvent.Phase,
         momentumPhase: AppleScrollEvent.MomentumPhase = .none
     ) {
+        handleScroll(
+            x: x,
+            y: y,
+            pointDeltaX: pointDeltaX,
+            pointDeltaY: pointDeltaY,
+            coarseDeltaX: Self.coarseDelta(for: pointDeltaX),
+            coarseDeltaY: Self.coarseDelta(for: pointDeltaY),
+            scrollPhase: scrollPhase,
+            momentumPhase: momentumPhase)
+    }
+
+    /// Forward a continuous scroll sample whose whole-wheel deltas were
+    /// accumulated across the gesture (see `ScrollWheelUnitAccumulator`).
+    /// Per-sample truncation would let a stream of small deltas either vanish
+    /// or, worse, round each sample up to a full wheel line — line-based
+    /// scrollers such as remote terminals read the coarse field and race away.
+    public func handleScroll(
+        x: UInt16,
+        y: UInt16,
+        pointDeltaX: Int32,
+        pointDeltaY: Int32,
+        coarseDeltaX: Int16,
+        coarseDeltaY: Int16,
+        scrollPhase: AppleScrollEvent.Phase,
+        momentumPhase: AppleScrollEvent.MomentumPhase = .none
+    ) {
         let event = AppleScrollEvent(
-            deltaX: Self.coarseDelta(for: pointDeltaX),
-            deltaY: Self.coarseDelta(for: pointDeltaY),
+            deltaX: coarseDeltaX,
+            deltaY: coarseDeltaY,
             fixedDeltaX: Self.fixed16_16(for: pointDeltaX),
             fixedDeltaY: Self.fixed16_16(for: pointDeltaY),
             pointDeltaX: pointDeltaX,
@@ -201,19 +227,17 @@ public struct TouchInputHandler {
         }
     }
 
+    /// Points of motion per one whole wheel unit, matching values measured
+    /// from public trackpad CGEvents.
+    nonisolated static let pointsPerWheelUnit: Int64 = 10
+
     private nonisolated static func fixed16_16(for pointDelta: Int32) -> Int32 {
-        // Measured public CGEvents use approximately ten pixels per one fixed
-        // wheel unit. Integer division preserves the sign and total direction.
-        Int32(clamping: Int64(pointDelta) * 65_536 / 10)
+        // Integer division preserves the sign and total direction.
+        Int32(clamping: Int64(pointDelta) * 65_536 / pointsPerWheelUnit)
     }
 
     private nonisolated static func coarseDelta(for pointDelta: Int32) -> Int16 {
-        guard pointDelta != 0 else { return 0 }
-        let wholeWheelUnits = pointDelta / 10
-        if wholeWheelUnits != 0 {
-            return Int16(clamping: wholeWheelUnits)
-        }
-        return pointDelta > 0 ? 1 : -1
+        Int16(clamping: Int64(pointDelta) / pointsPerWheelUnit)
     }
 
     /// Forward the gesture envelope defined around
@@ -272,6 +296,94 @@ struct ScrollPointAccumulator: Equatable, Sendable {
         let whole = Int32(remainder.rounded(.towardZero))
         remainder -= CGFloat(whole)
         return whole
+    }
+}
+
+/// Estimates a gesture's release velocity from displacement across a trailing
+/// time window, matching how native scroll views derive their fling velocity.
+///
+/// A single frame pair is hostage to lift-off noise: a sub-point wobble in the
+/// final few milliseconds reads as a fast fling in whatever direction the
+/// finger rolled while leaving the glass, sending momentum spiraling opposite
+/// to the drag. Displacement over the recent window keeps the tail aligned
+/// with the gesture's real motion, and a still finger naturally decays the
+/// window to zero so resting before lifting produces no fling.
+struct ScrollReleaseVelocityEstimator: Equatable, Sendable {
+    private struct Sample: Equatable {
+        var timestamp: CFTimeInterval
+        var position: CGPoint
+    }
+
+    /// Motion history considered when deriving the release velocity.
+    static let window: CFTimeInterval = 0.1
+    /// A release this long after the last recorded movement is a stationary
+    /// lift, never a fling.
+    static let maximumReleaseGap: CFTimeInterval = 0.15
+    /// Velocity floor for very short gestures so two samples a millisecond
+    /// apart cannot inflate into an enormous fling.
+    private static let minimumSpan: CFTimeInterval = 0.02
+
+    private var samples: [Sample] = []
+
+    mutating func record(position: CGPoint, at timestamp: CFTimeInterval) {
+        samples.append(Sample(timestamp: timestamp, position: position))
+        // Keep one sample beyond the window so the measured span always
+        // covers the full window once enough history exists.
+        while samples.count > 2,
+              samples[1].timestamp <= timestamp - Self.window {
+            samples.removeFirst()
+        }
+    }
+
+    mutating func reset() {
+        samples.removeAll(keepingCapacity: true)
+    }
+
+    func releaseVelocity(at releaseTime: CFTimeInterval) -> CGPoint {
+        guard let newest = samples.last,
+              let oldest = samples.first,
+              releaseTime - newest.timestamp <= Self.maximumReleaseGap else {
+            return CGPoint(x: 0, y: 0)
+        }
+        let span = max(newest.timestamp - oldest.timestamp, Self.minimumSpan)
+        return CGPoint(
+            x: (newest.position.x - oldest.position.x) / CGFloat(span),
+            y: (newest.position.y - oldest.position.y) / CGFloat(span))
+    }
+}
+
+/// Converts integer point deltas into whole wheel units without losing the
+/// sub-unit points between samples. Emitting truncated-with-carry whole
+/// units keeps a gesture's coarse total equal to its point total divided by
+/// `TouchInputHandler.pointsPerWheelUnit`, mirroring how real trackpad
+/// CGEvents relate the two representations. Remainders are kept in exact
+/// integer point space.
+struct ScrollWheelUnitAccumulator: Equatable, Sendable {
+    private(set) var remainderX: Int64 = 0
+    private(set) var remainderY: Int64 = 0
+
+    mutating func consume(pointDeltaX: Int32, pointDeltaY: Int32) -> (x: Int16, y: Int16) {
+        remainderX += Int64(pointDeltaX)
+        remainderY += Int64(pointDeltaY)
+        let x = Self.consumeAxis(&remainderX)
+        let y = Self.consumeAxis(&remainderY)
+        return (x, y)
+    }
+
+    mutating func reset() {
+        remainderX = 0
+        remainderY = 0
+    }
+
+    private static func consumeAxis(_ remainder: inout Int64) -> Int16 {
+        let wholeUnits = remainder / TouchInputHandler.pointsPerWheelUnit
+        let clamped = Int16(clamping: wholeUnits)
+        if Int64(clamped) != wholeUnits {
+            remainder = 0
+            return clamped
+        }
+        remainder -= wholeUnits * TouchInputHandler.pointsPerWheelUnit
+        return clamped
     }
 }
 

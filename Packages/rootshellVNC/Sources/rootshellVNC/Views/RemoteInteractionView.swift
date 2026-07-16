@@ -114,18 +114,24 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private var lastKnownFramebufferPoint: (x: UInt16, y: UInt16)?
     private var lastScrollPoint: (x: UInt16, y: UInt16)?
     private var scrollPointAccumulator = ScrollPointAccumulator()
+    private var wheelUnitAccumulator = ScrollWheelUnitAccumulator()
     private var horizontalScrollIntentFilter = HorizontalScrollIntentFilter()
     private var previousScrollTranslation = CGPoint.zero
     private var directScrollPhaseActive = false
     private var momentumScrollPhaseActive = false
     private weak var activeScrollRecognizer: UIGestureRecognizer?
     private var activeScrollUsesDirectTouch = false
-    private var lastDirectScrollVelocity = CGPoint.zero
-    private var lastDirectScrollVelocityTimestamp: CFTimeInterval = 0
+    private var releaseVelocityEstimator = ScrollReleaseVelocityEstimator()
     private var previousScrollTimestamp: CFTimeInterval = 0
     private var syntheticMomentumVelocity = CGPoint.zero
     private var syntheticMomentumLastTimestamp: CFTimeInterval = 0
     private var momentumDisplayLink: CADisplayLink?
+    /// A direct touch that lands during a fling catches it, exactly like
+    /// touching a decelerating native scroll view: the fling stops and that
+    /// touch must never click or hold-drag. Set at the catching touch-down,
+    /// cleared by the next touch-down or by whichever recognizer consumes it.
+    private var momentumCatchPending = false
+    private var momentumCatchTimestamp: CFTimeInterval = 0
     private let suppressedInputView = UIView(frame: .zero)
     private var consumedRemoteAliasUsages: Set<UInt32> = []
     /// Supplemental toolbar modifiers held around each physical key until its
@@ -146,7 +152,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             target: self,
             action: #selector(handleDirectTouchState(_:)))
         recognizer.onTouchDown = { [weak self] location in
-            self?.positionRemotePointerForTouch(at: location)
+            guard let self else { return false }
+            if self.catchMomentumFlingIfActive() {
+                self.momentumCatchPending = true
+                self.momentumCatchTimestamp = CACurrentMediaTime()
+                return true
+            }
+            self.momentumCatchPending = false
+            self.momentumCatchTimestamp = 0
+            self.positionRemotePointerForTouch(at: location)
+            return false
         }
         return recognizer
     }()
@@ -1336,7 +1351,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
 
     /// Catalyst does not consistently expose a deceleration phase for its
     /// UIEvent.scroll pan. Consume the direct translation and always generate
-    /// the momentum tail from the final measured velocity ourselves.
+    /// the momentum tail ourselves from displacement over the gesture's
+    /// trailing window, the same way native scroll views derive a fling.
     @objc private func handleNativeScrollState(_ recognizer: UIPanGestureRecognizer) {
         logInputRoute(
             "scroll state=\(recognizer.state.rawValue) "
@@ -1347,13 +1363,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 endMomentumScrollPhase()
                 finishScrollInteraction()
             }
+            momentumCatchPending = false
+            momentumCatchTimestamp = 0
             activeScrollRecognizer = recognizer
             activeScrollUsesDirectTouch = false
-            lastDirectScrollVelocity = .zero
-            lastDirectScrollVelocityTimestamp = 0
             let translation = recognizer.translation(in: self)
+            let now = CACurrentMediaTime()
+            releaseVelocityEstimator.reset()
+            releaseVelocityEstimator.record(position: translation, at: now)
             previousScrollTranslation = translation
-            previousScrollTimestamp = CACurrentMediaTime()
+            previousScrollTimestamp = now
             beginScrollInteractionIfNeeded(
                 at: recognizer.location(in: self),
                 initialTranslation: translation)
@@ -1361,17 +1380,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             guard activeScrollRecognizer === recognizer else { return }
             let translation = recognizer.translation(in: self)
             let now = CACurrentMediaTime()
-            let elapsed = now - previousScrollTimestamp
             let deltaX = translation.x - previousScrollTranslation.x
             let deltaY = translation.y - previousScrollTranslation.y
-            let reportedVelocity = recognizer.velocity(in: self)
-            if hypot(reportedVelocity.x, reportedVelocity.y) >= 1 {
-                rememberScrollVelocity(reportedVelocity, at: now)
-            } else if elapsed > 0, elapsed <= 0.1 {
-                rememberScrollVelocity(CGPoint(
-                    x: deltaX / CGFloat(elapsed),
-                    y: deltaY / CGFloat(elapsed)), at: now)
-            }
+            releaseVelocityEstimator.record(position: translation, at: now)
             previousScrollTranslation = translation
             previousScrollTimestamp = now
             sendFilteredScrollDelta(
@@ -1380,7 +1391,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 scrollPhase: .changed)
         case .ended:
             guard activeScrollRecognizer === recognizer else { return }
-            rememberScrollVelocity(recognizer.velocity(in: self))
             flushPendingScrollDelta()
             endDirectScrollPhase(.ended)
             if !beginSyntheticMomentumIfNeeded() {
@@ -1436,22 +1446,22 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             momentumPhase: .began)
     }
 
-    /// Preserve the final public pan velocity and generate a consistent tail
-    /// on every platform instead of depending on UIKit's private scroll phase.
+    /// Derive the fling from displacement over the gesture's trailing window
+    /// and generate a consistent tail on every platform instead of depending
+    /// on UIKit's private scroll phase.
     @discardableResult
     private func beginSyntheticMomentumIfNeeded() -> Bool {
         guard momentumDisplayLink == nil else { return false }
-        guard CACurrentMediaTime() - lastDirectScrollVelocityTimestamp <= 0.15 else {
-            return false
-        }
-        let speed = hypot(lastDirectScrollVelocity.x, lastDirectScrollVelocity.y)
+        let releaseVelocity = releaseVelocityEstimator.releaseVelocity(
+            at: CACurrentMediaTime())
+        let speed = hypot(releaseVelocity.x, releaseVelocity.y)
         guard speed >= 25 else { return false }
 
         let maximumSpeed: CGFloat = 12_000
         let scale = min(1, maximumSpeed / speed)
         syntheticMomentumVelocity = CGPoint(
-            x: lastDirectScrollVelocity.x * scale,
-            y: lastDirectScrollVelocity.y * scale)
+            x: releaseVelocity.x * scale,
+            y: releaseVelocity.y * scale)
         syntheticMomentumLastTimestamp = 0
         beginMomentumScrollPhaseIfNeeded()
 
@@ -1463,17 +1473,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             "synthetic momentum velocity=(\(syntheticMomentumVelocity.x),"
                 + "\(syntheticMomentumVelocity.y))")
         return true
-    }
-
-    private func rememberScrollVelocity(
-        _ velocity: CGPoint,
-        at timestamp: CFTimeInterval = CACurrentMediaTime()
-    ) {
-        // Some platforms report zero from the terminal callback. Retain the
-        // newest meaningful changed-state sample instead of erasing it.
-        guard hypot(velocity.x, velocity.y) >= 1 else { return }
-        lastDirectScrollVelocity = velocity
-        lastDirectScrollVelocityTimestamp = timestamp
     }
 
     @objc private func stepSyntheticMomentum(_ displayLink: CADisplayLink) {
@@ -1541,6 +1540,30 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         momentumScrollPhaseActive = false
     }
 
+    /// Stop an active synthetic fling because new input arrived, the way a
+    /// native scroll view halts deceleration on contact. Returns true when a
+    /// fling was actually caught.
+    @discardableResult
+    private func catchMomentumFlingIfActive() -> Bool {
+        guard momentumScrollPhaseActive else { return false }
+        endMomentumScrollPhase()
+        finishScrollInteraction()
+        return true
+    }
+
+    /// Trackpad tap-to-click and pencil contacts never create direct touches,
+    /// so the touch recognizer's fling catch cannot see them, and their tap
+    /// recognition is further delayed by double-tap disambiguation. Catch at
+    /// raw touch-down instead; the click that follows still lands normally.
+    /// Direct touches are left to the touch recognizer, whose catch also
+    /// suppresses the accidental click.
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        if touches.contains(where: { $0.type != .direct }) {
+            catchMomentumFlingIfActive()
+        }
+        super.touchesBegan(touches, with: event)
+    }
+
     private func cancelScrollInteraction() {
         endDirectScrollPhase(.cancelled)
         endMomentumScrollPhase()
@@ -1569,14 +1592,20 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         momentumPhase: AppleScrollEvent.MomentumPhase = .none
     ) {
         guard let point = lastScrollPoint else { return }
+        let coarse = wheelUnitAccumulator.consume(
+            pointDeltaX: pointDeltaX,
+            pointDeltaY: pointDeltaY)
         logInputRoute(
             "send scroll delta=(\(pointDeltaX),\(pointDeltaY)) "
+            + "coarse=(\(coarse.x),\(coarse.y)) "
             + "phase=\(scrollPhase.rawValue) pos=(\(point.x),\(point.y))")
         touchHandler.handleScroll(
             x: point.x,
             y: point.y,
             pointDeltaX: pointDeltaX,
             pointDeltaY: pointDeltaY,
+            coarseDeltaX: coarse.x,
+            coarseDeltaY: coarse.y,
             scrollPhase: scrollPhase,
             momentumPhase: momentumPhase)
     }
@@ -1650,10 +1679,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         activeScrollRecognizer = nil
         lastScrollPoint = nil
         scrollPointAccumulator.reset()
+        wheelUnitAccumulator.reset()
         horizontalScrollIntentFilter.reset()
         activeScrollUsesDirectTouch = false
-        lastDirectScrollVelocity = .zero
-        lastDirectScrollVelocityTimestamp = 0
+        releaseVelocityEstimator.reset()
         previousScrollTimestamp = 0
         previousScrollTranslation = .zero
     }
@@ -1757,6 +1786,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         focusForHardwareKeyboardIfNeeded(recognizer)
         switch recognizer.state {
         case .began, .changed:
+            catchMomentumFlingIfActive()
             guard let point = framebufferPoint(
                 for: recognizer.location(in: self)) else { return }
             lastPointerPoint = point
@@ -1773,6 +1803,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         guard recognizer.state == .ended,
               let point = framebufferPoint(
                 for: recognizer.location(in: self)) else { return }
+        if momentumCatchPending {
+            // The touch that stopped a fling belongs to the scroll
+            // interaction; catching never clicks the remote desktop.
+            momentumCatchPending = false
+            momentumCatchTimestamp = 0
+            return
+        }
+        // A pointer click during a fling stops it; the click still lands,
+        // matching a trackpad click on a decelerating native view.
+        catchMomentumFlingIfActive()
         focusForHardwareKeyboardIfNeeded(recognizer)
         if recognizer.buttonMask.contains(.secondary) {
             touchHandler.handleRightClick(x: point.x, y: point.y)
@@ -1786,6 +1826,17 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
               let point = framebufferPoint(
                 for: recognizer.location(in: self)) else { return }
         focusForHardwareKeyboardIfNeeded(recognizer)
+        if momentumCatchPending
+            || (momentumCatchTimestamp > 0
+                && CACurrentMediaTime() - momentumCatchTimestamp <= 0.75) {
+            // The first tap of the pair caught the fling; deliver only the
+            // second as an ordinary click, as a native scroll view would.
+            momentumCatchPending = false
+            momentumCatchTimestamp = 0
+            touchHandler.handleTap(x: point.x, y: point.y)
+            return
+        }
+        catchMomentumFlingIfActive()
         touchHandler.handleDoubleTap(x: point.x, y: point.y)
     }
 
@@ -1793,6 +1844,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         guard recognizer.state == .ended,
               let point = framebufferPoint(
                 for: recognizer.location(in: self)) else { return }
+        if catchMomentumFlingIfActive() || momentumCatchPending {
+            momentumCatchPending = false
+            momentumCatchTimestamp = 0
+            return
+        }
         touchHandler.handleRightClick(x: point.x, y: point.y)
     }
 
@@ -1806,12 +1862,17 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 endMomentumScrollPhase()
                 finishScrollInteraction()
             }
+            momentumCatchPending = false
+            momentumCatchTimestamp = 0
             activeScrollRecognizer = recognizer
             activeScrollUsesDirectTouch = true
-            lastDirectScrollVelocity = .zero
-            lastDirectScrollVelocityTimestamp = 0
+            let beginTimestamp = CACurrentMediaTime()
+            releaseVelocityEstimator.reset()
+            releaseVelocityEstimator.record(
+                position: recognizer.translation,
+                at: beginTimestamp)
             previousScrollTranslation = recognizer.translation
-            previousScrollTimestamp = CACurrentMediaTime()
+            previousScrollTimestamp = beginTimestamp
             beginScrollInteractionIfNeeded(
                 at: recognizer.currentLocation,
                 initialTranslation: recognizer.translation)
@@ -1821,7 +1882,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             let translation = recognizer.translation
             let deltaX = translation.x - previousScrollTranslation.x
             let deltaY = translation.y - previousScrollTranslation.y
-            rememberScrollVelocity(recognizer.velocity, at: now)
+            releaseVelocityEstimator.record(position: translation, at: now)
             previousScrollTranslation = translation
             previousScrollTimestamp = now
             sendFilteredScrollDelta(
@@ -1830,7 +1891,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
                 scrollPhase: .changed)
         case (.scroll, .ended):
             guard activeScrollRecognizer === recognizer else { return }
-            rememberScrollVelocity(recognizer.velocity)
             flushPendingScrollDelta()
             endDirectScrollPhase(.ended)
             if !beginSyntheticMomentumIfNeeded() {
@@ -1994,7 +2054,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         switch event.type {
         case .scroll:
             let accepted = gestureRecognizer === scrollRecognizer
-            if accepted { logInputRoute("received UIEvent.scroll") }
+            if accepted {
+                logInputRoute("received UIEvent.scroll")
+                // Trackpad contact surfaces here before the pan recognizer
+                // has any movement to begin with (the scroll stream's
+                // may-begin phase). Fingers returning to the trackpad must
+                // catch an active fling exactly like a finger on glass; the
+                // synthetic tail emits no UIEvents, so any scroll event
+                // during momentum is real user contact.
+                catchMomentumFlingIfActive()
+            }
             return accepted
         case .hover:
             return gestureRecognizer === hoverRecognizer
@@ -2102,15 +2171,15 @@ final class DirectTouchGestureRecognizer: UIGestureRecognizer {
     private(set) var mode: Mode?
     private(set) var currentLocation = CGPoint(x: 0, y: 0)
     private(set) var translation = CGPoint(x: 0, y: 0)
-    private(set) var velocity = CGPoint(x: 0, y: 0)
-    var onTouchDown: ((CGPoint) -> Void)?
+    /// Called at touch-down with the touch location. Returning true marks the
+    /// touch as captured by an active scroll fling: hold-to-drag is skipped so
+    /// the catching finger can only rest or continue scrolling.
+    var onTouchDown: ((CGPoint) -> Bool)?
 
     private let movementSlop: CGFloat = 6
     private let holdDuration: TimeInterval = 0.3
     private var trackedTouch: UITouch?
     private var startLocation = CGPoint(x: 0, y: 0)
-    private var previousLocation = CGPoint(x: 0, y: 0)
-    private var previousTimestamp: TimeInterval = 0
     private var holdTimer: Timer?
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
@@ -2127,12 +2196,11 @@ final class DirectTouchGestureRecognizer: UIGestureRecognizer {
         trackedTouch = touch
         currentLocation = touch.location(in: view)
         startLocation = currentLocation
-        previousLocation = currentLocation
-        previousTimestamp = touch.timestamp
         translation = CGPoint(x: 0, y: 0)
-        velocity = CGPoint(x: 0, y: 0)
-        onTouchDown?(currentLocation)
-        scheduleHoldTimer()
+        let capturedByFling = onTouchDown?(currentLocation) ?? false
+        if !capturedByFling {
+            scheduleHoldTimer()
+        }
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
@@ -2171,10 +2239,7 @@ final class DirectTouchGestureRecognizer: UIGestureRecognizer {
         trackedTouch = nil
         currentLocation = CGPoint(x: 0, y: 0)
         startLocation = CGPoint(x: 0, y: 0)
-        previousLocation = CGPoint(x: 0, y: 0)
-        previousTimestamp = 0
         translation = CGPoint(x: 0, y: 0)
-        velocity = CGPoint(x: 0, y: 0)
     }
 
     private func scheduleHoldTimer() {
@@ -2196,18 +2261,10 @@ final class DirectTouchGestureRecognizer: UIGestureRecognizer {
 
     private func updateMetrics(for touch: UITouch) {
         let location = touch.location(in: view)
-        let elapsed = touch.timestamp - previousTimestamp
-        if elapsed > 0 {
-            velocity = CGPoint(
-                x: (location.x - previousLocation.x) / elapsed,
-                y: (location.y - previousLocation.y) / elapsed)
-        }
         currentLocation = location
         translation = CGPoint(
             x: location.x - startLocation.x,
             y: location.y - startLocation.y)
-        previousLocation = location
-        previousTimestamp = touch.timestamp
     }
 
     private func rejectGesture() {
