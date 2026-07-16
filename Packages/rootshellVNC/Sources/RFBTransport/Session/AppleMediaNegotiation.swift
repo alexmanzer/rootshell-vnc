@@ -37,6 +37,37 @@ enum AppleMediaViewerClient: Sendable, Equatable {
     case appleRemoteDesktop
 }
 
+/// Locate an ordinary server-to-viewer RFB message inside a decrypted Apple
+/// media-control payload. Current ComCryption records usually start directly
+/// with RFB; another native framing variant retains a two-byte inner envelope.
+func appleRFBServerMessageOffset(in payload: Data) -> Int? {
+    func isMessage(at offset: Int) -> Bool {
+        guard payload.count > offset else { return false }
+        let start = payload.startIndex + offset
+        switch payload[start] {
+        case 0:
+            // FramebufferUpdate: type, padding, rectangle count.
+            guard payload.count >= offset + 4,
+                  payload[start + 1] == 0 else { return false }
+            let count = Int(payload[start + 2]) << 8
+                | Int(payload[start + 3])
+            return count > 0 && count <= 256
+        case 2:
+            return true // Bell
+        case 3:
+            return payload.count >= offset + 8 // ServerCutText
+        case 0x14, AppleClipboardProtocol.packedScrapMessageType:
+            return true
+        default:
+            return false
+        }
+    }
+
+    if isMessage(at: 0) { return 0 }
+    if isMessage(at: 2) { return 2 }
+    return nil
+}
+
 /// Flags at byte 6 of Apple's media-server configuration message.
 ///
 /// The native implementation advertises 60-fps support independently for the

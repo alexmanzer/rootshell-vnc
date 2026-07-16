@@ -335,9 +335,9 @@ public struct RemoteDesktopView: View {
             requestDictation: requestDictation,
             toggleFullScreen: toggleFullScreen,
             disconnect: { session.disconnect() },
-            // Adaptive mode's video composites the server cursor; only the
-            // classic framebuffer path adopts the remote shape locally.
-            remoteCursor: session.isHighPerformanceMode ? nil : session.remoteCursor)
+            // Apple's adaptive profile asks the server for cached cursor
+            // images so the responsive local pointer can adopt their shape.
+            remoteCursor: session.remoteCursor)
             .frame(width: viewSize.width, height: viewSize.height)
             .contentShape(Rectangle())
         #else

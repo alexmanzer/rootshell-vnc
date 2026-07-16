@@ -34,6 +34,48 @@ final class TightVNCCursorTests: XCTestCase {
             data: Data([255, 255, 255, 0, 0, 0, 0x80]),
             pixelFormat: .bgra8888))
     }
+
+    func testDecodesAndRecallsAppleAlphaCursor() throws {
+        let renderer = FramebufferRenderer(
+            framebuffer: Framebuffer(
+                width: 2, height: 1, pixelFormat: .bgra8888),
+            pixelFormat: .bgra8888)
+        let rect = FramebufferRect(
+            x: 1, y: 0, width: 2, height: 1,
+            encoding: .unknown(1104))
+        // Inflates to two BGRA pixels followed by their alpha plane. Only the
+        // first pixel is visible. The first UInt32 is Apple's cache ID.
+        let compressed = Data([
+            120, 156, 99, 96, 248, 207, 0, 65, 0, 14, 251, 2, 254,
+        ])
+        var definition = Data([0, 0, 0, 7, 0, 0, 0, 13])
+        definition.append(compressed)
+
+        let first = renderer.applyBatch([(rect, definition)], snapshot: false)
+        guard case .shape(let cursor)? = first.cursorUpdate else {
+            return XCTFail("Expected an Apple cursor shape")
+        }
+        XCTAssertEqual(cursor.hotspotX, 1)
+        XCTAssertEqual(cursor.hotspotY, 0)
+        XCTAssertEqual(cursor.shapePath.boundingBoxOfPath, CGRect(
+            x: -1, y: 0, width: 1, height: 1))
+
+        let reference = Data([0, 0, 0, 7, 0, 0, 0, 0])
+        let recalled = renderer.applyBatch([(rect, reference)], snapshot: false)
+        guard case .shape(let cached)? = recalled.cursorUpdate else {
+            return XCTFail("Expected the cached Apple cursor shape")
+        }
+        XCTAssertTrue(cached.image === cursor.image)
+    }
+
+    func testRejectsTruncatedAppleAlphaCursor() {
+        let rect = FramebufferRect(
+            x: 0, y: 0, width: 1, height: 1,
+            encoding: .unknown(1104))
+        XCTAssertNil(RemoteCursorDecoder.decodeAppleCursorRecord(
+            rect: rect,
+            data: Data([0, 0, 0, 1, 0, 0, 0, 5, 120])))
+    }
 }
 
 final class StandardFramebufferPipelineTests: XCTestCase {
@@ -372,6 +414,8 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(effective.contains(.serverDisplayInfo))
         XCTAssertTrue(effective.contains(.desktopSize))
         XCTAssertTrue(effective.contains(.extendedDesktopSize))
+        XCTAssertTrue(effective.contains(.unknown(1104)))
+        XCTAssertTrue(effective.contains(.unknown(1100)))
         XCTAssertTrue(effective.contains(.cursor))
         XCTAssertTrue(effective.contains(.xCursor))
         XCTAssertTrue(effective.contains(.raw))
@@ -390,6 +434,8 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertFalse(effective.contains(.mediaStreamAnswer))
         XCTAssertTrue(effective.contains(.desktopSize))
         XCTAssertTrue(effective.contains(.extendedDesktopSize))
+        XCTAssertTrue(effective.contains(.unknown(1104)))
+        XCTAssertTrue(effective.contains(.unknown(1100)))
         XCTAssertTrue(effective.contains(.cursor))
         XCTAssertTrue(effective.contains(.xCursor))
         XCTAssertTrue(effective.contains(.raw))
@@ -403,6 +449,8 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertFalse(effective.contains(.mediaStreamOffer))
         XCTAssertTrue(effective.contains(.zlib))
         XCTAssertTrue(effective.contains(.zrle))
+        XCTAssertTrue(effective.contains(.unknown(1104)))
+        XCTAssertTrue(effective.contains(.unknown(1100)))
     }
 
     func testStandardUsesAppleDCTWithPortableFallbackProfile() {

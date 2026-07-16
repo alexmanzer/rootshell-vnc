@@ -189,7 +189,21 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     private lazy var pointerInteraction = UIPointerInteraction(delegate: self)
     #if targetEnvironment(macCatalyst)
     private var catalystCursor: NSCursor?
-    private var catalystCursorScale: CGFloat = 0
+    private var catalystCursorDisplayScale: CGFloat = 0
+    #else
+    /// UIPointerShape outlines every scanline in a bitmap silhouette, which
+    /// makes detailed macOS cursors look striped or duplicated on iPad. Keep
+    /// one ordinary image view under the locally tracked pointer instead.
+    private lazy var remoteCursorImageView: UIImageView = {
+        let imageView = UIImageView(frame: .zero)
+        imageView.isHidden = true
+        imageView.isUserInteractionEnabled = false
+        imageView.contentMode = .scaleToFill
+        imageView.layer.magnificationFilter = .linear
+        imageView.layer.minificationFilter = .linear
+        return imageView
+    }()
+    private var remoteCursorHoverLocation: CGPoint?
     #endif
 
     override var keyCommands: [UIKeyCommand]? {
@@ -457,6 +471,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         configureRecognizers()
         #if !targetEnvironment(macCatalyst)
         addInteraction(pointerInteraction)
+        addSubview(remoteCursorImageView)
         #endif
         NotificationCenter.default.addObserver(
             self,
@@ -518,6 +533,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             releasePointerDrag()
             releaseAllPressedKeys()
             cancelScrollInteraction()
+            #if !targetEnvironment(macCatalyst)
+            remoteCursorHoverLocation = nil
+            remoteCursorImageView.isHidden = true
+            #endif
         }
         super.willMove(toWindow: newWindow)
     }
@@ -579,11 +598,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
             self.remoteCursor = remoteCursor
             #if targetEnvironment(macCatalyst)
             catalystCursor = nil
-            catalystCursorScale = 0
+            catalystCursorDisplayScale = 0
             if hoverRecognizer.state == .began || hoverRecognizer.state == .changed {
                 applyCatalystCursor()
             }
             #else
+            updateRemoteCursorImage(at: remoteCursorHoverLocation)
             pointerInteraction.invalidate()
             #endif
         }
@@ -1332,6 +1352,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         releaseAllPressedKeys()
         releasePointerDrag()
         releaseTouchHoldDrag()
+        #if !targetEnvironment(macCatalyst)
+        remoteCursorHoverLocation = nil
+        remoteCursorImageView.isHidden = true
+        #endif
     }
 
     @objc private func windowDidResignKey(_ notification: Notification) {
@@ -1339,6 +1363,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         releaseAllPressedKeys()
         releasePointerDrag()
         releaseTouchHoldDrag()
+        #if !targetEnvironment(macCatalyst)
+        remoteCursorHoverLocation = nil
+        remoteCursorImageView.isHidden = true
+        #endif
     }
 
     private func releasePointerDrag() {
@@ -1947,6 +1975,15 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         if recognizer.state == .began || recognizer.state == .changed {
             applyCatalystCursor()
         }
+        #else
+        if recognizer.state == .ended || recognizer.state == .cancelled {
+            remoteCursorHoverLocation = nil
+            remoteCursorImageView.isHidden = true
+            return
+        }
+        if recognizer.state == .began || recognizer.state == .changed {
+            updateRemoteCursorImage(at: recognizer.location(in: self))
+        }
         #endif
 
         guard !directScrollPhaseActive,
@@ -1969,35 +2006,56 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
     /// colors, and its hotspot; UIPointerShape is an iPad pointer-morphing API
     /// and is not reliably applied to the Mac arrow.
     private func applyCatalystCursor() {
-        guard let remoteCursor,
-              framebufferSize.width > 0,
-              let frame = viewport.displayedFrame(
-                viewSize: bounds.size,
-                framebufferSize: framebufferSize),
-              frame.width > 0 else {
+        guard let remoteCursor else {
             NSCursor.arrow.set()
             return
         }
 
-        let scale = frame.width / framebufferSize.width
-        guard scale > 0 else {
-            NSCursor.arrow.set()
-            return
-        }
-
-        if catalystCursor == nil || abs(catalystCursorScale - scale) > 0.001 {
+        // Cursor size is a local accessibility/display preference. Remote
+        // framebuffer zoom and Retina scaling must not shrink or enlarge it.
+        // AppleVNCServer's cursor dimensions are already expressed in local
+        // points, not Retina backing pixels.
+        let displayScale: CGFloat = 1
+        if catalystCursor == nil
+            || abs(catalystCursorDisplayScale - displayScale) > 0.001 {
             let image = UIImage(
                 cgImage: remoteCursor.image,
-                scale: 1 / scale,
+                scale: displayScale,
                 orientation: .up)
             catalystCursor = NSCursor(
                 image: image,
                 hotSpot: CGPoint(
-                    x: CGFloat(remoteCursor.hotspotX) * scale,
-                    y: CGFloat(remoteCursor.hotspotY) * scale))
-            catalystCursorScale = scale
+                    x: CGFloat(remoteCursor.hotspotX) / displayScale,
+                    y: CGFloat(remoteCursor.hotspotY) / displayScale))
+            catalystCursorDisplayScale = displayScale
         }
         catalystCursor?.set()
+    }
+    #endif
+
+    #if !targetEnvironment(macCatalyst)
+    /// Draw the server-selected bitmap at the locally delivered hover point.
+    /// This remains as responsive as UIKit's pointer because it does not wait
+    /// for the remote cursor-position echo; only shape changes cross the wire.
+    private func updateRemoteCursorImage(at location: CGPoint?) {
+        remoteCursorHoverLocation = location
+        guard let location, let remoteCursor else {
+            remoteCursorImageView.isHidden = true
+            remoteCursorImageView.image = nil
+            return
+        }
+
+        remoteCursorImageView.image = UIImage(
+            cgImage: remoteCursor.image,
+            scale: 1,
+            orientation: .up)
+        remoteCursorImageView.frame = CGRect(
+            x: location.x - CGFloat(remoteCursor.hotspotX),
+            y: location.y - CGFloat(remoteCursor.hotspotY),
+            width: CGFloat(remoteCursor.width),
+            height: CGFloat(remoteCursor.height))
+        remoteCursorImageView.isHidden = false
+        bringSubviewToFront(remoteCursorImageView)
     }
     #endif
 
@@ -2023,28 +2081,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate, 
         return defaultRegion
     }
 
-    /// Adopt the remote cursor's silhouette so shape changes (I-beam, resize
-    /// arrows, pointing hand) show without a server round trip. The pointer
-    /// itself stays fully local; nil falls back to the system arrow.
+    /// iPad has no public bitmap-backed UIPointerShape. Hide its synthetic
+    /// pointer while the local image overlay above displays the exact remote
+    /// cursor; nil retains the ordinary system pointer.
     func pointerInteraction(
         _ interaction: UIPointerInteraction,
         styleFor region: UIPointerRegion
     ) -> UIPointerStyle? {
-        guard let cursor = remoteCursor,
-              framebufferSize.width > 0,
-              let frame = viewport.displayedFrame(
-                viewSize: bounds.size,
-                framebufferSize: framebufferSize),
-              frame.width > 0 else { return nil }
-
-        // Cursor pixels arrive in framebuffer units; the pointer is drawn in
-        // view points.
-        let scale = frame.width / framebufferSize.width
-        var transform = CGAffineTransform(scaleX: scale, y: scale)
-        guard scale > 0,
-              let scaledPath = cursor.shapePath.copy(using: &transform),
-              !scaledPath.isEmpty else { return nil }
-        return UIPointerStyle(shape: .path(UIBezierPath(cgPath: scaledPath)))
+        remoteCursor == nil ? nil : .hidden()
     }
 
     func gestureRecognizer(

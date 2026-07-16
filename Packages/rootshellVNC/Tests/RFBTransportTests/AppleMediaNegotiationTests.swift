@@ -1,9 +1,72 @@
 import Compression
 import Foundation
+import RFBProtocol
 import XCTest
 @testable import RFBTransport
 
 final class AppleMediaNegotiationTests: XCTestCase {
+    func testFindsTwoByteWrappedDecryptedRFBUpdate() {
+        let update = Data([0, 0, 0, 1])
+            + Self.rectangleHeader(encoding: 1104)
+            + Data([0, 0, 0, 7, 0, 0, 0, 0])
+
+        XCTAssertEqual(appleRFBServerMessageOffset(in: update), 0)
+        XCTAssertEqual(
+            appleRFBServerMessageOffset(in: Data([0x12, 0x34]) + update),
+            2)
+    }
+
+    func testDecryptedUpdateReachesCursorAfterDisplayInfo() async throws {
+        let connection = ScriptedRFBConnection()
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.appleH264, .unknown(1105), .unknown(1104)],
+            connection: connection)
+
+        var displayInfo = Data(repeating: 0, count: 78)
+        displayInfo[0] = 0
+        displayInfo[1] = 76
+        var update = Data([0, 0, 0, 2])
+        update.append(Self.rectangleHeader(encoding: 1105))
+        update.append(displayInfo)
+        update.append(Self.rectangleHeader(encoding: 1104))
+        // Cache reference: identifier 7 followed by a zero compressed length.
+        update.append(contentsOf: [0, 0, 0, 7, 0, 0, 0, 0])
+
+        let eventTask = Task { () -> [Encoding] in
+            for await event in session.events {
+                guard case .framebufferUpdate(let rects) = event else { continue }
+                return rects.map(\.0.encoding)
+            }
+            return []
+        }
+        try await session.ingestAppleDecryptedRFBPayload(update)
+
+        let encodings = await eventTask.value
+        XCTAssertEqual(encodings, [.unknown(1105), .unknown(1104)])
+
+        // HEVC carries screen pixels, but the native hardware-cursor path
+        // keeps polling this encrypted RFB channel for cursor pseudo-rects.
+        try await session.finishFramebufferUpdate()
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(sent.count, 10)
+        XCTAssertEqual(Array(sent.prefix(2)), [3, 1])
+    }
+
+    func testPostAcceptEncodingsRetainAppleLocalCursorCapabilities() {
+        let encodings = TransportSession.appleMediaPostAcceptEncodings(
+            from: [.appleH264, .zlib, .raw, .unknown(1104), .unknown(1100)])
+
+        XCTAssertTrue(encodings.contains(.unknown(1104)))
+        XCTAssertTrue(encodings.contains(.unknown(1100)))
+        XCTAssertTrue(encodings.contains(.cursor))
+        XCTAssertLessThan(
+            try XCTUnwrap(encodings.firstIndex(of: .unknown(1104))),
+            try XCTUnwrap(encodings.firstIndex(of: .cursor)))
+    }
+
     func testNativeScreenSharingReceiverFlagsTrackSixtyFPSCapability() {
         XCTAssertEqual(appleMediaReceiverFlags(displayCount: 1), 0x04)
         XCTAssertEqual(appleMediaReceiverFlags(displayCount: 2), 0x04)
@@ -13,6 +76,16 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertEqual(
             appleMediaReceiverFlags(displayCount: 2, supports60FPS: true),
             0x07)
+    }
+
+    private static func rectangleHeader(encoding: Int32) -> Data {
+        var data = Data(repeating: 0, count: FramebufferRect.wireSize)
+        let raw = UInt32(bitPattern: encoding)
+        data[8] = UInt8((raw >> 24) & 0xff)
+        data[9] = UInt8((raw >> 16) & 0xff)
+        data[10] = UInt8((raw >> 8) & 0xff)
+        data[11] = UInt8(raw & 0xff)
+        return data
     }
 
     func testReceiverFlagsKeepAppleRemoteDesktopIdentityDistinct() {

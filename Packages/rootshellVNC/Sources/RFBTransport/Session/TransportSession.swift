@@ -268,10 +268,6 @@ public actor TransportSession {
     /// bandwidth signal for its DCT quality controller.
     private var framebufferCreditWaiter: CheckedContinuation<Void, Never>?
     private let maxUnacknowledgedUpdates = 1
-    /// Latched once an Apple media stream offer arrives: media negotiation
-    /// switches this channel to encrypted control records, so no further
-    /// framebuffer update requests may be sent.
-    private var framebufferRequestsSuppressed = false
     private var udpReadTasks: [Task<Void, Never>] = []
     private var udpChannels: [PosixUDPChannel] = []
     private let log = VNCLogger(category: "TransportSession")
@@ -929,7 +925,7 @@ public actor TransportSession {
             return
         }
 
-        guard deferredUpdateRequest, !framebufferRequestsSuppressed else { return }
+        guard deferredUpdateRequest else { return }
         deferredUpdateRequest = false
         try await requestFramebufferUpdate(incremental: true)
     }
@@ -1652,19 +1648,12 @@ public actor TransportSession {
         continuation?.yield(.framebufferUpdate(rectsWithData))
 
         // Pipeline the next incremental request the moment this update is
-        // fully off the wire, so the server encodes the next frame while
-        // this one crosses the event stream and decodes. Once an Apple
-        // media stream offer arrives, stop requesting entirely: media
-        // negotiation switches this channel to encrypted control records.
+        // fully off the wire, so the server can produce the next update while
+        // this one crosses the event stream and decodes. Apple keeps this RFB
+        // request loop alive after HEVC starts: pixels move to the media path,
+        // while local hardware-cursor shapes remain cursor pseudo-rectangles
+        // on the encrypted control channel.
         let rects = rectsWithData.map(\.0)
-        if requestAppleMediaStream,
-           rects.contains(where: { $0.encoding == .mediaStreamOffer }) {
-            framebufferRequestsSuppressed = true
-            log.debug("Suppressing framebuffer update request after Apple media stream offer")
-            return
-        }
-        guard !framebufferRequestsSuppressed else { return }
-
         unacknowledgedUpdates += 1
         let actions = stateMachine.handle(event: .receivedFramebufferUpdate(rects))
         for action in actions {
@@ -2115,6 +2104,13 @@ public actor TransportSession {
     }
 
     private func appleMediaPostAcceptEncodings() -> [Encoding] {
+        Self.appleMediaPostAcceptEncodings(
+            from: stateMachine.preferredEncodings)
+    }
+
+    static func appleMediaPostAcceptEncodings(
+        from preferredEncodings: [Encoding]
+    ) -> [Encoding] {
         let nativeViewerEncodingRawValues: Set<Int32> = [
             0, 1, 6, 16,
             1000, 1001, 1002, 1010, 1011,
@@ -2122,14 +2118,17 @@ public actor TransportSession {
         // appleH264 (1010) selects the HEVC-over-UDP high-performance path.
         // This method is only reached for the native adaptive profile; public
         // Full Quality mode omits the media offer before a session is created.
-        let baseEncodings = stateMachine.preferredEncodings.filter {
+        let baseEncodings = preferredEncodings.filter {
             nativeViewerEncodingRawValues.contains($0.rawValue)
         }
 
         return baseEncodings + [
-            .cursor,
+            // Prefer macOS's cached alpha cursor over the generic RFB shape.
+            // Standard mode advertises the same priority; putting .cursor
+            // first makes AppleVNCServer choose its limited fallback path.
             .unknown(0x450),
             .unknown(0x44c),
+            .cursor,
             .desktopSize,
             .unknown(0x44d),
             .unknown(0x451),
@@ -2140,44 +2139,31 @@ public actor TransportSession {
     }
 
     private func handleAppleMediaServerControlIfPresent(_ payload: Data) async throws -> Bool {
+        if appleDecryptedRFBBuffer.isEmpty,
+           let messageOffset = appleRFBServerMessageOffset(in: payload) {
+            if messageOffset == 0 {
+                return false
+            }
+            // Some HEVC control records retain a two-byte inner envelope after
+            // decryption. The RFB message itself starts at byte two (which is
+            // why the legacy control scanner also checks encoding offset 16).
+            try await ingestAppleDecryptedRFBPayload(Data(
+                payload[payload.startIndex + messageOffset..<payload.endIndex]))
+            return true
+        }
+
+        // A framebuffer update carrying CursorImageAlpha has the value 0x450
+        // at byte 14 too. Do not mistake an RFB record (or its continuation)
+        // for the similarly numbered media-control envelope.
+        guard appleDecryptedRFBBuffer.isEmpty,
+              payload.first.map({ !isAppleRFBServerMessageType($0) }) == true
+        else { return false }
         guard let control = appleMediaServerControl(payload) else { return false }
         log.debug("Received Apple media server control encoding=0x\(String(control.encoding, radix: 16)) length=\(control.body.count)")
         if control.encoding == 0x450 {
             try await requestAppleMediaReconfigurationIfNeeded()
         } else if control.encoding == 0x451 {
-            let displays = appleDisplayInfo2Records(control.body)
-            if !displays.isEmpty {
-                appleMediaDisplayInfos = displays
-                let aggregateLumaSamples = displays.reduce(into: 0) { total, display in
-                    let width = Int(display.width)
-                    let height = Int(display.height)
-                    guard width > 0, height > 0,
-                          width <= Int.max / height,
-                          total <= Int.max - width * height else {
-                        total = Int.max
-                        return
-                    }
-                    total += width * height
-                }
-                appleMediaActiveCaptureLumaSamples = aggregateLumaSamples
-                let first = displays[0]
-                activeAppleMediaTilesPerFrame = selectedAppleMediaTilesPerFrame(
-                    pixelWidth: Int(first.width),
-                    pixelHeight: Int(first.height))
-                appleMediaDisplayCount = requestsVirtualDisplays
-                        && lastSentRemoteDisplaySize != nil
-                    ? min(requestedDisplayCount, displays.count)
-                    : 1
-                for display in displays {
-                    continuation?.yield(.displayInfo(display))
-                }
-                log.info(
-                    "Apple media DisplayInfo2 announced \(displays.count) screens: "
-                        + displays.map { "\($0.width)x\($0.height)" }
-                            .joined(separator: ", ")
-                        + "; captureLuma=\(aggregateLumaSamples) "
-                        + "tiles=\(activeAppleMediaTilesPerFrame)")
-            }
+            handleAppleMediaDisplayInfo2(control.body)
         } else if control.encoding == 0x455 {
             try await sendAppleMediaInitialSetDisplayIfNeeded()
             try await sendAppleMediaAutoFrameUpdateIfNeeded()
@@ -2187,6 +2173,41 @@ public actor TransportSession {
             try await sendAppleMediaServerConfigurationIfNeeded()
         }
         return true
+    }
+
+    private func handleAppleMediaDisplayInfo2(_ payload: Data) {
+        let displays = appleDisplayInfo2Records(payload)
+        guard !displays.isEmpty else { return }
+        appleMediaDisplayInfos = displays
+        let aggregateLumaSamples = displays.reduce(into: 0) { total, display in
+            let width = Int(display.width)
+            let height = Int(display.height)
+            guard width > 0, height > 0,
+                  width <= Int.max / height,
+                  total <= Int.max - width * height else {
+                total = Int.max
+                return
+            }
+            total += width * height
+        }
+        appleMediaActiveCaptureLumaSamples = aggregateLumaSamples
+        let first = displays[0]
+        activeAppleMediaTilesPerFrame = selectedAppleMediaTilesPerFrame(
+            pixelWidth: Int(first.width),
+            pixelHeight: Int(first.height))
+        appleMediaDisplayCount = requestsVirtualDisplays
+                && lastSentRemoteDisplaySize != nil
+            ? min(requestedDisplayCount, displays.count)
+            : 1
+        for display in displays {
+            continuation?.yield(.displayInfo(display))
+        }
+        log.info(
+            "Apple media DisplayInfo2 announced \(displays.count) screens: "
+                + displays.map { "\($0.width)x\($0.height)" }
+                    .joined(separator: ", ")
+                + "; captureLuma=\(aggregateLumaSamples) "
+                + "tiles=\(activeAppleMediaTilesPerFrame)")
     }
 
     private func requestAppleMediaReconfigurationIfNeeded() async throws {
@@ -2678,8 +2699,7 @@ public actor TransportSession {
                         let isRFBRecord = !appleDecryptedRFBBuffer.isEmpty
                             || startsRFBRecord
                         if !isAVCMediaRecord, isRFBRecord {
-                            appleDecryptedRFBBuffer.append(record.payload)
-                            try await drainAppleDecryptedRFBBuffer()
+                            try await ingestAppleDecryptedRFBPayload(record.payload)
                         }
 
                         let candidatePackets = extractAppleMediaRTPPackets(from: record.payload)
@@ -2713,8 +2733,7 @@ public actor TransportSession {
                         let isRFBRecord = !appleDecryptedRFBBuffer.isEmpty
                             || startsRFBRecord
                         if !isAVCMediaRecord, isRFBRecord {
-                            appleDecryptedRFBBuffer.append(plaintext)
-                            try await drainAppleDecryptedRFBBuffer()
+                            try await ingestAppleDecryptedRFBPayload(plaintext)
                         }
                         let candidatePackets = extractAppleMediaRTPPackets(from: plaintext)
                         for packet in confirmedAppleMediaRTPPackets(from: candidatePackets) {
@@ -2798,6 +2817,14 @@ public actor TransportSession {
         }
     }
 
+    /// Feed one authenticated control-channel payload into the ordinary RFB
+    /// message parser. Apple may split an update across encrypted records, so
+    /// incomplete data remains buffered for the next call.
+    func ingestAppleDecryptedRFBPayload(_ payload: Data) async throws {
+        appleDecryptedRFBBuffer.append(payload)
+        try await drainAppleDecryptedRFBBuffer()
+    }
+
     private nonisolated func isAppleRFBServerMessageType(
         _ messageType: UInt8
     ) -> Bool {
@@ -2860,6 +2887,36 @@ public actor TransportSession {
                 let rowBytes = (Int(rect.width) + 7) / 8
                 let bitmapBytes = rowBytes * Int(rect.height)
                 pixelDataLength = bitmapBytes == 0 ? 0 : 6 + bitmapBytes * 2
+            case .unknown(let value) where value == 1100:
+                pixelDataLength = 0
+            case .unknown(let value) where value == 1101:
+                guard offset + 10 <= appleDecryptedRFBBuffer.endIndex else {
+                    return false
+                }
+                let count = Int(appleDecryptedRFBBuffer[offset + 8]) << 8
+                    | Int(appleDecryptedRFBBuffer[offset + 9])
+                pixelDataLength = 10 + count * 28
+            case .unknown(let value) where value == 1104:
+                guard offset + 8 <= appleDecryptedRFBBuffer.endIndex else {
+                    return false
+                }
+                let b0 = UInt32(appleDecryptedRFBBuffer[offset + 4]) << 24
+                let b1 = UInt32(appleDecryptedRFBBuffer[offset + 5]) << 16
+                let b2 = UInt32(appleDecryptedRFBBuffer[offset + 6]) << 8
+                let b3 = UInt32(appleDecryptedRFBBuffer[offset + 7])
+                pixelDataLength = 8 + Int(b0 | b1 | b2 | b3)
+            case .unknown(let value)
+                where value == 1105 || value == 1107
+                    || value == 1109 || value == 1110:
+                // Apple HEVC control rectangles carry a UInt16 byte count.
+                // They can share a framebuffer update with CursorImageAlpha;
+                // consuming every preceding rectangle is required to reach it.
+                guard offset + 2 <= appleDecryptedRFBBuffer.endIndex else {
+                    return false
+                }
+                let length = Int(appleDecryptedRFBBuffer[offset]) << 8
+                    | Int(appleDecryptedRFBBuffer[offset + 1])
+                pixelDataLength = 2 + length
             default:
                 return false
             }
@@ -2872,6 +2929,22 @@ public actor TransportSession {
                 try await noteStandardDesktopSizeSupport(layout)
             } else if rect.encoding == .mediaStreamOffer {
                 try await handleAppleMediaStreamOfferPayload(pixelData)
+            } else if case .unknown(let value) = rect.encoding {
+                switch value {
+                case 1104:
+                    try await requestAppleMediaReconfigurationIfNeeded()
+                case 1105:
+                    handleAppleMediaDisplayInfo2(pixelData)
+                case 1109:
+                    try await sendAppleMediaInitialSetDisplayIfNeeded()
+                    try await sendAppleMediaAutoFrameUpdateIfNeeded()
+                case 1110:
+                    try await sendAppleMediaInitialSetDisplayIfNeeded()
+                    try await sendAppleMediaAutoFrameUpdateIfNeeded()
+                    try await sendAppleMediaServerConfigurationIfNeeded()
+                default:
+                    break
+                }
             }
             rectsWithData.append((rect, pixelData))
             if rect.isSuccessfulDesktopResize {
@@ -2883,6 +2956,11 @@ public actor TransportSession {
         if let resize = pendingResize {
             try await acceptFramebufferResize(width: resize.width, height: resize.height)
         }
+        // Match the ordinary framebuffer path's single-update credit. The
+        // consumer applies cursor/layout metadata, then finishFramebufferUpdate
+        // sends the next encrypted incremental request.
+        unacknowledgedUpdates += 1
+        deferredUpdateRequest = true
         continuation?.yield(.framebufferUpdate(rectsWithData))
         return true
     }

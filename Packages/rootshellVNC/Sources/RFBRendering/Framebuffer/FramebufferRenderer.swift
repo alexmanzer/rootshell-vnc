@@ -48,6 +48,7 @@ public final class FramebufferRenderer: @unchecked Sendable {
     private var zrleDecoder: ZRLEEncodingRenderer
     private var tightDecoder: TightEncodingRenderer
     private var appleDCTDecoder: AppleAdaptiveDCTDecoder
+    private var appleCursorCache: [UInt32: RemoteCursor] = [:]
 
     public init(framebuffer: Framebuffer, pixelFormat: PixelFormat) {
         self.framebuffer = framebuffer
@@ -133,13 +134,27 @@ public final class FramebufferRenderer: @unchecked Sendable {
                     cursorUpdate = update
                 }
 
+            case .unknown(let value) where value == 1104:
+                // macOS sends alpha cursors through its own cached pseudo-
+                // encoding. Empty records select an earlier cache entry.
+                if let record = RemoteCursorDecoder.decodeAppleCursorRecord(
+                    rect: rect, data: data) {
+                    if let cursor = record.cursor {
+                        appleCursorCache[record.identifier] = cursor
+                    }
+                    if let cursor = appleCursorCache[record.identifier] {
+                        cursorUpdate = .shape(cursor)
+                    }
+                }
+
             case .lastRect, .encryptionInfo, .serverDisplayInfo,
                  .mediaStreamOffer, .mediaStreamAnswer:
                 break
 
             case .unknown(let value)
                 where value == 1100 || value == 1101
-                    || value == 1104 || value == 1105:
+                    || value == 1105 || value == 1107
+                    || value == 1109 || value == 1110:
                 // Apple Screen Sharing capability/control rectangles are
                 // consumed by TransportSession and carry no framebuffer pixels.
                 break

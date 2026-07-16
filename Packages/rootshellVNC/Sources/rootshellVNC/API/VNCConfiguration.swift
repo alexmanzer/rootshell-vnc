@@ -432,7 +432,18 @@ public struct VNCConfiguration: Sendable {
             encodings.append(.extendedDesktopSize)
         }
 
-        // Always include cursor pseudo-encoding
+        // macOS uses its cached CursorImageAlpha record instead of the
+        // standard RFB cursor shape. CursorPosition is paired with it by the
+        // native clients, and advertising both makes the server send local-
+        // cursor updates in every quality mode (including Adaptive and Full
+        // Quality). Other VNC servers simply ignore these pseudo-encodings.
+        for encoding in [Encoding.unknown(1104), .unknown(1100)] {
+            if !encodings.contains(encoding) {
+                encodings.append(encoding)
+            }
+        }
+
+        // Always include the portable cursor pseudo-encodings as fallbacks.
         if !encodings.contains(.cursor) {
             encodings.append(.cursor)
         }

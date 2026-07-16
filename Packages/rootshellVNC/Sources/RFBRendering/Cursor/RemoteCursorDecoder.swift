@@ -26,6 +26,13 @@ public enum RemoteCursorUpdate: @unchecked Sendable {
     case hidden
 }
 
+/// Apple's CursorImageAlpha (1104) record. A record with a cursor installs a
+/// new cache entry; a record without one selects an entry sent previously.
+struct AppleRemoteCursorRecord: @unchecked Sendable {
+    let identifier: UInt32
+    let cursor: RemoteCursor?
+}
+
 public enum RemoteCursorDecoder {
 
     /// Decode a Cursor pseudo-encoding payload: width*height pixels in the
@@ -207,5 +214,115 @@ public enum RemoteCursorDecoder {
             hotspotX: Int(rect.x),
             hotspotY: Int(rect.y),
             shapePath: shapePath.copy() ?? shapePath))
+    }
+
+    /// Decode Apple's CursorImageAlpha (1104) pseudo-encoding.
+    ///
+    /// The payload starts with a big-endian cache identifier and compressed
+    /// byte count. A non-empty zlib stream expands to one BGRA word per pixel
+    /// followed by a byte-per-pixel alpha plane. A zero byte count recalls the
+    /// cursor already stored under the identifier.
+    static func decodeAppleCursorRecord(
+        rect: FramebufferRect,
+        data: Data
+    ) -> AppleRemoteCursorRecord? {
+        guard rect.encoding == .unknown(1104), data.count >= 8 else {
+            return nil
+        }
+
+        let identifier = readUInt32BE(data, at: 0)
+        let compressedCount = Int(readUInt32BE(data, at: 4))
+        guard compressedCount > 0 else {
+            return AppleRemoteCursorRecord(
+                identifier: identifier, cursor: nil)
+        }
+        guard compressedCount <= data.count - 8 else { return nil }
+
+        let width = Int(rect.width)
+        let height = Int(rect.height)
+        guard width > 0, height > 0,
+              width <= Int.max / height else { return nil }
+        let pixelCount = width * height
+        // Cursor images are tiny in practice. Keep a malformed server from
+        // turning a cosmetic update into an unbounded allocation.
+        guard pixelCount <= 4_096 * 4_096,
+              pixelCount <= (Int.max - 1) / 5 else { return nil }
+        let inflatedCount = pixelCount * 5
+
+        let compressedStart = data.startIndex + 8
+        let compressed = Data(
+            data[compressedStart..<compressedStart + compressedCount])
+        guard let inflater = try? RFBZlibStreamInflater(),
+              let inflated = try? inflater.decompress(
+                compressed, maxOutputSize: inflatedCount + 1),
+              inflated.count == inflatedCount else { return nil }
+
+        var bgra = Data(inflated.prefix(pixelCount * 4))
+        let alphaOffset = pixelCount * 4
+        let shapePath = CGMutablePath()
+        bgra.withUnsafeMutableBytes { output in
+            inflated.withUnsafeBytes { source in
+                guard let outputBase = output.baseAddress?
+                        .assumingMemoryBound(to: UInt8.self),
+                      let sourceBase = source.baseAddress?
+                        .assumingMemoryBound(to: UInt8.self) else { return }
+
+                for y in 0..<height {
+                    var runStart: Int?
+                    func closeRun(at endX: Int) {
+                        guard let start = runStart else { return }
+                        runStart = nil
+                        shapePath.addRect(CGRect(
+                            x: start - Int(rect.x),
+                            y: y - Int(rect.y),
+                            width: endX - start,
+                            height: 1))
+                    }
+
+                    for x in 0..<width {
+                        let pixel = y * width + x
+                        let alpha = sourceBase[alphaOffset + pixel]
+                        outputBase[pixel * 4 + 3] = alpha
+                        if alpha > 0 {
+                            if runStart == nil { runStart = x }
+                        } else {
+                            closeRun(at: x)
+                        }
+                    }
+                    closeRun(at: width)
+                }
+            }
+        }
+
+        guard let provider = CGDataProvider(data: bgra as CFData),
+              let image = CGImage(
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bitsPerPixel: 32,
+                bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo.byteOrder32Little.union(
+                    CGBitmapInfo(rawValue: CGImageAlphaInfo.first.rawValue)),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent)
+        else { return nil }
+
+        return AppleRemoteCursorRecord(
+            identifier: identifier,
+            cursor: RemoteCursor(
+                image: image,
+                hotspotX: Int(rect.x),
+                hotspotY: Int(rect.y),
+                shapePath: shapePath.copy() ?? shapePath))
+    }
+
+    private static func readUInt32BE(_ data: Data, at offset: Int) -> UInt32 {
+        UInt32(data[data.startIndex + offset]) << 24
+            | UInt32(data[data.startIndex + offset + 1]) << 16
+            | UInt32(data[data.startIndex + offset + 2]) << 8
+            | UInt32(data[data.startIndex + offset + 3])
     }
 }
