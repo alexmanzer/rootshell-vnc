@@ -92,9 +92,11 @@ public final class VNCClipboardSynchronizer {
             establishBaseline()
             if sharedClipboardEnabled, automaticallyMonitors {
                 startMonitoring()
+                startClipboardObservation()
             } else {
                 monitoringTask?.cancel()
                 monitoringTask = nil
+                stopClipboardObservation()
             }
             if canControlRemoteSharedClipboard() {
                 setRemoteSharedClipboard(sharedClipboardEnabled)
@@ -120,6 +122,11 @@ public final class VNCClipboardSynchronizer {
         canSend() && clipboard.hasTransferableContent
     }
 
+    /// Internal visibility for deterministic observer lifecycle tests.
+    var isObservingClipboardChanges: Bool {
+        clipboardChangeObserver != nil
+    }
+
     @ObservationIgnored
     private let clipboard: any VNCClipboardProviding
     @ObservationIgnored
@@ -138,6 +145,10 @@ public final class VNCClipboardSynchronizer {
     private let notificationCenter: NotificationCenter
     @ObservationIgnored
     private let automaticallyMonitors: Bool
+    @ObservationIgnored
+    private let clipboardChangeNotification: Notification.Name?
+    @ObservationIgnored
+    private let clipboardChangeObject: Any?
 
     @ObservationIgnored
     private weak var session: VNCSession?
@@ -147,6 +158,8 @@ public final class VNCClipboardSynchronizer {
     private var connectionStateObserverID: UUID?
     @ObservationIgnored
     private var lifecycleObservers: [NSObjectProtocol] = []
+    @ObservationIgnored
+    private var clipboardChangeObserver: NSObjectProtocol?
     @ObservationIgnored
     private var monitoringTask: Task<Void, Never>?
 
@@ -178,6 +191,14 @@ public final class VNCClipboardSynchronizer {
     /// general pasteboard.
     public convenience init(session: VNCSession) {
         let clipboard = VNCSystemClipboard()
+        #if canImport(UIKit)
+        let clipboardChangeNotification: Notification.Name? =
+            UIPasteboard.changedNotification
+        let clipboardChangeObject: Any? = UIPasteboard.general
+        #else
+        let clipboardChangeNotification: Notification.Name? = nil
+        let clipboardChangeObject: Any? = nil
+        #endif
         self.init(
             clipboard: clipboard,
             canSend: { [weak session] in
@@ -202,7 +223,9 @@ public final class VNCClipboardSynchronizer {
             },
             notificationCenter: .default,
             observesApplicationLifecycle: true,
-            automaticallyMonitors: true
+            automaticallyMonitors: true,
+            clipboardChangeNotification: clipboardChangeNotification,
+            clipboardChangeObject: clipboardChangeObject
         )
         self.session = session
         self.sessionObserverID = session.addServerClipboardObserver { [weak self] text in
@@ -224,7 +247,9 @@ public final class VNCClipboardSynchronizer {
         setRemoteSharedClipboard: @escaping (Bool) -> Void = { _ in },
         notificationCenter: NotificationCenter = .default,
         observesApplicationLifecycle: Bool,
-        automaticallyMonitors: Bool
+        automaticallyMonitors: Bool,
+        clipboardChangeNotification: Notification.Name? = nil,
+        clipboardChangeObject: Any? = nil
     ) {
         self.clipboard = clipboard
         self.canSend = canSend
@@ -235,6 +260,8 @@ public final class VNCClipboardSynchronizer {
         self.setRemoteSharedClipboard = setRemoteSharedClipboard
         self.notificationCenter = notificationCenter
         self.automaticallyMonitors = automaticallyMonitors
+        self.clipboardChangeNotification = clipboardChangeNotification
+        self.clipboardChangeObject = clipboardChangeObject
         self.observedLocalChangeCount = clipboard.changeCount
         self.backgroundLocalChangeCount = clipboard.changeCount
 
@@ -245,6 +272,9 @@ public final class VNCClipboardSynchronizer {
 
     isolated deinit {
         monitoringTask?.cancel()
+        if let clipboardChangeObserver {
+            notificationCenter.removeObserver(clipboardChangeObserver)
+        }
         for observer in lifecycleObservers {
             notificationCenter.removeObserver(observer)
         }
@@ -311,6 +341,7 @@ public final class VNCClipboardSynchronizer {
         invalidated = true
         monitoringTask?.cancel()
         monitoringTask = nil
+        stopClipboardObservation()
         for observer in lifecycleObservers {
             notificationCenter.removeObserver(observer)
         }
@@ -457,6 +488,34 @@ public final class VNCClipboardSynchronizer {
         }
     }
 
+    /// Observe pasteboard changes only while automatic sharing is enabled.
+    /// NotificationCenter delivers observers registered on a specific queue
+    /// synchronously. Using the posting queue here is essential: Ghostty can
+    /// mutate the pasteboard from its surface API queue while holding the
+    /// surface mutex, so waiting for `.main` would deadlock with main-thread
+    /// surface queries. The callback itself only enqueues MainActor work.
+    private func startClipboardObservation() {
+        guard clipboardChangeObserver == nil,
+              !invalidated,
+              let clipboardChangeNotification else { return }
+
+        clipboardChangeObserver = notificationCenter.addObserver(
+            forName: clipboardChangeNotification,
+            object: clipboardChangeObject,
+            queue: nil
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.localClipboardDidChange()
+            }
+        }
+    }
+
+    private func stopClipboardObservation() {
+        guard let clipboardChangeObserver else { return }
+        notificationCenter.removeObserver(clipboardChangeObserver)
+        self.clipboardChangeObserver = nil
+    }
+
     private func clearRemoteCache() {
         latestRemoteText = nil
         pendingManualGet = false
@@ -484,15 +543,6 @@ public final class VNCClipboardSynchronizer {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.applicationDidBecomeActive()
-            }
-        })
-        lifecycleObservers.append(notificationCenter.addObserver(
-            forName: UIPasteboard.changedNotification,
-            object: UIPasteboard.general,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.localClipboardDidChange()
             }
         })
         #elseif canImport(AppKit)

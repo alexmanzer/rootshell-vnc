@@ -30,6 +30,8 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         requestRemoteClipboard: @escaping () -> Void = {},
         canControlRemoteSharedClipboard: @escaping () -> Bool = { false },
         setRemoteSharedClipboard: @escaping (Bool) -> Void = { _ in },
+        notificationCenter: NotificationCenter = NotificationCenter(),
+        clipboardChangeNotification: Notification.Name? = nil,
         send: @escaping (String) -> Void
     ) -> VNCClipboardSynchronizer {
         VNCClipboardSynchronizer(
@@ -40,9 +42,10 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
             requestRemoteClipboard: requestRemoteClipboard,
             canControlRemoteSharedClipboard: canControlRemoteSharedClipboard,
             setRemoteSharedClipboard: setRemoteSharedClipboard,
-            notificationCenter: NotificationCenter(),
+            notificationCenter: notificationCenter,
             observesApplicationLifecycle: false,
-            automaticallyMonitors: automaticallyMonitors)
+            automaticallyMonitors: automaticallyMonitors,
+            clipboardChangeNotification: clipboardChangeNotification)
     }
 
     func testManualGetUsesLatestRemoteClipboardWhileSharingIsOff() {
@@ -301,6 +304,79 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
 
         try? await Task.sleep(for: .milliseconds(600))
         XCTAssertNil(weakSynchronizer)
+    }
+
+    func testClipboardObservationFollowsSharedModeWithoutDuplicates() async {
+        let clipboard = FakeClipboard()
+        let notificationCenter = NotificationCenter()
+        let notificationName = Notification.Name("VNCClipboardDidChange")
+        var sent: [String] = []
+        var transferExpectation: XCTestExpectation?
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            automaticallyMonitors: true,
+            notificationCenter: notificationCenter,
+            clipboardChangeNotification: notificationName
+        ) {
+            sent.append($0)
+            transferExpectation?.fulfill()
+        }
+
+        XCTAssertFalse(synchronizer.isObservingClipboardChanges)
+        clipboard.copyOnDevice("sharing disabled")
+        notificationCenter.post(name: notificationName, object: nil)
+        XCTAssertTrue(sent.isEmpty)
+
+        synchronizer.sharedClipboardEnabled = true
+        XCTAssertTrue(synchronizer.isObservingClipboardChanges)
+        let firstTransfer = expectation(description: "First clipboard transfer")
+        transferExpectation = firstTransfer
+        clipboard.copyOnDevice("sharing enabled")
+        notificationCenter.post(name: notificationName, object: nil)
+        await fulfillment(of: [firstTransfer], timeout: 1)
+        transferExpectation = nil
+        XCTAssertEqual(sent, ["sharing enabled"])
+
+        synchronizer.sharedClipboardEnabled = false
+        XCTAssertFalse(synchronizer.isObservingClipboardChanges)
+        clipboard.copyOnDevice("disabled again")
+        notificationCenter.post(name: notificationName, object: nil)
+        XCTAssertEqual(sent, ["sharing enabled"])
+
+        synchronizer.sharedClipboardEnabled = true
+        XCTAssertTrue(synchronizer.isObservingClipboardChanges)
+        let secondTransfer = expectation(description: "Second clipboard transfer")
+        transferExpectation = secondTransfer
+        clipboard.copyOnDevice("enabled again")
+        notificationCenter.post(name: notificationName, object: nil)
+        await fulfillment(of: [secondTransfer], timeout: 1)
+        transferExpectation = nil
+        XCTAssertEqual(sent, ["sharing enabled", "enabled again"])
+    }
+
+    func testBackgroundClipboardNotificationDoesNotWaitForMainActor() {
+        let clipboard = FakeClipboard()
+        let notificationCenter = NotificationCenter()
+        let notificationName = Notification.Name("VNCClipboardDidChange")
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            automaticallyMonitors: true,
+            notificationCenter: notificationCenter,
+            clipboardChangeNotification: notificationName
+        ) { _ in }
+        synchronizer.sharedClipboardEnabled = true
+
+        let postFinished = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            notificationCenter.post(name: notificationName, object: nil)
+            postFinished.signal()
+        }
+
+        XCTAssertEqual(
+            postFinished.wait(timeout: .now() + 1),
+            .success,
+            "Posting a clipboard change must not synchronously wait for main"
+        )
     }
 
     func testTransferCallbackOnlyReportsAppliedTransfers() {
