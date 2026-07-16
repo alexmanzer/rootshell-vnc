@@ -2,6 +2,111 @@ import Foundation
 import RFBProtocol
 import Security
 
+/// Login-window state published by Apple's DisplayInfo2 extension.
+public struct AppleRemoteSessionState: Sendable, Equatable {
+    /// The macOS Login Window is the active server session.
+    public let loginWindowActive: Bool
+
+    /// The server is showing the Login Window as a lock screen.
+    public let loginWindowLockScreenActive: Bool
+
+    /// Whether the remote Mac is currently waiting at either login surface.
+    public var requiresLogin: Bool {
+        loginWindowActive || loginWindowLockScreenActive
+    }
+
+    public init(
+        loginWindowActive: Bool,
+        loginWindowLockScreenActive: Bool
+    ) {
+        self.loginWindowActive = loginWindowActive
+        self.loginWindowLockScreenActive = loginWindowLockScreenActive
+    }
+}
+
+/// Decode the session-wide flags in Apple's DisplayInfo2 (encoding 1105).
+/// The RFB payload includes a two-byte length prefix, so the structure's
+/// version and screen-flags fields begin at byte offsets 2 and 16.
+struct AppleDisplayInfo2SessionMetadata: Equatable {
+    let version: UInt16
+    let screenFlagsBigEndian: UInt32
+    let screenFlagsLittleEndian: UInt32
+    let hasLengthPrefix: Bool
+
+    var state: AppleRemoteSessionState {
+        // DisplayInfo2's geometry fields are network ordered, but macOS
+        // releases have emitted screenFlags in both byte orders. Since this is
+        // a bitset whose defined values occupy the low byte, checking both
+        // interpretations is unambiguous and avoids rejecting either form.
+        let flags = screenFlagsBigEndian | screenFlagsLittleEndian
+        return AppleRemoteSessionState(
+            loginWindowActive: flags & 0x10 != 0,
+            loginWindowLockScreenActive: flags & 0x08 != 0)
+    }
+}
+
+func appleDisplayInfo2SessionMetadata(
+    _ payload: Data
+) -> AppleDisplayInfo2SessionMetadata? {
+    guard payload.count >= 18 else { return nil }
+    let start = payload.startIndex
+    func uint16BE(at offset: Int) -> UInt16? {
+        guard offset >= 0, offset + 2 <= payload.count else { return nil }
+        return UInt16(payload[start + offset]) << 8
+            | UInt16(payload[start + offset + 1])
+    }
+    func uint16LE(at offset: Int) -> UInt16? {
+        guard offset >= 0, offset + 2 <= payload.count else { return nil }
+        return UInt16(payload[start + offset])
+            | UInt16(payload[start + offset + 1]) << 8
+    }
+    func uint32BE(at offset: Int) -> UInt32? {
+        guard offset >= 0, offset + 4 <= payload.count else { return nil }
+        return UInt32(payload[start + offset]) << 24
+            | UInt32(payload[start + offset + 1]) << 16
+            | UInt32(payload[start + offset + 2]) << 8
+            | UInt32(payload[start + offset + 3])
+    }
+    func uint32LE(at offset: Int) -> UInt32? {
+        guard offset >= 0, offset + 4 <= payload.count else { return nil }
+        return UInt32(payload[start + offset])
+            | UInt32(payload[start + offset + 1]) << 8
+            | UInt32(payload[start + offset + 2]) << 16
+            | UInt32(payload[start + offset + 3]) << 24
+    }
+    func version(at offset: Int) -> UInt16? {
+        if let value = uint16BE(at: offset), (4...16).contains(value) {
+            return value
+        }
+        if let value = uint16LE(at: offset), (4...16).contains(value) {
+            return value
+        }
+        return nil
+    }
+
+    let header: (version: UInt16, flagsOffset: Int, prefixed: Bool)
+    if let value = version(at: 2), payload.count >= 20 {
+        header = (value, 16, true)
+    } else if let value = version(at: 0) {
+        header = (value, 14, false)
+    } else {
+        return nil
+    }
+    guard let flagsBE = uint32BE(at: header.flagsOffset),
+          let flagsLE = uint32LE(at: header.flagsOffset) else { return nil }
+    return AppleDisplayInfo2SessionMetadata(
+        version: header.version,
+        screenFlagsBigEndian: flagsBE,
+        screenFlagsLittleEndian: flagsLE,
+        hasLengthPrefix: header.prefixed)
+}
+
+func appleDisplayInfo2RemoteSessionState(
+    _ payload: Data
+) -> AppleRemoteSessionState? {
+    appleDisplayInfo2SessionMetadata(payload)?.state
+}
+
 /// Decode the stable display records in Apple's DisplayInfo2 (encoding 1105).
 /// The payload includes its two-byte length prefix. Version 5 stores the
 /// display count at byte 20 and places each 56-byte record's UInt32 display ID
@@ -72,6 +177,9 @@ public enum SessionEvent: Sendable {
 
     /// Apple display info pseudo-encoding received.
     case displayInfo(AppleDisplayInfo)
+
+    /// Apple Login Window and lock-screen state changed.
+    case appleRemoteSessionState(AppleRemoteSessionState)
 
     /// Standard RFB multi-screen layout received.
     case desktopLayout(ExtendedDesktopSizePayload)
@@ -253,6 +361,10 @@ public actor TransportSession {
     /// Whether this connection negotiated Apple's adaptive DCT encoding.
     private let appleDCTRequested: Bool
     private let appleClassicAutoUpdateRequested: Bool
+    /// Last DisplayInfo2 session state emitted to the UI layer. Apple can send
+    /// this metadata with every layout/control refresh, so suppress identical
+    /// events at the transport boundary.
+    private var lastAppleRemoteSessionState: AppleRemoteSessionState?
     /// A full-screen type-2 quantization update commonly precedes the initial
     /// DCT image. Treat that control rectangle, or complete type-0 coverage,
     /// as the handoff from the full type-3 request to the type-9 stream.
@@ -580,7 +692,8 @@ public actor TransportSession {
             configuredEncodings.contains(.appleMultiVariantScreenshare)
                 && !configuredEncodings.contains(.appleH264)
         let shouldUseAppleClassicAutoUpdate =
-            !configuredEncodings.contains(.appleH264)
+            !preferFullQualityVideo
+                && !configuredEncodings.contains(.appleH264)
                 && configuredEncodings.contains(.unknown(1105))
                 && configuredEncodings.contains(.unknown(1104))
         self.stateMachine = ConnectionStateMachine(
@@ -1577,6 +1690,9 @@ public actor TransportSession {
                 if length > 0 {
                     payload.append(try await tcp.read(exactly: length))
                 }
+                emitAppleRemoteSessionState(
+                    from: payload,
+                    source: "standard RFB 1105")
                 let displayInfos = appleDisplayInfo2Records(payload)
                 for info in displayInfos {
                     continuation?.yield(.displayInfo(info))
@@ -2159,7 +2275,13 @@ public actor TransportSession {
               payload.first.map({ !isAppleRFBServerMessageType($0) }) == true
         else { return false }
         guard let control = appleMediaServerControl(payload) else { return false }
-        log.debug("Received Apple media server control encoding=0x\(String(control.encoding, radix: 16)) length=\(control.body.count)")
+        if control.encoding == 0x451 {
+            log.debug(
+                "Received High Performance DisplayInfo2 control "
+                    + "length=\(control.body.count)")
+        } else {
+            log.debug("Received Apple media server control encoding=0x\(String(control.encoding, radix: 16)) length=\(control.body.count)")
+        }
         if control.encoding == 0x450 {
             try await requestAppleMediaReconfigurationIfNeeded()
         } else if control.encoding == 0x451 {
@@ -2175,7 +2297,17 @@ public actor TransportSession {
         return true
     }
 
+    /// Ingest one decrypted Apple media-control payload. Kept internal so the
+    /// wire-equivalent High Performance path can be exercised without a live
+    /// encrypted media session.
+    func ingestAppleMediaServerControlPayload(_ payload: Data) async throws -> Bool {
+        try await handleAppleMediaServerControlIfPresent(payload)
+    }
+
     private func handleAppleMediaDisplayInfo2(_ payload: Data) {
+        emitAppleRemoteSessionState(
+            from: payload,
+            source: "High Performance 0x451")
         let displays = appleDisplayInfo2Records(payload)
         guard !displays.isEmpty else { return }
         appleMediaDisplayInfos = displays
@@ -2208,6 +2340,40 @@ public actor TransportSession {
                     .joined(separator: ", ")
                 + "; captureLuma=\(aggregateLumaSamples) "
                 + "tiles=\(activeAppleMediaTilesPerFrame)")
+    }
+
+    private func emitAppleRemoteSessionState(
+        from payload: Data,
+        source: String
+    ) {
+        guard let metadata = appleDisplayInfo2SessionMetadata(payload) else {
+            let first = payload.prefix(20).map {
+                String(format: "%02x", $0)
+            }.joined(separator: " ")
+            log.debug(
+                "Could not decode Apple login flags from \(source): "
+                    + "bytes=\(payload.count) header=\(first)")
+            return
+        }
+        let state = metadata.state
+        guard state != lastAppleRemoteSessionState else {
+            log.debug(
+                "Apple login state unchanged from \(source): "
+                    + "loginWindow=\(state.loginWindowActive) "
+                    + "lockScreen=\(state.loginWindowLockScreenActive)")
+            return
+        }
+        lastAppleRemoteSessionState = state
+        log.debug(
+            "Apple login state changed from \(source): "
+                + "loginWindow=\(state.loginWindowActive) "
+                + "lockScreen=\(state.loginWindowLockScreenActive) "
+                + "version=\(metadata.version) "
+                + "flagsBE=0x\(String(metadata.screenFlagsBigEndian, radix: 16)) "
+                + "flagsLE=0x\(String(metadata.screenFlagsLittleEndian, radix: 16)) "
+                + "lengthPrefix=\(metadata.hasLengthPrefix) "
+                + "payloadBytes=\(payload.count)")
+        continuation?.yield(.appleRemoteSessionState(state))
     }
 
     private func requestAppleMediaReconfigurationIfNeeded() async throws {

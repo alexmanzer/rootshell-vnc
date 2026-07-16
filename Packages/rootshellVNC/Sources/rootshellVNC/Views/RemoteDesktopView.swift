@@ -216,9 +216,15 @@ public struct RemoteDesktopView: View {
                         framebufferSize: newSize)
                 }
                 .onAppear {
+                    presentPendingLoginPasswordPrompt()
                     #if !canImport(UIKit)
                     updateRemoteDisplaySize(for: geometry.size)
                     #endif
+                }
+                .onChange(of: session.loginPasswordPromptPending) { _, pending in
+                    if pending {
+                        presentPendingLoginPasswordPrompt()
+                    }
                 }
                 .onChange(of: displayScale) { _, _ in
                     #if canImport(UIKit)
@@ -234,6 +240,8 @@ public struct RemoteDesktopView: View {
                         #else
                         updateRemoteDisplaySize(for: geometry.size)
                         #endif
+                    } else {
+                        confirmPasswordSend = false
                     }
                 }
                 .onChange(of: session.configuration.displaySizingMode) { _, mode in
@@ -508,6 +516,12 @@ public struct RemoteDesktopView: View {
 
     private func requestPasswordSend() {
         guard session.canSendLoginPassword else { return }
+        confirmPasswordSend = true
+    }
+
+    private func presentPendingLoginPasswordPrompt() {
+        guard session.loginPasswordPromptPending else { return }
+        guard session.consumeLoginPasswordPromptRequest() else { return }
         confirmPasswordSend = true
     }
 

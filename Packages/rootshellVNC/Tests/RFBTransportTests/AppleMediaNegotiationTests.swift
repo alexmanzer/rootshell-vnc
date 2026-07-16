@@ -5,6 +5,46 @@ import XCTest
 @testable import RFBTransport
 
 final class AppleMediaNegotiationTests: XCTestCase {
+    func testMediaDisplayInfo2ControlEmitsLoginWindowState() async throws {
+        let connection = ScriptedRFBConnection()
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "secret",
+            preferredEncodings: [.appleH264, .unknown(1105)],
+            connection: connection)
+
+        // Apple media controls place the encoding at byte 14. The control
+        // length word is retained as DisplayInfo2's leading length field.
+        var payload = Data(repeating: 0, count: 36)
+        payload[0] = 0x20
+        payload[14] = 0x04
+        payload[15] = 0x51
+        payload[16] = 0
+        payload[17] = 20
+        payload[18] = 0
+        payload[19] = 5
+        payload[35] = 0x08
+
+        let eventTask = Task { () -> AppleRemoteSessionState? in
+            for await event in session.events {
+                guard case .appleRemoteSessionState(let state) = event else {
+                    continue
+                }
+                return state
+            }
+            return nil
+        }
+        let handled = try await session.ingestAppleMediaServerControlPayload(
+            payload)
+        let state = await eventTask.value
+
+        XCTAssertTrue(handled)
+        XCTAssertEqual(state?.loginWindowActive, false)
+        XCTAssertEqual(state?.loginWindowLockScreenActive, true)
+        XCTAssertEqual(state?.requiresLogin, true)
+    }
+
     func testFindsTwoByteWrappedDecryptedRFBUpdate() {
         let update = Data([0, 0, 0, 1])
             + Self.rectangleHeader(encoding: 1104)

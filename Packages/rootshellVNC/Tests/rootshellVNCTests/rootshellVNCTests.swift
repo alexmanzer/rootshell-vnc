@@ -5,6 +5,75 @@ import CoreVideo
 import RFBProtocol
 @testable import RFBRendering
 
+final class AppleLoginScreenDetectorTests: XCTestCase {
+    func testDetectsCentralEnterPasswordPhrase() {
+        let result = AppleLoginScreenDetector.analyze([
+            AppleLoginTextLine(
+                text: "Touch ID or Enter Password",
+                confidence: 0.94,
+                bounds: CGRect(x: 0.35, y: 0.30, width: 0.30, height: 0.04)),
+        ])
+
+        XCTAssertTrue(result.isLoginScreen)
+        XCTAssertEqual(result.evidence, "central password-entry phrase")
+    }
+
+    func testDetectsPasswordPhraseAtBottomOfModernLockScreen() {
+        let result = AppleLoginScreenDetector.analyze([
+            AppleLoginTextLine(
+                text: "Touch ID or Enter Password",
+                confidence: 0.98,
+                bounds: CGRect(x: 0.38, y: 0.02, width: 0.24, height: 0.02)),
+        ])
+
+        XCTAssertTrue(result.isLoginScreen)
+        XCTAssertEqual(result.evidence, "central password-entry phrase")
+    }
+
+    func testRejectsPasswordTextOutsideLoginRegion() {
+        let result = AppleLoginScreenDetector.analyze([
+            AppleLoginTextLine(
+                text: "Enter Password",
+                confidence: 0.99,
+                bounds: CGRect(x: 0.02, y: 0.90, width: 0.15, height: 0.03)),
+        ])
+
+        XCTAssertFalse(result.isLoginScreen)
+    }
+
+    func testRejectsWeakPasswordMentionOnOrdinaryDesktop() {
+        let result = AppleLoginScreenDetector.analyze([
+            AppleLoginTextLine(
+                text: "Change your password in Settings",
+                confidence: 0.92,
+                bounds: CGRect(x: 0.25, y: 0.45, width: 0.50, height: 0.04)),
+        ])
+
+        XCTAssertFalse(result.isLoginScreen)
+        XCTAssertEqual(result.evidence, "weak password text only")
+    }
+
+    func testGenericPasswordNeedsMultipleLoginActions() {
+        let result = AppleLoginScreenDetector.analyze([
+            AppleLoginTextLine(
+                text: "Password",
+                confidence: 0.90,
+                bounds: CGRect(x: 0.44, y: 0.34, width: 0.12, height: 0.03)),
+            AppleLoginTextLine(
+                text: "Switch User",
+                confidence: 0.88,
+                bounds: CGRect(x: 0.38, y: 0.14, width: 0.10, height: 0.03)),
+            AppleLoginTextLine(
+                text: "Cancel",
+                confidence: 0.89,
+                bounds: CGRect(x: 0.52, y: 0.14, width: 0.08, height: 0.03)),
+        ])
+
+        XCTAssertTrue(result.isLoginScreen)
+        XCTAssertEqual(result.evidence, "password and login-window actions")
+    }
+}
+
 final class TightVNCCursorTests: XCTestCase {
     func testDecodesXCursorShapeAndHotspot() throws {
         let rect = FramebufferRect(
@@ -265,6 +334,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(config.displayMode, .oneDisplay)
         XCTAssertEqual(config.displayCount, 1)
         XCTAssertTrue(config.enableRemoteAudio)
+        XCTAssertFalse(config.promptForLoginPasswordAtLoginWindow)
         XCTAssertEqual(config.targetFrameRate, 60)
         XCTAssertFalse(config.enableProtocolTrace)
         XCTAssertTrue(config.reconnectionPolicy.isEnabled)
@@ -279,6 +349,7 @@ final class VNCConfigurationTests: XCTestCase {
             displaySizingMode: .remoteDisplay,
             displayCount: 2,
             enableRemoteAudio: false,
+            promptForLoginPasswordAtLoginWindow: true,
             targetFrameRate: 60,
             enableProtocolTrace: true
         )
@@ -289,6 +360,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(config.displayMode, .allDisplaysCombined)
         XCTAssertEqual(config.displayCount, 2)
         XCTAssertFalse(config.enableRemoteAudio)
+        XCTAssertTrue(config.promptForLoginPasswordAtLoginWindow)
         XCTAssertEqual(config.targetFrameRate, 60)
         XCTAssertTrue(config.enableProtocolTrace)
     }
@@ -449,6 +521,7 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertFalse(effective.contains(.mediaStreamOffer))
         XCTAssertTrue(effective.contains(.zlib))
         XCTAssertTrue(effective.contains(.zrle))
+        XCTAssertTrue(effective.contains(.unknown(1105)))
         XCTAssertTrue(effective.contains(.unknown(1104)))
         XCTAssertTrue(effective.contains(.unknown(1100)))
     }
@@ -518,6 +591,60 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertEqual(
             VNCConfiguration.DisplaySizingMode.matchClient.title,
             "Match Client")
+    }
+}
+
+final class AppleLoginPromptTransitionTrackerTests: XCTestCase {
+    func testPromptsOnlyWhenEnteringEnabledLoginState() {
+        var tracker = AppleLoginPromptTransitionTracker()
+
+        XCTAssertFalse(tracker.update(
+            isLoginActive: false,
+            promptEnabled: true,
+            canSendPassword: true))
+        XCTAssertTrue(tracker.update(
+            isLoginActive: true,
+            promptEnabled: true,
+            canSendPassword: true))
+        XCTAssertFalse(tracker.update(
+            isLoginActive: true,
+            promptEnabled: true,
+            canSendPassword: true))
+        XCTAssertFalse(tracker.update(
+            isLoginActive: false,
+            promptEnabled: true,
+            canSendPassword: true))
+        XCTAssertTrue(tracker.update(
+            isLoginActive: true,
+            promptEnabled: true,
+            canSendPassword: true))
+    }
+
+    func testDisabledOrUnavailablePasswordSuppressesEntryPrompt() {
+        var disabled = AppleLoginPromptTransitionTracker()
+        XCTAssertFalse(disabled.update(
+            isLoginActive: true,
+            promptEnabled: false,
+            canSendPassword: true))
+
+        var missingPassword = AppleLoginPromptTransitionTracker()
+        XCTAssertFalse(missingPassword.update(
+            isLoginActive: true,
+            promptEnabled: true,
+            canSendPassword: false))
+    }
+
+    func testResetAllowsAConnectedReplacementToPrompt() {
+        var tracker = AppleLoginPromptTransitionTracker()
+        XCTAssertTrue(tracker.update(
+            isLoginActive: true,
+            promptEnabled: true,
+            canSendPassword: true))
+        tracker.reset()
+        XCTAssertTrue(tracker.update(
+            isLoginActive: true,
+            promptEnabled: true,
+            canSendPassword: true))
     }
 }
 
@@ -1889,6 +2016,22 @@ final class VideoBandGeometryTests: XCTestCase {
             renderer.containerLayer.sublayers?.count,
             1,
             "The first new frame must replace, not accumulate with, old SSRC layers")
+    }
+
+    @MainActor
+    func testCommittedHighPerformanceFrameIsAvailableForVision() throws {
+        let renderer = VideoBandLayerRenderer()
+        renderer.setScreenSize(width: 100, height: 100)
+        var committedSize: CGSize?
+        renderer.onFrameCommitted = { buffer in
+            committedSize = CGSize(
+                width: CVPixelBufferGetWidth(buffer),
+                height: CVPixelBufferGetHeight(buffer))
+        }
+
+        renderer.setBands([1: try makePixelBuffer(width: 100, height: 100)])
+
+        XCTAssertEqual(committedSize, CGSize(width: 100, height: 100))
     }
 
     @MainActor

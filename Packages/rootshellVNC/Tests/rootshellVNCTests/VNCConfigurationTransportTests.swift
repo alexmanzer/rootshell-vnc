@@ -21,6 +21,7 @@ private struct StubTransportConnection: RFBConnection {
     func setDisconnectHandler(
         _ handler: (@Sendable (VNCProtocolError) -> Void)?
     ) async {}
+
 }
 
 /// Records provider invocations across concurrency domains.
@@ -94,6 +95,13 @@ private actor SuccessfulRFBConnection: RFBConnection {
     func setDisconnectHandler(
         _ handler: (@Sendable (VNCProtocolError) -> Void)?
     ) async {}
+
+    func enqueueServerBytes(_ data: Data) {
+        serverBytes.append(data)
+        let waiters = readWaiters
+        readWaiters = []
+        for waiter in waiters { waiter.resume() }
+    }
 
     private func consume(_ count: Int) -> Data {
         let start = serverBytes.startIndex + readOffset
@@ -229,6 +237,38 @@ final class VNCConfigurationTransportTests: XCTestCase {
     }
 
     @MainActor
+    func testSessionPublishesAppleLoginPromptFromDisplayInfo2() async throws {
+        let connection = SuccessfulRFBConnection(name: "apple-login")
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            promptForLoginPasswordAtLoginWindow: true,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0))
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+
+        try await session.connect(credentials: VNCCredentials(
+            host: "apple.test",
+            port: 5900,
+            password: "secret"))
+        let connected = await waitUntil {
+            session.connectionState.isConnected
+        }
+        XCTAssertTrue(connected)
+
+        await connection.enqueueServerBytes(
+            Self.appleLoginFramebufferUpdate(screenFlags: 0x10))
+        let prompted = await waitUntil {
+            session.loginPasswordPromptPending
+        }
+        XCTAssertTrue(prompted)
+        XCTAssertTrue(session.consumeLoginPasswordPromptRequest())
+        XCTAssertFalse(session.consumeLoginPasswordPromptRequest())
+        session.disconnect()
+    }
+
+    @MainActor
     func testReconnectAppliesConfigurationAndRetainsActiveCredentials() async throws {
         let recorder = SuccessfulProviderRecorder()
         var configuration = VNCConfiguration(
@@ -269,6 +309,28 @@ final class VNCConfigurationTransportTests: XCTestCase {
         XCTAssertEqual(recorder.recorded.map(\.port), [5901, 5901])
 
         session.disconnect()
+    }
+
+    private static func appleLoginFramebufferUpdate(
+        screenFlags: UInt32
+    ) -> Data {
+        var payload = Data(repeating: 0, count: 20)
+        payload[0] = 0
+        payload[1] = 18
+        payload[2] = 0
+        payload[3] = 5
+        payload[16] = UInt8((screenFlags >> 24) & 0xff)
+        payload[17] = UInt8((screenFlags >> 16) & 0xff)
+        payload[18] = UInt8((screenFlags >> 8) & 0xff)
+        payload[19] = UInt8(screenFlags & 0xff)
+
+        var update = Data([0, 0, 0, 1])
+        update.append(contentsOf: [
+            0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 4, 81,
+        ])
+        update.append(payload)
+        return update
     }
 
     @MainActor

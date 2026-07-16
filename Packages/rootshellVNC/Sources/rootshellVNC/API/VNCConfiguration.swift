@@ -241,6 +241,11 @@ public struct VNCConfiguration: Sendable {
     /// Whether negotiated remote system audio should play on this device.
     public var enableRemoteAudio: Bool
 
+    /// Whether an Apple Login Window or visually detected lock screen should
+    /// offer to type the saved connection password. The user must still
+    /// confirm the existing password-send dialog before any input is sent.
+    public var promptForLoginPasswordAtLoginWindow: Bool
+
     /// Whether the selected connection and sizing modes can carry remote
     /// system audio.
     var supportsRemoteAudio: Bool {
@@ -305,6 +310,7 @@ public struct VNCConfiguration: Sendable {
         displayCount: Int = 1,
         displayMode: DisplayMode? = nil,
         enableRemoteAudio: Bool = true,
+        promptForLoginPasswordAtLoginWindow: Bool = false,
         targetFrameRate: Int = 60,
         enableProtocolTrace: Bool = false,
         reconnectionPolicy: VNCReconnectionPolicy = VNCReconnectionPolicy(),
@@ -341,6 +347,8 @@ public struct VNCConfiguration: Sendable {
         }
         self.displayMode = resolvedDisplayMode
         self.enableRemoteAudio = enableRemoteAudio
+        self.promptForLoginPasswordAtLoginWindow =
+            promptForLoginPasswordAtLoginWindow
         self.targetFrameRate = max(1, min(120, targetFrameRate))
         self.enableProtocolTrace = enableProtocolTrace
         self.reconnectionPolicy = reconnectionPolicy
@@ -432,12 +440,12 @@ public struct VNCConfiguration: Sendable {
             encodings.append(.extendedDesktopSize)
         }
 
-        // macOS uses its cached CursorImageAlpha record instead of the
-        // standard RFB cursor shape. CursorPosition is paired with it by the
-        // native clients, and advertising both makes the server send local-
-        // cursor updates in every quality mode (including Adaptive and Full
-        // Quality). Other VNC servers simply ignore these pseudo-encodings.
-        for encoding in [Encoding.unknown(1104), .unknown(1100)] {
+        // DisplayInfo2 carries both display layout and the real Login Window
+        // state (ordinary user locks require the visual fallback). macOS also
+        // uses its cached CursorImageAlpha record instead of the standard RFB
+        // cursor shape. Advertise all three in every quality
+        // mode; other VNC servers simply ignore these pseudo-encodings.
+        for encoding in [Encoding.unknown(1105), .unknown(1104), .unknown(1100)] {
             if !encodings.contains(encoding) {
                 encodings.append(encoding)
             }

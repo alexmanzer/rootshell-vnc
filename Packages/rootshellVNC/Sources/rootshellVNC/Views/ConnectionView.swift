@@ -206,6 +206,15 @@ public struct ConnectionView: View {
                     .submitLabel(.go)
                     .onSubmit(initiateConnection)
             }
+
+            Toggle(
+                String(localized: "Prompt at Mac Login", bundle: .module),
+                isOn: $session.configuration.promptForLoginPasswordAtLoginWindow)
+            Text(String(
+                localized: "When an Apple Login Window or lock screen is detected, offer to type the saved password.",
+                bundle: .module))
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
     }
 

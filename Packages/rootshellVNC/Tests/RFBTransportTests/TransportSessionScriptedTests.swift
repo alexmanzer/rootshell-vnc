@@ -773,6 +773,57 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    func testAppleDisplayInfo2EmitsDeduplicatedLoginStateChanges() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 2, height: 1, name: "apple-login-state"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "secret",
+            preferredEncodings: [.unknown(1105), .raw],
+            connection: connection)
+        let eventTask = Task { () -> [AppleRemoteSessionState] in
+            var states: [AppleRemoteSessionState] = []
+            for await event in session.events {
+                switch event {
+                case .appleRemoteSessionState(let state):
+                    states.append(state)
+                    if states.count == 3 { return states }
+                case .framebufferUpdate:
+                    try? await session.finishFramebufferUpdate()
+                default:
+                    break
+                }
+            }
+            return states
+        }
+        try await session.connect()
+
+        var updates = Data()
+        for flags: UInt32 in [0, 0x10, 0x10, 0] {
+            updates.append(Self.framebufferUpdate([(
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: 0, height: 0,
+                    encoding: 1105),
+                Self.appleDisplayInfo2Payload(screenFlags: flags)
+            )]))
+        }
+        await connection.enqueueServerBytes(updates)
+
+        let states = await eventTask.value
+        XCTAssertEqual(states.count, 3)
+        XCTAssertFalse(states[0].requiresLogin)
+        XCTAssertTrue(states[1].loginWindowActive)
+        XCTAssertFalse(states[2].requiresLogin)
+        await session.disconnect()
+    }
+
     func testAppleClassicPortableFrameStillActivatesAutoUpdatesAfterFullFrame() async throws {
         let connection = ScriptedRFBConnection()
         let width: UInt16 = 2
@@ -947,6 +998,21 @@ final class TransportSessionScriptedTests: XCTestCase {
             UInt8((value >> 8) & 0xff),
             UInt8(value & 0xff),
         ])
+    }
+
+    private static func appleDisplayInfo2Payload(
+        screenFlags: UInt32
+    ) -> Data {
+        var data = Data(repeating: 0, count: 20)
+        data[0] = 0
+        data[1] = 18
+        data[2] = 0
+        data[3] = 5
+        data[16] = UInt8((screenFlags >> 24) & 0xff)
+        data[17] = UInt8((screenFlags >> 16) & 0xff)
+        data[18] = UInt8((screenFlags >> 8) & 0xff)
+        data[19] = UInt8(screenFlags & 0xff)
+        return data
     }
 
     private static func occurrenceCount(of pattern: Data, in data: Data) -> Int {

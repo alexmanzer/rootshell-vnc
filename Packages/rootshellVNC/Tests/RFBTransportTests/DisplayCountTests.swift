@@ -2,6 +2,72 @@ import XCTest
 @testable import RFBTransport
 
 final class DisplayCountTests: XCTestCase {
+    func testAppleDisplayInfo2DecodesLoginWindowFlags() throws {
+        var payload = Data(repeating: 0, count: 20)
+        payload[0] = 0
+        payload[1] = 18
+        payload[2] = 0
+        payload[3] = 5
+
+        payload[19] = 0x10
+        var state = try XCTUnwrap(
+            appleDisplayInfo2RemoteSessionState(payload))
+        XCTAssertTrue(state.loginWindowActive)
+        XCTAssertFalse(state.loginWindowLockScreenActive)
+        XCTAssertTrue(state.requiresLogin)
+
+        payload[19] = 0x08
+        state = try XCTUnwrap(
+            appleDisplayInfo2RemoteSessionState(payload))
+        XCTAssertFalse(state.loginWindowActive)
+        XCTAssertTrue(state.loginWindowLockScreenActive)
+        XCTAssertTrue(state.requiresLogin)
+
+        payload[19] = 0x18
+        state = try XCTUnwrap(
+            appleDisplayInfo2RemoteSessionState(payload))
+        XCTAssertTrue(state.loginWindowActive)
+        XCTAssertTrue(state.loginWindowLockScreenActive)
+    }
+
+    func testAppleDisplayInfo2IgnoresUnavailableSessionFlags() {
+        var legacy = Data(repeating: 0, count: 20)
+        legacy[2] = 0
+        legacy[3] = 3
+        legacy[19] = 0x18
+        XCTAssertNil(appleDisplayInfo2RemoteSessionState(legacy))
+        XCTAssertNil(appleDisplayInfo2RemoteSessionState(
+            Data(repeating: 0, count: 19)))
+    }
+
+    func testAppleDisplayInfo2DecodesUnprefixedMediaBody() throws {
+        var payload = Data(repeating: 0, count: 18)
+        payload[0] = 0
+        payload[1] = 5
+        payload[17] = 0x10
+
+        let state = try XCTUnwrap(
+            appleDisplayInfo2RemoteSessionState(payload))
+        XCTAssertTrue(state.loginWindowActive)
+        XCTAssertFalse(state.loginWindowLockScreenActive)
+    }
+
+    func testAppleDisplayInfo2DecodesLittleEndianScreenFlags() throws {
+        var payload = Data(repeating: 0, count: 20)
+        payload[0] = 0
+        payload[1] = 18
+        payload[2] = 0
+        payload[3] = 5
+        payload[16] = 0x08
+
+        let metadata = try XCTUnwrap(
+            appleDisplayInfo2SessionMetadata(payload))
+        XCTAssertEqual(metadata.version, 5)
+        XCTAssertEqual(metadata.screenFlagsBigEndian, 0x0800_0000)
+        XCTAssertEqual(metadata.screenFlagsLittleEndian, 0x08)
+        XCTAssertTrue(metadata.state.loginWindowLockScreenActive)
+    }
+
     func testAppleDisplayInfo2DecodesPhysicalPixelRegions() {
         var payload = Data(repeating: 0, count: 134)
         func write(_ value: UInt16, at offset: Int) {

@@ -37,6 +37,38 @@ func normalizedSelectedDisplayRegion(
     return selected.offsetBy(dx: -all.minX, dy: -all.minY)
 }
 
+/// Edge detector for Apple Login Window announcements. DisplayInfo2 is sent
+/// repeatedly while a layout is stable, but a password prompt should only be
+/// offered once per entry into the login or lock-screen state.
+struct AppleLoginPromptTransitionTracker {
+    private(set) var isLoginActive = false
+
+    mutating func update(
+        isLoginActive newValue: Bool,
+        promptEnabled: Bool,
+        canSendPassword: Bool
+    ) -> Bool {
+        let enteredLogin = newValue && !isLoginActive
+        isLoginActive = newValue
+        return enteredLogin && promptEnabled && canSendPassword
+    }
+
+    mutating func reset() {
+        isLoginActive = false
+    }
+}
+
+private enum AppleLoginVisionFrame: @unchecked Sendable {
+    case image(CGImage)
+    case pixelBuffer(CVPixelBuffer)
+}
+
+private struct AppleLoginVisionOutcome: Sendable {
+    let analysis: AppleLoginTextAnalysis?
+    let errorDescription: String?
+    let elapsedMilliseconds: UInt64
+}
+
 /// Tracks the portions of Apple DCT type-0 base images that have not yet been
 /// covered by type-1 refinement rectangles. A large base is commonly followed
 /// by many horizontal bands, not one refinement message.
@@ -265,6 +297,11 @@ public final class VNCSession {
     /// (or sent an explicit empty one) — callers fall back to the default.
     public private(set) var remoteCursor: RemoteCursor?
 
+    /// Whether the server has requested a one-shot password confirmation for
+    /// the current Apple Login Window episode. This remains pending until a
+    /// host UI consumes it, so an event received during navigation is not lost.
+    public private(set) var loginPasswordPromptPending = false
+
     // MARK: - Configuration
 
     /// The configuration for this session.
@@ -312,6 +349,29 @@ public final class VNCSession {
     /// offer credential actions without ever reading or displaying the secret.
     @ObservationIgnored
     private var activeCredentials: VNCCredentials?
+    @ObservationIgnored
+    private var appleLoginPromptTracker = AppleLoginPromptTransitionTracker()
+    @ObservationIgnored
+    private var appleLoginVisionTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var appleLoginVisionRetryTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var appleLoginVisionLatestFrame: (
+        frame: AppleLoginVisionFrame,
+        source: String
+    )?
+    @ObservationIgnored
+    private var appleLoginVisionAttemptCount = 0
+    @ObservationIgnored
+    private var appleLoginVisionLastAttemptNanos: UInt64 = 0
+    @ObservationIgnored
+    private var appleLoginVisionGeneration: UInt64 = 0
+    @ObservationIgnored
+    private var appleLoginVisionDetected = false
+    @ObservationIgnored
+    private var appleLoginVisionPromptOffered = false
+    @ObservationIgnored
+    private var appleServerProtocolObserved = false
     private var framebuffer: Framebuffer?
     private var renderer: FramebufferRenderer?
     private var videoStreamManager: VideoStreamManager?
@@ -426,6 +486,11 @@ public final class VNCSession {
     /// - Parameter configuration: Session configuration. Defaults to sensible values.
     public init(configuration: VNCConfiguration = VNCConfiguration()) {
         self.configuration = configuration
+        videoBandRenderer.onFrameCommitted = { [weak self] pixelBuffer in
+            self?.considerAppleLoginVisionFrame(
+                .pixelBuffer(pixelBuffer),
+                source: "High Performance full frame")
+        }
         #if canImport(UIKit)
         observeApplicationLifecycle()
         #endif
@@ -471,6 +536,14 @@ public final class VNCSession {
         connectionState = .connecting
         connectionPhaseDescription = String(localized: "Opening connection…", bundle: .module)
         activeCredentials = credentials
+        resetAppleLoginPromptState()
+        logger.debug(
+            "Apple login prompt configured: enabled="
+                + "\(configuration.promptForLoginPasswordAtLoginWindow) "
+                + "passwordAvailable=\(!credentials.password.isEmpty) "
+                + "quality=\(configuration.videoQualityMode.rawValue) "
+                + "displayInfo2Requested="
+                + "\(configuration.effectiveEncodings.contains(.unknown(1105)))")
         appleMediaTilesPerFrameOverride = nil
         lastError = nil
         currentImage = nil
@@ -557,6 +630,7 @@ public final class VNCSession {
         }
         transportSession = nil
         activeCredentials = nil
+        resetAppleLoginPromptState()
 
         // Clear rendering state
         framebuffer = nil
@@ -630,6 +704,26 @@ public final class VNCSession {
     /// login window. The password itself is intentionally never exposed.
     public var canSendLoginPassword: Bool {
         connectionState.isConnected && !(activeCredentials?.password.isEmpty ?? true)
+    }
+
+    /// Consume a pending Apple Login Window password prompt.
+    ///
+    /// Returns `true` exactly once for each pending request. Consuming a
+    /// request does not send input; the caller should first present its own
+    /// confirmation UI and invoke ``sendLoginPassword()`` only if accepted.
+    @discardableResult
+    public func consumeLoginPasswordPromptRequest() -> Bool {
+        guard loginPasswordPromptPending, canSendLoginPassword else {
+            logger.debug(
+                "Apple login prompt was not consumed: pending="
+                    + "\(loginPasswordPromptPending) "
+                    + "canSendPassword=\(canSendLoginPassword)")
+            loginPasswordPromptPending = false
+            return false
+        }
+        loginPasswordPromptPending = false
+        logger.debug("Apple login prompt consumed by host UI")
+        return true
     }
 
     /// Type the active connection's password and press Return. This mirrors
@@ -937,6 +1031,7 @@ public final class VNCSession {
             diagnostics.encryptionMode = "Cipher mode \(info.cipherMode), key length \(info.keyLength)"
 
         case .displayInfo(let info):
+            appleServerProtocolObserved = true
             logger.info("Display info: \(info.width)x\(info.height) at (\(info.originX),\(info.originY))")
             updateRemoteDisplayRegion(
                 id: info.displayIndex,
@@ -945,10 +1040,15 @@ public final class VNCSession {
                 width: Int(info.width),
                 height: Int(info.height))
 
+        case .appleRemoteSessionState(let state):
+            appleServerProtocolObserved = true
+            handleAppleRemoteSessionState(state)
+
         case .desktopLayout(let layout):
             updateRemoteDisplayRegions(layout.screens)
 
         case .mediaStreamOffer(let offer):
+            appleServerProtocolObserved = true
             logger.info(
                 "Media stream offer: stream=\(offer.streamID) type=\(offer.messageType ?? 0) "
                     + "audioPort=\(offer.audioStreamUDPPort ?? 0) "
@@ -1238,6 +1338,9 @@ public final class VNCSession {
             trailingSnapshotTask = nil
             currentImage = image
             lastImagePublishNanos = DispatchTime.now().uptimeNanoseconds
+            considerAppleLoginVisionFrame(
+                .image(image),
+                source: "Standard framebuffer snapshot")
         } else {
             if awaitsDCTRefinement || completedDCTRefinement {
                 // Pending bases replace cadence-only snapshots so they cannot
@@ -1435,6 +1538,7 @@ public final class VNCSession {
         if clearCredentials {
             activeCredentials = nil
         }
+        resetAppleLoginPromptState()
 
         // These values describe the retired transport's negotiated media and
         // display topology. Keeping them across a configuration reconnect can
@@ -1456,6 +1560,173 @@ public final class VNCSession {
         secondaryVideoStreamManager = nil
         remoteAudioPlayer?.stop()
         remoteAudioPlayer = nil
+    }
+
+    private func handleAppleRemoteSessionState(
+        _ state: AppleRemoteSessionState
+    ) {
+        let promptEnabled =
+            configuration.promptForLoginPasswordAtLoginWindow
+        let passwordAvailable = canSendLoginPassword
+        let shouldPrompt = appleLoginPromptTracker.update(
+            isLoginActive: state.requiresLogin,
+            promptEnabled: promptEnabled,
+            canSendPassword: passwordAvailable)
+        logger.debug(
+            "Apple login state reached session: loginWindow="
+                + "\(state.loginWindowActive) "
+                + "lockScreen=\(state.loginWindowLockScreenActive) "
+                + "enabled=\(promptEnabled) "
+                + "canSendPassword=\(passwordAvailable) "
+                + "willPrompt=\(shouldPrompt)")
+        if !state.requiresLogin {
+            // Ordinary user locks deliberately arrive as false here. Preserve
+            // a prompt established from the full-frame visual fallback.
+            if !appleLoginVisionDetected {
+                loginPasswordPromptPending = false
+            }
+        } else if shouldPrompt {
+            appleLoginVisionAttemptCount = Self.appleLoginVisionMaximumAttempts
+            appleLoginVisionRetryTask?.cancel()
+            appleLoginVisionRetryTask = nil
+            loginPasswordPromptPending = true
+            logger.info("Apple server entered Login Window state")
+        }
+    }
+
+    private func resetAppleLoginPromptState() {
+        appleLoginPromptTracker.reset()
+        appleLoginVisionTask?.cancel()
+        appleLoginVisionTask = nil
+        appleLoginVisionRetryTask?.cancel()
+        appleLoginVisionRetryTask = nil
+        appleLoginVisionLatestFrame = nil
+        appleLoginVisionAttemptCount = 0
+        appleLoginVisionLastAttemptNanos = 0
+        appleLoginVisionGeneration &+= 1
+        appleLoginVisionDetected = false
+        appleLoginVisionPromptOffered = false
+        appleServerProtocolObserved = false
+        loginPasswordPromptPending = false
+    }
+
+    private static let appleLoginVisionMaximumAttempts = 3
+    private static let appleLoginVisionMinimumIntervalNanos: UInt64 = 700_000_000
+
+    /// Inspect only a few initial, already-composited full frames. The cheap
+    /// guards run on the main actor; Vision itself runs at utility priority.
+    private func considerAppleLoginVisionFrame(
+        _ frame: AppleLoginVisionFrame,
+        source: String
+    ) {
+        guard configuration.promptForLoginPasswordAtLoginWindow,
+              canSendLoginPassword,
+              appleServerProtocolObserved else { return }
+        appleLoginVisionLatestFrame = (frame, source)
+
+        guard !appleLoginPromptTracker.isLoginActive,
+              !appleLoginVisionDetected,
+              !appleLoginVisionPromptOffered,
+              appleLoginVisionAttemptCount
+                < Self.appleLoginVisionMaximumAttempts,
+              appleLoginVisionTask == nil else { return }
+
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard appleLoginVisionLastAttemptNanos == 0
+                || now &- appleLoginVisionLastAttemptNanos
+                    >= Self.appleLoginVisionMinimumIntervalNanos else {
+            return
+        }
+
+        appleLoginVisionAttemptCount += 1
+        appleLoginVisionRetryTask?.cancel()
+        appleLoginVisionRetryTask = nil
+        appleLoginVisionLastAttemptNanos = now
+        let attempt = appleLoginVisionAttemptCount
+        let generation = appleLoginVisionGeneration
+        logger.debug(
+            "Apple login Vision attempt \(attempt)/"
+                + "\(Self.appleLoginVisionMaximumAttempts) source=\(source)")
+
+        appleLoginVisionTask = Task { [weak self] in
+            let outcome = await Task.detached(priority: .utility) {
+                let started = DispatchTime.now().uptimeNanoseconds
+                do {
+                    let analysis: AppleLoginTextAnalysis
+                    switch frame {
+                    case .image(let image):
+                        analysis = try AppleLoginScreenDetector.recognize(
+                            cgImage: image)
+                    case .pixelBuffer(let pixelBuffer):
+                        analysis = try AppleLoginScreenDetector.recognize(
+                            pixelBuffer: pixelBuffer)
+                    }
+                    return AppleLoginVisionOutcome(
+                        analysis: analysis,
+                        errorDescription: nil,
+                        elapsedMilliseconds:
+                            (DispatchTime.now().uptimeNanoseconds &- started)
+                                / 1_000_000)
+                } catch {
+                    return AppleLoginVisionOutcome(
+                        analysis: nil,
+                        errorDescription: error.localizedDescription,
+                        elapsedMilliseconds:
+                            (DispatchTime.now().uptimeNanoseconds &- started)
+                                / 1_000_000)
+                }
+            }.value
+
+            guard let self, !Task.isCancelled,
+                  generation == self.appleLoginVisionGeneration else { return }
+            self.appleLoginVisionTask = nil
+
+            guard let analysis = outcome.analysis else {
+                let errorText = outcome.errorDescription ?? "unknown error"
+                self.logger.warning(
+                    "Apple login Vision attempt \(attempt) failed after "
+                        + "\(outcome.elapsedMilliseconds)ms: "
+                        + errorText)
+                self.scheduleAppleLoginVisionRetry(generation: generation)
+                return
+            }
+            self.logger.debug(
+                "Apple login Vision result attempt=\(attempt) "
+                    + "detected=\(analysis.isLoginScreen) "
+                    + "lines=\(analysis.recognizedLineCount) "
+                    + "evidence=\(analysis.evidence) "
+                    + "elapsed=\(outcome.elapsedMilliseconds)ms")
+
+            if analysis.isLoginScreen {
+                self.appleLoginVisionDetected = true
+                self.appleLoginVisionPromptOffered = true
+                self.loginPasswordPromptPending = true
+                self.logger.info(
+                    "Apple lock screen detected from full-frame Vision; "
+                        + "password confirmation prompt dispatched")
+            } else if attempt == Self.appleLoginVisionMaximumAttempts {
+                self.logger.debug(
+                    "Apple login Vision exhausted initial full-frame attempts "
+                        + "without a high-confidence lock-screen match")
+            } else {
+                self.scheduleAppleLoginVisionRetry(generation: generation)
+            }
+        }
+    }
+
+    private func scheduleAppleLoginVisionRetry(generation: UInt64) {
+        guard appleLoginVisionAttemptCount < Self.appleLoginVisionMaximumAttempts,
+              appleLoginVisionRetryTask == nil else { return }
+        appleLoginVisionRetryTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard let self, !Task.isCancelled,
+                  generation == self.appleLoginVisionGeneration,
+                  let latest = self.appleLoginVisionLatestFrame else { return }
+            self.appleLoginVisionRetryTask = nil
+            self.considerAppleLoginVisionFrame(
+                latest.frame,
+                source: latest.source + " retry")
+        }
     }
 
     /// Escalation of last resort for a video bootstrap that never produced a
@@ -1722,6 +1993,9 @@ public final class VNCSession {
             if let image {
                 self.currentImage = image
                 self.lastImagePublishNanos = DispatchTime.now().uptimeNanoseconds
+                self.considerAppleLoginVisionFrame(
+                    .image(image),
+                    source: "Standard trailing snapshot")
                 if resetsDCTRefinement {
                     self.dctRefinementTracker.reset()
                 }

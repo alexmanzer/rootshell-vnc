@@ -11875,6 +11875,7 @@
         }
       }
     },
+    "Prompt at Mac Login": {},
     "Protocol error: %@": {
       "localizations": {
         "ar": {
@@ -17889,7 +17890,8 @@
           }
         }
       }
-    }
+    },
+    "When an Apple Login Window or lock screen is detected, offer to type the saved password.": {}
   },
   "version": "1.0"
 }
