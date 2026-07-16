@@ -762,13 +762,23 @@ public actor TransportSession {
             || serverVersion?.isApple == true
     }
 
+    static func shouldUseApplePackedClipboard(
+        capabilities: AppleServerCapabilities?
+    ) -> Bool {
+        capabilities?.supportsServerCommand(
+            AppleClipboardProtocol.packedScrapMessageType) == true
+    }
+
     /// Send clipboard text to the server.
     public func sendClipboardText(_ text: String) async throws {
-        // AppleVNCServer still implements ordinary ClientCutText for text.
-        // Keep this interoperable path instead of emitting Apple's private
-        // packed-scrap send format, whose rich-flavor schema is not public.
-        let msg = ClientMessage.clientCutText(text)
-        try await sendClientPayload(msg.serialize())
+        let payload: Data
+        if Self.shouldUseApplePackedClipboard(
+            capabilities: appleServerCapabilities) {
+            payload = try AppleClipboardProtocol.packedTextMessage(text)
+        } else {
+            payload = ClientMessage.clientCutText(text).serialize()
+        }
+        try await sendClientPayload(payload)
     }
 
     public var supportsRemoteClipboardRequest: Bool {

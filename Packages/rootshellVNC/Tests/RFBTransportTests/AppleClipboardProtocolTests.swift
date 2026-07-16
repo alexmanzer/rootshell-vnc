@@ -1,4 +1,5 @@
 import XCTest
+import RFBProtocol
 @testable import RFBTransport
 
 final class AppleClipboardProtocolTests: XCTestCase {
@@ -32,5 +33,102 @@ final class AppleClipboardProtocolTests: XCTestCase {
                 compressed: compressed,
                 uncompressedSize: 47),
             "hello")
+    }
+
+    func testPackedTextMessageHeaderAndRoundTrip() throws {
+        let text = "hello, 🌎"
+        let message = try AppleClipboardProtocol.packedTextMessage(text)
+
+        XCTAssertEqual(message[0], AppleClipboardProtocol.packedScrapMessageType)
+        XCTAssertEqual(message[2], 0, "Full clipboard data is not a promise")
+        XCTAssertEqual(message.count, AppleClipboardProtocol.packedScrapHeaderSize
+            + Int(AppleClipboardProtocol.uint32BE(message, at: 12)!))
+
+        let uncompressedSize = Int(
+            AppleClipboardProtocol.uint32BE(message, at: 8)!)
+        let compressed = Data(message.dropFirst(
+            AppleClipboardProtocol.packedScrapHeaderSize))
+        XCTAssertEqual(
+            try AppleClipboardProtocol.unpackText(
+                compressed: compressed,
+                uncompressedSize: uncompressedSize),
+            text)
+    }
+
+    func testPackedTextMessageRoundTripsEmptyText() throws {
+        let message = try AppleClipboardProtocol.packedTextMessage("")
+        let uncompressedSize = Int(
+            AppleClipboardProtocol.uint32BE(message, at: 8)!)
+        let compressed = Data(message.dropFirst(
+            AppleClipboardProtocol.packedScrapHeaderSize))
+
+        XCTAssertEqual(
+            try AppleClipboardProtocol.unpackText(
+                compressed: compressed,
+                uncompressedSize: uncompressedSize),
+            "")
+    }
+
+    func testPackedTextMessageUsesNativeSyncFlushBoundary() throws {
+        let message = try AppleClipboardProtocol.packedTextMessage("abcdef")
+        let compressed = Data(message.dropFirst(
+            AppleClipboardProtocol.packedScrapHeaderSize))
+
+        // Apple's CopyPackedScrapData leaves its zlib stream open at a
+        // Z_SYNC_FLUSH boundary instead of emitting Z_STREAM_END + Adler-32.
+        // Block selection and total compressed length are implementation
+        // details; only the empty stored-block marker is guaranteed.
+        XCTAssertEqual(
+            compressed.suffix(4),
+            Data([0x00, 0x00, 0xFF, 0xFF]))
+    }
+
+    func testPackedTextMessageDrainsMultipleCompressionBuffers() throws {
+        var state: UInt64 = 0x1234_5678_9ABC_DEF0
+        var bytes = [UInt8]()
+        bytes.reserveCapacity(128 * 1024)
+        for _ in 0..<(128 * 1024) {
+            state = state &* 6_364_136_223_846_793_005
+                &+ 1_442_695_040_888_963_407
+            bytes.append(UInt8((state >> 32) % 95) + 32)
+        }
+        let text = String(decoding: bytes, as: UTF8.self)
+        let message = try AppleClipboardProtocol.packedTextMessage(text)
+        let compressed = Data(message.dropFirst(
+            AppleClipboardProtocol.packedScrapHeaderSize))
+        let uncompressedSize = Int(
+            AppleClipboardProtocol.uint32BE(message, at: 8)!)
+
+        XCTAssertGreaterThan(
+            compressed.count,
+            AppleClipboardProtocol.compressionChunkSize)
+        XCTAssertEqual(
+            try AppleClipboardProtocol.unpackText(
+                compressed: compressed,
+                uncompressedSize: uncompressedSize),
+            text)
+    }
+
+    func testPackedClipboardSelectionUsesServerCommandBitmap() {
+        var packedBitmap = Data(repeating: 0, count: 16)
+        packedBitmap[3] = 0x01 // command 31, MSB-first numbering
+        let packedCapabilities = capabilities(bitmap: packedBitmap)
+
+        var legacyBitmap = Data(repeating: 0, count: 16)
+        legacyBitmap[0] = 0x02 // command 6 only
+        let legacyCapabilities = capabilities(bitmap: legacyBitmap)
+
+        XCTAssertTrue(TransportSession.shouldUseApplePackedClipboard(
+            capabilities: packedCapabilities))
+        XCTAssertFalse(TransportSession.shouldUseApplePackedClipboard(
+            capabilities: legacyCapabilities))
+        XCTAssertFalse(TransportSession.shouldUseApplePackedClipboard(
+            capabilities: nil))
+    }
+
+    private func capabilities(bitmap: Data) -> AppleServerCapabilities {
+        var field = Data([0, 0, 0, 0, 0, 0])
+        field.append(bitmap)
+        return AppleServerCapabilities(serverInitNameField: field)!
     }
 }

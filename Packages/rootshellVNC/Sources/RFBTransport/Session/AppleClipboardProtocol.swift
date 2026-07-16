@@ -1,5 +1,6 @@
 import Foundation
 import RFBProtocol
+import zlib
 
 /// Text-only support for the private pasteboard extension used by Apple's
 /// Screen Sharing client. Rich flavors are consumed and ignored so clipboard
@@ -10,6 +11,7 @@ enum AppleClipboardProtocol {
     static let packedScrapMessageType: UInt8 = 31
     static let packedScrapHeaderSize = 16
     static let maximumClipboardSize = 100 * 1024 * 1024
+    static let compressionChunkSize = 64 * 1024
 
     static func requestMessage(requestID: UInt32 = 0) -> Data {
         var data = Data([requestMessageType, 0, 0, 0])
@@ -25,6 +27,44 @@ enum AppleClipboardProtocol {
         ])
     }
 
+    /// Serialize one UTF-8 text flavor using the packed-scrap message emitted
+    /// by Apple's Screen Sharing client. Byte two remains zero because this is
+    /// complete pasteboard data rather than a pasteboard promise.
+    static func packedTextMessage(_ text: String) throws -> Data {
+        let flavorType = Data("public.utf8-plain-text".utf8)
+        let textData = Data(text.utf8)
+        let fixedScrapSize = 4 + 4 + flavorType.count + 4 + 4 + 4
+        guard textData.count <= maximumClipboardSize - fixedScrapSize else {
+            throw VNCProtocolError.protocolViolation(
+                "Apple clipboard size is out of range")
+        }
+
+        var scrap = Data(capacity: fixedScrapSize + textData.count)
+        appendUInt32BE(1, to: &scrap) // one pasteboard item flavor
+        appendUInt32BE(UInt32(flavorType.count), to: &scrap)
+        scrap.append(flavorType)
+        appendUInt32BE(0, to: &scrap) // no translation requested
+        appendUInt32BE(0, to: &scrap) // no additional UTI tags
+        appendUInt32BE(UInt32(textData.count), to: &scrap)
+        scrap.append(textData)
+
+        let compressed = try compress(scrap)
+        guard !compressed.isEmpty,
+              compressed.count <= maximumClipboardSize else {
+            throw VNCProtocolError.protocolViolation(
+                "Apple clipboard size is out of range")
+        }
+
+        var message = Data([
+            packedScrapMessageType, 0, 0, 0,
+            0, 0, 0, 0,
+        ])
+        appendUInt32BE(UInt32(scrap.count), to: &message)
+        appendUInt32BE(UInt32(compressed.count), to: &message)
+        message.append(compressed)
+        return message
+    }
+
     static func unpackText(
         compressed: Data,
         uncompressedSize: Int
@@ -37,7 +77,9 @@ enum AppleClipboardProtocol {
                 "Apple clipboard size is out of range")
         }
 
-        // Apple uses a complete RFC 1950 zlib stream for packed scraps.
+        // Apple clipboard data uses zlib-wrapped DEFLATE. Native client
+        // uploads stop at a Z_SYNC_FLUSH boundary, while server responses may
+        // also use a complete stream; the persistent inflater accepts both.
         let inflater = try RFBZlibStreamInflater()
         let scrap = try inflater.decompress(
             compressed,
@@ -158,5 +200,65 @@ enum AppleClipboardProtocol {
         data.append(UInt8((value >> 16) & 0xFF))
         data.append(UInt8((value >> 8) & 0xFF))
         data.append(UInt8(value & 0xFF))
+    }
+
+    private static func compress(_ input: Data) throws -> Data {
+        var stream = z_stream()
+        let initializeStatus = deflateInit_(
+            &stream,
+            Z_BEST_COMPRESSION,
+            zlibVersion(),
+            Int32(MemoryLayout<z_stream>.size))
+        guard initializeStatus == Z_OK else {
+            throw VNCProtocolError.ioError(
+                "Could not initialize Apple clipboard zlib stream "
+                    + "(status \(initializeStatus))")
+        }
+        defer { deflateEnd(&stream) }
+
+        // compressBound is a useful allocation hint, but zlib does not
+        // guarantee it is sufficient for Z_SYNC_FLUSH. Keep draining with the
+        // same flush mode until deflate reports unused output space.
+        var output = Data()
+        output.reserveCapacity(min(
+            Int(compressBound(uLong(input.count))),
+            maximumClipboardSize))
+        var chunk = Data(count: compressionChunkSize)
+
+        try input.withUnsafeBytes { inputBytes in
+            guard let inputBase = inputBytes
+                .bindMemory(to: Bytef.self).baseAddress else {
+                throw VNCProtocolError.ioError(
+                    "Could not access Apple clipboard bytes")
+            }
+            stream.next_in = UnsafeMutablePointer(mutating: inputBase)
+            stream.avail_in = uInt(input.count)
+
+            repeat {
+                let inputBefore = stream.avail_in
+                let status = chunk.withUnsafeMutableBytes { outputBytes in
+                    guard let outputBase = outputBytes
+                        .bindMemory(to: Bytef.self).baseAddress else {
+                        return Z_BUF_ERROR
+                    }
+                    stream.next_out = outputBase
+                    stream.avail_out = uInt(compressionChunkSize)
+                    return deflate(&stream, Z_SYNC_FLUSH)
+                }
+                let produced = compressionChunkSize - Int(stream.avail_out)
+                guard status == Z_OK,
+                      produced > 0 || stream.avail_in < inputBefore else {
+                    throw VNCProtocolError.ioError(
+                        "Could not compress Apple clipboard "
+                            + "(zlib status \(status))")
+                }
+                output.append(chunk.prefix(produced))
+                guard output.count <= maximumClipboardSize else {
+                    throw VNCProtocolError.protocolViolation(
+                        "Apple clipboard size is out of range")
+                }
+            } while stream.avail_in > 0 || stream.avail_out == 0
+        }
+        return output
     }
 }

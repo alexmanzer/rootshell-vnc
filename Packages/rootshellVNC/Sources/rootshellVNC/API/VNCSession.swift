@@ -1658,11 +1658,29 @@ public final class VNCSession {
                 case .gesture(let event):
                     try? await transport.sendGestureEvent(event)
                 case .clipboard(let text):
-                    try? await transport.sendClipboardText(text)
+                    do {
+                        try await transport.sendClipboardText(text)
+                    } catch {
+                        self.logger.warning(
+                            "Failed to send clipboard: "
+                                + error.localizedDescription)
+                    }
                 case .clipboardRequest:
-                    try? await transport.requestRemoteClipboard()
+                    do {
+                        try await transport.requestRemoteClipboard()
+                    } catch {
+                        self.logger.warning(
+                            "Failed to request remote clipboard: "
+                                + error.localizedDescription)
+                    }
                 case .sharedClipboard(let enabled):
-                    try? await transport.setSharedClipboardEnabled(enabled)
+                    do {
+                        try await transport.setSharedClipboardEnabled(enabled)
+                    } catch {
+                        self.logger.warning(
+                            "Failed to update shared clipboard state: "
+                                + error.localizedDescription)
+                    }
                 }
             }
             if self.inputGeneration == generation {
