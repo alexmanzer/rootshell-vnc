@@ -90,7 +90,7 @@ struct RemoteInteractionView: UIViewRepresentable {
 
 @MainActor
 final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
-    UIPointerInteractionDelegate, UIContextMenuInteractionDelegate {
+    UIPointerInteractionDelegate {
     var onViewportChange: ((RemoteViewportState) -> Void)?
     var onKeyboardActiveChange: ((Bool) -> Void)?
     var onHardwareKeyboardAttachedChange: ((Bool) -> Void)?
@@ -113,7 +113,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var lastPointerPoint: (x: UInt16, y: UInt16)?
     private var remoteCursor: RemoteCursor?
     private var pointerDragActive = false
-    private var activeDirectTouches = Set<ObjectIdentifier>()
     private var touchHoldDragLastPoint: (x: UInt16, y: UInt16)?
     private var touchHoldDragActive = false
     private var lastKnownFramebufferPoint: (x: UInt16, y: UInt16)?
@@ -198,7 +197,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         target: self,
         action: #selector(handleHover(_:)))
     private lazy var pointerInteraction = UIPointerInteraction(delegate: self)
-    private lazy var secondaryClickInteraction = UIContextMenuInteraction(delegate: self)
     #if targetEnvironment(macCatalyst)
     private var catalystCursor: NSCursor?
     private var catalystCursorDisplayScale: CGFloat = 0
@@ -481,7 +479,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         isMultipleTouchEnabled = true
         accessibilityLabel = String(localized: "Remote desktop input", bundle: .module)
         configureRecognizers()
-        addInteraction(secondaryClickInteraction)
         #if !targetEnvironment(macCatalyst)
         addInteraction(pointerInteraction)
         addSubview(remoteCursorImageView)
@@ -1608,26 +1605,34 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// Direct touches are left to the touch recognizer, whose catch also
     /// suppresses the accidental click.
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        activeDirectTouches.formUnion(touches.lazy
-            .filter { $0.type == .direct }
-            .map(ObjectIdentifier.init))
         if touches.contains(where: { $0.type == .direct }) {
             stopEdgeScrolling()
         }
         if touches.contains(where: { $0.type != .direct }) {
             catchMomentumFlingIfActive()
         }
+        handleSecondaryPointerDown(in: touches, event: event)
         super.touchesBegan(touches, with: event)
     }
 
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        activeDirectTouches.subtract(Set(touches.lazy.map(ObjectIdentifier.init)))
-        super.touchesEnded(touches, with: event)
-    }
-
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        activeDirectTouches.subtract(Set(touches.lazy.map(ObjectIdentifier.init)))
-        super.touchesCancelled(touches, with: event)
+    /// A context-menu interaction also owns held primary-button input, which
+    /// can cancel a Finder drag before it moves. Route an actual trackpad
+    /// secondary button from its raw mask instead, leaving primary holds under
+    /// the dedicated drag recognizer's exclusive control.
+    private func handleSecondaryPointerDown(
+        in touches: Set<UITouch>,
+        event: UIEvent?
+    ) {
+        guard let event,
+              event.buttonMask.contains(.secondary),
+              !event.buttonMask.contains(.primary),
+              let touch = touches.first(where: {
+                  $0.type == .indirectPointer
+              }),
+              let point = framebufferPoint(
+                  for: touch.location(in: self)) else { return }
+        focusForHardwareKeyboard()
+        touchHandler.handleRightClick(x: point.x, y: point.y)
     }
 
     private func cancelScrollInteraction() {
@@ -1856,6 +1861,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         case .began, .changed:
             catchMomentumFlingIfActive()
             let location = recognizer.location(in: self)
+            #if !targetEnvironment(macCatalyst)
+            // Hover updates pause while the trackpad button is down. Advance
+            // the custom remote-cursor image from the drag stream without
+            // sending a zero-button pointer event that would release the item.
+            updateRemoteCursorImage(at: location)
+            #endif
             if pointerDragUsesIndirectPointer {
                 updatePointerPanning(at: location, isDragging: true)
             } else {
@@ -2244,23 +2255,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         styleFor region: UIPointerRegion
     ) -> UIPointerStyle? {
         remoteCursor == nil ? nil : .hidden()
-    }
-
-    func contextMenuInteraction(
-        _ interaction: UIContextMenuInteraction,
-        configurationForMenuAtLocation location: CGPoint
-    ) -> UIContextMenuConfiguration? {
-        // UIContextMenuInteraction also recognizes a direct-touch long press.
-        // That gesture is already remote hold-to-drag, so only accept the
-        // context interaction when no finger is currently on the display.
-        guard activeDirectTouches.isEmpty,
-              let point = framebufferPoint(for: location) else { return nil }
-
-        catchMomentumFlingIfActive()
-        focusForHardwareKeyboard()
-        touchHandler.handleRightClick(x: point.x, y: point.y)
-        // The remote desktop owns the contextual action; suppress a local menu.
-        return nil
     }
 
     func gestureRecognizer(

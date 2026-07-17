@@ -2206,6 +2206,28 @@ final class TouchInputHandlerTests: XCTestCase {
     }
 
     @MainActor
+    func testDragSequenceKeepsLeftButtonPressedUntilRelease() {
+        var events: [(UInt8, UInt16, UInt16)] = []
+        let handler = TouchInputHandler { mask, x, y in
+            events.append((mask, x, y))
+        }
+
+        handler.handleDrag(x: 100, y: 200)
+        handler.handleDrag(x: 140, y: 240)
+        handler.handleDrag(x: 180, y: 280)
+        handler.handleDragEnd(x: 180, y: 280)
+
+        XCTAssertEqual(events.map { $0.0 }, [
+            TouchInputHandler.leftButton,
+            TouchInputHandler.leftButton,
+            TouchInputHandler.leftButton,
+            0,
+        ])
+        XCTAssertEqual(events.map { $0.1 }, [100, 140, 180, 180])
+        XCTAssertEqual(events.map { $0.2 }, [200, 240, 280, 280])
+    }
+
+    @MainActor
     func testHandleDoubleTap() {
         var events: [(UInt8, UInt16, UInt16)] = []
         let handler = TouchInputHandler { mask, x, y in
