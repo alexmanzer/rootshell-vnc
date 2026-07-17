@@ -420,11 +420,13 @@ public struct RemoteDesktopView: View {
             }
 
             if keyboardCapture.hasReservedHostShortcuts {
-                Toggle(isOn: Binding(
-                    get: { keyboardCapture.routesReservedHostShortcutsToVNC },
-                    set: { keyboardCapture.routeReservedHostShortcutsToVNC($0) }
-                )) {
-                    Label(String(localized: "Route Reserved Shortcuts to VNC", bundle: .module), systemImage: "keyboard.badge.ellipsis")
+                if hardwareKeyboardAttached {
+                    Toggle(isOn: Binding(
+                        get: { keyboardCapture.routesReservedHostShortcutsToVNC },
+                        set: { keyboardCapture.routeReservedHostShortcutsToVNC($0) }
+                    )) {
+                        Label(String(localized: "Route Reserved Shortcuts to VNC", bundle: .module), systemImage: "keyboard.badge.ellipsis")
+                    }
                 }
             } else {
                 Button {
