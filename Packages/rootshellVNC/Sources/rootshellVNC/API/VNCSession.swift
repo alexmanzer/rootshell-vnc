@@ -739,14 +739,55 @@ public final class VNCSession {
     public func sendLoginPassword() {
         guard canSendLoginPassword, let password = activeCredentials?.password else { return }
 
-        for character in password {
-            let keysym = KeyboardInputHandler.keysymForCharacter(character)
-            guard keysym != 0 else { continue }
-            sendKeyEvent(downFlag: true, key: keysym)
-            sendKeyEvent(downFlag: false, key: keysym)
+        for event in Self.loginPasswordInputEvents(password: password) {
+            switch event {
+            case .key(let downFlag, let keysym):
+                sendKeyEvent(downFlag: downFlag, key: keysym)
+            case .pause:
+                enqueueInput(event)
+            case .pointer, .scroll, .gesture, .clipboard, .clipboardRequest,
+                 .sharedClipboard:
+                assertionFailure("Unexpected event in login password sequence")
+            }
         }
-        sendKeyEvent(downFlag: true, key: KeyboardInputHandler.keysymReturn)
-        sendKeyEvent(downFlag: false, key: KeyboardInputHandler.keysymReturn)
+    }
+
+    /// Construct the exact ordered input sequence used by
+    /// ``sendLoginPassword()``. Modifier releases prevent a locally held or
+    /// remotely latched modifier from changing the password, while a small
+    /// delay after each complete key tap gives login windows time to process
+    /// secure text input without separating a key-down from its key-up.
+    nonisolated static func loginPasswordInputEvents(
+        password: String
+    ) -> [SessionInputEvent] {
+        let modifierKeysyms: [UInt32] = [
+            KeyboardInputHandler.keysymCapsLock,
+            KeyboardInputHandler.keysymShiftL,
+            KeyboardInputHandler.keysymSuperL,
+            KeyboardInputHandler.keysymAltL,
+            KeyboardInputHandler.keysymControlL,
+            KeyboardInputHandler.keysymControlR,
+            KeyboardInputHandler.keysymSuperR,
+            KeyboardInputHandler.keysymAltR,
+            KeyboardInputHandler.keysymShiftR,
+        ]
+        let interKeyDelayNanoseconds: UInt64 = 5_000_000
+        var events = modifierKeysyms.map {
+            SessionInputEvent.key(downFlag: false, keysym: $0)
+        }
+
+        func appendKeyTap(_ keysym: UInt32) {
+            guard keysym != 0 else { return }
+            events.append(.key(downFlag: true, keysym: keysym))
+            events.append(.key(downFlag: false, keysym: keysym))
+            events.append(.pause(nanoseconds: interKeyDelayNanoseconds))
+        }
+
+        for character in password {
+            appendKeyTap(KeyboardInputHandler.keysymForCharacter(character))
+        }
+        appendKeyTap(KeyboardInputHandler.keysymReturn)
+        return events
     }
 
     /// Send a key press or release event to the VNC server.
@@ -2030,6 +2071,9 @@ public final class VNCSession {
                         batch.append(batchable)
                     }
                     try? await transport.sendInputEvents(batch)
+                case .pause(let nanoseconds):
+                    try? await Task.sleep(
+                        for: .nanoseconds(Int64(clamping: nanoseconds)))
                 case .scroll(let event):
                     try? await transport.sendScrollEvent(event)
                 case .gesture(let event):
@@ -2118,7 +2162,8 @@ public final class VNCSession {
             return .key(downFlag: downFlag, key: keysym)
         case .pointer(let buttonMask, let x, let y):
             return .pointer(buttonMask: buttonMask, x: x, y: y)
-        case .scroll, .gesture, .clipboard, .clipboardRequest, .sharedClipboard:
+        case .pause, .scroll, .gesture, .clipboard, .clipboardRequest,
+             .sharedClipboard:
             return nil
         }
     }

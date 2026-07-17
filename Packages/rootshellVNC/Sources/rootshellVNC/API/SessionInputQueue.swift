@@ -10,6 +10,9 @@ import RFBProtocol
 /// coalescing only redundant samples within one uninterrupted input run.
 enum SessionInputEvent: Sendable, Equatable {
     case key(downFlag: Bool, keysym: UInt32)
+    /// An ordering barrier used for input sequences that remote login fields
+    /// can otherwise process too quickly. This never produces an RFB message.
+    case pause(nanoseconds: UInt64)
     case pointer(buttonMask: UInt8, x: UInt16, y: UInt16)
     case scroll(AppleScrollEvent)
     case gesture(AppleGestureEvent)
