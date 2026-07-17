@@ -13,6 +13,29 @@ final class TransportSessionScriptedTests: XCTestCase {
         .serverDisplayInfo, .raw,
     ]
 
+    func testStagedRemoteDisplayRequestMarksResizeUnsettled() async throws {
+        let states = LockedResizeSettledStates()
+        let session = TransportSession(
+            host: "display.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.appleH264, .raw],
+            requestsVirtualDisplays: true)
+        await session.setAppleRemoteDisplayResizeSettledSink {
+            states.append($0)
+        }
+
+        XCTAssertEqual(states.snapshot(), [true])
+        let disposition = try await session.requestRemoteDisplaySize(
+            pixelWidth: 2048,
+            pixelHeight: 1536,
+            pointWidth: 1024,
+            pointHeight: 768)
+
+        XCTAssertEqual(disposition, .waitingForServerSupport)
+        XCTAssertEqual(states.snapshot(), [true, false])
+    }
+
     func testRFB33ServerSelectedNoneDoesNotSendSecuritySelectionByte() async throws {
         let connection = ScriptedRFBConnection()
         var script = ProtocolVersion.v3_3.wireBytes()
@@ -1056,5 +1079,22 @@ final class TransportSessionScriptedTests: XCTestCase {
             group.cancelAll()
             return first
         }
+    }
+}
+
+private final class LockedResizeSettledStates: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [Bool] = []
+
+    func append(_ value: Bool) {
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+
+    func snapshot() -> [Bool] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
     }
 }

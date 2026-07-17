@@ -334,6 +334,8 @@ public actor TransportSession {
     /// from the new keys/SSRC can overtake it.
     private var appleMediaGenerationSink: (@Sendable (UInt64, Int) -> Void)?
     private var appleRemoteDisplaySizeSink: (@Sendable (UInt16, UInt16) -> Void)?
+    private var appleRemoteDisplayResizeSettledSink:
+        (@Sendable (Bool) -> Void)?
     private var activeAppleMediaTilesPerFrame = Int(
         AppleMediaVideoMode.negotiatedTilesPerFrame)
     /// Physical or virtual screen geometry announced by Apple's encrypted
@@ -1036,6 +1038,16 @@ public actor TransportSession {
         appleRemoteDisplaySizeSink = sink
     }
 
+    /// Reports whether every staged Apple virtual-display request has reached
+    /// a media generation with all expected RTP sources. A complete decoded
+    /// frame is still required by the UI before input is considered safe.
+    public func setAppleRemoteDisplayResizeSettledSink(
+        _ sink: (@Sendable (Bool) -> Void)?
+    ) {
+        appleRemoteDisplayResizeSettledSink = sink
+        sink?(isAppleRemoteDisplayResizeSettled)
+    }
+
     /// Request a framebuffer update from the server.
     public func requestFramebufferUpdate(incremental: Bool) async throws {
         if appleAutoUpdateActive {
@@ -1132,6 +1144,7 @@ public actor TransportSession {
             pointWidth: pointWidth,
             pointHeight: pointHeight)
         guard requested != lastSentRemoteDisplaySize else {
+            emitAppleRemoteDisplayResizeSettled()
             return appleServerCapabilities?.supportsServerCommand(
                 AppleServerCapabilities.displayConfigurationCommand) == true
                 ? .appleVirtualDisplay
@@ -1139,6 +1152,7 @@ public actor TransportSession {
         }
 
         pendingRemoteDisplaySize = requested
+        emitAppleRemoteDisplayResizeSettled()
         if appleServerCapabilities?.supportsServerCommand(
             AppleServerCapabilities.displayConfigurationCommand) == true {
             if requestAppleMediaStream,
@@ -1181,6 +1195,7 @@ public actor TransportSession {
         framebufferCreditWaiter = nil
         appleMediaGenerationSink = nil
         appleRemoteDisplaySizeSink = nil
+        appleRemoteDisplayResizeSettledSink = nil
         await stopAppleMediaUDP()
         await tcp.close()
         let actions = stateMachine.handle(event: .userRequestedDisconnect)
@@ -2713,6 +2728,7 @@ public actor TransportSession {
         try await sendClientPayload(message.serialize())
         lastSentRemoteDisplaySize = requested
         pendingRemoteDisplaySize = nil
+        emitAppleRemoteDisplayResizeSettled()
         appleRemoteDisplaySizeSink?(
             request.width,
             request.height)
@@ -2788,6 +2804,7 @@ public actor TransportSession {
         }
         lastSentRemoteDisplaySize = requested
         pendingRemoteDisplaySize = nil
+        emitAppleRemoteDisplayResizeSettled()
         let aggregateWidth = UInt16(min(
             Int(UInt16.max),
             Int(requested.pixelWidth) * displays.count))
@@ -2800,6 +2817,16 @@ public actor TransportSession {
                 + "\(requested.pointHeight) points), count=\(displays.count) "
                 + "captureLuma=\(appleMediaActiveCaptureLumaSamples) "
                 + "tiles=\(activeAppleMediaTilesPerFrame)")
+    }
+
+    private var isAppleRemoteDisplayResizeSettled: Bool {
+        pendingRemoteDisplaySize == nil
+            && appleDisplayReconfigurationGeneration == nil
+    }
+
+    private func emitAppleRemoteDisplayResizeSettled() {
+        appleRemoteDisplayResizeSettledSink?(
+            isAppleRemoteDisplayResizeSettled)
     }
 
     private nonisolated func appleMediaServerControl(_ payload: Data) -> (encoding: UInt16, body: Data)? {
@@ -4964,6 +4991,8 @@ public actor TransportSession {
                 Task { [weak self] in
                     await self?.applyQueuedVirtualDisplayAfterMediaReady()
                 }
+            } else {
+                emitAppleRemoteDisplayResizeSettled()
             }
         }
 

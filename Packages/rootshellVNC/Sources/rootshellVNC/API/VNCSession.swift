@@ -58,6 +58,63 @@ struct AppleLoginPromptTransitionTracker {
     }
 }
 
+/// Holds one user-approved password-send intent across Match Client display
+/// transitions. A token is valid only for the latest requested display target
+/// and latest complete High Performance media generation.
+struct LoginPasswordSendStabilityGate {
+    struct Token: Sendable, Equatable {
+        let displayRevision: UInt64
+        let mediaGeneration: UInt64
+    }
+
+    private(set) var isPending = false
+    private(set) var displayRevision: UInt64 = 0
+    private(set) var stableCandidate: Token?
+    private(set) var isTransportSettled = false
+
+    mutating func requestSend() -> Token? {
+        isPending = true
+        return isTransportSettled ? stableCandidate : nil
+    }
+
+    mutating func displayTargetChanged() {
+        displayRevision &+= 1
+        isTransportSettled = false
+        stableCandidate = nil
+    }
+
+    mutating func transportSettled(_ settled: Bool) {
+        guard settled != isTransportSettled else { return }
+        isTransportSettled = settled
+        // A frame committed before the transport finished draining queued
+        // resize commands may belong to the capture graph being retired.
+        displayRevision &+= 1
+        stableCandidate = nil
+    }
+
+    mutating func noteEligibleFrame(mediaGeneration: UInt64) -> Token? {
+        guard isTransportSettled else { return nil }
+        let token = Token(
+            displayRevision: displayRevision,
+            mediaGeneration: mediaGeneration)
+        stableCandidate = token
+        return isPending ? token : nil
+    }
+
+    mutating func consume(_ token: Token) -> Bool {
+        guard isPending, stableCandidate == token else { return false }
+        isPending = false
+        return true
+    }
+
+    mutating func reset() {
+        isPending = false
+        isTransportSettled = false
+        displayRevision &+= 1
+        stableCandidate = nil
+    }
+}
+
 private enum AppleLoginVisionFrame: @unchecked Sendable {
     case image(CGImage)
     case pixelBuffer(CVPixelBuffer)
@@ -377,6 +434,13 @@ public final class VNCSession {
     private var appleLoginVisionHighPerformanceGeneration: UInt64?
     @ObservationIgnored
     private var appleServerProtocolObserved = false
+    @ObservationIgnored
+    private var loginPasswordSendGate = LoginPasswordSendStabilityGate()
+    @ObservationIgnored
+    private var loginPasswordSendStabilityTask: Task<Void, Never>?
+    @ObservationIgnored
+    private var loginPasswordSendScheduledToken:
+        LoginPasswordSendStabilityGate.Token?
     private var framebuffer: Framebuffer?
     private var renderer: FramebufferRenderer?
     private var videoStreamManager: VideoStreamManager?
@@ -493,6 +557,9 @@ public final class VNCSession {
         self.configuration = configuration
         videoBandRenderer.onFrameCommitted = {
             [weak self] pixelBuffer, streamGeneration in
+            self?.noteHighPerformanceFrameForPendingLoginPassword(
+                pixelBuffer,
+                mediaGeneration: streamGeneration)
             self?.considerAppleLoginVisionFrame(
                 .pixelBuffer(pixelBuffer),
                 source: "High Performance full frame",
@@ -713,6 +780,18 @@ public final class VNCSession {
         connectionState.isConnected && !(activeCredentials?.password.isEmpty ?? true)
     }
 
+    /// Apple may publish Login Window state just before its media offer. Treat
+    /// that short negotiation window as High Performance too, otherwise an
+    /// immediate confirmation can type into the display about to be retired.
+    private var shouldDeferLoginPasswordForMatchClientStability: Bool {
+        guard configuration.displaySizingMode == .matchClient else {
+            return false
+        }
+        return isHighPerformanceMode
+            || (configuration.videoQualityMode == .adaptive
+                && appleServerProtocolObserved)
+    }
+
     /// Consume a pending Apple Login Window password prompt.
     ///
     /// Returns `true` exactly once for each pending request. Consuming a
@@ -739,17 +818,57 @@ public final class VNCSession {
     public func sendLoginPassword() {
         guard canSendLoginPassword, let password = activeCredentials?.password else { return }
 
-        for event in Self.loginPasswordInputEvents(password: password) {
+        guard shouldDeferLoginPasswordForMatchClientStability else {
+            sendLoginPasswordNow(password)
+            return
+        }
+
+        let wasPending = loginPasswordSendGate.isPending
+        let token = loginPasswordSendGate.requestSend()
+        if let token {
+            scheduleLoginPasswordSendAfterStability(token: token)
+        }
+        if !wasPending {
+            logger.info(
+                "Password send queued until Match Client display is stable")
+        }
+    }
+
+    private func sendLoginPasswordNow(_ password: String) {
+        logger.info("Sending approved login password input")
+
+        let focusX = UInt16(clamping: framebufferWidth / 2)
+        let focusY = UInt16(clamping: framebufferHeight / 2)
+        let events = Self.loginPasswordFocusInputEvents(x: focusX, y: focusY)
+            + Self.loginPasswordInputEvents(password: password)
+        for event in events {
             switch event {
             case .key(let downFlag, let keysym):
                 sendKeyEvent(downFlag: downFlag, key: keysym)
             case .pause:
                 enqueueInput(event)
-            case .pointer, .scroll, .gesture, .clipboard, .clipboardRequest,
+            case .pointer(let buttonMask, let x, let y):
+                sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
+            case .scroll, .gesture, .clipboard, .clipboardRequest,
                  .sharedClipboard:
                 assertionFailure("Unexpected event in login password sequence")
             }
         }
+    }
+
+    /// Focus macOS Login Window before typing. Pointer events and the pause
+    /// share the ordered input queue with the password, so no key can overtake
+    /// the click that establishes the secure field's first responder.
+    nonisolated static func loginPasswordFocusInputEvents(
+        x: UInt16,
+        y: UInt16
+    ) -> [SessionInputEvent] {
+        [
+            .pointer(buttonMask: 0, x: x, y: y),
+            .pointer(buttonMask: 1, x: x, y: y),
+            .pointer(buttonMask: 0, x: x, y: y),
+            .pause(nanoseconds: 150_000_000),
+        ]
     }
 
     /// Construct the exact ordered input sequence used by
@@ -953,7 +1072,14 @@ public final class VNCSession {
 
         // ConnectionView supplies the viewport before connecting; the remote
         // desktop view keeps it current for window changes and device rotation.
+        let displayTargetChanged = preparedClientDisplaySize != requested
         preparedClientDisplaySize = requested
+
+        if displayTargetChanged,
+           isHighPerformanceMode || loginPasswordSendGate.isPending {
+            loginPasswordSendGate.displayTargetChanged()
+            cancelScheduledLoginPasswordSend()
+        }
 
         guard connectionState.isConnected,
               let transport = transportSession,
@@ -1662,6 +1788,8 @@ public final class VNCSession {
         appleLoginVisionPromptOffered = false
         appleLoginVisionHighPerformanceGeneration = nil
         appleServerProtocolObserved = false
+        cancelScheduledLoginPasswordSend()
+        loginPasswordSendGate.reset()
         loginPasswordPromptPending = false
     }
 
@@ -1669,6 +1797,71 @@ public final class VNCSession {
     private static let appleLoginVisionMinimumIntervalNanos: UInt64 = 700_000_000
     private static let appleLoginVisionHighPerformanceStabilityDelay =
         Duration.milliseconds(350)
+    /// Transport settlement plus a final-size frame gates the send. The
+    /// ordered center click establishes Login Window focus without a fixed
+    /// multi-second delay.
+    private static let loginPasswordPostResizeInputReadinessDelay =
+        Duration.zero
+
+    private func noteHighPerformanceFrameForPendingLoginPassword(
+        _ pixelBuffer: CVPixelBuffer,
+        mediaGeneration: UInt64
+    ) {
+        guard isHighPerformanceMode,
+              configuration.displaySizingMode == .matchClient,
+              isEligibleHighPerformanceLoginVisionFrame(pixelBuffer),
+              let token = loginPasswordSendGate.noteEligibleFrame(
+                mediaGeneration: mediaGeneration) else { return }
+        scheduleLoginPasswordSendAfterStability(token: token)
+    }
+
+    private func noteRemoteDisplayResizeSettled(_ settled: Bool) {
+        loginPasswordSendGate.transportSettled(settled)
+        let pending = loginPasswordSendGate.isPending
+        logger.debug(
+            "Match Client resize transport settled=\(settled) "
+                + "passwordPending=\(pending)")
+        if !settled {
+            cancelScheduledLoginPasswordSend()
+        }
+    }
+
+    private func scheduleLoginPasswordSendAfterStability(
+        token: LoginPasswordSendStabilityGate.Token
+    ) {
+        if loginPasswordSendScheduledToken == token,
+           loginPasswordSendStabilityTask != nil {
+            return
+        }
+        cancelScheduledLoginPasswordSend()
+        let displayRevision = token.displayRevision
+        let mediaGeneration = token.mediaGeneration
+        logger.debug(
+            "Final Match Client frame eligible for password send; "
+                + "waiting for remote input readiness: "
+                + "displayRevision=\(displayRevision) "
+                + "mediaGeneration=\(mediaGeneration)")
+        loginPasswordSendScheduledToken = token
+        loginPasswordSendStabilityTask = Task { [weak self] in
+            try? await Task.sleep(
+                for: Self.loginPasswordPostResizeInputReadinessDelay)
+            guard let self, !Task.isCancelled else { return }
+            self.loginPasswordSendStabilityTask = nil
+            self.loginPasswordSendScheduledToken = nil
+            guard self.isHighPerformanceMode,
+                  self.configuration.displaySizingMode == .matchClient,
+                  self.canSendLoginPassword,
+                  self.loginPasswordSendGate.consume(token),
+                  let password = self.activeCredentials?.password else { return }
+            self.sendLoginPasswordNow(password)
+        }
+    }
+
+    private func cancelScheduledLoginPasswordSend() {
+        loginPasswordSendStabilityTask?.cancel()
+        loginPasswordSendStabilityTask = nil
+        loginPasswordSendScheduledToken = nil
+    }
 
     /// Inspect only a few initial, already-composited full frames. The cheap
     /// guards run on the main actor; Vision itself runs at utility priority.
@@ -2767,6 +2960,12 @@ public final class VNCSession {
             await transport.setAppleRemoteDisplaySizeSink { [weak self] width, height in
                 Task { @MainActor [weak self] in
                     self?.applyDesktopResizeMetadata(width: width, height: height)
+                }
+            }
+            await transport.setAppleRemoteDisplayResizeSettledSink {
+                [weak self] settled in
+                Task { @MainActor [weak self] in
+                    self?.noteRemoteDisplayResizeSettled(settled)
                 }
             }
             await transport.setAppleMediaRoutedRTPSink { packet, displayIndex in
