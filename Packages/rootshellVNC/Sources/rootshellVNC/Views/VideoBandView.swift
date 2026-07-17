@@ -16,10 +16,11 @@ import RFBTransport
 @MainActor
 public final class VideoBandLayerRenderer {
 
-    /// The layer the host view displays. It contains one atomic display layer.
-    public let containerLayer = CALayer()
-
     private let displayLayer = AVSampleBufferDisplayLayer()
+    private let brightnessPresenter = VNCBrightnessPresenter(contentsGravity: .resize)
+    /// The layer the host view displays. Boosted IOSurface contents live on
+    /// this same layer, preserving the renderer's one atomic display sublayer.
+    public var containerLayer: CALayer { brightnessPresenter.layer }
     private let compositor = CompoundBandSurfaceCompositor()
     private var bandBuffers: [UInt32: CVPixelBuffer] = [:]
     private var previousBandBuffers: [UInt32: CVPixelBuffer] = [:]
@@ -41,6 +42,7 @@ public final class VideoBandLayerRenderer {
     private(set) var lastCommitBandCount = 0
     private(set) var partialCommitCount: UInt64 = 0
     private var expectedBandCount = Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
+    private var brightnessGain = 1.0
 
     /// Called after a complete stitched surface has been committed. Consumers
     /// such as one-shot Vision analysis can inspect the exact full image
@@ -62,6 +64,16 @@ public final class VideoBandLayerRenderer {
         displayLayer.masksToBounds = true
         displayLayer.contentsScale = pixelScale
         containerLayer.addSublayer(displayLayer)
+    }
+
+    /// Apply the host's global HDR brightness gain. The presenter internally
+    /// forces this to neutral on pre-26 systems and retains the native
+    /// AVSampleBufferDisplayLayer path when no boost is active.
+    public func setBrightnessGain(_ gain: Double) {
+        guard brightnessGain != gain else { return }
+        brightnessGain = gain
+        brightnessPresenter.setGain(gain)
+        reconcilePresentationPath()
     }
 
     /// Set the backing scale to the host display's scale so the decoded frames
@@ -91,6 +103,9 @@ public final class VideoBandLayerRenderer {
         previousBandBuffers.removeAll()
         displayedBuffer = nil
         previousDisplayedBuffer = nil
+        brightnessPresenter.reset()
+        brightnessPresenter.setGain(brightnessGain)
+        reconcilePresentationPath()
         compositor.reset()
         replaceLayersOnNextFrame = false
     }
@@ -142,6 +157,8 @@ public final class VideoBandLayerRenderer {
         // Core Image can observe a pool surface after it has been recycled.
         previousDisplayedBuffer = displayedBuffer
         displayedBuffer = frame
+        brightnessPresenter.setSource(frame, gain: brightnessGain)
+        reconcilePresentationPath()
 
         let videoRenderer = displayLayer.sampleBufferRenderer
         if videoRenderer.status == .failed {
@@ -220,6 +237,13 @@ public final class VideoBandLayerRenderer {
         CATransaction.setDisableActions(true)
         containerLayer.frame = CGRect(x: originX, y: originY, width: fitWidth, height: fitHeight)
         displayLayer.frame = containerLayer.bounds
+        CATransaction.commit()
+    }
+
+    private func reconcilePresentationPath() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        displayLayer.isHidden = brightnessPresenter.isPresentingBoostedContent
         CATransaction.commit()
     }
 }
@@ -354,15 +378,20 @@ private final class BandHostView: UIView {
 /// SwiftUI wrapper that displays a session's decoded screen bands on the GPU.
 public struct VideoBandView: UIViewRepresentable {
     private let renderer: VideoBandLayerRenderer
+    private let brightnessGain: Double
 
-    public init(renderer: VideoBandLayerRenderer) {
+    public init(renderer: VideoBandLayerRenderer, brightnessGain: Double = 1.0) {
         self.renderer = renderer
+        self.brightnessGain = brightnessGain
     }
 
     public func makeUIView(context: Context) -> UIView {
-        BandHostView(renderer: renderer)
+        renderer.setBrightnessGain(brightnessGain)
+        return BandHostView(renderer: renderer)
     }
 
-    public func updateUIView(_ uiView: UIView, context: Context) {}
+    public func updateUIView(_ uiView: UIView, context: Context) {
+        renderer.setBrightnessGain(brightnessGain)
+    }
 }
 #endif

@@ -2,6 +2,8 @@ import SwiftUI
 import RFBProtocol
 #if canImport(UIKit)
 import UIKit
+#elseif canImport(AppKit)
+import AppKit
 #endif
 
 struct DockedKeyboardViewportMetrics: Equatable {
@@ -66,6 +68,7 @@ public struct RemoteDesktopView: View {
     private let keyboardAvoidanceMode: VNCKeyboardAvoidanceMode
     private let clipboardSynchronizer: VNCClipboardSynchronizer?
     private let hostOwnsRecoveryChrome: Bool
+    private let brightnessGain: Double
 
     #if canImport(UIKit)
     /// A host-provided accessory can remain visible without the software
@@ -83,7 +86,8 @@ public struct RemoteDesktopView: View {
         toggleFullScreen: (() -> Void)? = nil,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
         clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
-        hostOwnsRecoveryChrome: Bool = false
+        hostOwnsRecoveryChrome: Bool = false,
+        brightnessGain: Double = 1.0
     ) {
         self.init(
             session: session,
@@ -93,6 +97,7 @@ public struct RemoteDesktopView: View {
             keyboardAvoidanceMode: keyboardAvoidanceMode,
             clipboardSynchronizer: clipboardSynchronizer,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
+            brightnessGain: brightnessGain,
             hudMenuExtras: nil)
     }
 
@@ -110,6 +115,7 @@ public struct RemoteDesktopView: View {
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
         clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
         hostOwnsRecoveryChrome: Bool = false,
+        brightnessGain: Double = 1.0,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
     ) {
         self.init(
@@ -120,6 +126,7 @@ public struct RemoteDesktopView: View {
             keyboardAvoidanceMode: keyboardAvoidanceMode,
             clipboardSynchronizer: clipboardSynchronizer,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
+            brightnessGain: brightnessGain,
             hudMenuExtras: AnyView(hudMenuExtras()))
     }
 
@@ -131,6 +138,7 @@ public struct RemoteDesktopView: View {
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode,
         clipboardSynchronizer: VNCClipboardSynchronizer?,
         hostOwnsRecoveryChrome: Bool,
+        brightnessGain: Double,
         hudMenuExtras: AnyView?
     ) {
         self.session = session
@@ -142,6 +150,7 @@ public struct RemoteDesktopView: View {
         self.toggleFullScreen = toggleFullScreen
         self.keyboardAvoidanceMode = keyboardAvoidanceMode
         self.clipboardSynchronizer = clipboardSynchronizer
+        self.brightnessGain = brightnessGain
         self.touchHandler = TouchInputHandler(
             sendPointerEvent: { [session] buttonMask, x, y in
                 session.sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
@@ -310,7 +319,8 @@ public struct RemoteDesktopView: View {
             AdaptiveDisplayView(
                 primaryRenderer: session.videoBandRenderer,
                 secondaryRenderer: session.secondaryVideoBandRenderer,
-                displayRegions: session.presentedVideoDisplayRegions)
+                displayRegions: session.presentedVideoDisplayRegions,
+                brightnessGain: brightnessGain)
                 .frame(width: viewSize.width, height: viewSize.height)
             #else
             placeholderView
@@ -319,7 +329,8 @@ public struct RemoteDesktopView: View {
         } else {
             StandardFramebufferContent(
                 session: session,
-                showsWaitingCard: !hostOwnsRecoveryChrome)
+                showsWaitingCard: !hostOwnsRecoveryChrome,
+                brightnessGain: brightnessGain)
                 .frame(width: viewSize.width, height: viewSize.height)
         }
     }
@@ -949,6 +960,7 @@ private struct StandardFramebufferContent: View {
     @Bindable var session: VNCSession
     /// False when the host renders its own connected-but-no-frame prompt.
     let showsWaitingCard: Bool
+    let brightnessGain: Double
 
     var body: some View {
         if let image = session.currentImage {
@@ -957,6 +969,14 @@ private struct StandardFramebufferContent: View {
                 .interpolation(.high)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
+                .overlay {
+                    #if canImport(UIKit) || canImport(AppKit)
+                    VNCEDRImageView(
+                        image: displayedImage,
+                        brightnessGain: brightnessGain)
+                        .allowsHitTesting(false)
+                    #endif
+                }
         } else if showsWaitingCard, session.connectionState.isConnected {
             // Handshake finished but no framebuffer content has been
             // published. The reconnect/failure overlays own the other states.
@@ -987,6 +1007,7 @@ private struct AdaptiveDisplayView: View {
     let primaryRenderer: VideoBandLayerRenderer
     let secondaryRenderer: VideoBandLayerRenderer
     let displayRegions: [CGRect]
+    let brightnessGain: Double
 
     var body: some View {
         GeometryReader { geometry in
@@ -1025,13 +1046,103 @@ private struct AdaptiveDisplayView: View {
         scale: CGFloat,
         origin: CGPoint
     ) -> some View {
-        VideoBandView(renderer: renderer)
+        VideoBandView(
+            renderer: renderer,
+            brightnessGain: brightnessGain)
             .frame(
                 width: region.width * scale,
                 height: region.height * scale)
             .offset(
                 x: origin.x + region.minX * scale,
                 y: origin.y + region.minY * scale)
+    }
+}
+#endif
+
+#if canImport(UIKit)
+private struct VNCEDRImageView: UIViewRepresentable {
+    let image: CGImage
+    let brightnessGain: Double
+
+    func makeUIView(context: Context) -> VNCEDRImageHostView {
+        let view = VNCEDRImageHostView()
+        view.update(image: image, gain: brightnessGain)
+        return view
+    }
+
+    func updateUIView(_ uiView: VNCEDRImageHostView, context: Context) {
+        uiView.update(image: image, gain: brightnessGain)
+    }
+}
+
+@MainActor
+private final class VNCEDRImageHostView: UIView {
+    private let presenter = VNCBrightnessPresenter(contentsGravity: .resizeAspect)
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = false
+        backgroundColor = .clear
+        layer.addSublayer(presenter.layer)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(image: CGImage, gain: Double) {
+        presenter.setSource(image, gain: gain)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        presenter.layer.frame = bounds
+        CATransaction.commit()
+    }
+}
+#elseif canImport(AppKit)
+private struct VNCEDRImageView: NSViewRepresentable {
+    let image: CGImage
+    let brightnessGain: Double
+
+    func makeNSView(context: Context) -> VNCEDRImageHostView {
+        let view = VNCEDRImageHostView()
+        view.update(image: image, gain: brightnessGain)
+        return view
+    }
+
+    func updateNSView(_ nsView: VNCEDRImageHostView, context: Context) {
+        nsView.update(image: image, gain: brightnessGain)
+    }
+}
+
+@MainActor
+private final class VNCEDRImageHostView: NSView {
+    private let presenter = VNCBrightnessPresenter(contentsGravity: .resizeAspect)
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.addSublayer(presenter.layer)
+    }
+
+    convenience init() { self.init(frame: .zero) }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(image: CGImage, gain: Double) {
+        presenter.setSource(image, gain: gain)
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        presenter.layer.frame = bounds
+        CATransaction.commit()
     }
 }
 #endif
