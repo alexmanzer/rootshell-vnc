@@ -71,6 +71,10 @@ struct LoginPasswordSendStabilityGate {
     private(set) var displayRevision: UInt64 = 0
     private(set) var stableCandidate: Token?
     private(set) var isTransportSettled = false
+    /// Media generation of the newest final-size frame, retained across
+    /// settlement edges so a commit that raced the settled signal can be
+    /// revalidated by generation instead of discarded by arrival order.
+    private(set) var latestEligibleFrameGeneration: UInt64?
 
     mutating func requestSend() -> Token? {
         isPending = true
@@ -81,6 +85,7 @@ struct LoginPasswordSendStabilityGate {
         displayRevision &+= 1
         isTransportSettled = false
         stableCandidate = nil
+        latestEligibleFrameGeneration = nil
     }
 
     mutating func transportSettled(_ settled: Bool) {
@@ -92,7 +97,35 @@ struct LoginPasswordSendStabilityGate {
         stableCandidate = nil
     }
 
+    /// A static Login Window may never commit another frame after the settled
+    /// signal arrives, so waiting for one deadlocks the send. A frame that
+    /// committed just before settlement is safe to reuse when it belongs to
+    /// the media generation that is still live: the capture graph that
+    /// produced it was not retired by the resize.
+    mutating func adoptRetainedFrame(liveMediaGeneration: UInt64) -> Token? {
+        guard isTransportSettled,
+              stableCandidate == nil,
+              latestEligibleFrameGeneration == liveMediaGeneration else {
+            return nil
+        }
+        let token = Token(
+            displayRevision: displayRevision,
+            mediaGeneration: liveMediaGeneration)
+        stableCandidate = token
+        return isPending ? token : nil
+    }
+
+    /// A media generation replacement (server capture restart) retires every
+    /// frame and any armed token without necessarily producing a settle edge:
+    /// only a frame from the replacement generation may validate a send.
+    mutating func mediaGenerationChanged() {
+        displayRevision &+= 1
+        stableCandidate = nil
+        latestEligibleFrameGeneration = nil
+    }
+
     mutating func noteEligibleFrame(mediaGeneration: UInt64) -> Token? {
+        latestEligibleFrameGeneration = mediaGeneration
         guard isTransportSettled else { return nil }
         let token = Token(
             displayRevision: displayRevision,
@@ -107,11 +140,42 @@ struct LoginPasswordSendStabilityGate {
         return true
     }
 
-    mutating func reset() {
+    /// Deliver an explicit user request whose stability signals never
+    /// converged. Callers are expected to have exhausted bounded retries
+    /// first; an unconsumed pending click must not stay silent forever.
+    mutating func forceConsumePending() -> Bool {
+        guard isPending else { return false }
         isPending = false
+        return true
+    }
+
+    /// Transport-scoped state always resets; the pending flag is the user's
+    /// approval, not transport state, so an automatic reconnect preserves it
+    /// and delivers once the replacement connection stabilizes.
+    mutating func reset(preservePendingSend: Bool = false) {
+        if !preservePendingSend {
+            isPending = false
+        }
         isTransportSettled = false
         displayRevision &+= 1
         stableCandidate = nil
+        latestEligibleFrameGeneration = nil
+    }
+}
+
+/// Assigns a monotonic sequence to sink emissions on the emitting executor so
+/// a main-actor observer can drop hops that arrive out of order. Unstructured
+/// `Task` hops preserve no ordering; a reordered settled=false landing after
+/// its settled=true would otherwise latch a gate closed indefinitely.
+final class SinkEventSequencer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastValue: UInt64 = 0
+
+    func next() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        lastValue &+= 1
+        return lastValue
     }
 }
 
@@ -445,6 +509,39 @@ public final class VNCSession {
     @ObservationIgnored
     private var loginPasswordSendScheduledToken:
         LoginPasswordSendStabilityGate.Token?
+    @ObservationIgnored
+    private var loginPasswordSendWatchdogTask: Task<Void, Never>?
+    /// Uptime of the most recent display transition affecting the login
+    /// send: a Match Client target change, a resize settlement edge, or a
+    /// media generation replacement. A password send may only start after
+    /// this has been quiet for the full hysteresis window, so a short stable
+    /// gap between resize steps can never half-type a password into a
+    /// capture that is about to restart.
+    @ObservationIgnored
+    private var lastLoginDisplayTransitionNanos: UInt64 = 0
+    /// Renderer generation of the most recent committed frame; a change is a
+    /// display transition even when no resize request produced it.
+    @ObservationIgnored
+    private var lastCommittedFrameGeneration: UInt64?
+    /// Uptime of the most recent password delivery. Never used to authorize
+    /// another send — only to debounce a login-state announcement that the
+    /// unlock itself produces moments after a successful delivery.
+    @ObservationIgnored
+    private var lastLoginPasswordDeliveryNanos: UInt64 = 0
+    @ObservationIgnored
+    private var loginPasswordPromptRecheckTask: Task<Void, Never>?
+    /// Uptime of the newest Apple session-state announcement, regardless of
+    /// its content. Apple servers repeat DisplayInfo2 while a layout is
+    /// stable, so "an announcement newer than X" is a liveness signal the
+    /// prompt debounce can trust over stored state.
+    @ObservationIgnored
+    private var lastSessionStateAnnouncementNanos: UInt64 = 0
+    /// Shared across transport generations: every settled emission funnels
+    /// through this one counter, so ordering holds even across a sink
+    /// reinstall while an old hop is still in flight.
+    private let appleResizeSettledSequencer = SinkEventSequencer()
+    @ObservationIgnored
+    private var appleResizeSettledSequenceApplied: UInt64 = 0
     private var framebuffer: Framebuffer?
     private var renderer: FramebufferRenderer?
     private var videoStreamManager: VideoStreamManager?
@@ -561,6 +658,8 @@ public final class VNCSession {
         self.configuration = configuration
         videoBandRenderer.onFrameCommitted = {
             [weak self] pixelBuffer, streamGeneration in
+            self?.noteCommittedFrameGenerationForLoginQuietClock(
+                streamGeneration)
             self?.noteHighPerformanceFrameForPendingLoginPassword(
                 pixelBuffer,
                 mediaGeneration: streamGeneration)
@@ -833,6 +932,8 @@ public final class VNCSession {
         let token = loginPasswordSendGate.requestSend()
         if let token {
             scheduleLoginPasswordSendAfterStability(token: token)
+        } else {
+            ensurePendingLoginPasswordProgress(reason: "user request")
         }
         if !wasPending {
             logger.info(
@@ -842,6 +943,7 @@ public final class VNCSession {
 
     private func sendLoginPasswordNow(_ password: String) {
         logger.info("Sending approved login password input")
+        lastLoginPasswordDeliveryNanos = DispatchTime.now().uptimeNanoseconds
 
         let focusX = UInt16(clamping: framebufferWidth / 2)
         let focusY = UInt16(clamping: framebufferHeight / 2)
@@ -864,7 +966,10 @@ public final class VNCSession {
 
     /// Focus macOS Login Window before typing. Pointer events and the pause
     /// share the ordered input queue with the password, so no key can overtake
-    /// the click that establishes the secure field's first responder.
+    /// the click that establishes the secure field's first responder. The
+    /// select-all + backspace empties the secure field first: a delivery
+    /// interrupted by a server capture restart can leave a partial password
+    /// behind, and a later confirmed send must replace it, never append.
     nonisolated static func loginPasswordFocusInputEvents(
         x: UInt16,
         y: UInt16
@@ -874,6 +979,13 @@ public final class VNCSession {
             .pointer(buttonMask: 1, x: x, y: y),
             .pointer(buttonMask: 0, x: x, y: y),
             .pause(nanoseconds: 150_000_000),
+            .key(downFlag: true, keysym: KeyboardInputHandler.keysymSuperL),
+            .key(downFlag: true, keysym: 0x61),
+            .key(downFlag: false, keysym: 0x61),
+            .key(downFlag: false, keysym: KeyboardInputHandler.keysymSuperL),
+            .key(downFlag: true, keysym: KeyboardInputHandler.keysymBackspace),
+            .key(downFlag: false, keysym: KeyboardInputHandler.keysymBackspace),
+            .pause(nanoseconds: 50_000_000),
         ]
     }
 
@@ -1083,6 +1195,8 @@ public final class VNCSession {
 
         if displayTargetChanged,
            isHighPerformanceMode || loginPasswordSendGate.isPending {
+            lastLoginDisplayTransitionNanos =
+                DispatchTime.now().uptimeNanoseconds
             loginPasswordSendGate.displayTargetChanged()
             cancelScheduledLoginPasswordSend()
         }
@@ -1769,7 +1883,11 @@ public final class VNCSession {
         if clearCredentials {
             activeCredentials = nil
         }
-        resetAppleLoginPromptState()
+        // An automatic reconnect (credentials retained) tears the transport
+        // down mid-bootstrap; the user's approved password send must outlive
+        // it or a tap during bootstrap silently evaporates.
+        resetAppleLoginPromptState(
+            preservePendingPasswordSend: !clearCredentials)
 
         // These values describe the retired transport's negotiated media and
         // display topology. Keeping them across a configuration reconnect can
@@ -1797,6 +1915,7 @@ public final class VNCSession {
     private func handleAppleRemoteSessionState(
         _ state: AppleRemoteSessionState
     ) {
+        lastSessionStateAnnouncementNanos = DispatchTime.now().uptimeNanoseconds
         let promptEnabled =
             configuration.promptForLoginPasswordAtLoginWindow
         let passwordAvailable = canSendLoginPassword
@@ -1821,12 +1940,25 @@ public final class VNCSession {
             appleLoginVisionAttemptCount = Self.appleLoginVisionMaximumAttempts
             appleLoginVisionRetryTask?.cancel()
             appleLoginVisionRetryTask = nil
-            loginPasswordPromptPending = true
-            logger.info("Apple server entered Login Window state")
+            if loginPasswordSendGate.isPending {
+                // The user already approved a send that is waiting for
+                // display stability; a second dialog would double-type the
+                // password. Treat the announcement as a delivery kick.
+                logger.info(
+                    "Login Window re-announced while a password send is "
+                        + "queued; driving delivery instead of re-prompting")
+                ensurePendingLoginPasswordProgress(
+                    reason: "login window announced")
+            } else {
+                offerLoginPasswordPrompt(
+                    source: "server entered Login Window state")
+            }
         }
     }
 
-    private func resetAppleLoginPromptState() {
+    private func resetAppleLoginPromptState(
+        preservePendingPasswordSend: Bool = false
+    ) {
         appleLoginPromptTracker.reset()
         appleLoginVisionTask?.cancel()
         appleLoginVisionTask = nil
@@ -1843,7 +1975,13 @@ public final class VNCSession {
         appleLoginVisionHighPerformanceGeneration = nil
         appleServerProtocolObserved = false
         cancelScheduledLoginPasswordSend()
-        loginPasswordSendGate.reset()
+        cancelLoginPasswordSendWatchdog()
+        loginPasswordPromptRecheckTask?.cancel()
+        loginPasswordPromptRecheckTask = nil
+        lastSessionStateAnnouncementNanos = 0
+        loginPasswordSendGate.reset(
+            preservePendingSend: preservePendingPasswordSend
+                && !(activeCredentials?.password.isEmpty ?? true))
         loginPasswordPromptPending = false
     }
 
@@ -1851,11 +1989,54 @@ public final class VNCSession {
     private static let appleLoginVisionMinimumIntervalNanos: UInt64 = 700_000_000
     private static let appleLoginVisionHighPerformanceStabilityDelay =
         Duration.milliseconds(350)
-    /// Transport settlement plus a final-size frame gates the send. The
-    /// ordered center click establishes Login Window focus without a fixed
-    /// multi-second delay.
-    private static let loginPasswordPostResizeInputReadinessDelay =
-        Duration.zero
+    /// Continuous display quiet time required before the first key of a
+    /// password send. Transport settlement plus a validated final-size frame
+    /// arm the send; this hysteresis only defers it while transitions are
+    /// still landing, so a tap on a long-quiet login screen types instantly.
+    private static let loginPasswordQuietPeriodNanos: UInt64 = 700_000_000
+    /// Bounded retry cadence for a pending send: re-attempt frame adoption or
+    /// keyframe recovery, then force-deliver once the transport confirms no
+    /// resize remains in flight (some servers never answer FIR, so a fresh
+    /// frame can be genuinely unobtainable). Worst case ~2.8 s; the normal
+    /// path sends the moment a final-size frame validates.
+    private static let loginPasswordSendWatchdogInterval =
+        Duration.milliseconds(700)
+    private static let loginPasswordSendWatchdogMaxAttempts = 4
+    /// A login-state signal inside this window after a delivery is vetted
+    /// against fresh announcements before it may become a dialog: the unlock
+    /// and the loginwindow→session capture handoff bounce the server's login
+    /// state, sometimes with stale flags, and a full login can take tens of
+    /// seconds.
+    private static let loginPasswordPromptDebounceWindowNanos: UInt64 =
+        30_000_000_000
+    private static let loginPasswordPromptRecheckDelay =
+        Duration.milliseconds(2_500)
+    private static let loginPasswordPromptRecheckMaxRounds = 4
+
+    /// The first committed frame of a replacement generation restarts the
+    /// quiet clock: the visible content just changed wholesale, even when no
+    /// resize request or settle edge announced it.
+    private func noteCommittedFrameGenerationForLoginQuietClock(
+        _ generation: UInt64
+    ) {
+        guard lastCommittedFrameGeneration != generation else { return }
+        lastCommittedFrameGeneration = generation
+        lastLoginDisplayTransitionNanos = DispatchTime.now().uptimeNanoseconds
+    }
+
+    /// A server capture restart announces a replacement media generation
+    /// without necessarily staging a resize, so the settle-edge signals never
+    /// see it. Restart the quiet clock and retire any armed send token; only
+    /// a frame from the new generation may validate a send again.
+    private func noteAppleMediaGenerationTransitionForLoginSend() {
+        lastLoginDisplayTransitionNanos = DispatchTime.now().uptimeNanoseconds
+        loginPasswordSendGate.mediaGenerationChanged()
+        cancelScheduledLoginPasswordSend()
+        if loginPasswordSendGate.isPending {
+            ensurePendingLoginPasswordProgress(
+                reason: "media generation replaced")
+        }
+    }
 
     private func noteHighPerformanceFrameForPendingLoginPassword(
         _ pixelBuffer: CVPixelBuffer,
@@ -1869,7 +2050,16 @@ public final class VNCSession {
         scheduleLoginPasswordSendAfterStability(token: token)
     }
 
-    private func noteRemoteDisplayResizeSettled(_ settled: Bool) {
+    private func noteRemoteDisplayResizeSettled(
+        _ settled: Bool,
+        sequence: UInt64
+    ) {
+        guard sequence > appleResizeSettledSequenceApplied else { return }
+        appleResizeSettledSequenceApplied = sequence
+        if settled != loginPasswordSendGate.isTransportSettled {
+            lastLoginDisplayTransitionNanos =
+                DispatchTime.now().uptimeNanoseconds
+        }
         loginPasswordSendGate.transportSettled(settled)
         let pending = loginPasswordSendGate.isPending
         logger.debug(
@@ -1877,7 +2067,208 @@ public final class VNCSession {
                 + "passwordPending=\(pending)")
         if !settled {
             cancelScheduledLoginPasswordSend()
+        } else {
+            ensurePendingLoginPasswordProgress(reason: "resize settled")
         }
+    }
+
+    /// Offer the confirmation dialog, debouncing announcements that arrive
+    /// in the wake of a delivery: the unlock and the session handoff bounce
+    /// the server's login state — sometimes with stale flags — and those
+    /// transients must not present a second dialog for a password that just
+    /// landed. Display logic only — no path here ever sends the password
+    /// without a fresh confirmation.
+    private func offerLoginPasswordPrompt(source: String) {
+        let sinceDelivery = DispatchTime.now().uptimeNanoseconds
+            &- lastLoginPasswordDeliveryNanos
+        if lastLoginPasswordDeliveryNanos != 0,
+           sinceDelivery < Self.loginPasswordPromptDebounceWindowNanos {
+            scheduleLoginPasswordPromptRecheck(source: source)
+            return
+        }
+        loginPasswordPromptPending = true
+        logger.info("Login password prompt offered (\(source))")
+    }
+
+    /// Only fresh evidence may resurrect the dialog after a delivery: the
+    /// tracker's stored state was last written by the very announcement being
+    /// vetted, so consulting it directly is circular. Apple servers repeat
+    /// session-state announcements while a layout is stable, so wait for one
+    /// that arrives after this deferral began — it reflects the actual
+    /// outcome of the delivered password. Servers that never announce state
+    /// have no stale-bounce problem; their prompt shows after one round.
+    private func scheduleLoginPasswordPromptRecheck(source: String) {
+        guard loginPasswordPromptRecheckTask == nil else { return }
+        let deferralStartNanos = DispatchTime.now().uptimeNanoseconds
+        logger.info(
+            "Deferring login prompt arriving in a delivery's wake (\(source))")
+        loginPasswordPromptRecheckTask = Task { [weak self] in
+            for _ in 1...Self.loginPasswordPromptRecheckMaxRounds {
+                try? await Task.sleep(
+                    for: Self.loginPasswordPromptRecheckDelay)
+                guard let self, !Task.isCancelled else { return }
+                guard self.canSendLoginPassword,
+                      !self.loginPasswordSendGate.isPending,
+                      !self.loginPasswordPromptPending else {
+                    self.loginPasswordPromptRecheckTask = nil
+                    return
+                }
+                if self.lastSessionStateAnnouncementNanos == 0 {
+                    self.loginPasswordPromptRecheckTask = nil
+                    self.loginPasswordPromptPending = true
+                    self.logger.info(
+                        "Login prompt offered after deferral; this server "
+                            + "does not announce session state (\(source))")
+                    return
+                }
+                guard self.lastSessionStateAnnouncementNanos
+                        > deferralStartNanos else {
+                    continue
+                }
+                self.loginPasswordPromptRecheckTask = nil
+                if self.appleLoginPromptTracker.isLoginActive {
+                    self.loginPasswordPromptPending = true
+                    self.logger.info(
+                        "Fresh announcement confirms the login screen "
+                            + "persists; prompting (\(source))")
+                } else {
+                    self.logger.info(
+                        "Fresh announcement shows no login needed; the "
+                            + "delivered password logged in — no second "
+                            + "prompt")
+                }
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.loginPasswordPromptRecheckTask = nil
+            self.logger.info(
+                "No fresh session-state evidence arrived after the "
+                    + "delivery; staying silent (\(source))")
+        }
+    }
+
+    /// Drive a queued password send forward without waiting for a frame a
+    /// static Login Window may never produce: adopt the retained final-size
+    /// frame when its media generation proves it live, otherwise ask the
+    /// server for a fresh keyframe and let the normal commit path validate it.
+    /// A bounded watchdog covers signals that never arrive.
+    private func ensurePendingLoginPasswordProgress(reason: String) {
+        guard loginPasswordSendGate.isPending else { return }
+        if loginPasswordSendGate.isTransportSettled,
+           loginPasswordSendStabilityTask == nil,
+           let token = loginPasswordSendGate.adoptRetainedFrame(
+               liveMediaGeneration: videoBandRenderer.streamGenerationCount) {
+            logger.info(
+                "Adopting final-size frame that preceded resize settlement "
+                    + "(\(reason))")
+            scheduleLoginPasswordSendAfterStability(token: token)
+            return
+        }
+        if loginPasswordSendGate.isTransportSettled,
+           loginPasswordSendGate.stableCandidate == nil {
+            requestLoginPasswordKeyframe(reason: reason)
+        }
+        startLoginPasswordSendWatchdog()
+    }
+
+    private func requestLoginPasswordKeyframe(reason: String) {
+        guard isHighPerformanceMode, let transport = transportSession else {
+            return
+        }
+        logger.info(
+            "Requesting keyframe so the pending password send can validate "
+                + "the final display (\(reason))")
+        Task { await transport.requestVideoKeyframe() }
+    }
+
+    /// Re-attempts adoption or keyframe recovery on a short cadence while a
+    /// send stays pending, then force-delivers the user's explicit request
+    /// once the transport itself confirms no resize is in flight. The happy
+    /// path never waits on this timer.
+    private func startLoginPasswordSendWatchdog() {
+        guard loginPasswordSendWatchdogTask == nil else { return }
+        loginPasswordSendWatchdogTask = Task { [weak self] in
+            for attempt in 1...Self.loginPasswordSendWatchdogMaxAttempts {
+                try? await Task.sleep(
+                    for: Self.loginPasswordSendWatchdogInterval)
+                guard let self, !Task.isCancelled else { return }
+                guard self.loginPasswordSendGate.isPending else {
+                    self.loginPasswordSendWatchdogTask = nil
+                    return
+                }
+                if self.loginPasswordSendStabilityTask != nil { continue }
+                // The settled sink can lose an edge; the transport's direct
+                // answer is authoritative.
+                if !self.loginPasswordSendGate.isTransportSettled,
+                   let transport = self.transportSession,
+                   await transport.isAppleRemoteDisplayResizeSettled {
+                    self.noteRemoteDisplayResizeSettled(
+                        true,
+                        sequence: self.appleResizeSettledSequencer.next())
+                    if self.loginPasswordSendStabilityTask != nil { continue }
+                }
+                guard self.loginPasswordSendGate.isTransportSettled else {
+                    continue
+                }
+                if let token = self.loginPasswordSendGate.adoptRetainedFrame(
+                    liveMediaGeneration:
+                        self.videoBandRenderer.streamGenerationCount) {
+                    self.scheduleLoginPasswordSendAfterStability(token: token)
+                    continue
+                }
+                self.logger.warning(
+                    "Password send still pending after resize "
+                        + "(attempt \(attempt)); requesting keyframe")
+                self.requestLoginPasswordKeyframe(
+                    reason: "watchdog attempt \(attempt)")
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.loginPasswordSendWatchdogTask = nil
+            guard self.loginPasswordSendGate.isPending,
+                  self.loginPasswordSendStabilityTask == nil,
+                  self.canSendLoginPassword,
+                  let password = self.activeCredentials?.password else {
+                return
+            }
+            let transportSettled: Bool
+            if self.loginPasswordSendGate.isTransportSettled {
+                transportSettled = true
+            } else if let transport = self.transportSession {
+                transportSettled =
+                    await transport.isAppleRemoteDisplayResizeSettled
+            } else {
+                transportSettled = false
+            }
+            let quietElapsed = DispatchTime.now().uptimeNanoseconds
+                &- self.lastLoginDisplayTransitionNanos
+            let loginEvidenceCurrent =
+                self.appleLoginPromptTracker.isLoginActive
+                    || self.appleLoginVisionDetected
+            // This is the only path that can type without a validated frame,
+            // and the send is unrepeatable: the password crosses the wire at
+            // most once per user confirmation. Never fire it into a display
+            // that transitioned moments ago or shows no login screen.
+            guard transportSettled,
+                  quietElapsed >= Self.loginPasswordQuietPeriodNanos,
+                  loginEvidenceCurrent,
+                  self.loginPasswordSendGate.forceConsumePending() else {
+                self.logger.warning(
+                    "Queued password send is holding: settled="
+                        + "\(transportSettled) "
+                        + "quietMs=\(quietElapsed / 1_000_000) "
+                        + "loginEvidence=\(loginEvidenceCurrent)")
+                return
+            }
+            self.logger.warning(
+                "Stability signals never converged after resize; sending "
+                    + "login password now")
+            self.sendLoginPasswordNow(password)
+        }
+    }
+
+    private func cancelLoginPasswordSendWatchdog() {
+        loginPasswordSendWatchdogTask?.cancel()
+        loginPasswordSendWatchdogTask = nil
     }
 
     private func scheduleLoginPasswordSendAfterStability(
@@ -1897,16 +2288,36 @@ public final class VNCSession {
                 + "mediaGeneration=\(mediaGeneration)")
         loginPasswordSendScheduledToken = token
         loginPasswordSendStabilityTask = Task { [weak self] in
-            try? await Task.sleep(
-                for: Self.loginPasswordPostResizeInputReadinessDelay)
+            // Start typing only after the display has been quiet for the
+            // full hysteresis window. A tap on an already-quiet login screen
+            // proceeds immediately; near a resize cascade, every new
+            // transition both extends this wait and invalidates the token,
+            // so a send can never begin inside a short stable gap between
+            // steps — that is how passwords got half-typed into a capture
+            // about to restart.
+            while !Task.isCancelled {
+                guard let self else { return }
+                let elapsed = DispatchTime.now().uptimeNanoseconds
+                    &- self.lastLoginDisplayTransitionNanos
+                if elapsed >= Self.loginPasswordQuietPeriodNanos { break }
+                let remaining = Self.loginPasswordQuietPeriodNanos - elapsed
+                try? await Task.sleep(for: .nanoseconds(Int64(remaining)))
+            }
             guard let self, !Task.isCancelled else { return }
             self.loginPasswordSendStabilityTask = nil
             self.loginPasswordSendScheduledToken = nil
             guard self.isHighPerformanceMode,
                   self.configuration.displaySizingMode == .matchClient,
                   self.canSendLoginPassword,
-                  self.loginPasswordSendGate.consume(token),
                   let password = self.activeCredentials?.password else { return }
+            guard self.loginPasswordSendGate.consume(token) else {
+                // The token was superseded while this send was queued; keep
+                // the user's request alive instead of dropping it silently.
+                self.ensurePendingLoginPasswordProgress(
+                    reason: "send token superseded")
+                return
+            }
+            self.cancelLoginPasswordSendWatchdog()
             self.sendLoginPasswordNow(password)
         }
     }
@@ -2095,10 +2506,17 @@ public final class VNCSession {
             if analysis.isLoginScreen {
                 self.appleLoginVisionDetected = true
                 self.appleLoginVisionPromptOffered = true
-                self.loginPasswordPromptPending = true
-                self.logger.info(
-                    "Apple lock screen detected from full-frame Vision; "
-                        + "password confirmation prompt dispatched")
+                if self.loginPasswordSendGate.isPending {
+                    self.logger.info(
+                        "Apple lock screen detected while a password send is "
+                            + "queued; driving delivery instead of "
+                            + "re-prompting")
+                    self.ensurePendingLoginPasswordProgress(
+                        reason: "lock screen detected")
+                } else {
+                    self.offerLoginPasswordPrompt(
+                        source: "lock screen detected from full-frame Vision")
+                }
             } else if attempt == Self.appleLoginVisionMaximumAttempts {
                 self.logger.debug(
                     "Apple login Vision exhausted initial full-frame attempts "
@@ -2925,7 +3343,15 @@ public final class VNCSession {
                     Task { await transport.requestVideoKeyframe(ssrc: failure.ssrc) }
                 }
             }
+            let generationTransitionKick: @Sendable () -> Void = {
+                [weak self] in
+                let session = self
+                Task { @MainActor in
+                    session?.noteAppleMediaGenerationTransitionForLoginSend()
+                }
+            }
             await transport.setAppleMediaGenerationSink { generation, numberOfTiles in
+                generationTransitionKick()
                 queue.async {
                     sinkManager.prepareForStreamReconfiguration(
                         mediaGeneration: generation,
@@ -3016,10 +3442,15 @@ public final class VNCSession {
                     self?.applyDesktopResizeMetadata(width: width, height: height)
                 }
             }
+            let settledSequencer = appleResizeSettledSequencer
             await transport.setAppleRemoteDisplayResizeSettledSink {
                 [weak self] settled in
+                // Sequence on the emitting executor: the main-actor hops
+                // below carry no ordering of their own.
+                let sequence = settledSequencer.next()
                 Task { @MainActor [weak self] in
-                    self?.noteRemoteDisplayResizeSettled(settled)
+                    self?.noteRemoteDisplayResizeSettled(
+                        settled, sequence: sequence)
                 }
             }
             await transport.setAppleMediaRoutedRTPSink { packet, displayIndex in

@@ -2934,7 +2934,10 @@ public actor TransportSession {
                 + "tiles=\(activeAppleMediaTilesPerFrame)")
     }
 
-    private var isAppleRemoteDisplayResizeSettled: Bool {
+    /// Public so a client with a queued input intent can query the
+    /// authoritative answer on demand; sink emissions can race their
+    /// main-actor delivery.
+    public var isAppleRemoteDisplayResizeSettled: Bool {
         pendingRemoteDisplaySize == nil
             && appleDisplayReconfigurationGeneration == nil
     }
