@@ -954,6 +954,108 @@ final class TransportSessionScriptedTests: XCTestCase {
         }
     }
 
+    // MARK: - Handshake info + statistics
+
+    func testHandshakeInfoReportsVersionSecurityAndEncryption() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_8.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 1024, height: 768, name: "scripted"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.copyRect, .raw],
+            connection: connection)
+        try await session.connect()
+
+        let info = await session.handshakeInfo
+        XCTAssertEqual(info.serverReportedVersion, .v3_8)
+        XCTAssertEqual(info.negotiatedVersion, .v3_8)
+        XCTAssertEqual(info.offeredSecurityTypes, [SecurityType.none])
+        XCTAssertEqual(info.selectedSecurityType, SecurityType.none)
+        XCTAssertEqual(info.contentEncryption, .none)
+        XCTAssertNil(info.appleServerCapabilities)
+        await session.disconnect()
+    }
+
+    func testStatisticsSnapshotCountsFramebufferTraffic() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_8.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 1024, height: 768, name: "scripted"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.copyRect, .raw],
+            connection: connection)
+        try await session.connect()
+
+        let initial = await session.statisticsSnapshot()
+        XCTAssertEqual(initial.framebufferBytesReceived, 0)
+        XCTAssertEqual(initial.framebufferUpdateCount, 0)
+        XCTAssertEqual(initial.encodingUsage, [])
+        XCTAssertNil(initial.recentInterval)
+        XCTAssertFalse(initial.isHighPerformanceMode)
+
+        // Update 1: one raw content rect (2x1, 8 payload bytes).
+        let pixels = Data((1...8).map(UInt8.init))
+        await connection.enqueueServerBytes(Self.framebufferUpdate([
+            (Self.rectangleHeader(
+                x: 0, y: 0, width: 2, height: 1,
+                encoding: Encoding.raw.rawValue), pixels),
+        ]))
+        // Update 2: a copyRect content rect and a zero-sized cursor
+        // pseudo-rect that must stay out of the encoding-usage map.
+        await connection.enqueueServerBytes(Self.framebufferUpdate([
+            (Self.rectangleHeader(
+                x: 0, y: 0, width: 4, height: 4,
+                encoding: Encoding.copyRect.rawValue), Data([0, 0, 0, 0])),
+            (Self.rectangleHeader(
+                x: 0, y: 0, width: 0, height: 0,
+                encoding: Encoding.cursor.rawValue), Data()),
+        ]))
+
+        let sawBothUpdates = await Self.withTimeout(seconds: 10) {
+            var updates = 0
+            for await event in session.events {
+                if case .framebufferUpdate = event {
+                    updates += 1
+                    if updates == 2 { return true }
+                }
+            }
+            return false
+        }
+        XCTAssertEqual(sawBothUpdates, true)
+
+        try await Task.sleep(for: .milliseconds(300))
+        let stats = await session.statisticsSnapshot()
+        XCTAssertEqual(stats.framebufferUpdateCount, 2)
+        XCTAssertEqual(stats.framebufferRectCount, 3)
+        // Update 1: 4 header + 12 rect header + 8 payload = 24 bytes.
+        // Update 2: 4 header + (12 + 4) copyRect + (12 + 0) cursor = 32 bytes.
+        XCTAssertEqual(stats.framebufferBytesReceived, 56)
+        XCTAssertEqual(stats.encodingUsage, [
+            EncodingUsage(encoding: .raw, rectangles: 1, bytes: 20),
+            EncodingUsage(encoding: .copyRect, rectangles: 1, bytes: 16),
+        ])
+        XCTAssertNotNil(stats.recentInterval)
+        let recentKbps = try XCTUnwrap(stats.recentBitrateKbps)
+        XCTAssertGreaterThan(recentKbps, 0)
+        XCTAssertNil(stats.recentPacketLossPercent)
+        XCTAssertEqual(stats.mediaBytesReceived, 0)
+        await session.disconnect()
+    }
+
     // MARK: - Wire-format helpers
 
     private static func serverInitMessage(

@@ -336,6 +336,10 @@ public final class VNCSession {
     public private(set) var supportsRemoteClipboardRequest = false
     public private(set) var supportsRemoteSharedClipboardControl = false
 
+    /// Structured command support advertised by an Apple RFB 3.889 server;
+    /// nil for regular RFB servers.
+    public private(set) var serverCapabilities: AppleServerCapabilities?
+
     /// Number of independently decoded Apple video displays in the current
     /// media generation.
     public private(set) var activeVideoDisplayCount: Int = 1
@@ -625,6 +629,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        serverCapabilities = nil
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []
         remoteDisplayRegionByID = [:]
@@ -714,6 +719,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        serverCapabilities = nil
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []
         remoteDisplayRegionByID = [:]
@@ -1132,6 +1138,50 @@ public final class VNCSession {
         diagnostics
     }
 
+    /// Live traffic and decode statistics for the active connection, or nil
+    /// when no transport is up. Poll while a diagnostics UI is visible; each
+    /// call advances the snapshot's recent-rate window.
+    public func currentStatistics() async -> VNCSessionStatistics? {
+        guard let transport = transportSession else { return nil }
+        let stats = await transport.statisticsSnapshot()
+        guard transportSession === transport else { return nil }
+
+        var framesSubmitted: UInt64 = 0
+        var framesDecoded: UInt64 = 0
+        var gaps = 0
+        var droppedWhileGated = 0
+        for manager in [videoStreamManager, secondaryVideoStreamManager].compactMap({ $0 }) {
+            let progress = manager.decodeProgress
+            framesSubmitted &+= progress.submittedFrameCount
+            framesDecoded &+= progress.decoderOutputCount
+            let loss = manager.lossStatsSnapshot
+            gaps += loss.gapsDetected
+            droppedWhileGated += loss.framesDroppedWhileGated
+        }
+
+        return VNCSessionStatistics(
+            transport: stats,
+            framesSubmitted: framesSubmitted,
+            framesDecoded: framesDecoded,
+            lossGapsDetected: gaps,
+            framesDroppedWhileGated: droppedWhileGated,
+            capturedAt: Date())
+    }
+
+    /// Populate handshake-derived diagnostics from the transport. Called on
+    /// ServerInit and again when encryption facts upgrade (EncryptionInfo,
+    /// media-stream start).
+    private func refreshHandshakeDiagnostics(from transport: TransportSession) async {
+        let handshake = await transport.handshakeInfo
+        guard transportSession === transport else { return }
+        diagnostics.serverVersion = handshake.serverReportedVersion
+        diagnostics.clientVersion = handshake.negotiatedVersion
+        diagnostics.offeredSecurityTypes = handshake.offeredSecurityTypes
+        diagnostics.selectedSecurityType = handshake.selectedSecurityType
+        diagnostics.contentEncryption = handshake.contentEncryption
+        serverCapabilities = handshake.appleServerCapabilities
+    }
+
     var liveMediaDebugSnapshot: (submitted: UInt64, outputs: UInt64) {
         let progress = videoStreamManager?.decodeProgress
         return (
@@ -1165,6 +1215,7 @@ public final class VNCSession {
             supportsRemoteSharedClipboardControl =
                 await transport.supportsRemoteSharedClipboardControl
             handleServerInit(serverInit)
+            await refreshHandshakeDiagnostics(from: transport)
 
         case .framebufferUpdate(let rects):
             // Returning the credit below requests the next incremental frame.
@@ -1207,6 +1258,7 @@ public final class VNCSession {
         case .encryptionInfo(let info):
             logger.info("Encryption info: cipher=\(info.cipherMode) keyLen=\(info.keyLength)")
             diagnostics.encryptionMode = "Cipher mode \(info.cipherMode), key length \(info.keyLength)"
+            await refreshHandshakeDiagnostics(from: transport)
 
         case .displayInfo(let info):
             appleServerProtocolObserved = true
@@ -1241,6 +1293,7 @@ public final class VNCSession {
                 : 1
             diagnostics.isHighPerformanceMode = true
             await startVideoStream(offer: offer)
+            await refreshHandshakeDiagnostics(from: transport)
 
         case .udpDatagram(let datagram):
             routeAppleMediaRTPPacket(datagram)
@@ -1725,6 +1778,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        serverCapabilities = nil
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []
         remoteDisplayRegionByID = [:]

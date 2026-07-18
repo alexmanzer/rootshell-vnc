@@ -110,4 +110,47 @@ public enum Encoding: Sendable, Equatable, Hashable {
     public var isPseudo: Bool {
         rawValue < 0 || self == .mediaStreamOffer
     }
+
+    /// Whether rectangles of this encoding carry framebuffer pixel content,
+    /// as opposed to pseudo-encodings and Apple metadata records.
+    public var isFramebufferContent: Bool {
+        switch self {
+        case .raw, .copyRect, .rre, .hextile, .zlib, .tight, .zlibhex, .zrle,
+             .appleJPEG, .appleMultiVariantScreenshare, .appleSubZlibThousands,
+             .appleH264:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Human-readable name for diagnostics UI. Technical proper nouns,
+    /// deliberately not localized.
+    public var displayName: String {
+        switch self {
+        case .raw:                  return "Raw"
+        case .copyRect:             return "CopyRect"
+        case .rre:                  return "RRE"
+        case .hextile:              return "Hextile"
+        case .zlib:                 return "Zlib"
+        case .tight:                return "Tight"
+        case .zlibhex:              return "ZlibHex"
+        case .zrle:                 return "ZRLE"
+        case .cursor:               return "Cursor"
+        case .xCursor:              return "X Cursor"
+        case .lastRect:             return "LastRect"
+        case .desktopSize:          return "DesktopSize"
+        case .extendedDesktopSize:  return "ExtendedDesktopSize"
+        case .appleJPEG:            return "Apple JPEG"
+        case .apple1:               return "Apple Extension"
+        case .appleMultiVariantScreenshare: return "Apple Adaptive DCT"
+        case .appleSubZlibThousands: return "Apple SubZlib"
+        case .appleH264:            return "Apple HEVC"
+        case .encryptionInfo:       return "EncryptionInfo"
+        case .serverDisplayInfo:    return "ServerDisplayInfo"
+        case .mediaStreamOffer:     return "MediaStreamOffer"
+        case .mediaStreamAnswer:    return "MediaStreamAnswer"
+        case .unknown(let v):       return "Encoding \(v)"
+        }
+    }
 }

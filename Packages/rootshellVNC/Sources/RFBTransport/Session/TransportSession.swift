@@ -358,6 +358,19 @@ public actor TransportSession {
     private var terminalDisconnectHandled = false
     private var framebufferRequestSentNanos: UInt64 = 0
 
+    /// Cumulative standard-path framebuffer traffic (headers + payloads) and
+    /// per-encoding content-rectangle breakdown, for `statisticsSnapshot()`.
+    private var framebufferBytesReceived: UInt64 = 0
+    private var framebufferUpdateCount: UInt64 = 0
+    private var framebufferRectCount: UInt64 = 0
+    private var framebufferEncodingTraffic: [Encoding: (rectangles: UInt64, bytes: UInt64)] = [:]
+    /// Previous `statisticsSnapshot()` sample for the recent-rate window.
+    /// Updated at most every quarter second, so two concurrent pollers would
+    /// share (and shorten) each other's windows — there is one sheet.
+    private var statsPreviousSample: (nanos: UInt64, bytes: UInt64, packets: UInt64, lost: UInt64)?
+    /// Server's EncryptionInfo record, retained for `handshakeInfo`.
+    private var lastAppleEncryptionInfo: AppleEncryptionInfo?
+
     /// Updates yielded to the consumer but not yet acknowledged via
     /// finishFramebufferUpdate(). Bounds the undecoded backlog: persistent
     /// Zlib/ZRLE streams mean updates can never be dropped, so backpressure
@@ -738,6 +751,12 @@ public actor TransportSession {
         isDisconnecting = false
         terminalDisconnectHandled = false
         handshakeComplete = false
+        framebufferBytesReceived = 0
+        framebufferUpdateCount = 0
+        framebufferRectCount = 0
+        framebufferEncodingTraffic = [:]
+        statsPreviousSample = nil
+        lastAppleEncryptionInfo = nil
         await tcp.setDisconnectHandler { [weak self] error in
             Task { await self?.handleUnexpectedTCPDisconnect(error) }
         }
@@ -1017,6 +1036,85 @@ public actor TransportSession {
 
     public var mediaControlDiagnostic: String? {
         latestAppleMediaControlDiagnostic
+    }
+
+    /// Negotiated handshake facts. Meaningful once the connection reaches
+    /// ServerInit; the encryption facet upgrades again when Apple's
+    /// EncryptionInfo record and ComCryption channel arrive.
+    public var handshakeInfo: TransportHandshakeInfo {
+        let contentEncryption: VNCContentEncryption
+        if stateMachine.selectedSecurityType == .vencrypt {
+            contentEncryption = .tlsX509
+        } else if appleEncryptedControlChannel != nil {
+            contentEncryption = .appleComCryption(
+                cipherMode: lastAppleEncryptionInfo?.cipherMode,
+                keyLength: lastAppleEncryptionInfo?.keyLength,
+                mediaSRTP: appleMediaExpectsSRTP)
+        } else {
+            contentEncryption = .none
+        }
+        return TransportHandshakeInfo(
+            serverReportedVersion: stateMachine.serverReportedVersion,
+            negotiatedVersion: stateMachine.negotiatedVersion,
+            offeredSecurityTypes: stateMachine.offeredSecurityTypes,
+            selectedSecurityType: stateMachine.selectedSecurityType,
+            contentEncryption: contentEncryption,
+            appleServerCapabilities: appleServerCapabilities)
+    }
+
+    /// Live traffic statistics. The recent-rate window spans the time since
+    /// the previous call (at most one sample per quarter second).
+    public func statisticsSnapshot() -> TransportStatistics {
+        let mediaPackets = UInt64(appleRCTLTotalPacketsReceived)
+        let lostCumulative = appleMediaReceptionStats.values
+            .reduce(UInt64(0)) { $0 + UInt64($1.confirmedLost) }
+        let totalBytes = appleRCTLTotalBytesReceived &+ framebufferBytesReceived
+
+        let nowNanos = DispatchTime.now().uptimeNanoseconds
+        var recentInterval: TimeInterval?
+        var recentBitrateKbps: Double?
+        var recentPacketLossPercent: Double?
+        if let previous = statsPreviousSample {
+            let elapsed = Double(nowNanos &- previous.nanos) / 1_000_000_000
+            if elapsed >= 0.25 {
+                recentInterval = elapsed
+                recentBitrateKbps = Double(totalBytes &- previous.bytes) * 8 / elapsed / 1_000
+                let packetDelta = mediaPackets &- previous.packets
+                let lostDelta = lostCumulative &- previous.lost
+                let expected = packetDelta &+ lostDelta
+                if expected > 0 {
+                    recentPacketLossPercent = Double(lostDelta) / Double(expected) * 100
+                }
+                statsPreviousSample = (nowNanos, totalBytes, mediaPackets, lostCumulative)
+            }
+        } else {
+            statsPreviousSample = (nowNanos, totalBytes, mediaPackets, lostCumulative)
+        }
+
+        let nowSeconds = Double(nowNanos) / 1_000_000_000
+        let controller = appleMediaRateController
+        let encodingUsage = framebufferEncodingTraffic
+            .map { EncodingUsage(encoding: $0.key, rectangles: $0.value.rectangles, bytes: $0.value.bytes) }
+            .sorted { $0.bytes > $1.bytes }
+
+        return TransportStatistics(
+            isHighPerformanceMode: acceptedAppleMediaStream,
+            mediaBytesReceived: appleRCTLTotalBytesReceived,
+            mediaPacketsReceived: mediaPackets,
+            audioPacketsReceived: UInt64(appleRCTLAudioPacketsReceived),
+            packetsLostCumulative: lostCumulative,
+            bandwidthEstimateKbps: controller.map { Double($0.bandwidthEstimateBps) / 1_000 },
+            throughputKbps: controller.map { $0.throughputBps(now: nowSeconds) / 1_000 },
+            queueDelayMilliseconds: controller.map { $0.peakQueueDelaySeconds * 1_000 },
+            oneWayRelativeDelayMilliseconds: controller.map { $0.owrdSeconds * 1_000 },
+            videoSourceCount: videoSourceCount,
+            framebufferBytesReceived: framebufferBytesReceived,
+            framebufferUpdateCount: framebufferUpdateCount,
+            framebufferRectCount: framebufferRectCount,
+            encodingUsage: encodingUsage,
+            recentInterval: recentInterval,
+            recentBitrateKbps: recentBitrateKbps,
+            recentPacketLossPercent: recentPacketLossPercent)
     }
 
     public var currentAppleMediaTilesPerFrame: Int {
@@ -1694,6 +1792,7 @@ public actor TransportSession {
                 let eiData = try await tcp.read(exactly: 8)
                 var eiReader = MessageReader(data: eiData)
                 let info = try AppleEncryptionInfo(reader: &eiReader)
+                lastAppleEncryptionInfo = info
                 continuation?.yield(.encryptionInfo(info))
                 // Feed to state machine for response path (Finding 6)
                 let eiActions = stateMachine.handle(event: .receivedEncryptionInfo(info))
@@ -1826,6 +1925,22 @@ public actor TransportSession {
         }
 
         recordAppleDCTBootstrapCoverage(from: rectsWithData)
+
+        // Statistics: message header (type + padding + count) plus one wire
+        // header per rectangle; payloads retain their wire framing, so this
+        // tracks bytes on the socket closely.
+        framebufferUpdateCount &+= 1
+        framebufferRectCount &+= UInt64(rectsWithData.count)
+        framebufferBytesReceived &+= UInt64(4 + rectsWithData.count * FramebufferRect.wireSize)
+        for (rect, payload) in rectsWithData {
+            framebufferBytesReceived &+= UInt64(payload.count)
+            if rect.encoding.isFramebufferContent {
+                var traffic = framebufferEncodingTraffic[rect.encoding] ?? (0, 0)
+                traffic.rectangles &+= 1
+                traffic.bytes &+= UInt64(FramebufferRect.wireSize + payload.count)
+                framebufferEncodingTraffic[rect.encoding] = traffic
+            }
+        }
 
         let now = DispatchTime.now().uptimeNanoseconds
         if framebufferRequestSentNanos != 0 {

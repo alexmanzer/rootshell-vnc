@@ -17,8 +17,15 @@ public struct ConnectionStateMachine: Sendable {
     /// The negotiated protocol version (set after version exchange).
     public private(set) var negotiatedVersion: ProtocolVersion?
 
+    /// The version the server reported, before client selection.
+    public private(set) var serverReportedVersion: ProtocolVersion?
+
     /// The security type selected during handshake.
     public private(set) var selectedSecurityType: SecurityType?
+
+    /// Security types the server offered. On the RFB 3.3 server-selected
+    /// path this holds just the server's choice.
+    public private(set) var offeredSecurityTypes: [SecurityType] = []
 
     /// The server's initialization info (set after ServerInit).
     public private(set) var serverInit: ServerInit?
@@ -81,6 +88,7 @@ public struct ConnectionStateMachine: Sendable {
         // MARK: waitingForProtocolVersion → waitingForSecurityTypes
 
         case (.waitingForProtocolVersion, .receivedProtocolVersion(let serverVersion)):
+            serverReportedVersion = serverVersion
             let ourVersion: ProtocolVersion
             if serverVersion.isApple {
                 // Apple ARD: echo back their version to activate Apple extensions.
@@ -103,6 +111,7 @@ public struct ConnectionStateMachine: Sendable {
         // MARK: waitingForSecurityTypes → authenticating / waitingForAuthResult
 
         case (.waitingForSecurityTypes, .receivedSecurityTypes(let types)):
+            offeredSecurityTypes = types
             guard !types.isEmpty else {
                 let error = VNCProtocolError.authenticationFailed("Server offered no security types")
                 state = .failed(error)
@@ -136,6 +145,7 @@ public struct ConnectionStateMachine: Sendable {
             }
 
         case (.waitingForSecurityTypes, .receivedServerSelectedSecurityType(let selected)):
+            offeredSecurityTypes = [selected]
             guard securityTypeIsAllowed(selected) else {
                 let error = VNCProtocolError.authenticationFailed(
                     "The server selected a security method that violates the configured policy")

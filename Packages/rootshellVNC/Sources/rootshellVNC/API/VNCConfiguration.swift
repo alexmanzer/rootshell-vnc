@@ -378,7 +378,7 @@ public struct VNCConfiguration: Sendable {
 
     /// The full list of encodings to advertise to the server, including
     /// pseudo-encodings for desktop resize and high-performance mode.
-    var effectiveEncodings: [Encoding] {
+    public var effectiveEncodings: [Encoding] {
         var encodings = preferredEncodings
 
         // Apple's default/high quality mode offers AVC first. Its Full Quality

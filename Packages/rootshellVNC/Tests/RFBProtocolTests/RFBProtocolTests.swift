@@ -1357,6 +1357,61 @@ final class ConnectionStateMachineTests: XCTestCase {
         }
     }
 
+    // MARK: - Handshake fact recording
+
+    func testHandshakeFactsRecordedOnStandardPath() {
+        var sm = ConnectionStateMachine()
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.v3_8))
+        XCTAssertEqual(sm.serverReportedVersion, .v3_8)
+        XCTAssertEqual(sm.negotiatedVersion, .v3_8)
+
+        _ = sm.handle(event: .receivedSecurityTypes([.none, .vncAuthentication]))
+        XCTAssertEqual(sm.offeredSecurityTypes, [.none, .vncAuthentication])
+        XCTAssertEqual(sm.selectedSecurityType, .vncAuthentication)
+    }
+
+    func testHandshakeFactsRecordServerReportedVersionAboveNegotiated() {
+        var sm = ConnectionStateMachine()
+        _ = sm.handle(event: .connected)
+
+        let futureVersion = ProtocolVersion(major: 4, minor: 1)
+        _ = sm.handle(event: .receivedProtocolVersion(futureVersion))
+        XCTAssertEqual(sm.serverReportedVersion, futureVersion)
+        XCTAssertEqual(sm.negotiatedVersion, .v3_8)
+    }
+
+    func testHandshakeFactsRecordedOnServerSelectedPath() {
+        var sm = ConnectionStateMachine()
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.v3_3))
+        XCTAssertEqual(sm.serverReportedVersion, .v3_3)
+
+        _ = sm.handle(event: .receivedServerSelectedSecurityType(.vncAuthentication))
+        XCTAssertEqual(sm.offeredSecurityTypes, [.vncAuthentication])
+        XCTAssertEqual(sm.selectedSecurityType, .vncAuthentication)
+    }
+
+    func testHandshakeFactsRecordedOnAppleEchoPath() {
+        var sm = ConnectionStateMachine()
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.apple))
+        XCTAssertEqual(sm.serverReportedVersion, .apple)
+        XCTAssertEqual(sm.negotiatedVersion, .apple)
+    }
+
+    func testOfferedTypesRecordedEvenWhenSelectionFails() {
+        var sm = ConnectionStateMachine(securityPolicy: .requireEncryption)
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.v3_8))
+        _ = sm.handle(event: .receivedSecurityTypes([.vncAuthentication]))
+        XCTAssertEqual(sm.offeredSecurityTypes, [.vncAuthentication])
+        XCTAssertNil(sm.selectedSecurityType)
+        if case .failed = sm.state {} else {
+            XCTFail("Expected failed state, got \(sm.state)")
+        }
+    }
+
     // MARK: - Version negotiation
 
     func testNegotiateDown_v3_7() {

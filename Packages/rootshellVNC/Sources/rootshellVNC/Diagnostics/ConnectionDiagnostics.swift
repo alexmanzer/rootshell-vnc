@@ -1,5 +1,6 @@
 import Foundation
 import RFBProtocol
+import RFBTransport
 
 /// Captures diagnostic information about a VNC connection attempt.
 ///
@@ -58,6 +59,13 @@ public final class ConnectionDiagnostics: @unchecked Sendable {
         set { withLock { _encryptionMode = newValue } }
     }
     private var _encryptionMode: String?
+
+    /// Semantic content-encryption state negotiated by the transport.
+    public var contentEncryption: VNCContentEncryption? {
+        get { withLock { _contentEncryption } }
+        set { withLock { _contentEncryption = newValue } }
+    }
+    private var _contentEncryption: VNCContentEncryption?
 
     /// Whether the connection is using high-performance mode (HEVC/H.264).
     public var isHighPerformanceMode: Bool {
@@ -125,6 +133,7 @@ public final class ConnectionDiagnostics: @unchecked Sendable {
         _selectedSecurityType = nil
         _serverInit = nil
         _encryptionMode = nil
+        _contentEncryption = nil
         _isHighPerformanceMode = false
         _connectionStartTime = nil
         _handshakeCompleteTime = nil
@@ -165,6 +174,9 @@ public final class ConnectionDiagnostics: @unchecked Sendable {
 
         if let enc = _encryptionMode {
             lines.append("Encryption: \(enc)")
+        }
+        if let content = _contentEncryption {
+            lines.append("Content Encryption: \(content)")
         }
         lines.append("High-Performance Mode: \(_isHighPerformanceMode)")
 
