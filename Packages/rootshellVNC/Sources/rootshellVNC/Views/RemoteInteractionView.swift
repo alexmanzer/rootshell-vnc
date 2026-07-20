@@ -198,6 +198,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         action: #selector(handleHover(_:)))
     private lazy var pointerInteraction = UIPointerInteraction(delegate: self)
     #if targetEnvironment(macCatalyst)
+    private lazy var secondaryClickInteraction = UIContextMenuInteraction(delegate: self)
     private var catalystCursor: NSCursor?
     private var catalystCursorDisplayScale: CGFloat = 0
     #else
@@ -479,7 +480,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         isMultipleTouchEnabled = true
         accessibilityLabel = String(localized: "Remote desktop input", bundle: .module)
         configureRecognizers()
-        #if !targetEnvironment(macCatalyst)
+        #if targetEnvironment(macCatalyst)
+        // Catalyst surfaces a trackpad secondary click as a touchless button
+        // event that only the context-menu machinery consumes — it never
+        // reaches touchesBegan or tap recognizers, even with buttonMaskRequired.
+        addInteraction(secondaryClickInteraction)
+        #else
         addInteraction(pointerInteraction)
         addSubview(remoteCursorImageView)
         #endif
@@ -1611,7 +1617,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         if touches.contains(where: { $0.type != .direct }) {
             catchMomentumFlingIfActive()
         }
+        #if !targetEnvironment(macCatalyst)
+        // Catalyst never delivers secondary clicks as indirect-pointer
+        // touches; they arrive as a touchless button event consumed by
+        // secondaryClickInteraction instead.
         handleSecondaryPointerDown(in: touches, event: event)
+        #endif
         super.touchesBegan(touches, with: event)
     }
 
@@ -2305,7 +2316,30 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
            !gestureRecognizer.buttonMask.isEmpty {
             return gestureRecognizer.buttonMask.contains(.primary)
         }
+        #if targetEnvironment(macCatalyst)
+        // The context-menu interaction also recognizes a held primary button,
+        // which would cancel an in-flight remote drag (e.g. a Finder drag)
+        // before it moves. Primary input belongs exclusively to
+        // pointerDragRecognizer; the interaction's recognizers may begin only
+        // for the touchless secondary-click event.
+        if !isOwnRecognizer(gestureRecognizer),
+           pointerDragActive || gestureRecognizer.buttonMask.contains(.primary) {
+            return false
+        }
+        #endif
         return true
+    }
+
+    private func isOwnRecognizer(_ recognizer: UIGestureRecognizer) -> Bool {
+        recognizer === scrollRecognizer
+            || recognizer === directTouchRecognizer
+            || recognizer === pinchRecognizer
+            || recognizer === viewportPanRecognizer
+            || recognizer === pointerDragRecognizer
+            || recognizer === tapRecognizer
+            || recognizer === doubleTapRecognizer
+            || recognizer === rightTapRecognizer
+            || recognizer === hoverRecognizer
     }
 
     func gestureRecognizer(
@@ -2511,4 +2545,20 @@ final class DirectTouchGestureRecognizer: UIGestureRecognizer {
         state = .began
     }
 }
+
+#if targetEnvironment(macCatalyst)
+extension RemoteInputUIView: UIContextMenuInteractionDelegate {
+    func contextMenuInteraction(
+        _ interaction: UIContextMenuInteraction,
+        configurationForMenuAtLocation location: CGPoint
+    ) -> UIContextMenuConfiguration? {
+        guard let point = framebufferPoint(for: location) else { return nil }
+        catchMomentumFlingIfActive()
+        focusForHardwareKeyboard()
+        touchHandler.handleRightClick(x: point.x, y: point.y)
+        // The remote desktop owns the contextual action; suppress a local menu.
+        return nil
+    }
+}
+#endif
 #endif

@@ -276,12 +276,15 @@ final class RemoteViewportStateTests: XCTestCase {
             framebufferSize: framebufferSize)
         XCTAssertEqual(viewport.offset.width, -500, accuracy: 0.001)
         XCTAssertEqual(viewport.offset.height, 281.25, accuracy: 0.001)
+        // Zoomed frame is 2000x1125; after the pan its origin sits at
+        // (-1000, 218.75), so the pointer lies 0.875 across and 31.25 points
+        // into the desktop: x = 0.875 * 1920, y = 31.25 / 1125 * 1080.
         let remotePoint = try XCTUnwrap(viewport.framebufferPoint(
             for: pointer,
             viewSize: viewSize,
             framebufferSize: framebufferSize))
-        XCTAssertEqual(remotePoint.x, 1_400, accuracy: 0.001)
-        XCTAssertEqual(remotePoint.y, 50, accuracy: 0.001)
+        XCTAssertEqual(remotePoint.x, 1_680, accuracy: 0.001)
+        XCTAssertEqual(remotePoint.y, 30, accuracy: 0.001)
     }
 
     func testContinuousPanningDoesNotApplyAtFittedScale() {
