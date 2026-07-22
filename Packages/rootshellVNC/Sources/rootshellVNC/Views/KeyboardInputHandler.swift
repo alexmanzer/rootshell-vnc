@@ -78,14 +78,32 @@ public struct KeyboardInputHandler {
 
     private let sendKeyEvent: KeyEventHandler
 
+    /// Whether the connected server uses Apple's swapped modifier-keysym
+    /// convention (`Alt_L` = Command, `Meta_L` = Option). Read live so it
+    /// reflects the negotiated server once the handshake completes.
+    private let usesAppleModifierConvention: @MainActor () -> Bool
+
+    /// Whether Option should currently be sent as `Meta_L`/`Meta_R` (Apple)
+    /// instead of `Alt_L`/`Alt_R` (standard X11).
+    public var usesAppleModifierMapping: Bool { usesAppleModifierConvention() }
+
     // MARK: - Init
 
     /// Create a keyboard input handler that delegates key events to the given closure.
     ///
-    /// - Parameter sendKeyEvent: A closure called with (downFlag, keysym)
-    ///   for each generated key event.
-    public init(sendKeyEvent: @escaping KeyEventHandler) {
+    /// - Parameters:
+    ///   - sendKeyEvent: A closure called with (downFlag, keysym) for each
+    ///     generated key event.
+    ///   - usesAppleModifierConvention: Read at send time; when it returns
+    ///     `true`, Option is emitted as `Meta_L`/`Meta_R` so Apple's Screen
+    ///     Sharing server types Option rather than Command. Defaults to the
+    ///     standard X11 convention for standalone and non-Apple use.
+    public init(
+        sendKeyEvent: @escaping KeyEventHandler,
+        usesAppleModifierConvention: @escaping @MainActor () -> Bool = { false }
+    ) {
         self.sendKeyEvent = sendKeyEvent
+        self.usesAppleModifierConvention = usesAppleModifierConvention
     }
 
     // MARK: - Key Event Handlers
@@ -143,7 +161,9 @@ public struct KeyboardInputHandler {
         modifiers: VNCKeyboardModifiers
     ) {
         handleChord(RemoteKeyChord(
-            modifiers: Self.keysyms(for: modifiers),
+            modifiers: Self.keysyms(
+                for: modifiers,
+                appleModifierConvention: usesAppleModifierConvention()),
             key: Self.keysymForCharacter(character)))
     }
 
@@ -154,7 +174,9 @@ public struct KeyboardInputHandler {
         supplementalModifiers: VNCKeyboardModifiers
     ) -> Bool {
         guard keysym != 0 else { return false }
-        let modifiers = Self.keysyms(for: supplementalModifiers)
+        let modifiers = Self.keysyms(
+            for: supplementalModifiers,
+            appleModifierConvention: usesAppleModifierConvention())
         for modifier in modifiers {
             sendKeyEvent(true, modifier)
         }
@@ -178,7 +200,8 @@ public struct KeyboardInputHandler {
     /// aliases both use this path so local shortcut modifiers never leak to
     /// the remote computer.
     func handleRemoteCommand(_ command: RemoteCommand) {
-        handleChord(command.remoteChord)
+        handleChord(command.remoteChord(
+            appleModifierConvention: usesAppleModifierConvention()))
     }
 
     /// Send an atomic Command/Super shortcut. Kept for clients and the iPad
@@ -292,7 +315,8 @@ public struct KeyboardInputHandler {
     /// iPad, and Mac Catalyst.
     public nonisolated static func keysymForHIDUsage(
         _ usage: UInt32,
-        characters: String
+        characters: String,
+        appleModifierConvention: Bool = false
     ) -> UInt32 {
         switch usage {
         case 0x28: return keysymReturn
@@ -319,16 +343,33 @@ public struct KeyboardInputHandler {
         case 0x68...0x73: return keysymF1 + 12 + usage - 0x68
         case 0xE0: return keysymControlL
         case 0xE1: return keysymShiftL
-        case 0xE2: return keysymAltL
+        case 0xE2: return optionLeftKeysym(appleModifierConvention: appleModifierConvention)
         case 0xE3: return keysymSuperL
         case 0xE4: return keysymControlR
         case 0xE5: return keysymShiftR
-        case 0xE6: return keysymAltR
+        case 0xE6: return optionRightKeysym(appleModifierConvention: appleModifierConvention)
         case 0xE7: return keysymSuperR
         default:
             guard let character = characters.first else { return 0 }
             return keysymForCharacter(character)
         }
+    }
+
+    /// The keysym that makes the server register the **Option** modifier.
+    /// Apple's Screen Sharing server maps `Alt_L` to Command and `Meta_L` to
+    /// Option, so Apple targets require `Meta_L`; standard X11 servers use
+    /// `Alt_L`.
+    public nonisolated static func optionLeftKeysym(
+        appleModifierConvention: Bool
+    ) -> UInt32 {
+        appleModifierConvention ? keysymMetaL : keysymAltL
+    }
+
+    /// Right-hand counterpart of ``optionLeftKeysym(appleModifierConvention:)``.
+    public nonisolated static func optionRightKeysym(
+        appleModifierConvention: Bool
+    ) -> UInt32 {
+        appleModifierConvention ? keysymMetaR : keysymAltR
     }
 
     /// Choose text for a physical key without turning Control chords into
@@ -350,11 +391,15 @@ public struct KeyboardInputHandler {
 
     /// X11 keysyms for host-supplied modifiers in stable press order.
     public nonisolated static func keysyms(
-        for modifiers: VNCKeyboardModifiers
+        for modifiers: VNCKeyboardModifiers,
+        appleModifierConvention: Bool = false
     ) -> [UInt32] {
         var result: [UInt32] = []
         if modifiers.contains(.control) { result.append(keysymControlL) }
-        if modifiers.contains(.option) { result.append(keysymAltL) }
+        if modifiers.contains(.option) {
+            result.append(optionLeftKeysym(
+                appleModifierConvention: appleModifierConvention))
+        }
         if modifiers.contains(.shift) { result.append(keysymShiftL) }
         if modifiers.contains(.command) { result.append(keysymSuperL) }
         return result

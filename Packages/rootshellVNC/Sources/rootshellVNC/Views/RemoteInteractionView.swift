@@ -721,7 +721,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                     .intersection([.control, .command]).isEmpty)
             let keysym = KeyboardInputHandler.keysymForHIDUsage(
                 usage,
-                characters: characters)
+                characters: characters,
+                appleModifierConvention: keyboardHandler.usesAppleModifierMapping)
             guard keysym != 0 else {
                 unhandled.insert(press)
                 continue
@@ -1099,13 +1100,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             rightPressed: input?.button(forKeyCode: .rightShift)?.isPressed == true,
             leftKeysym: KeyboardInputHandler.keysymShiftL,
             rightKeysym: KeyboardInputHandler.keysymShiftR)
+        let appleModifiers = keyboardHandler.usesAppleModifierMapping
         ensureModifier(
             enabled: flags.contains(.alternate),
             leftUsage: 0xE2,
             rightUsage: 0xE6,
             rightPressed: input?.button(forKeyCode: .rightAlt)?.isPressed == true,
-            leftKeysym: KeyboardInputHandler.keysymAltL,
-            rightKeysym: KeyboardInputHandler.keysymAltR)
+            leftKeysym: KeyboardInputHandler.optionLeftKeysym(
+                appleModifierConvention: appleModifiers),
+            rightKeysym: KeyboardInputHandler.optionRightKeysym(
+                appleModifierConvention: appleModifiers))
         ensureModifier(
             enabled: flags.contains(.command),
             leftUsage: 0xE3,
@@ -1190,7 +1194,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         ensureLeftModifier(
             command.modifierFlags.contains(.alternate),
             usage: 0xE2,
-            keysym: KeyboardInputHandler.keysymAltL)
+            keysym: KeyboardInputHandler.optionLeftKeysym(
+                appleModifierConvention: keyboardHandler.usesAppleModifierMapping))
         ensureLeftModifier(
             command.modifierFlags.contains(.command),
             usage: 0xE3,
@@ -1324,7 +1329,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
         let configured = keyboardCapture.supplementalModifiers
         guard !configured.isEmpty else { return }
-        let keysyms = KeyboardInputHandler.keysyms(for: configured).filter {
+        let keysyms = KeyboardInputHandler.keysyms(
+            for: configured,
+            appleModifierConvention: keyboardHandler.usesAppleModifierMapping
+        ).filter {
             !physicalModifierIsPressed(for: $0)
         }
 
@@ -1359,7 +1367,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         case KeyboardInputHandler.keysymShiftL:
             return hardwareKeyboard.contains(usage: 0xE1)
                 || hardwareKeyboard.contains(usage: 0xE5)
-        case KeyboardInputHandler.keysymAltL:
+        // Option maps to Alt_L on standard servers and Meta_L on Apple servers;
+        // both correspond to the physical Option keys (HID usage 0xE2/0xE6), so
+        // a supplemental Option isn't re-sent when physical Option is held.
+        case KeyboardInputHandler.keysymAltL, KeyboardInputHandler.keysymMetaL:
             return hardwareKeyboard.contains(usage: 0xE2)
                 || hardwareKeyboard.contains(usage: 0xE6)
         case KeyboardInputHandler.keysymSuperL:

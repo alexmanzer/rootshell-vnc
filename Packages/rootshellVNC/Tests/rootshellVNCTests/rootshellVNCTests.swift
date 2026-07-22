@@ -1420,6 +1420,95 @@ final class KeyboardInputHandlerTests: XCTestCase {
         XCTAssertEqual(KeyboardInputHandler.keysymAltR, 0xFFEA)
     }
 
+    // MARK: - Apple modifier convention (Option ⌥ = Meta, not Alt)
+
+    func testOptionKeysymFollowsServerModifierConvention() {
+        // Apple's Screen Sharing server maps Alt_L to Command and Meta_L to
+        // Option, so Option must be sent as Meta on Apple servers and Alt on
+        // standard X11 servers.
+        XCTAssertEqual(
+            KeyboardInputHandler.optionLeftKeysym(appleModifierConvention: true),
+            KeyboardInputHandler.keysymMetaL)
+        XCTAssertEqual(
+            KeyboardInputHandler.optionRightKeysym(appleModifierConvention: true),
+            KeyboardInputHandler.keysymMetaR)
+        XCTAssertEqual(
+            KeyboardInputHandler.optionLeftKeysym(appleModifierConvention: false),
+            KeyboardInputHandler.keysymAltL)
+        XCTAssertEqual(
+            KeyboardInputHandler.optionRightKeysym(appleModifierConvention: false),
+            KeyboardInputHandler.keysymAltR)
+
+        // Supplemental (on-screen toolbar / software keyboard) modifiers.
+        XCTAssertEqual(
+            KeyboardInputHandler.keysyms(for: [.option], appleModifierConvention: true),
+            [KeyboardInputHandler.keysymMetaL])
+        XCTAssertEqual(
+            KeyboardInputHandler.keysyms(for: [.option], appleModifierConvention: false),
+            [KeyboardInputHandler.keysymAltL])
+
+        // Physical hardware Option keys (HID usage 0xE2 / 0xE6).
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0xE2, characters: "", appleModifierConvention: true),
+            KeyboardInputHandler.keysymMetaL)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0xE6, characters: "", appleModifierConvention: true),
+            KeyboardInputHandler.keysymMetaR)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0xE2, characters: "", appleModifierConvention: false),
+            KeyboardInputHandler.keysymAltL)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForHIDUsage(0xE6, characters: "", appleModifierConvention: false),
+            KeyboardInputHandler.keysymAltR)
+    }
+
+    @MainActor
+    func testAppleOptionDeleteSendsMetaBackspaceNotCommand() {
+        // Regression for issue #259: on-screen / software-keyboard Option-Delete
+        // must reach an Apple Mac as Option-Delete (Meta_L), not Command-Delete.
+        var transitions: [HardwareKeyboardTransition] = []
+        let handler = KeyboardInputHandler(
+            sendKeyEvent: { downFlag, keysym in
+                transitions.append(HardwareKeyboardTransition(
+                    downFlag: downFlag, keysym: keysym))
+            },
+            usesAppleModifierConvention: { true })
+
+        XCTAssertTrue(handler.handleKeysymTap(
+            KeyboardInputHandler.keysymBackspace,
+            supplementalModifiers: [.option]))
+        XCTAssertEqual(transitions, [
+            HardwareKeyboardTransition(downFlag: true, keysym: KeyboardInputHandler.keysymMetaL),
+            HardwareKeyboardTransition(downFlag: true, keysym: KeyboardInputHandler.keysymBackspace),
+            HardwareKeyboardTransition(downFlag: false, keysym: KeyboardInputHandler.keysymBackspace),
+            HardwareKeyboardTransition(downFlag: false, keysym: KeyboardInputHandler.keysymMetaL),
+        ])
+        XCTAssertFalse(
+            transitions.contains { $0.keysym == KeyboardInputHandler.keysymSuperL },
+            "Option-Delete must never emit Super_L (Command) on an Apple server")
+    }
+
+    @MainActor
+    func testForceQuitUsesMetaOptionUnderAppleConvention() {
+        // Force Quit is ⌘⌥⎋. With Alt_L=Command on Apple, the Option leg must be
+        // Meta_L or the chord collapses to ⌘⎋.
+        var transitions: [HardwareKeyboardTransition] = []
+        let handler = KeyboardInputHandler(
+            sendKeyEvent: { downFlag, keysym in
+                transitions.append(HardwareKeyboardTransition(
+                    downFlag: downFlag, keysym: keysym))
+            },
+            usesAppleModifierConvention: { true })
+
+        handler.handleRemoteCommand(.forceQuit)
+
+        XCTAssertEqual(transitions.prefix(3).map(\.keysym), [
+            KeyboardInputHandler.keysymSuperL,
+            KeyboardInputHandler.keysymMetaL,
+            KeyboardInputHandler.keysymEscape,
+        ])
+    }
+
     // MARK: - Character to keysym mapping
 
     func testKeysymForASCIICharacters() {

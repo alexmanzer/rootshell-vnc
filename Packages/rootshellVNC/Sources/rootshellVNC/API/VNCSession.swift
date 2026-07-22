@@ -408,6 +408,13 @@ public final class VNCSession {
     /// nil for regular RFB servers.
     public private(set) var serverCapabilities: AppleServerCapabilities?
 
+    /// Whether the negotiated server uses Apple's modifier-keysym convention,
+    /// in which `Alt_L`/`Alt_R` mean Command and `Meta_L`/`Meta_R` mean Option
+    /// (the reverse of standard X11). The keyboard layer reads this to send
+    /// Option as `Meta_L` on Apple servers while standard servers keep `Alt_L`.
+    /// Known once the handshake reaches ServerInit, before any typing.
+    public private(set) var serverUsesAppleModifierConvention = false
+
     /// Number of independently decoded Apple video displays in the current
     /// media generation.
     public private(set) var activeVideoDisplayCount: Int = 1
@@ -1303,6 +1310,10 @@ public final class VNCSession {
             negotiatedContentEncryption = handshake.contentEncryption
         }
         serverCapabilities = handshake.appleServerCapabilities
+        let usesAppleModifiers = handshake.negotiatedVersion?.isApple == true
+        if serverUsesAppleModifierConvention != usesAppleModifiers {
+            serverUsesAppleModifierConvention = usesAppleModifiers
+        }
     }
 
     var liveMediaDebugSnapshot: (submitted: UInt64, outputs: UInt64) {

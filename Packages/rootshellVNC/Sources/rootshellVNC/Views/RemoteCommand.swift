@@ -83,36 +83,45 @@ enum RemoteCommand: String, CaseIterable, Identifiable, Sendable {
         }
     }
 
-    var remoteChord: RemoteKeyChord {
+    /// The remote key chord this command expands to.
+    ///
+    /// - Parameter appleModifierConvention: When `true`, the **Option** leg of
+    ///   commands such as Force Quit (⌘⌥⎋) is emitted as `Meta_L`, because
+    ///   Apple's Screen Sharing server maps `Alt_L` to Command. `controlAltDelete`
+    ///   keeps the literal `Alt_L` (PC "Ctrl-Alt-Del" semantics; the combo has no
+    ///   Mac meaning anyway).
+    func remoteChord(appleModifierConvention: Bool) -> RemoteKeyChord {
+        let optionKeysym = KeyboardInputHandler.optionLeftKeysym(
+            appleModifierConvention: appleModifierConvention)
         switch self {
         case .missionControl:
-            RemoteKeyChord(modifiers: [KeyboardInputHandler.keysymControlL], key: KeyboardInputHandler.keysymUp)
+            return RemoteKeyChord(modifiers: [KeyboardInputHandler.keysymControlL], key: KeyboardInputHandler.keysymUp)
         case .applicationWindows:
-            RemoteKeyChord(modifiers: [KeyboardInputHandler.keysymControlL], key: KeyboardInputHandler.keysymDown)
+            return RemoteKeyChord(modifiers: [KeyboardInputHandler.keysymControlL], key: KeyboardInputHandler.keysymDown)
         case .moveLeftASpace:
-            RemoteKeyChord(modifiers: [KeyboardInputHandler.keysymControlL], key: KeyboardInputHandler.keysymLeft)
+            return RemoteKeyChord(modifiers: [KeyboardInputHandler.keysymControlL], key: KeyboardInputHandler.keysymLeft)
         case .moveRightASpace:
-            RemoteKeyChord(modifiers: [KeyboardInputHandler.keysymControlL], key: KeyboardInputHandler.keysymRight)
+            return RemoteKeyChord(modifiers: [KeyboardInputHandler.keysymControlL], key: KeyboardInputHandler.keysymRight)
         case .forceQuit:
-            RemoteKeyChord(
-                modifiers: [KeyboardInputHandler.keysymSuperL, KeyboardInputHandler.keysymAltL],
+            return RemoteKeyChord(
+                modifiers: [KeyboardInputHandler.keysymSuperL, optionKeysym],
                 key: KeyboardInputHandler.keysymEscape)
         case .lockScreen:
-            RemoteKeyChord(
+            return RemoteKeyChord(
                 modifiers: [KeyboardInputHandler.keysymControlL, KeyboardInputHandler.keysymSuperL],
                 key: KeyboardInputHandler.keysymForCharacter("q"))
         case .logOutUser:
-            RemoteKeyChord(
+            return RemoteKeyChord(
                 modifiers: [KeyboardInputHandler.keysymShiftL, KeyboardInputHandler.keysymSuperL],
                 key: KeyboardInputHandler.keysymForCharacter("q"))
         case .controlAltDelete:
-            RemoteKeyChord(
+            return RemoteKeyChord(
                 modifiers: [KeyboardInputHandler.keysymControlL, KeyboardInputHandler.keysymAltL],
                 key: KeyboardInputHandler.keysymDelete)
         case .backslash:
-            RemoteKeyChord(modifiers: [], key: KeyboardInputHandler.keysymForCharacter("\\"))
+            return RemoteKeyChord(modifiers: [], key: KeyboardInputHandler.keysymForCharacter("\\"))
         case .insert:
-            RemoteKeyChord(modifiers: [], key: KeyboardInputHandler.keysymInsert)
+            return RemoteKeyChord(modifiers: [], key: KeyboardInputHandler.keysymInsert)
         }
     }
 }

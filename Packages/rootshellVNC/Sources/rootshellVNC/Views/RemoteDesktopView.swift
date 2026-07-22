@@ -177,6 +177,9 @@ public struct RemoteDesktopView: View {
         self.keyboardHandler = KeyboardInputHandler(
             sendKeyEvent: { [session] downFlag, key in
                 session.sendKeyEvent(downFlag: downFlag, key: key)
+            },
+            usesAppleModifierConvention: { [session] in
+                session.serverUsesAppleModifierConvention
             })
     }
 
