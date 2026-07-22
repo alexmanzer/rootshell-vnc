@@ -1,6 +1,6 @@
 import CoreGraphics
 
-enum RemoteViewportPanningMode: CaseIterable, Hashable, Sendable {
+public enum RemoteViewportPanningMode: CaseIterable, Hashable, Sendable {
     case edge
     case continuous
 }

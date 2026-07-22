@@ -46,7 +46,7 @@ public struct RemoteDesktopView: View {
     @Environment(\.displayScale) private var displayScale
 
     @State private var viewport = RemoteViewportState()
-    @State private var viewportPanningMode = RemoteViewportPanningMode.edge
+    @State private var viewportPanningMode: RemoteViewportPanningMode
     @State private var keyboardActive = false
     @State private var confirmPasswordSend = false
     @State private var keyboardCapture: VNCKeyboardCapture
@@ -67,6 +67,7 @@ public struct RemoteDesktopView: View {
     private let hudMenuExtras: AnyView?
     private let keyboardAvoidanceMode: VNCKeyboardAvoidanceMode
     private let clipboardSynchronizer: VNCClipboardSynchronizer?
+    private let onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?
     private let hostOwnsRecoveryChrome: Bool
     private let brightnessGain: Double
 
@@ -86,6 +87,8 @@ public struct RemoteDesktopView: View {
         toggleFullScreen: (() -> Void)? = nil,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
         clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
+        initialViewportPanningMode: RemoteViewportPanningMode = .edge,
+        onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0
     ) {
@@ -96,6 +99,8 @@ public struct RemoteDesktopView: View {
             toggleFullScreen: toggleFullScreen,
             keyboardAvoidanceMode: keyboardAvoidanceMode,
             clipboardSynchronizer: clipboardSynchronizer,
+            initialViewportPanningMode: initialViewportPanningMode,
+            onSharedClipboardUserChange: onSharedClipboardUserChange,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
             hudMenuExtras: nil)
@@ -114,6 +119,8 @@ public struct RemoteDesktopView: View {
         toggleFullScreen: (() -> Void)? = nil,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
         clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
+        initialViewportPanningMode: RemoteViewportPanningMode = .edge,
+        onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
@@ -125,6 +132,8 @@ public struct RemoteDesktopView: View {
             toggleFullScreen: toggleFullScreen,
             keyboardAvoidanceMode: keyboardAvoidanceMode,
             clipboardSynchronizer: clipboardSynchronizer,
+            initialViewportPanningMode: initialViewportPanningMode,
+            onSharedClipboardUserChange: onSharedClipboardUserChange,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
             hudMenuExtras: AnyView(hudMenuExtras()))
@@ -137,6 +146,8 @@ public struct RemoteDesktopView: View {
         toggleFullScreen: (() -> Void)?,
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode,
         clipboardSynchronizer: VNCClipboardSynchronizer?,
+        initialViewportPanningMode: RemoteViewportPanningMode,
+        onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?,
         hostOwnsRecoveryChrome: Bool,
         brightnessGain: Double,
         hudMenuExtras: AnyView?
@@ -144,12 +155,14 @@ public struct RemoteDesktopView: View {
         self.session = session
         self.hostOwnsRecoveryChrome = hostOwnsRecoveryChrome
         self.hudMenuExtras = hudMenuExtras
+        self._viewportPanningMode = State(initialValue: initialViewportPanningMode)
         self._keyboardCapture = State(
             initialValue: keyboardCapture ?? VNCKeyboardCapture())
         self.isFullScreen = isFullScreen
         self.toggleFullScreen = toggleFullScreen
         self.keyboardAvoidanceMode = keyboardAvoidanceMode
         self.clipboardSynchronizer = clipboardSynchronizer
+        self.onSharedClipboardUserChange = onSharedClipboardUserChange
         self.brightnessGain = brightnessGain
         self.touchHandler = TouchInputHandler(
             sendPointerEvent: { [session] buttonMask, x, y in
@@ -517,7 +530,10 @@ public struct RemoteDesktopView: View {
             }
 
             if let clipboardSynchronizer {
-                VNCClipboardMenu(synchronizer: clipboardSynchronizer)
+                VNCClipboardMenu(
+                    synchronizer: clipboardSynchronizer,
+                    onSharedClipboardUserChange: onSharedClipboardUserChange
+                )
             }
 
             Divider()
@@ -761,6 +777,17 @@ public struct RemoteDesktopView: View {
 /// Shared HUD submenu used by both the package demo and container apps.
 private struct VNCClipboardMenu: View {
     @Bindable var synchronizer: VNCClipboardSynchronizer
+    let onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?
+
+    private var sharedClipboardBinding: Binding<Bool> {
+        Binding(
+            get: { synchronizer.sharedClipboardEnabled },
+            set: { enabled in
+                synchronizer.sharedClipboardEnabled = enabled
+                onSharedClipboardUserChange?(enabled)
+            }
+        )
+    }
 
     var body: some View {
         Menu {
@@ -780,7 +807,7 @@ private struct VNCClipboardMenu: View {
 
             Divider()
 
-            Toggle(isOn: $synchronizer.sharedClipboardEnabled) {
+            Toggle(isOn: sharedClipboardBinding) {
                 Label(String(localized: "Shared Clipboard", bundle: .module), systemImage: "arrow.triangle.2.circlepath")
             }
         } label: {

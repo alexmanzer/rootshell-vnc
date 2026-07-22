@@ -400,6 +400,10 @@ public final class VNCSession {
     public private(set) var supportsRemoteClipboardRequest = false
     public private(set) var supportsRemoteSharedClipboardControl = false
 
+    /// Content encryption negotiated by the active RFB transport. This excludes
+    /// host-provided tunnels such as SSH and is nil while no transport is active.
+    public private(set) var negotiatedContentEncryption: VNCContentEncryption?
+
     /// Structured command support advertised by an Apple RFB 3.889 server;
     /// nil for regular RFB servers.
     public private(set) var serverCapabilities: AppleServerCapabilities?
@@ -728,6 +732,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        negotiatedContentEncryption = nil
         serverCapabilities = nil
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []
@@ -818,6 +823,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        negotiatedContentEncryption = nil
         serverCapabilities = nil
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []
@@ -1293,6 +1299,9 @@ public final class VNCSession {
         diagnostics.offeredSecurityTypes = handshake.offeredSecurityTypes
         diagnostics.selectedSecurityType = handshake.selectedSecurityType
         diagnostics.contentEncryption = handshake.contentEncryption
+        if negotiatedContentEncryption != handshake.contentEncryption {
+            negotiatedContentEncryption = handshake.contentEncryption
+        }
         serverCapabilities = handshake.appleServerCapabilities
     }
 
@@ -1328,8 +1337,8 @@ public final class VNCSession {
                 await transport.supportsRemoteClipboardRequest
             supportsRemoteSharedClipboardControl =
                 await transport.supportsRemoteSharedClipboardControl
-            handleServerInit(serverInit)
             await refreshHandshakeDiagnostics(from: transport)
+            handleServerInit(serverInit)
 
         case .framebufferUpdate(let rects):
             // Returning the credit below requests the next incremental frame.
@@ -1896,6 +1905,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        negotiatedContentEncryption = nil
         serverCapabilities = nil
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []

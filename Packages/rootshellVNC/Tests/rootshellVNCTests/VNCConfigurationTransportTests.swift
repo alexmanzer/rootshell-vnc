@@ -237,6 +237,40 @@ final class VNCConfigurationTransportTests: XCTestCase {
     }
 
     @MainActor
+    func testSessionPublishesAndClearsNegotiatedContentEncryption() async throws {
+        let connection = SuccessfulRFBConnection(name: "encryption-state")
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0))
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        var encryptionAtConnected: VNCContentEncryption?
+        let observerID = session.addConnectionStateObserver { state in
+            if state.isConnected {
+                encryptionAtConnected = session.negotiatedContentEncryption
+            }
+        }
+
+        XCTAssertNil(session.negotiatedContentEncryption)
+        try await session.connect(credentials: VNCCredentials(
+            host: "plain.test",
+            port: 5900,
+            password: ""))
+
+        let published = await waitUntil {
+            session.negotiatedContentEncryption == VNCContentEncryption.none
+        }
+        XCTAssertTrue(published)
+        XCTAssertEqual(encryptionAtConnected, VNCContentEncryption.none)
+
+        session.removeConnectionStateObserver(observerID)
+        session.disconnect()
+        XCTAssertNil(session.negotiatedContentEncryption)
+    }
+
+    @MainActor
     func testSessionPublishesAppleLoginPromptFromDisplayInfo2() async throws {
         let connection = SuccessfulRFBConnection(name: "apple-login")
         var configuration = VNCConfiguration(
