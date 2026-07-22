@@ -149,6 +149,13 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// from releasing a shared synthetic modifier too early.
     private var supplementalModifierState = SupplementalHardwareModifierState()
     private weak var monitoredCatalystKeyboardInput: GCKeyboardInput?
+    #if targetEnvironment(macCatalyst)
+    // Repeat state for Option/Command+arrow chords read from GameController,
+    // which UIKit does not deliver to the responder on Catalyst.
+    private var catalystArrowDelayTimer: Timer?
+    private var catalystArrowRepeatTimer: Timer?
+    private var catalystArrowRepeatUsage: UInt32?
+    #endif
     #if DEBUG
     private let inputLog = VNCLogger(category: "InputRouting")
     private var inputLogBudget = 128
@@ -224,6 +231,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             + standardRemoteKeyCommands
             + remoteNavigationKeyCommands
             + viewerCommandKeyCommands
+            + catalystEditingKeyCommands
             + remoteControlKeyCommands
         #else
         return reservedHostKeyCommands
@@ -402,6 +410,29 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             commands.append(command)
         }
         return commands
+    }()
+
+    /// Delete/Backspace word-editing chords (Option/Command ± Shift) that macOS
+    /// Catalyst consumes as its own `deleteWordBackward:`/`deleteToBeginning…`
+    /// before a `UIPress` can reach the responder, so they never reach the
+    /// remote. Unlike arrows, an eaten Delete produces no key-up, so each is
+    /// sent as one atomic remote chord rather than a held press.
+    private lazy var catalystEditingKeyCommands: [UIKeyCommand] = {
+        let modifierVariants: [UIKeyModifierFlags] = [
+            [.alternate],
+            [.alternate, .shift],
+            [.command],
+            [.command, .shift],
+        ]
+        return modifierVariants.map { modifiers in
+            let command = UIKeyCommand(
+                input: "\u{8}",
+                modifierFlags: modifiers,
+                action: #selector(handleCatalystEditingKeyCommand(_:)))
+            command.wantsPriorityOverSystemBehavior = true
+            command.allowsAutomaticLocalization = false
+            return command
+        }
     }()
     #else
     private lazy var remoteCommandKeyCommands: [UIKeyCommand] = {
@@ -1013,6 +1044,42 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         monitoredCatalystKeyboardInput?.keyChangedHandler = nil
         monitoredCatalystKeyboardInput = input
         input?.keyChangedHandler = { [weak self] keyboard, _, keyCode, pressed in
+            // Option/Command+arrow chords: Catalyst consumes these as its own
+            // cursor movement and never delivers them via pressesBegan or a
+            // UIKeyCommand, so read them straight from GameController — the same
+            // approach the terminal uses for Control+arrow. Plain arrows and
+            // Control(+Option) arrows keep their existing UIKeyCommand paths.
+            let arrowUsage: UInt32?
+            switch keyCode {
+            case .upArrow: arrowUsage = 0x52
+            case .downArrow: arrowUsage = 0x51
+            case .leftArrow: arrowUsage = 0x50
+            case .rightArrow: arrowUsage = 0x4F
+            default: arrowUsage = nil
+            }
+            if let arrowUsage {
+                let control = keyboard.button(forKeyCode: .leftControl)?.isPressed == true
+                    || keyboard.button(forKeyCode: .rightControl)?.isPressed == true
+                let option = keyboard.button(forKeyCode: .leftAlt)?.isPressed == true
+                    || keyboard.button(forKeyCode: .rightAlt)?.isPressed == true
+                let command = keyboard.button(forKeyCode: .leftGUI)?.isPressed == true
+                    || keyboard.button(forKeyCode: .rightGUI)?.isPressed == true
+                let shift = keyboard.button(forKeyCode: .leftShift)?.isPressed == true
+                    || keyboard.button(forKeyCode: .rightShift)?.isPressed == true
+                // Control(+Option)+arrow is the Spaces/Mission Control shortcut
+                // owned by the standard remote commands; leave it alone.
+                guard (option || command), !control else { return }
+                Task { @MainActor [weak self] in
+                    self?.handleCatalystModifiedArrow(
+                        usage: arrowUsage,
+                        pressed: pressed,
+                        option: option,
+                        command: command,
+                        shift: shift)
+                }
+                return
+            }
+
             let alias: (usage: UInt32, character: Character)?
             switch keyCode {
             case .keyH: alias = (0x0B, "h")
@@ -1056,6 +1123,128 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         if consumedRemoteAliasUsages.insert(usage).inserted {
             keyboardHandler.handleCommandTap(character)
         }
+    }
+
+    /// Deliver an Option/Command+arrow chord read from GameController as one
+    /// atomic remote chord (Option mapped to `Meta_L` on Apple servers), with
+    /// key-repeat while the chord stays physically held. Used because Catalyst
+    /// routes these arrows to its own cursor movement instead of the responder.
+    private func handleCatalystModifiedArrow(
+        usage: UInt32,
+        pressed: Bool,
+        option: Bool,
+        command: Bool,
+        shift: Bool
+    ) {
+        guard keyboardCapture.isCaptured else {
+            stopCatalystArrowRepeat()
+            return
+        }
+        guard pressed else {
+            stopCatalystArrowRepeat(matching: usage)
+            return
+        }
+
+        var modifiers: VNCKeyboardModifiers = []
+        if command { modifiers.insert(.command) }
+        if option { modifiers.insert(.option) }
+        if shift { modifiers.insert(.shift) }
+
+        let keysym = KeyboardInputHandler.keysymForHIDUsage(usage, characters: "")
+        guard keysym != 0 else { return }
+
+        // A physical modifier that reached RFB via pressesBegan is cleared so
+        // each atomic chord is self-contained; subsequent repeats then no-op.
+        releaseAllPressedKeys()
+        keyboardHandler.handleKeysymTap(keysym, supplementalModifiers: modifiers)
+        startCatalystArrowRepeat(usage: usage, keysym: keysym, modifiers: modifiers)
+    }
+
+    private func startCatalystArrowRepeat(
+        usage: UInt32,
+        keysym: UInt32,
+        modifiers: VNCKeyboardModifiers
+    ) {
+        stopCatalystArrowRepeat()
+        catalystArrowRepeatUsage = usage
+        let delay = Timer(timeInterval: 0.225, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.catalystArrowRepeatUsage == usage,
+                      self.catalystArrowChordStillHeld(usage: usage) else {
+                    self?.stopCatalystArrowRepeat(matching: usage)
+                    return
+                }
+                self.keyboardHandler.handleKeysymTap(keysym, supplementalModifiers: modifiers)
+                let repeating = Timer(timeInterval: 0.03, repeats: true) { [weak self] _ in
+                    MainActor.assumeIsolated {
+                        guard let self, self.catalystArrowRepeatUsage == usage,
+                              self.catalystArrowChordStillHeld(usage: usage) else {
+                            self?.stopCatalystArrowRepeat(matching: usage)
+                            return
+                        }
+                        self.keyboardHandler.handleKeysymTap(
+                            keysym, supplementalModifiers: modifiers)
+                    }
+                }
+                self.catalystArrowRepeatTimer = repeating
+                RunLoop.main.add(repeating, forMode: .common)
+            }
+        }
+        catalystArrowDelayTimer = delay
+        RunLoop.main.add(delay, forMode: .common)
+    }
+
+    private func stopCatalystArrowRepeat(matching usage: UInt32? = nil) {
+        guard usage == nil || catalystArrowRepeatUsage == usage else { return }
+        catalystArrowDelayTimer?.invalidate()
+        catalystArrowDelayTimer = nil
+        catalystArrowRepeatTimer?.invalidate()
+        catalystArrowRepeatTimer = nil
+        catalystArrowRepeatUsage = nil
+    }
+
+    /// Whether the repeating arrow and at least one of its Option/Command
+    /// modifiers are still physically held, read live from GameController.
+    private func catalystArrowChordStillHeld(usage: UInt32) -> Bool {
+        guard let input = GCKeyboard.coalesced?.keyboardInput else { return false }
+        let keyCode: GCKeyCode
+        switch usage {
+        case 0x52: keyCode = .upArrow
+        case 0x51: keyCode = .downArrow
+        case 0x50: keyCode = .leftArrow
+        case 0x4F: keyCode = .rightArrow
+        default: return false
+        }
+        guard input.button(forKeyCode: keyCode)?.isPressed == true else { return false }
+        let option = input.button(forKeyCode: .leftAlt)?.isPressed == true
+            || input.button(forKeyCode: .rightAlt)?.isPressed == true
+        let command = input.button(forKeyCode: .leftGUI)?.isPressed == true
+            || input.button(forKeyCode: .rightGUI)?.isPressed == true
+        let control = input.button(forKeyCode: .leftControl)?.isPressed == true
+            || input.button(forKeyCode: .rightControl)?.isPressed == true
+        return (option || command) && !control
+    }
+
+    /// Send a Catalyst Delete word-editing chord (Option/Command ± Shift +
+    /// Delete) as one atomic remote chord. Routing through `handleKeysymTap`
+    /// keeps Option mapped to `Meta_L` on Apple servers and leaves no modifier
+    /// held, since the system-consumed Delete never yields a matching key-up.
+    @objc private func handleCatalystEditingKeyCommand(_ command: UIKeyCommand) {
+        guard keyboardCapture.isCaptured else { return }
+
+        var modifiers: VNCKeyboardModifiers = []
+        let flags = command.modifierFlags
+        if flags.contains(.control) { modifiers.insert(.control) }
+        if flags.contains(.alternate) { modifiers.insert(.option) }
+        if flags.contains(.shift) { modifiers.insert(.shift) }
+        if flags.contains(.command) { modifiers.insert(.command) }
+
+        // Any physical modifier that reached RFB before UIKit delivered this
+        // command is cleared so the atomic chord is the only thing in flight.
+        releaseAllPressedKeys()
+        keyboardHandler.handleKeysymTap(
+            KeyboardInputHandler.keysymBackspace,
+            supplementalModifiers: modifiers)
     }
 
     @objc private func handleControlKeyCommand(_ command: UIKeyCommand) {
@@ -1320,6 +1509,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private func releaseAllPressedKeys() {
         hardwareKeyboard.releaseAll()
         releaseAllSupplementalModifiers()
+        #if targetEnvironment(macCatalyst)
+        stopCatalystArrowRepeat()
+        #endif
     }
 
     private func beginSupplementalModifiersIfNeeded(for usage: UInt32) {
