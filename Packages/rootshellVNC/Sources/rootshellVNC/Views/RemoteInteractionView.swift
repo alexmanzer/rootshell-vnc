@@ -21,6 +21,11 @@ struct RemoteInteractionView: UIViewRepresentable {
     let touchHandler: TouchInputHandler
     let keyboardHandler: KeyboardInputHandler
     let keyboardCapture: VNCKeyboardCapture
+    /// Set while a modal prompt owns the keyboard. Keyboard capture re-claims
+    /// first responder on every update, and this view updates once per decoded
+    /// frame, so without this a text field in an alert loses focus after each
+    /// character the user types.
+    let suspendsKeyboardCapture: Bool
     let framebufferOrigin: CGPoint
     let requestPasswordSend: () -> Void
     let requestDictation: () -> Void
@@ -68,7 +73,8 @@ struct RemoteInteractionView: UIViewRepresentable {
             viewport: viewport,
             viewportPanningMode: viewportPanningMode,
             keyboardActive: keyboardActive,
-            keyboardCaptured: keyboardCapture.isCaptured,
+            keyboardCaptured: keyboardCapture.isCaptured
+                && !suspendsKeyboardCapture,
             inputViewsGeneration: keyboardCapture.inputViewsGeneration,
             framebufferOrigin: framebufferOrigin,
             requestPasswordSend: requestPasswordSend,

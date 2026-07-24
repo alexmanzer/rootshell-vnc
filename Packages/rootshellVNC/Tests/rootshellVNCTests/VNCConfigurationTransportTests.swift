@@ -303,6 +303,49 @@ final class VNCConfigurationTransportTests: XCTestCase {
     }
 
     @MainActor
+    func testSessionTracksCurtainStateFromDisplayInfo2() async throws {
+        let connection = SuccessfulRFBConnection(name: "apple-curtain")
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0))
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+
+        try await session.connect(credentials: VNCCredentials(
+            host: "apple.test",
+            port: 5900,
+            password: "secret"))
+        let connected = await waitUntil {
+            session.connectionState.isConnected
+        }
+        XCTAssertTrue(connected)
+
+        // Curtain is never offered until the server says so.
+        XCTAssertFalse(session.supportsCurtainMode)
+        session.setCurtainMode(true, message: "ignored")
+
+        // Offered, and the session is still drawn on the remote console.
+        await connection.enqueueServerBytes(
+            Self.appleLoginFramebufferUpdate(screenFlags: 0x02 | 0x04))
+        let offered = await waitUntil { session.supportsCurtainMode }
+        XCTAssertTrue(offered)
+        XCTAssertFalse(session.isCurtained)
+
+        // The server reports the session has left the console.
+        await connection.enqueueServerBytes(
+            Self.appleLoginFramebufferUpdate(screenFlags: 0x02))
+        let curtained = await waitUntil { session.isCurtained }
+        XCTAssertTrue(curtained)
+        XCTAssertFalse(session.curtainChangeFailed)
+
+        session.disconnect()
+        XCTAssertFalse(session.supportsCurtainMode)
+        XCTAssertFalse(session.isCurtained)
+    }
+
+    @MainActor
     func testReconnectAppliesConfigurationAndRetainsActiveCredentials() async throws {
         let recorder = SuccessfulProviderRecorder()
         var configuration = VNCConfiguration(

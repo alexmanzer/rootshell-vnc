@@ -4934,6 +4934,15 @@
         }
       }
     },
+    "Curtain" : {
+
+    },
+    "Curtain Mode" : {
+
+    },
+    "Curtain Mode Did Not Change" : {
+
+    },
     "Dictate" : {
       "localizations" : {
         "ar" : {
@@ -10642,6 +10651,9 @@
         }
       }
     },
+    "OK" : {
+
+    },
     "One Display" : {
       "comment" : "VNC display mode",
       "localizations" : {
@@ -11258,6 +11270,9 @@
           }
         }
       }
+    },
+    "optional message" : {
+
     },
     "Other Commands" : {
       "localizations" : {
@@ -16195,6 +16210,12 @@
         }
       }
     },
+    "The remote computer did not confirm the change, so its display may still be visible to anyone nearby." : {
+
+    },
+    "The remote computer's own display will be hidden while you keep control. Anyone at that computer sees a lock screen with your message." : {
+
+    },
     "The saved Keychain item did not contain credential data." : {
       "localizations" : {
         "ar" : {
@@ -16656,6 +16677,9 @@
           }
         }
       }
+    },
+    "Turn On Curtain Mode?" : {
+
     },
     "Two Virtual Displays" : {
       "comment" : "VNC display mode",

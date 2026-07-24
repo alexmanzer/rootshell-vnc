@@ -2,7 +2,7 @@ import Foundation
 import RFBProtocol
 import Security
 
-/// Login-window state published by Apple's DisplayInfo2 extension.
+/// Login-window and console state published by Apple's DisplayInfo2 extension.
 public struct AppleRemoteSessionState: Sendable, Equatable {
     /// The macOS Login Window is the active server session.
     public let loginWindowActive: Bool
@@ -10,17 +10,34 @@ public struct AppleRemoteSessionState: Sendable, Equatable {
     /// The server is showing the Login Window as a lock screen.
     public let loginWindowLockScreenActive: Bool
 
+    /// The server will accept curtain mode commands. This tracks the remote
+    /// account's rights and console state, so it can change mid-session.
+    public let curtainToggleAvailable: Bool
+
+    /// The remote session is being drawn on the Mac's physical display.
+    public let onConsole: Bool
+
     /// Whether the remote Mac is currently waiting at either login surface.
     public var requiresLogin: Bool {
         loginWindowActive || loginWindowLockScreenActive
     }
 
+    /// Curtain mode is active: the session left the console, so the Mac's own
+    /// display shows a lock screen instead of this session's content.
+    public var curtained: Bool {
+        !onConsole
+    }
+
     public init(
         loginWindowActive: Bool,
-        loginWindowLockScreenActive: Bool
+        loginWindowLockScreenActive: Bool,
+        curtainToggleAvailable: Bool = false,
+        onConsole: Bool = true
     ) {
         self.loginWindowActive = loginWindowActive
         self.loginWindowLockScreenActive = loginWindowLockScreenActive
+        self.curtainToggleAvailable = curtainToggleAvailable
+        self.onConsole = onConsole
     }
 }
 
@@ -41,7 +58,9 @@ struct AppleDisplayInfo2SessionMetadata: Equatable {
         let flags = screenFlagsBigEndian | screenFlagsLittleEndian
         return AppleRemoteSessionState(
             loginWindowActive: flags & 0x10 != 0,
-            loginWindowLockScreenActive: flags & 0x08 != 0)
+            loginWindowLockScreenActive: flags & 0x08 != 0,
+            curtainToggleAvailable: flags & 0x02 != 0,
+            onConsole: flags & 0x04 != 0)
     }
 }
 
@@ -1015,6 +1034,37 @@ public actor TransportSession {
             appleSharedClipboardEnabled = previousValue
             throw error
         }
+    }
+
+    /// Whether the server has advertised that it will accept curtain mode
+    /// commands. Apple publishes this in DisplayInfo2 rather than the ServerInit
+    /// command bitmap, and withdraws it when the session may not leave the
+    /// console, so an absent DisplayInfo2 means "not offered".
+    ///
+    /// The remote Mac must have **Remote Management** enabled (System Settings ›
+    /// General › Sharing). Plain Screen Sharing is not enough: such a server
+    /// negotiates RFB 3.889 and sends DisplayInfo2 as usual but leaves the
+    /// curtain bit clear forever, which is a correct "no", not a decode bug.
+    /// Verified against a real Mac 2026-07-24.
+    public var supportsCurtainMode: Bool {
+        stateMachine.negotiatedVersion?.isApple == true
+            && lastAppleRemoteSessionState?.curtainToggleAvailable == true
+    }
+
+    /// Hide or restore the remote session on the Mac's physical display.
+    ///
+    /// The note is shown on the curtained Mac and is only meaningful when
+    /// enabling, matching Apple's client. Success is not acknowledged here: the
+    /// server reports the resulting state in its next DisplayInfo2.
+    public func setCurtainEnabled(
+        _ enabled: Bool,
+        message: String
+    ) async throws {
+        guard supportsCurtainMode else { return }
+        try await sendClientPayload(
+            AppleCurtainProtocol.sessionVisibilityMessage(
+                visible: !enabled,
+                message: enabled ? message : ""))
     }
 
     /// Number of distinct video RTP sources (screen bands) seen this session.
@@ -2571,6 +2621,8 @@ public actor TransportSession {
             "Apple login state changed from \(source): "
                 + "loginWindow=\(state.loginWindowActive) "
                 + "lockScreen=\(state.loginWindowLockScreenActive) "
+                + "canCurtain=\(state.curtainToggleAvailable) "
+                + "onConsole=\(state.onConsole) "
                 + "version=\(metadata.version) "
                 + "flagsBE=0x\(String(metadata.screenFlagsBigEndian, radix: 16)) "
                 + "flagsLE=0x\(String(metadata.screenFlagsLittleEndian, radix: 16)) "

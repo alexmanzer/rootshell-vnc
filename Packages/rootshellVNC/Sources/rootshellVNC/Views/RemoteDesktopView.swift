@@ -49,6 +49,7 @@ public struct RemoteDesktopView: View {
     @State private var viewportPanningMode: RemoteViewportPanningMode
     @State private var keyboardActive = false
     @State private var confirmPasswordSend = false
+    @State private var curtainPromptPresented = false
     @State private var keyboardCapture: VNCKeyboardCapture
     #if canImport(UIKit)
     @State private var keyboardViewportMetrics = DockedKeyboardViewportMetrics()
@@ -183,6 +184,22 @@ public struct RemoteDesktopView: View {
             })
     }
 
+    /// Reads the server's reported state, never a local optimistic one, so the
+    /// switch cannot claim the remote screen is hidden when it isn't. Turning it
+    /// on opens the message prompt first; turning it off is immediate, matching
+    /// Apple's client.
+    private var curtainBinding: Binding<Bool> {
+        Binding(
+            get: { session.isCurtained },
+            set: { enabled in
+                if enabled {
+                    curtainPromptPresented = true
+                } else {
+                    session.setCurtainMode(false)
+                }
+            })
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
             GeometryReader { geometry in
@@ -207,6 +224,10 @@ public struct RemoteDesktopView: View {
                     }
 
                     viewportControls
+
+                    VNCCurtainPrompt(
+                        session: session,
+                        isPresented: $curtainPromptPresented)
 
                     // Hosts that render their own reconnect/failure prompts
                     // suppress these; drawing both would stack duplicate
@@ -268,6 +289,7 @@ public struct RemoteDesktopView: View {
                         #endif
                     } else {
                         confirmPasswordSend = false
+                        curtainPromptPresented = false
                     }
                 }
                 .onChange(of: session.configuration.displaySizingMode) { _, mode in
@@ -367,6 +389,7 @@ public struct RemoteDesktopView: View {
             touchHandler: touchHandler,
             keyboardHandler: keyboardHandler,
             keyboardCapture: keyboardCapture,
+            suspendsKeyboardCapture: curtainPromptPresented,
             framebufferOrigin: framebufferOrigin,
             requestPasswordSend: requestPasswordSend,
             requestDictation: requestDictation,
@@ -529,6 +552,16 @@ public struct RemoteDesktopView: View {
                         systemImage: isFullScreen
                             ? "arrow.down.right.and.arrow.up.left"
                             : "arrow.up.left.and.arrow.down.right")
+                }
+            }
+
+            if session.supportsCurtainMode {
+                Toggle(isOn: curtainBinding) {
+                    Label(
+                        String(localized: "Curtain Mode", bundle: .module),
+                        systemImage: session.isCurtained
+                            ? "eye.slash.fill"
+                            : "eye.slash")
                 }
             }
 
@@ -778,6 +811,58 @@ public struct RemoteDesktopView: View {
 }
 
 /// Shared HUD submenu used by both the package demo and container apps.
+/// Hosts the curtain prompts on their own, deliberately frame-independent view.
+///
+/// `RemoteDesktopView.body` re-evaluates on every decoded frame, and an alert
+/// whose text field is bound to state up there is rebuilt on each keystroke,
+/// which drops keyboard focus after every character. Keeping the draft message
+/// as this view's own state, and reading nothing that changes per frame, means
+/// typing only invalidates this zero-sized view.
+private struct VNCCurtainPrompt: View {
+    @Bindable var session: VNCSession
+    @Binding var isPresented: Bool
+    @State private var message = ""
+
+    private var failureBinding: Binding<Bool> {
+        Binding(
+            get: { session.curtainChangeFailed },
+            set: { presented in
+                if !presented { session.acknowledgeCurtainFailure() }
+            })
+    }
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .alert(
+                String(localized: "Turn On Curtain Mode?", bundle: .module),
+                isPresented: $isPresented
+            ) {
+                TextField(
+                    String(localized: "optional message", bundle: .module),
+                    text: $message)
+                Button(String(localized: "Curtain", bundle: .module)) {
+                    session.setCurtainMode(true, message: message)
+                    message = ""
+                }
+                Button(String(localized: "Cancel", bundle: .module), role: .cancel) {
+                    message = ""
+                }
+            } message: {
+                Text(String(localized: "The remote computer's own display will be hidden while you keep control. Anyone at that computer sees a lock screen with your message.", bundle: .module))
+            }
+            .alert(
+                String(localized: "Curtain Mode Did Not Change", bundle: .module),
+                isPresented: failureBinding
+            ) {
+                Button(String(localized: "OK", bundle: .module), role: .cancel) {}
+            } message: {
+                Text(String(localized: "The remote computer did not confirm the change, so its display may still be visible to anyone nearby.", bundle: .module))
+            }
+    }
+}
+
 private struct VNCClipboardMenu: View {
     @Bindable var synchronizer: VNCClipboardSynchronizer
     let onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?

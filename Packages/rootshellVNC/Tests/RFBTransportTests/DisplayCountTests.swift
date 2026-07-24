@@ -68,6 +68,52 @@ final class DisplayCountTests: XCTestCase {
         XCTAssertTrue(metadata.state.loginWindowLockScreenActive)
     }
 
+    func testAppleDisplayInfo2DecodesCurtainFlags() throws {
+        var payload = Data(repeating: 0, count: 20)
+        payload[1] = 18
+        payload[3] = 5
+
+        // Curtain offered, session still drawn on the remote console.
+        payload[19] = 0x02 | 0x04
+        var state = try XCTUnwrap(
+            appleDisplayInfo2RemoteSessionState(payload))
+        XCTAssertTrue(state.curtainToggleAvailable)
+        XCTAssertTrue(state.onConsole)
+        XCTAssertFalse(state.curtained)
+
+        // Curtain offered and engaged: the session has left the console.
+        payload[19] = 0x02
+        state = try XCTUnwrap(appleDisplayInfo2RemoteSessionState(payload))
+        XCTAssertTrue(state.curtainToggleAvailable)
+        XCTAssertTrue(state.curtained)
+
+        // A server that never offers curtain still reports console state.
+        payload[19] = 0x04
+        state = try XCTUnwrap(appleDisplayInfo2RemoteSessionState(payload))
+        XCTAssertFalse(state.curtainToggleAvailable)
+        XCTAssertFalse(state.curtained)
+    }
+
+    func testAppleDisplayInfo2DecodesCurtainFlagsInLittleEndianOrder() throws {
+        var payload = Data(repeating: 0, count: 20)
+        payload[1] = 18
+        payload[3] = 5
+        payload[16] = 0x02 | 0x04
+
+        let state = try XCTUnwrap(
+            appleDisplayInfo2RemoteSessionState(payload))
+        XCTAssertTrue(state.curtainToggleAvailable)
+        XCTAssertTrue(state.onConsole)
+    }
+
+    func testAppleRemoteSessionStateDefaultsHideCurtain() {
+        let state = AppleRemoteSessionState(
+            loginWindowActive: false,
+            loginWindowLockScreenActive: false)
+        XCTAssertFalse(state.curtainToggleAvailable)
+        XCTAssertFalse(state.curtained)
+    }
+
     func testAppleDisplayInfo2DecodesPhysicalPixelRegions() {
         var payload = Data(repeating: 0, count: 134)
         func write(_ value: UInt16, at offset: Int) {

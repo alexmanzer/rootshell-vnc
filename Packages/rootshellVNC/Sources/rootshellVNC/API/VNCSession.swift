@@ -400,6 +400,37 @@ public final class VNCSession {
     public private(set) var supportsRemoteClipboardRequest = false
     public private(set) var supportsRemoteSharedClipboardControl = false
 
+    /// Whether the server offers curtain mode, in which the remote Mac's own
+    /// display shows a lock screen while this viewer keeps control. Apple
+    /// publishes this per DisplayInfo2, so it stays false until one arrives and
+    /// can be withdrawn mid-session.
+    public private(set) var supportsCurtainMode = false
+
+    /// Whether the remote Mac is currently curtained. This mirrors the server's
+    /// reported console state rather than what was last requested, so it is
+    /// safe to present as the true privacy state.
+    public private(set) var isCurtained = false
+
+    /// Set when a curtain change was requested but the server never reported
+    /// the matching state. Hosts surface this because silently failing to
+    /// curtain leaves the remote screen visible to bystanders.
+    public private(set) var curtainChangeFailed = false
+
+    /// How long the server has to reflect a requested curtain change before it
+    /// is reported as failed.
+    ///
+    /// Satisfying the request makes the remote Mac switch console sessions and
+    /// restart its capture pipeline, and the confirming DisplayInfo2 only lands
+    /// after that settles. Apple's own client schedules an 8s `dispatch_after`
+    /// in `-[SSSession stSetCurtained]` before it re-checks, so anything near
+    /// that budget reports false failures on changes that did work.
+    static let curtainConfirmationTimeoutNanoseconds: UInt64 = 20_000_000_000
+
+    @ObservationIgnored
+    private var pendingCurtainRequest: Bool?
+    @ObservationIgnored
+    private var curtainConfirmationTask: Task<Void, Never>?
+
     /// Content encryption negotiated by the active RFB transport. This excludes
     /// host-provided tunnels such as SSH and is nil while no transport is active.
     public private(set) var negotiatedContentEncryption: VNCContentEncryption?
@@ -739,6 +770,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        resetCurtainState()
         negotiatedContentEncryption = nil
         serverCapabilities = nil
         activeVideoDisplayCount = 1
@@ -830,6 +862,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        resetCurtainState()
         negotiatedContentEncryption = nil
         serverCapabilities = nil
         activeVideoDisplayCount = 1
@@ -971,7 +1004,7 @@ public final class VNCSession {
             case .pointer(let buttonMask, let x, let y):
                 sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
             case .scroll, .gesture, .clipboard, .clipboardRequest,
-                 .sharedClipboard:
+                 .sharedClipboard, .curtain:
                 assertionFailure("Unexpected event in login password sequence")
             }
         }
@@ -1144,6 +1177,60 @@ public final class VNCSession {
               transportSession != nil,
               supportsRemoteSharedClipboardControl else { return }
         enqueueInput(.sharedClipboard(enabled))
+    }
+
+    /// Curtain or uncurtain the remote Mac's own display.
+    ///
+    /// The note is shown on the curtained screen and is ignored when disabling.
+    /// `isCurtained` does not change here — it follows the server's next
+    /// DisplayInfo2, and `curtainChangeFailed` is set if that never confirms.
+    public func setCurtainMode(_ enabled: Bool, message: String = "") {
+        guard connectionState.isConnected,
+              transportSession != nil,
+              supportsCurtainMode else { return }
+        curtainChangeFailed = false
+        // The server only re-announces DisplayInfo2 when something changes, so
+        // a request that is already satisfied would never be confirmed and
+        // would raise a false privacy warning. Still send it: the note on a
+        // curtained screen may differ.
+        if isCurtained != enabled {
+            startCurtainConfirmationWatchdog(expecting: enabled)
+        }
+        enqueueInput(.curtain(enabled: enabled, message: message))
+    }
+
+    /// Dismiss the failure notice after a host has presented it.
+    public func acknowledgeCurtainFailure() {
+        curtainChangeFailed = false
+    }
+
+    /// Apple never acknowledges the curtain command, so a request that the
+    /// server declines is indistinguishable from one still in flight. Give the
+    /// state change a grace period, then report the mismatch rather than
+    /// leaving the toggle showing a privacy guarantee that does not hold.
+    private func startCurtainConfirmationWatchdog(expecting enabled: Bool) {
+        curtainConfirmationTask?.cancel()
+        pendingCurtainRequest = enabled
+        curtainConfirmationTask = Task { [weak self] in
+            try? await Task.sleep(
+                nanoseconds: Self.curtainConfirmationTimeoutNanoseconds)
+            guard !Task.isCancelled, let self else { return }
+            guard self.pendingCurtainRequest == enabled else { return }
+            self.pendingCurtainRequest = nil
+            self.curtainConfirmationTask = nil
+            self.curtainChangeFailed = true
+            self.logger.warning(
+                "Curtain mode change to \(enabled) was not confirmed by the server")
+        }
+    }
+
+    private func resetCurtainState() {
+        curtainConfirmationTask?.cancel()
+        curtainConfirmationTask = nil
+        pendingCurtainRequest = nil
+        supportsCurtainMode = false
+        isCurtained = false
+        curtainChangeFailed = false
     }
 
     func addServerClipboardObserver(
@@ -1916,6 +2003,7 @@ public final class VNCSession {
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
+        resetCurtainState()
         negotiatedContentEncryption = nil
         serverCapabilities = nil
         activeVideoDisplayCount = 1
@@ -1933,10 +2021,28 @@ public final class VNCSession {
         remoteAudioPlayer = nil
     }
 
+    /// Adopt the server's authoritative curtain facts and settle any request
+    /// waiting on them.
+    private func applyCurtainState(_ state: AppleRemoteSessionState) {
+        if supportsCurtainMode != state.curtainToggleAvailable {
+            supportsCurtainMode = state.curtainToggleAvailable
+        }
+        if isCurtained != state.curtained {
+            isCurtained = state.curtained
+        }
+        if let requested = pendingCurtainRequest, requested == state.curtained {
+            curtainConfirmationTask?.cancel()
+            curtainConfirmationTask = nil
+            pendingCurtainRequest = nil
+            curtainChangeFailed = false
+        }
+    }
+
     private func handleAppleRemoteSessionState(
         _ state: AppleRemoteSessionState
     ) {
         lastSessionStateAnnouncementNanos = DispatchTime.now().uptimeNanoseconds
+        applyCurtainState(state)
         let promptEnabled =
             configuration.promptForLoginPasswordAtLoginWindow
         let passwordAvailable = canSendLoginPassword
@@ -2788,6 +2894,15 @@ public final class VNCSession {
                             "Failed to update shared clipboard state: "
                                 + error.localizedDescription)
                     }
+                case .curtain(let enabled, let message):
+                    do {
+                        try await transport.setCurtainEnabled(
+                            enabled, message: message)
+                    } catch {
+                        self.logger.warning(
+                            "Failed to change curtain mode: "
+                                + error.localizedDescription)
+                    }
                 }
             }
             if self.inputGeneration == generation {
@@ -2849,7 +2964,7 @@ public final class VNCSession {
         case .pointer(let buttonMask, let x, let y):
             return .pointer(buttonMask: buttonMask, x: x, y: y)
         case .pause, .scroll, .gesture, .clipboard, .clipboardRequest,
-             .sharedClipboard:
+             .sharedClipboard, .curtain:
             return nil
         }
     }

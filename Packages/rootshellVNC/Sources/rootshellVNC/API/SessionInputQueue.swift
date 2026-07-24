@@ -19,6 +19,7 @@ enum SessionInputEvent: Sendable, Equatable {
     case clipboard(String)
     case clipboardRequest
     case sharedClipboard(Bool)
+    case curtain(enabled: Bool, message: String)
 }
 
 struct SessionInputQueue: Sendable {
@@ -61,7 +62,8 @@ struct SessionInputQueue: Sendable {
 
         default:
             // Key transitions, button transitions, scroll lifecycle boundaries,
-            // and clipboard messages are ordering barriers and are never merged.
+            // and clipboard and curtain messages are ordering barriers and are
+            // never merged.
             pending.append(event)
         }
     }
