@@ -682,6 +682,17 @@ public final class VNCSession {
     /// replacement transport retries its known native four-source profile.
     @ObservationIgnored
     private var appleMediaTilesPerFrameOverride: UInt64?
+    /// Forced media reconnects since the last healthy media bootstrap. The
+    /// video watchdogs tear down a control channel that is doing nothing
+    /// wrong, so this bounds how many times a media-only fault is allowed to
+    /// cost the user a working session.
+    @ObservationIgnored
+    private var consecutiveMediaBootstrapReconnects = 0
+    /// After this many forced media reconnects with no healthy bootstrap in
+    /// between, retrying is not working: a third attempt only re-enters the
+    /// loop the user experiences as repeated "Connection interrupted". See
+    /// ``failAfterMediaBootstrapExhausted(reason:)`` for what happens instead.
+    private static let maximumConsecutiveMediaBootstrapReconnects = 2
     #if canImport(UIKit)
     @ObservationIgnored
     private var backgroundLifecycleTask: Task<Void, Never>?
@@ -752,6 +763,7 @@ public final class VNCSession {
         reconnectTask = nil
         intentionallyDisconnected = false
         hasEstablishedConnection = false
+        consecutiveMediaBootstrapReconnects = 0
         connectionState = .connecting
         connectionPhaseDescription = String(localized: "Opening connection…", bundle: .module)
         activeCredentials = credentials
@@ -892,6 +904,10 @@ public final class VNCSession {
               activeCredentials != nil,
               connectionState.canConnect else { return }
         intentionallyDisconnected = false
+        // A deliberate retry earns a fresh media-recovery budget; otherwise a
+        // session parked by `failAfterMediaBootstrapExhausted` would re-trip
+        // the cap on its first watchdog and never get a real second chance.
+        consecutiveMediaBootstrapReconnects = 0
         scheduleReconnect(immediate: true)
     }
 
@@ -913,6 +929,9 @@ public final class VNCSession {
 
         self.configuration = configuration
         intentionallyDisconnected = false
+        // Handshake-level options changed (often precisely to escape a failing
+        // video profile), so the media-recovery budget starts over.
+        consecutiveMediaBootstrapReconnects = 0
 
         // Mirror the proven media-bootstrap recovery path: close the old
         // transport while the reconnect task performs ordered cleanup and
@@ -2676,8 +2695,40 @@ public final class VNCSession {
     /// during bootstrap, and a lowered controller origin destabilizes large
     /// framebuffers.)
     private func noteMediaBootstrapHealthy() {
-        // Bootstrap health currently needs no state; kept as the single hook
-        // point for future per-connection learning.
+        guard consecutiveMediaBootstrapReconnects > 0 else { return }
+        logger.info(
+            "Media bootstrap healthy after \(consecutiveMediaBootstrapReconnects) "
+                + "forced reconnect(s); clearing the escalation count")
+        consecutiveMediaBootstrapReconnects = 0
+    }
+
+    /// Stop automatic media recovery and hand the decision back to the user.
+    ///
+    /// Every watchdog that reaches ``forceMediaBootstrapReconnect`` has already
+    /// retired its own task by the time it calls, and the two long-lived
+    /// in-session ladders cannot cover for them: the decode-output stall
+    /// detector needs compressed frames to keep being submitted, and the gated
+    /// recovery escalator needs gated bands. A stream that never produced a
+    /// video source has neither. Simply returning would therefore leave the
+    /// session `.connected` on a permanently blank screen with nothing left
+    /// retrying, which is worse than the reconnect loop this cap exists to
+    /// break. Retire the transport and publish `.failed` instead, which is the
+    /// state the UI offers a Retry button for.
+    private func failAfterMediaBootstrapExhausted(reason: String) {
+        let attempts = consecutiveMediaBootstrapReconnects
+        logger.error(
+            "Video bootstrap failed (\(reason)) after \(attempts) forced "
+                + "reconnects; giving up on automatic recovery")
+
+        // Order matters: cleanup cancels event processing and clears
+        // `transportSession` first, so the retired transport's `.disconnected`
+        // event cannot reach `handleDisconnected` and start the loop again.
+        let transport = transportSession
+        cleanupTransport(clearCredentials: false)
+        Task { await transport?.disconnect() }
+        connectionState = .failed(String(
+            localized: "The remote video stream could not start after \(attempts) attempts. Try again, or switch this connection to Standard mode.",
+            bundle: .module))
     }
 
     private func forceMediaBootstrapReconnect(
@@ -2694,6 +2745,18 @@ public final class VNCSession {
                     + "is unavailable; leaving the session as-is")
             return
         }
+
+        // A media fault must not cost a healthy control channel indefinitely.
+        // Reconnecting rebuilds the whole session to fix a video stream, and
+        // if two attempts have not produced a healthy bootstrap, a third will
+        // not either: it just re-enters the loop the user experiences as
+        // repeated "Connection interrupted".
+        guard consecutiveMediaBootstrapReconnects
+                < Self.maximumConsecutiveMediaBootstrapReconnects else {
+            failAfterMediaBootstrapExhausted(reason: reason)
+            return
+        }
+        consecutiveMediaBootstrapReconnects += 1
         if let retryTilesPerFrame {
             appleMediaTilesPerFrameOverride = retryTilesPerFrame
             logger.warning(
@@ -2769,8 +2832,9 @@ public final class VNCSession {
                 guard !Task.isCancelled, !self.intentionallyDisconnected else { return }
                 let delay = immediate && attempt == 1 ? 0 : policy.delay(forAttempt: attempt)
                 self.connectionState = .reconnecting(attempt: attempt, delay: delay)
+                let cause = self.lastError?.localizedDescription ?? "no transport error recorded"
                 self.logger.warning(
-                    "Connection lost; retry \(attempt)/\(maximumAttempts) in "
+                    "Connection lost (\(cause)); retry \(attempt)/\(maximumAttempts) in "
                         + String(format: "%.1f", delay) + "s")
 
                 do {

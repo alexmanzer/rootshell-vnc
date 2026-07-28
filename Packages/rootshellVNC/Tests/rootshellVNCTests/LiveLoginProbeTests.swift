@@ -43,7 +43,7 @@ final class LiveLoginProbeTests: XCTestCase {
         }()
 
         let hp: [Encoding] = [
-            .appleH264, .appleMultiVariantScreenshare, .appleSubZlibThousands, .zlib, .zrle,
+            .appleH264, .appleMultiVariantScreenshare, .zlib, .zrle,
             .encryptionInfo, .serverDisplayInfo, .mediaStreamOffer, .mediaStreamAnswer,
         ]
         let session = TransportSession(host: host, port: port, password: pass, username: user, preferredEncodings: hp)
@@ -232,7 +232,7 @@ final class LiveLoginProbeTests: XCTestCase {
         try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
 
         let hp: [Encoding] = [
-            .appleH264, .appleMultiVariantScreenshare, .appleSubZlibThousands, .zlib, .zrle,
+            .appleH264, .appleMultiVariantScreenshare, .zlib, .zrle,
             .encryptionInfo, .serverDisplayInfo, .mediaStreamOffer, .mediaStreamAnswer,
         ]
         let session = TransportSession(host: host, port: port, password: pass, username: user, preferredEncodings: hp)

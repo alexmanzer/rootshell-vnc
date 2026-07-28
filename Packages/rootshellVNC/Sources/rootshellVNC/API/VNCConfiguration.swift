@@ -379,15 +379,24 @@ public struct VNCConfiguration: Sendable {
     /// The full list of encodings to advertise to the server, including
     /// pseudo-encodings for desktop resize and high-performance mode.
     public var effectiveEncodings: [Encoding] {
-        var encodings = preferredEncodings
+        // Drop anything whose payload the rectangle parsers cannot frame,
+        // before any mode-specific list is layered on. `preferredEncodings` is
+        // caller-supplied, so filtering only the lists this property injects
+        // would still let a host advertise, say, Apple SubZlib (1002) and
+        // desynchronize the stream. See `Encoding.hasKnownFramebufferFraming`.
+        var encodings = preferredEncodings.filter { !$0.isUnframeableContent }
 
         // Apple's default/high quality mode offers AVC first. Its Full Quality
         // mode does not negotiate AVC at all: the native binary's exact video
         // list is [Zlib (6), ZRLE (16)]. Keep those semantics instead of trying
         // to manufacture a "lossless HEVC" profile that the protocol lacks.
+        //
+        // Apple SubZlib (1002) is deliberately absent even though the native
+        // viewer advertises it: no rectangle parser here can frame its
+        // payload. Restore it only together with a real implementation.
         if enableHighPerformanceMode, videoQualityMode == .adaptive {
             let proModeEncodings: [Encoding] = [
-                .appleH264, .appleMultiVariantScreenshare, .appleSubZlibThousands, .zlib, .zrle,
+                .appleH264, .appleMultiVariantScreenshare, .zlib, .zrle,
             ]
             for encoding in proModeEncodings.reversed() where !encodings.contains(encoding) {
                 encodings.insert(encoding, at: 0)

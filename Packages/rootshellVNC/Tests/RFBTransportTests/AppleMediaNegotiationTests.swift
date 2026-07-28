@@ -107,6 +107,19 @@ final class AppleMediaNegotiationTests: XCTestCase {
             try XCTUnwrap(encodings.firstIndex(of: .cursor)))
     }
 
+    /// The post-accept list is rebuilt from `preferredEncodings`, so it needs
+    /// the same "never advertise what the parsers cannot frame" guarantee as
+    /// `VNCConfiguration.effectiveEncodings`.
+    func testPostAcceptEncodingsRejectUnframeableContent() {
+        let encodings = TransportSession.appleMediaPostAcceptEncodings(
+            from: [.appleH264, .appleSubZlibThousands, .zlib, .raw])
+
+        XCTAssertFalse(encodings.contains(.appleSubZlibThousands))
+        XCTAssertTrue(encodings.contains(.appleH264))
+        XCTAssertTrue(encodings.contains(.zlib))
+        XCTAssertTrue(encodings.contains(.raw))
+    }
+
     func testNativeScreenSharingReceiverFlagsTrackSixtyFPSCapability() {
         XCTAssertEqual(appleMediaReceiverFlags(displayCount: 1), 0x04)
         XCTAssertEqual(appleMediaReceiverFlags(displayCount: 2), 0x04)

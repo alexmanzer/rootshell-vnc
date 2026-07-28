@@ -37,7 +37,7 @@ final class LiveVideoBenchmarkTests: XCTestCase {
         let targetFrameRate = Int(env["VNC_BENCH_TARGET_FPS"] ?? "60") ?? 60
 
         let hp: [Encoding] = [
-            .appleH264, .appleMultiVariantScreenshare, .appleSubZlibThousands, .zlib, .zrle,
+            .appleH264, .appleMultiVariantScreenshare, .zlib, .zrle,
             .encryptionInfo, .serverDisplayInfo, .mediaStreamOffer, .mediaStreamAnswer,
         ]
         let session = TransportSession(

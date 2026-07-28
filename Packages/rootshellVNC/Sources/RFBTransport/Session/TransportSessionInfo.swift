@@ -83,4 +83,26 @@ public struct TransportStatistics: Sendable, Equatable {
     public let recentBitrateKbps: Double?
     /// Loss share of packets expected in the recent window (media path only).
     public let recentPacketLossPercent: Double?
+
+    // Liveness. In High Performance mode the video and rate-control traffic is
+    // UDP and what stays on TCP is request/response, so an idle remote desktop
+    // legitimately leaves the control channel silent. That silence is also the
+    // condition TCP keepalive acts on, which makes these the numbers to look at
+    // when a session drops for no visible reason. Keepalive arms only once the
+    // socket is quiet in *both* directions, so read the two together.
+    /// Seconds since the read loop last took bytes off the control channel,
+    /// or nil before the first post-handshake read.
+    public let secondsSinceControlChannelByte: TimeInterval?
+    /// Cumulative bytes the read loop has taken off the control channel.
+    public let controlChannelBytesReceived: UInt64
+    /// Seconds since the last control-channel write, or nil if there has been
+    /// none on this connection.
+    public let secondsSinceControlChannelSend: TimeInterval?
+    /// Cumulative bytes written to the control channel.
+    public let controlChannelBytesSent: UInt64
+    /// Seconds since the last video RTP packet was ingested, or nil if none
+    /// has arrived (including every standard-mode session).
+    public let secondsSinceVideoRTPPacket: TimeInterval?
+    /// Seconds since the handshake completed, or nil if it has not.
+    public let connectionUptime: TimeInterval?
 }

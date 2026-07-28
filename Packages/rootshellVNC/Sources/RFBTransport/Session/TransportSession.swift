@@ -448,6 +448,27 @@ public actor TransportSession {
     private var drainedAppleMediaControlBytes = 0
     private var appleMediaControlBuffer = Data()
     private var appleDecryptedRFBBuffer = Data()
+
+    // MARK: Liveness accounting
+    //
+    // These exist to answer one question after an unexplained mid-session
+    // drop: was the control channel starved, or was it busy right up to the
+    // moment it died? In High Performance mode video and rate control are UDP
+    // and what stays on TCP is request/response, so an idle remote desktop
+    // produces a long control-channel silence that is entirely normal, and is
+    // exactly the condition TCP keepalive acts on.
+
+    /// Uptime nanoseconds when the handshake completed.
+    private var connectionEstablishedNanos: UInt64 = 0
+    /// Uptime nanoseconds when the read loop last received control-channel
+    /// bytes. Zero until the first post-handshake read completes.
+    private var lastControlChannelByteNanos: UInt64 = 0
+    /// Total bytes the read loop has taken off the control channel.
+    private var controlChannelBytesReceived: UInt64 = 0
+    /// Uptime nanoseconds of the last control-channel write, and the running
+    /// byte total. Keepalive only arms once both directions are quiet.
+    private var lastControlChannelSendNanos: UInt64 = 0
+    private var controlChannelBytesSent: UInt64 = 0
     private var emittedAppleMediaControlDiagnostics = 0
     private var latestAppleMediaControlDiagnostic: String?
     private var appleSessionKey: Data?
@@ -581,6 +602,28 @@ public actor TransportSession {
     private var appleMediaSupportsHDR = false
     private var appleMediaUDPBindings: [AppleMediaUDPBinding] = []
     private let appleMediaControlBufferLimit = 64 * 1024
+
+    /// Memory backstop on the post-decrypt RFB reassembly buffer.
+    ///
+    /// This is deliberately derived from what the protocol actually permits
+    /// rather than picked as a round number, because messages are allowed to
+    /// span encrypted records: a partially reassembled message is normal, and
+    /// discarding one below its legal maximum corrupts a valid session. The
+    /// two largest legal messages are a packed clipboard scrap (capped at
+    /// ``AppleClipboardProtocol/maximumClipboardSize``) and a framebuffer
+    /// update, whose worst case is full-screen Raw. Two full frames of
+    /// headroom covers an update whose rectangles overlap.
+    ///
+    /// Exceeding this therefore means the drain has genuinely stopped
+    /// consuming, and dropping the buffer is the only way to make progress.
+    /// The precise wedge detector is the unframeable-encoding branch in
+    /// ``drainAppleDecryptedFramebufferUpdate``; this only bounds memory.
+    private var appleDecryptedRFBBufferLimit: Int {
+        let fullFrameBytes = Int(fbWidth) * Int(fbHeight) * pixelFormat.bytesPerPixel
+        return max(
+            AppleClipboardProtocol.maximumClipboardSize,
+            fullFrameBytes * 2) + 1024 * 1024
+    }
 
     private struct AppleMediaUDPBinding: Equatable {
         let localPort: UInt16?
@@ -776,6 +819,11 @@ public actor TransportSession {
         framebufferEncodingTraffic = [:]
         statsPreviousSample = nil
         lastAppleEncryptionInfo = nil
+        connectionEstablishedNanos = 0
+        lastControlChannelByteNanos = 0
+        controlChannelBytesReceived = 0
+        lastControlChannelSendNanos = 0
+        controlChannelBytesSent = 0
         await tcp.setDisconnectHandler { [weak self] error in
             Task { await self?.handleUnexpectedTCPDisconnect(error) }
         }
@@ -819,6 +867,7 @@ public actor TransportSession {
         // Perform handshake
         try await performHandshake()
         handshakeComplete = true
+        connectionEstablishedNanos = DispatchTime.now().uptimeNanoseconds
 
         // Start the message read loop
         readTask = Task { [weak self] in
@@ -1164,7 +1213,17 @@ public actor TransportSession {
             encodingUsage: encodingUsage,
             recentInterval: recentInterval,
             recentBitrateKbps: recentBitrateKbps,
-            recentPacketLossPercent: recentPacketLossPercent)
+            recentPacketLossPercent: recentPacketLossPercent,
+            secondsSinceControlChannelByte:
+                Self.secondsSince(lastControlChannelByteNanos, now: nowNanos),
+            controlChannelBytesReceived: controlChannelBytesReceived,
+            secondsSinceControlChannelSend:
+                Self.secondsSince(lastControlChannelSendNanos, now: nowNanos),
+            controlChannelBytesSent: controlChannelBytesSent,
+            secondsSinceVideoRTPPacket:
+                Self.secondsSince(appleMediaLastVideoIngestNanos, now: nowNanos),
+            connectionUptime:
+                Self.secondsSince(connectionEstablishedNanos, now: nowNanos))
     }
 
     public var currentAppleMediaTilesPerFrame: Int {
@@ -1359,7 +1418,7 @@ public actor TransportSession {
 
     private func performHandshake() async throws {
         // Step 1: Read server protocol version (12 bytes)
-        let versionData = try await tcp.read(exactly: ProtocolVersion.wireSize)
+        let versionData = try await readControlChannel(exactly: ProtocolVersion.wireSize)
         let serverVersion = try ProtocolVersion(data: versionData)
         log.info("Server version: \(serverVersion)")
 
@@ -1420,7 +1479,7 @@ public actor TransportSession {
     }
 
     private func readSecurityTypes37() async throws {
-        let countData = try await tcp.read(exactly: 1)
+        let countData = try await readControlChannel(exactly: 1)
         let count = Int(countData[countData.startIndex])
 
         if count == 0 {
@@ -1429,7 +1488,7 @@ public actor TransportSession {
             throw VNCProtocolError.authenticationFailed(reason)
         }
 
-        let typesData = try await tcp.read(exactly: count)
+        let typesData = try await readControlChannel(exactly: count)
         let types = typesData.map { SecurityType(rawValue: $0) }
         log.info("Server offers security types: \(types)")
 
@@ -1449,7 +1508,7 @@ public actor TransportSession {
     private var securityTypeSentSeparately = true
 
     private func readSecurityTypes33() async throws {
-        let secData = try await tcp.read(exactly: 4)
+        let secData = try await readControlChannel(exactly: 4)
         var reader = MessageReader(data: secData)
         let secTypeRaw = try reader.readUInt32()
 
@@ -1552,7 +1611,7 @@ public actor TransportSession {
     }
 
     private func readSecurityResult(canReadReason: Bool) async throws {
-        let resultData = try await tcp.read(exactly: 4)
+        let resultData = try await readControlChannel(exactly: 4)
         var reader = MessageReader(data: resultData)
         let result = try reader.readUInt32()
 
@@ -1584,14 +1643,14 @@ public actor TransportSession {
         // its pending Match Client request may still use public SetDesktopSize
         // when a regular RFB server advertises ExtendedDesktopSize support.
         let flags: UInt8 = requestAppleMediaStream ? 0xc1 : 0x01
-        try await tcp.send(Data([flags]))
+        try await sendControlChannel(Data([flags]))
         log.debug("Sent ClientInit flags=0x\(String(flags, radix: 16))")
     }
 
     private func readServerInit() async throws {
         // Read the fixed-size portion: width(2) + height(2) + pixelFormat(16) + nameLength(4) = 24
         log.info("Reading ServerInit (\(ServerInit.minWireSize) bytes)...")
-        let headerData = try await tcp.read(exactly: ServerInit.minWireSize)
+        let headerData = try await readControlChannel(exactly: ServerInit.minWireSize)
         log.debug("ServerInit raw header: \(headerData.map { String(format: "%02x", $0) }.joined(separator: " "))")
         var reader = MessageReader(data: headerData)
         let width = try reader.readUInt16()
@@ -1599,7 +1658,7 @@ public actor TransportSession {
         let pf = try reader.readPixelFormat()
         let nameLen = try reader.readUInt32()
 
-        let serverInitNameField = try await tcp.read(exactly: Int(nameLen))
+        let serverInitNameField = try await readControlChannel(exactly: Int(nameLen))
         var nameData = serverInitNameField
         if stateMachine.negotiatedVersion?.isApple == true,
            let capabilities = AppleServerCapabilities(
@@ -1662,11 +1721,11 @@ public actor TransportSession {
     }
 
     private func readReasonString() async throws -> String {
-        let lenData = try await tcp.read(exactly: 4)
+        let lenData = try await readControlChannel(exactly: 4)
         var reader = MessageReader(data: lenData)
         let len = try reader.readUInt32()
         guard len > 0 else { return "Unknown error" }
-        let textData = try await tcp.read(exactly: Int(len))
+        let textData = try await readControlChannel(exactly: Int(len))
         return String(data: textData, encoding: .utf8) ?? "Unknown error"
     }
 
@@ -1680,7 +1739,7 @@ public actor TransportSession {
                     continue
                 }
 
-                let typeData = try await tcp.read(exactly: 1)
+                let typeData = try await readControlChannel(exactly: 1)
                 let messageType = typeData[typeData.startIndex]
 
                 switch messageType {
@@ -1727,12 +1786,97 @@ public actor TransportSession {
               !terminalDisconnectHandled else { return }
         log.error("TCP state reported connection loss: \(error.localizedDescription)")
         continuation?.yield(.error(error))
-        await terminateUnexpectedConnection(error)
+        await terminateUnexpectedConnection(error, origin: "tcp-state")
     }
 
-    private func terminateUnexpectedConnection(_ error: VNCProtocolError) async {
+    /// Every control-channel read funnels through these two wrappers, so the
+    /// liveness counters see real bytes rather than one tick per message.
+    /// Counting only message-type bytes would report silence while a large
+    /// framebuffer or clipboard payload was still streaming in, which is
+    /// exactly the reading the disconnect diagnostics must not get wrong.
+    ///
+    /// Granularity is one read: a single very large `read(exactly:)` updates
+    /// the timestamp only when it completes, because the byte stream does not
+    /// expose partial progress.
+    private func readControlChannel(exactly count: Int) async throws -> Data {
+        let data = try await tcp.read(exactly: count)
+        noteControlChannelActivity(byteCount: data.count)
+        return data
+    }
+
+    private func readControlChannel(upTo maxCount: Int) async throws -> Data {
+        let data = try await tcp.read(upTo: maxCount)
+        noteControlChannelActivity(byteCount: data.count)
+        return data
+    }
+
+    /// Outbound counterpart. TCP keepalive probes only start once the socket
+    /// has been idle in *both* directions, so an inbound-only measure would
+    /// call a session "starved" while our own input events were still keeping
+    /// the connection warm, and point the diagnosis at the wrong cause.
+    private func sendControlChannel(_ data: Data) async throws {
+        try await tcp.send(data)
+        guard !data.isEmpty else { return }
+        lastControlChannelSendNanos = DispatchTime.now().uptimeNanoseconds
+        controlChannelBytesSent &+= UInt64(data.count)
+    }
+
+    private func noteControlChannelActivity(byteCount: Int) {
+        guard byteCount > 0 else { return }
+        lastControlChannelByteNanos = DispatchTime.now().uptimeNanoseconds
+        controlChannelBytesReceived &+= UInt64(byteCount)
+    }
+
+    private static func secondsSince(_ nanos: UInt64, now: UInt64) -> Double? {
+        guard nanos != 0, now >= nanos else { return nil }
+        return Double(now &- nanos) / 1_000_000_000
+    }
+
+    private static func format(_ seconds: Double?) -> String {
+        guard let seconds else { return "never" }
+        return String(format: "%.1fs", seconds)
+    }
+
+    /// One line that explains an unsolicited teardown well enough to act on.
+    ///
+    /// The three causes that produce the same "Connection interrupted" card are
+    /// only distinguishable here: a keepalive verdict on a socket idle in both
+    /// directions (long `sinceControlByte` *and* `sinceControlSend`, with
+    /// `posix(ETIMEDOUT)`), a peer-initiated close, or a protocol parse failure
+    /// (the error names the message or encoding). Media liveness is included
+    /// because in High Performance mode a healthy UDP stream alongside a dead
+    /// TCP channel is itself the finding.
+    private func logDisconnectSummary(_ error: VNCProtocolError, origin: String) async {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let path = await tcp.pathCharacteristics()
+        let interface = path.map { characteristics -> String in
+            var description = String(describing: characteristics.interface)
+            if characteristics.isExpensive { description += ",expensive" }
+            if characteristics.isConstrained { description += ",constrained" }
+            return description
+        } ?? "unknown"
+
+        log.error(
+            "Connection terminated: origin=\(origin) "
+                + "error=\(error.localizedDescription) "
+                + "connectedFor=\(Self.format(Self.secondsSince(connectionEstablishedNanos, now: now))) "
+                + "sinceControlByte=\(Self.format(Self.secondsSince(lastControlChannelByteNanos, now: now))) "
+                + "sinceControlSend=\(Self.format(Self.secondsSince(lastControlChannelSendNanos, now: now))) "
+                + "controlBytesIn=\(controlChannelBytesReceived) "
+                + "controlBytesOut=\(controlChannelBytesSent) "
+                + "sinceVideoRTP=\(Self.format(Self.secondsSince(appleMediaLastVideoIngestNanos, now: now))) "
+                + "highPerformance=\(acceptedAppleMediaStream) "
+                + "videoSources=\(appleMediaVideoSSRCChannels.count) "
+                + "interface=\(interface)")
+    }
+
+    private func terminateUnexpectedConnection(
+        _ error: VNCProtocolError,
+        origin: String = "read-loop"
+    ) async {
         guard !isDisconnecting, !terminalDisconnectHandled else { return }
         terminalDisconnectHandled = true
+        await logDisconnectSummary(error, origin: origin)
         readTask?.cancel()
         appleAutoUpdateRefreshTask?.cancel()
         appleAutoUpdateRefreshTask = nil
@@ -1748,7 +1892,7 @@ public actor TransportSession {
 
     private func handleFramebufferUpdate() async throws {
         // padding(1) + numberOfRectangles(2) = 3 bytes
-        let headerData = try await tcp.read(exactly: 3)
+        let headerData = try await readControlChannel(exactly: 3)
         let rectCount = UInt16(headerData[headerData.startIndex + 1]) << 8
                       | UInt16(headerData[headerData.startIndex + 2])
 
@@ -1757,7 +1901,7 @@ public actor TransportSession {
         var pendingResize: FramebufferRect?
 
         for _ in 0..<rectCount {
-            let rectData = try await tcp.read(exactly: FramebufferRect.wireSize)
+            let rectData = try await readControlChannel(exactly: FramebufferRect.wireSize)
             var reader = MessageReader(data: rectData)
             let rect = try FramebufferRect(reader: &reader)
 
@@ -1775,7 +1919,7 @@ public actor TransportSession {
             case .raw:
                 let byteCount = Int(rect.width) * Int(rect.height) * pixelFormat.bytesPerPixel
                 if byteCount > 0 {
-                    pixelData = try await tcp.read(exactly: byteCount)
+                    pixelData = try await readControlChannel(exactly: byteCount)
                 } else {
                     pixelData = Data()
                 }
@@ -1784,13 +1928,13 @@ public actor TransportSession {
                 // Wire format: UInt32 compressedLength, then compressedLength bytes.
                 // We read the length prefix + compressed data and forward both to the
                 // renderer so it can decompress using its persistent zlib stream.
-                let lenData = try await tcp.read(exactly: 4)
+                let lenData = try await readControlChannel(exactly: 4)
                 let compressedLen = Int(lenData[lenData.startIndex]) << 24
                     | Int(lenData[lenData.startIndex + 1]) << 16
                     | Int(lenData[lenData.startIndex + 2]) << 8
                     | Int(lenData[lenData.startIndex + 3])
                 let compressedData = compressedLen > 0
-                    ? try await tcp.read(exactly: compressedLen)
+                    ? try await readControlChannel(exactly: compressedLen)
                     : Data()
                 // Forward length prefix + compressed bytes so the renderer can parse
                 var fullPayload = Data(capacity: 4 + compressedLen)
@@ -1804,20 +1948,20 @@ public actor TransportSession {
             case .appleMultiVariantScreenshare:
                 // Apple Adaptive DCT (1011) is framed as a big-endian UInt32
                 // byte count followed by one self-typed codec message.
-                let lengthData = try await tcp.read(exactly: 4)
+                let lengthData = try await readControlChannel(exactly: 4)
                 let length = Int(lengthData[lengthData.startIndex]) << 24
                     | Int(lengthData[lengthData.startIndex + 1]) << 16
                     | Int(lengthData[lengthData.startIndex + 2]) << 8
                     | Int(lengthData[lengthData.startIndex + 3])
                 var fullPayload = lengthData
                 if length > 0 {
-                    fullPayload.append(try await tcp.read(exactly: length))
+                    fullPayload.append(try await readControlChannel(exactly: length))
                 }
                 pixelData = fullPayload
 
             case .copyRect:
                 // 4 bytes: srcX(2) + srcY(2)
-                pixelData = try await tcp.read(exactly: 4)
+                pixelData = try await readControlChannel(exactly: 4)
 
             case .desktopSize:
                 pixelData = Data()
@@ -1826,11 +1970,11 @@ public actor TransportSession {
                 // ExtendedDesktopSize is not payload-free: one count byte and
                 // three padding bytes are followed by 16 bytes per screen.
                 // Consume it in full or the next RFB message begins mid-layout.
-                var payload = try await tcp.read(exactly: ExtendedDesktopSizePayload.headerWireSize)
+                var payload = try await readControlChannel(exactly: ExtendedDesktopSizePayload.headerWireSize)
                 let payloadSize = ExtendedDesktopSizePayload.wireSize(screenCount: payload[payload.startIndex])
                 let remaining = payloadSize - ExtendedDesktopSizePayload.headerWireSize
                 if remaining > 0 {
-                    payload.append(try await tcp.read(exactly: remaining))
+                    payload.append(try await readControlChannel(exactly: remaining))
                 }
                 let layout = try ExtendedDesktopSizePayload(data: payload)
                 try await noteStandardDesktopSizeSupport(layout)
@@ -1839,7 +1983,7 @@ public actor TransportSession {
 
             case .encryptionInfo:
                 // Apple encryption pseudo-encoding: read 8 bytes
-                let eiData = try await tcp.read(exactly: 8)
+                let eiData = try await readControlChannel(exactly: 8)
                 var eiReader = MessageReader(data: eiData)
                 let info = try AppleEncryptionInfo(reader: &eiReader)
                 lastAppleEncryptionInfo = info
@@ -1851,7 +1995,7 @@ public actor TransportSession {
 
             case .serverDisplayInfo:
                 // Apple display info pseudo-encoding: read 24 bytes
-                let diData = try await tcp.read(exactly: 24)
+                let diData = try await readControlChannel(exactly: 24)
                 var diReader = MessageReader(data: diData)
                 let info = try AppleDisplayInfo(reader: &diReader)
                 continuation?.yield(.displayInfo(info))
@@ -1863,7 +2007,7 @@ public actor TransportSession {
 
             case .mediaStreamOffer:
                 // Apple RFBMediaStreamMessage1: current macOS payload is 36 bytes.
-                let offerData = try await tcp.read(exactly: AppleMediaStreamOffer.wirePayloadSize)
+                let offerData = try await readControlChannel(exactly: AppleMediaStreamOffer.wirePayloadSize)
                 try await handleAppleMediaStreamOfferPayload(offerData)
                 pixelData = offerData
 
@@ -1873,7 +2017,7 @@ public actor TransportSession {
                 let maskBytes = Int((Int(rect.width) + 7) / 8) * Int(rect.height)
                 let totalBytes = pixelBytes + maskBytes
                 if totalBytes > 0 {
-                    pixelData = try await tcp.read(exactly: totalBytes)
+                    pixelData = try await readControlChannel(exactly: totalBytes)
                 } else {
                     pixelData = Data()
                 }
@@ -1885,7 +2029,7 @@ public actor TransportSession {
                 let bitmapBytes = rowBytes * Int(rect.height)
                 let totalBytes = bitmapBytes == 0 ? 0 : 6 + bitmapBytes * 2
                 if totalBytes > 0 {
-                    pixelData = try await tcp.read(exactly: totalBytes)
+                    pixelData = try await readControlChannel(exactly: totalBytes)
                 } else {
                     pixelData = Data()
                 }
@@ -1898,34 +2042,34 @@ public actor TransportSession {
             case .unknown(let value) where value == 1101:
                 // Legacy Apple display layout: 10-byte header followed by
                 // 28 bytes per display. The count is the final UInt16.
-                var payload = try await tcp.read(exactly: 10)
+                var payload = try await readControlChannel(exactly: 10)
                 let count = Int(payload[payload.startIndex + 8]) << 8
                     | Int(payload[payload.startIndex + 9])
                 if count > 0 {
-                    payload.append(try await tcp.read(exactly: count * 28))
+                    payload.append(try await readControlChannel(exactly: count * 28))
                 }
                 pixelData = payload
 
             case .unknown(let value) where value == 1104:
                 // Apple cursor cache record: id + payload byte count.
-                var payload = try await tcp.read(exactly: 8)
+                var payload = try await readControlChannel(exactly: 8)
                 let length = Int(payload[payload.startIndex + 4]) << 24
                     | Int(payload[payload.startIndex + 5]) << 16
                     | Int(payload[payload.startIndex + 6]) << 8
                     | Int(payload[payload.startIndex + 7])
                 if length > 0 {
-                    payload.append(try await tcp.read(exactly: length))
+                    payload.append(try await readControlChannel(exactly: length))
                 }
                 pixelData = payload
 
             case .unknown(let value) where value == 1105:
                 // Apple DisplayInfo2: a UInt16 byte count followed by the
                 // complete display-layout structure.
-                var payload = try await tcp.read(exactly: 2)
+                var payload = try await readControlChannel(exactly: 2)
                 let length = Int(payload[payload.startIndex]) << 8
                     | Int(payload[payload.startIndex + 1])
                 if length > 0 {
-                    payload.append(try await tcp.read(exactly: length))
+                    payload.append(try await readControlChannel(exactly: length))
                 }
                 emitAppleRemoteSessionState(
                     from: payload,
@@ -1942,9 +2086,24 @@ public actor TransportSession {
                 pixelData = payload
 
             default:
-                // For encodings we don't specifically handle, log and skip.
-                // Since we only advertise encodings we implement, this path
-                // should only be hit if the server misbehaves.
+                // A rectangle whose encoding carries pixel content also
+                // carries payload bytes on the wire. Skipping it consumes
+                // zero of them, so the very next byte read as a message type
+                // is really payload: the stream is desynchronized from here
+                // on and the failure surfaces one message later as a
+                // baffling "unknown server message type". Fail here instead,
+                // where the log can name the encoding that did it.
+                if rect.encoding.isUnframeableContent {
+                    throw VNCProtocolError.protocolViolation(
+                        "Unsupported framebuffer encoding "
+                            + "\(rect.encoding.rawValue) (\(rect.encoding.displayName)) "
+                            + "for rect \(rect.width)x\(rect.height); "
+                            + "its payload cannot be framed without desynchronizing the stream")
+                }
+                // What is left is pseudo-encodings, Apple metadata records,
+                // and `.appleH264`'s marker rectangle, none of which carry a
+                // payload the parser must consume. Skipping an unrecognized
+                // one is the pre-existing best guess.
                 log.warning("Unhandled encoding \(rect.encoding.rawValue) for rect \(rect.width)x\(rect.height)")
                 pixelData = Data()
             }
@@ -2046,7 +2205,7 @@ public actor TransportSession {
     /// entire RFB stream, so derive the basic-filter payload size exactly as
     /// specified instead of scanning for the next message boundary.
     private func readTightRectanglePayload(rect: FramebufferRect) async throws -> Data {
-        let controlData = try await tcp.read(exactly: 1)
+        let controlData = try await readControlChannel(exactly: 1)
         let control = controlData[controlData.startIndex]
         let compression = control >> 4
         var payload = controlData
@@ -2060,17 +2219,17 @@ public actor TransportSession {
 
         switch compression {
         case 8: // Fill
-            payload.append(try await tcp.read(exactly: tightPixelSize))
+            payload.append(try await readControlChannel(exactly: tightPixelSize))
 
         case 9: // JPEG
             let (lengthBytes, length) = try await readTightCompactLength()
             payload.append(lengthBytes)
-            if length > 0 { payload.append(try await tcp.read(exactly: length)) }
+            if length > 0 { payload.append(try await readControlChannel(exactly: length)) }
 
         case 0...7: // Basic compression, optionally with an explicit filter.
             var filter: UInt8 = 0
             if compression & 0x04 != 0 {
-                let filterData = try await tcp.read(exactly: 1)
+                let filterData = try await readControlChannel(exactly: 1)
                 filter = filterData[filterData.startIndex]
                 payload.append(filterData)
             }
@@ -2079,10 +2238,10 @@ public actor TransportSession {
             let height = Int(rect.height)
             let uncompressedSize: Int
             if filter == 1 {
-                let paletteSizeData = try await tcp.read(exactly: 1)
+                let paletteSizeData = try await readControlChannel(exactly: 1)
                 payload.append(paletteSizeData)
                 let paletteSize = Int(paletteSizeData[paletteSizeData.startIndex]) + 1
-                payload.append(try await tcp.read(exactly: paletteSize * tightPixelSize))
+                payload.append(try await readControlChannel(exactly: paletteSize * tightPixelSize))
                 uncompressedSize = paletteSize == 2
                     ? ((width + 7) / 8) * height
                     : width * height
@@ -2092,12 +2251,12 @@ public actor TransportSession {
 
             if uncompressedSize < 12 {
                 if uncompressedSize > 0 {
-                    payload.append(try await tcp.read(exactly: uncompressedSize))
+                    payload.append(try await readControlChannel(exactly: uncompressedSize))
                 }
             } else {
                 let (lengthBytes, length) = try await readTightCompactLength()
                 payload.append(lengthBytes)
-                if length > 0 { payload.append(try await tcp.read(exactly: length)) }
+                if length > 0 { payload.append(try await readControlChannel(exactly: length)) }
             }
 
         default:
@@ -2111,7 +2270,7 @@ public actor TransportSession {
         var bytes = Data()
         var value = 0
         for index in 0..<3 {
-            let byteData = try await tcp.read(exactly: 1)
+            let byteData = try await readControlChannel(exactly: 1)
             let byte = byteData[byteData.startIndex]
             bytes.append(byte)
             value |= Int(byte & 0x7F) << (7 * index)
@@ -2122,11 +2281,11 @@ public actor TransportSession {
 
     private func handleSetColorMapEntries() async throws {
         // padding(1) + firstColor(2) + numberOfColors(2) = 5 bytes
-        let headerData = try await tcp.read(exactly: 5)
+        let headerData = try await readControlChannel(exactly: 5)
         let numColors = UInt16(headerData[headerData.startIndex + 3]) << 8
                       | UInt16(headerData[headerData.startIndex + 4])
         // Each color is 6 bytes (r,g,b as UInt16)
-        let _ = try await tcp.read(exactly: Int(numColors) * 6)
+        let _ = try await readControlChannel(exactly: Int(numColors) * 6)
         // Color map entries are passed through but not currently surfaced as session events
     }
 
@@ -2137,13 +2296,13 @@ public actor TransportSession {
 
     private func handleServerCutText() async throws {
         // padding(3) + length(4) = 7 bytes
-        let headerData = try await tcp.read(exactly: 7)
+        let headerData = try await readControlChannel(exactly: 7)
         let length = UInt32(headerData[headerData.startIndex + 3]) << 24
                    | UInt32(headerData[headerData.startIndex + 4]) << 16
                    | UInt32(headerData[headerData.startIndex + 5]) << 8
                    | UInt32(headerData[headerData.startIndex + 6])
 
-        let textData = try await tcp.read(exactly: Int(length))
+        let textData = try await readControlChannel(exactly: Int(length))
         let text = String(data: textData, encoding: .utf8)
             ?? String(data: textData, encoding: .isoLatin1)
             ?? ""
@@ -2154,7 +2313,7 @@ public actor TransportSession {
 
     private func handleApplePackedClipboard() async throws {
         // readLoop already consumed the type byte.
-        let header = try await tcp.read(
+        let header = try await readControlChannel(
             exactly: AppleClipboardProtocol.packedScrapHeaderSize - 1)
         let uncompressedLength = Int(
             AppleClipboardProtocol.uint32BE(
@@ -2168,7 +2327,7 @@ public actor TransportSession {
                 "Apple clipboard size is out of range")
         }
 
-        let compressed = try await tcp.read(exactly: compressedLength)
+        let compressed = try await readControlChannel(exactly: compressedLength)
         decodeApplePackedClipboard(
             compressed,
             uncompressedLength: uncompressedLength)
@@ -2178,7 +2337,7 @@ public actor TransportSession {
         // Apple sends this fixed eight-byte notification after command 21 has
         // enabled automatic pasteboard updates. It announces a change; the
         // viewer must still issue command 11 to fetch the packed scrap.
-        _ = try await tcp.read(exactly: 7)
+        _ = try await readControlChannel(exactly: 7)
         guard appleSharedClipboardEnabled else { return }
         do {
             try await requestRemoteClipboard()
@@ -2296,7 +2455,7 @@ public actor TransportSession {
     private func executeAction(_ action: ConnectionAction) async throws {
         switch action {
         case .sendProtocolVersion(let version):
-            try await tcp.send(version.wireBytes())
+            try await sendControlChannel(version.wireBytes())
             log.debug("Sent protocol version: \(version)")
 
         case .sendSecurityType(let type):
@@ -2307,7 +2466,7 @@ public actor TransportSession {
                 securityTypeSentSeparately = false
                 log.debug("Security type \(type) will be sent with first auth message")
             } else {
-                try await tcp.send(Data([type.rawValue]))
+                try await sendControlChannel(Data([type.rawValue]))
                 securityTypeSentSeparately = true
                 log.debug("Sent security type: \(type)")
             }
@@ -2316,20 +2475,20 @@ public actor TransportSession {
             try await performAuthentication(secType)
 
         case .sendAuthResponse(let data):
-            try await tcp.send(data)
+            try await sendControlChannel(data)
 
         case .requestServerInit:
             try await sendClientInit()
 
         case .sendSetPixelFormat(let pf):
             let msg = ClientMessage.setPixelFormat(pf)
-            try await tcp.send(msg.serialize())
+            try await sendControlChannel(msg.serialize())
             self.pixelFormat = pf
             log.debug("Sent SetPixelFormat")
 
         case .sendSetEncodings(let encodings):
             let msg = ClientMessage.setEncodings(encodings)
-            try await tcp.send(msg.serialize())
+            try await sendControlChannel(msg.serialize())
             log.debug("Sent SetEncodings (\(encodings.count) encodings)")
             if requestAppleMediaStream && !sentAppleMediaStreamConfiguration {
                 try await sendAppleMediaStreamSetupIfNeeded()
@@ -2370,7 +2529,7 @@ public actor TransportSession {
         case .sendMediaStreamAnswer(let answer):
             // Send the media stream answer as a pseudo-encoding response
             dumpAppleMediaClientRecordIfRequested(answer.wireBytes())
-            try await tcp.send(answer.wireBytes())
+            try await sendControlChannel(answer.wireBytes())
             if answer.accepted {
                 let isInitialAcceptance = !acceptedAppleMediaStream
                 acceptedAppleMediaStream = true
@@ -2480,15 +2639,22 @@ public actor TransportSession {
     static func appleMediaPostAcceptEncodings(
         from preferredEncodings: [Encoding]
     ) -> [Encoding] {
+        // The native viewer also lists SubZlib (1002) here. We do not, because
+        // no rectangle parser in this package can frame its payload: sending
+        // it invites a rectangle that desynchronizes the stream. Re-add it
+        // only alongside a real implementation. The `isUnframeableContent`
+        // filter below is the belt to this list's braces, and covers anything
+        // a caller injected through `preferredEncodings`.
         let nativeViewerEncodingRawValues: Set<Int32> = [
             0, 1, 6, 16,
-            1000, 1001, 1002, 1010, 1011,
+            1000, 1001, 1010, 1011,
         ]
         // appleH264 (1010) selects the HEVC-over-UDP high-performance path.
         // This method is only reached for the native adaptive profile; public
         // Full Quality mode omits the media offer before a session is created.
         let baseEncodings = preferredEncodings.filter {
             nativeViewerEncodingRawValues.contains($0.rawValue)
+                && !$0.isUnframeableContent
         }
 
         return baseEncodings + [
@@ -3032,7 +3198,7 @@ public actor TransportSession {
             if requestAppleMediaStream {
                 traceAppleMediaClientPayload(label: "client plaintext payload", payload: payload)
             }
-            try await tcp.send(payload)
+            try await sendControlChannel(payload)
         }
     }
 
@@ -3051,7 +3217,7 @@ public actor TransportSession {
             framed.append(UInt8(encrypted.count & 0xFF))
             framed.append(encrypted)
             traceAppleMediaClientFrame(label: "client ComCryption frame", payload: payload, framed: framed)
-            try await tcp.send(framed)
+            try await sendControlChannel(framed)
             return
         }
 
@@ -3071,7 +3237,7 @@ public actor TransportSession {
         framed.append(UInt8(encrypted.count & 0xFF))
         framed.append(encrypted)
         traceAppleMediaClientFrame(label: "client AES frame", payload: payload, framed: framed)
-        try await tcp.send(framed)
+        try await sendControlChannel(framed)
     }
 
     private nonisolated func traceAppleMediaClientPayload(label: String, payload: Data) {
@@ -3106,7 +3272,7 @@ public actor TransportSession {
     }
 
     private func drainAppleMediaControlRecord() async throws {
-        let chunk = try await tcp.read(upTo: 4096)
+        let chunk = try await readControlChannel(upTo: 4096)
         dumpAppleMediaTCPChunkIfRequested(chunk)
         drainedAppleMediaControlBytes += chunk.count
         appleMediaControlBuffer.append(chunk)
@@ -3259,6 +3425,15 @@ public actor TransportSession {
     func ingestAppleDecryptedRFBPayload(_ payload: Data) async throws {
         appleDecryptedRFBBuffer.append(payload)
         try await drainAppleDecryptedRFBBuffer()
+        let limit = appleDecryptedRFBBufferLimit
+        if appleDecryptedRFBBuffer.count > limit {
+            log.error(
+                "Apple decrypted RFB buffer exceeded the protocol maximum of "
+                    + "\(limit) bytes without draining "
+                    + "(\(appleDecryptedRFBBuffer.count) buffered); "
+                    + "discarding to restore progress")
+            appleDecryptedRFBBuffer.removeAll(keepingCapacity: false)
+        }
     }
 
     private nonisolated func isAppleRFBServerMessageType(
@@ -3354,6 +3529,25 @@ public actor TransportSession {
                     | Int(appleDecryptedRFBBuffer[offset + 1])
                 pixelDataLength = 2 + length
             default:
+                // `false` means "incomplete, wait for more bytes", which is
+                // only true for an encoding whose framing we know. For a
+                // content encoding we cannot frame, no amount of further data
+                // resolves it: the drain wedges permanently and the decrypted
+                // buffer grows forever behind it. Throwing does not help here
+                // either, because the control-record reader treats decrypt and
+                // parse failures as non-fatal. Name it and resynchronize: the
+                // ingest heuristic only feeds records that begin with a known
+                // RFB message type once the buffer is empty, so dropping the
+                // wedged bytes lets the channel pick up the next clean record.
+                if rect.encoding.isUnframeableContent {
+                    log.error(
+                        "Unsupported framebuffer encoding "
+                            + "\(rect.encoding.rawValue) (\(rect.encoding.displayName)) "
+                            + "on the Apple control channel for rect "
+                            + "\(rect.width)x\(rect.height); "
+                            + "dropping \(appleDecryptedRFBBuffer.count) buffered bytes to resynchronize")
+                    appleDecryptedRFBBuffer.removeAll(keepingCapacity: true)
+                }
                 return false
             }
 
@@ -4185,8 +4379,8 @@ public actor TransportSession {
         guard !sentAppleMediaStreamConfiguration else { return }
 
         let mediaUDPPort = appleMediaConfigurationUDPPort()
-        try await tcp.send(appleMediaStreamConfiguration(localPort: mediaUDPPort))
-        try await tcp.send(ClientMessage.appleMediaStreamRequest.serialize())
+        try await sendControlChannel(appleMediaStreamConfiguration(localPort: mediaUDPPort))
+        try await sendControlChannel(ClientMessage.appleMediaStreamRequest.serialize())
         sentAppleMediaStreamConfiguration = true
         log.debug("Sent Apple media stream configuration and request udpPort=\(mediaUDPPort)")
     }
@@ -4198,7 +4392,7 @@ public actor TransportSession {
     public func restartAppleMediaStream() async {
         guard sentAppleMediaStreamConfiguration else { return }
         do {
-            try await tcp.send(ClientMessage.appleMediaStreamRequest.serialize())
+            try await sendControlChannel(ClientMessage.appleMediaStreamRequest.serialize())
             log.warning("Re-requested Apple media stream (bootstrap recovery)")
         } catch {
             log.error("Could not re-request Apple media stream: \(error.localizedDescription)")

@@ -17273,6 +17273,9 @@
         }
       }
     },
+    "The remote video stream could not start after %lld attempts. Try again, or switch this connection to Standard mode." : {
+
+    },
     "The saved Keychain item did not contain credential data." : {
       "localizations" : {
         "ar" : {

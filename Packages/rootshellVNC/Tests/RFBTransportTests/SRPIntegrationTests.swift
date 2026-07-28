@@ -144,7 +144,7 @@ final class SRPIntegrationTests: XCTestCase {
 
         print("\n=== FULL SRP AUTH TEST ===")
         let preferredEncodings: [Encoding]? = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_HIGH_PERFORMANCE"] == "1"
-            ? [.appleH264, .appleMultiVariantScreenshare, .appleSubZlibThousands, .zlib, .zrle,
+            ? [.appleH264, .appleMultiVariantScreenshare, .zlib, .zrle,
                .encryptionInfo, .serverDisplayInfo, .mediaStreamOffer, .mediaStreamAnswer]
             : nil
         let session = TransportSession(

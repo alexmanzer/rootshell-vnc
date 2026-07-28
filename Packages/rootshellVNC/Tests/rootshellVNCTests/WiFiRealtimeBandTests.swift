@@ -146,7 +146,7 @@ final class WiFiRealtimeBandTests: XCTestCase {
         let port = UInt16(env["VNC_TEST_PORT"] ?? "5900") ?? 5900
 
         let hp: [Encoding] = [
-            .appleH264, .appleMultiVariantScreenshare, .appleSubZlibThousands, .zlib, .zrle,
+            .appleH264, .appleMultiVariantScreenshare, .zlib, .zrle,
             .encryptionInfo, .serverDisplayInfo, .mediaStreamOffer, .mediaStreamAnswer,
         ]
         let session = TransportSession(host: host, port: port, password: pass, username: user, preferredEncodings: hp)

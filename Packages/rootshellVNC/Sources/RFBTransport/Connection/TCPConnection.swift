@@ -62,6 +62,40 @@ public actor TCPConnection: RFBConnection {
     private let maxDialAttempts: Int
     private let dialRetryBackoffNanos: UInt64
     private let connectTimeoutSeconds: Int
+    private let keepalive: KeepaliveSettings
+
+    /// TCP keepalive tuning.
+    ///
+    /// This is the only "peer has gone silent" detector in the whole stack:
+    /// there is no application-level read or idle timeout. In Apple's High
+    /// Performance mode the video and rate-control traffic is UDP, and what
+    /// remains on TCP is request/response (the client asks for the next update
+    /// only after consuming one), so an idle remote desktop legitimately means
+    /// an idle socket with no periodic traffic of any kind. The defaults must
+    /// therefore tolerate a transient run of lost probes over a wireless leg
+    /// rather than tearing down a working session, at the cost of taking
+    /// longer to notice a genuinely dead peer.
+    ///
+    /// Defaults declare death after roughly `idle + interval * count` seconds
+    /// of silence (20 + 60 = 80 s). The reconnect machinery takes over from
+    /// there, so a slower verdict costs recovery latency on a real failure but
+    /// buys immunity to false positives on a healthy idle session.
+    public struct KeepaliveSettings: Sendable, Equatable {
+        public var idleSeconds: Int
+        public var intervalSeconds: Int
+        public var probeCount: Int
+
+        public init(idleSeconds: Int = 20, intervalSeconds: Int = 10, probeCount: Int = 6) {
+            self.idleSeconds = max(1, idleSeconds)
+            self.intervalSeconds = max(1, intervalSeconds)
+            self.probeCount = max(1, probeCount)
+        }
+
+        /// Seconds of total silence before the socket is declared dead.
+        public var deadPeerDetectionSeconds: Int {
+            idleSeconds + intervalSeconds * probeCount
+        }
+    }
 
     public init(host: String, port: UInt16) {
         self.init(
@@ -76,13 +110,15 @@ public actor TCPConnection: RFBConnection {
         port: UInt16,
         maxDialAttempts: Int,
         dialRetryBackoffNanos: UInt64,
-        connectTimeoutSeconds: Int
+        connectTimeoutSeconds: Int,
+        keepalive: KeepaliveSettings = KeepaliveSettings()
     ) {
         self.host = host
         self.port = port
         self.maxDialAttempts = max(1, maxDialAttempts)
         self.dialRetryBackoffNanos = dialRetryBackoffNanos
         self.connectTimeoutSeconds = max(1, connectTimeoutSeconds)
+        self.keepalive = keepalive
     }
 
     public func connect() async throws {
@@ -130,9 +166,9 @@ public actor TCPConnection: RFBConnection {
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.noDelay = true
         tcpOptions.enableKeepalive = true
-        tcpOptions.keepaliveIdle = 15
-        tcpOptions.keepaliveInterval = 5
-        tcpOptions.keepaliveCount = 3
+        tcpOptions.keepaliveIdle = keepalive.idleSeconds
+        tcpOptions.keepaliveInterval = keepalive.intervalSeconds
+        tcpOptions.keepaliveCount = keepalive.probeCount
         tcpOptions.connectionTimeout = connectTimeoutSeconds
 
         let bootstrap = NIOTSConnectionBootstrap(group: Self.eventLoopGroup)
@@ -160,7 +196,12 @@ public actor TCPConnection: RFBConnection {
             inboundHandler = handler
             inboundQueue = handler.queue
             connected = true
-            log.info("Connected to \(host):\(port)")
+            log.info(
+                "Connected to \(host):\(port) "
+                    + "(keepalive idle=\(keepalive.idleSeconds)s "
+                    + "interval=\(keepalive.intervalSeconds)s "
+                    + "count=\(keepalive.probeCount), "
+                    + "dead-peer verdict after ~\(keepalive.deadPeerDetectionSeconds)s of silence)")
         } catch {
             let protocolError = VNCProtocolError.ioError(
                 "Connection failed: \(error.localizedDescription)")
@@ -511,11 +552,22 @@ private final class InboundByteStreamHandler: ChannelInboundHandler, @unchecked 
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        let protocolError = VNCProtocolError.ioError(error.localizedDescription)
+        // Keep the structural form alongside the localized text. Network
+        // framework reports `posix(ETIMEDOUT)` here when TCP keepalive gives
+        // up on a silent peer, and that distinction (versus a peer-sent reset
+        // or a protocol-level teardown) is the whole diagnosis for an
+        // unexplained mid-session drop.
+        let protocolError = VNCProtocolError.ioError(Self.describe(error))
         completeTLS(.failure(protocolError))
         finish(throwing: protocolError)
         disconnect(protocolError)
         context.close(promise: nil)
+    }
+
+    private static func describe(_ error: Error) -> String {
+        let structural = String(describing: error)
+        let localized = error.localizedDescription
+        return structural == localized ? structural : "\(structural) (\(localized))"
     }
 
     func channelInactive(context: ChannelHandlerContext) {

@@ -479,7 +479,10 @@ final class VNCConfigurationTests: XCTestCase {
         let effective = config.effectiveEncodings
         XCTAssertTrue(effective.contains(.appleH264))
         XCTAssertTrue(effective.contains(.appleMultiVariantScreenshare))
-        XCTAssertTrue(effective.contains(.appleSubZlibThousands))
+        // Never advertise SubZlib: no rectangle parser can frame its payload,
+        // so a server that takes us up on it desynchronizes the byte stream
+        // and the session drops.
+        XCTAssertFalse(effective.contains(.appleSubZlibThousands))
         XCTAssertTrue(effective.contains(.mediaStreamOffer))
         XCTAssertTrue(effective.contains(.mediaStreamAnswer))
         XCTAssertTrue(effective.contains(.encryptionInfo))
@@ -511,6 +514,74 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(effective.contains(.cursor))
         XCTAssertTrue(effective.contains(.xCursor))
         XCTAssertTrue(effective.contains(.raw))
+    }
+
+    /// Advertising a pixel-carrying encoding that no rectangle parser can
+    /// frame desynchronizes the byte stream the first time a server uses it,
+    /// which surfaces as a mid-session drop and reconnect. Every advertised
+    /// content encoding must therefore be one the parsers consume.
+    ///
+    /// Keep this list in step with the `switch rect.encoding` in
+    /// `TransportSession.handleFramebufferUpdate` and its encrypted twin
+    /// `drainAppleDecryptedFramebufferUpdate`.
+    func testAdvertisedContentEncodingsAreAllParseable() {
+        // Deliberately an independent literal rather than a re-read of
+        // `hasKnownFramebufferFraming`: this is what catches an encoding being
+        // declared parseable without a parser actually existing.
+        let parseable: Set<Encoding> = [
+            .raw, .copyRect, .zlib, .zrle, .tight,
+            .appleMultiVariantScreenshare,
+            // Classified as content, but its pixels ride the UDP media path;
+            // the RFB channel only ever carries its marker rectangle.
+            .appleH264,
+        ]
+
+        for mode in VNCConfiguration.VideoQualityMode.allCases {
+            let config = VNCConfiguration(
+                enableHighPerformanceMode: true,
+                videoQualityMode: mode)
+            let unparseable = config.effectiveEncodings
+                .filter { $0.isFramebufferContent && !parseable.contains($0) }
+            XCTAssertTrue(
+                unparseable.isEmpty,
+                "\(mode.rawValue) advertises content encodings with no parser: "
+                    + unparseable.map { $0.displayName }.joined(separator: ", "))
+        }
+
+        let allContent: [Encoding] = [
+            .raw, .copyRect, .rre, .hextile, .zlib, .tight, .zlibhex, .zrle,
+            .appleJPEG, .appleMultiVariantScreenshare, .appleSubZlibThousands,
+            .appleH264,
+        ]
+        for encoding in allContent where !parseable.contains(encoding) {
+            XCTAssertTrue(
+                encoding.isUnframeableContent,
+                "\(encoding.displayName) has no parser but is not flagged unframeable")
+        }
+    }
+
+    /// A caller can supply arbitrary `preferredEncodings`, so filtering only
+    /// the lists `effectiveEncodings` injects would still let a host advertise
+    /// an encoding the parsers cannot frame.
+    func testCallerSuppliedUnparseableEncodingsAreFilteredOut() {
+        for mode in VNCConfiguration.VideoQualityMode.allCases {
+            let config = VNCConfiguration(
+                preferredEncodings: [
+                    .appleSubZlibThousands, .appleJPEG, .rre, .hextile,
+                    .zlibhex, .zrle, .raw,
+                ],
+                enableHighPerformanceMode: true,
+                videoQualityMode: mode)
+            let effective = config.effectiveEncodings
+            XCTAssertFalse(effective.contains(.appleSubZlibThousands), mode.rawValue)
+            XCTAssertFalse(effective.contains(.appleJPEG), mode.rawValue)
+            XCTAssertFalse(effective.contains(.rre), mode.rawValue)
+            XCTAssertFalse(effective.contains(.hextile), mode.rawValue)
+            XCTAssertFalse(effective.contains(.zlibhex), mode.rawValue)
+            // The parseable ones survive.
+            XCTAssertTrue(effective.contains(.zrle), mode.rawValue)
+            XCTAssertTrue(effective.contains(.raw), mode.rawValue)
+        }
     }
 
     func testFullQualityUsesNativeLosslessEncodingProfile() {

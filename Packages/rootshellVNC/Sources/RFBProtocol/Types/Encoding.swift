@@ -124,6 +124,41 @@ public enum Encoding: Sendable, Equatable, Hashable {
         }
     }
 
+    /// Whether the transport can consume this content encoding's payload off
+    /// the wire.
+    ///
+    /// A rectangle's payload length is implied by its encoding. Advertising a
+    /// content encoding the parsers cannot frame therefore desynchronizes the
+    /// byte stream the first time a server uses one: the payload bytes are
+    /// left in place and the next of them is read as a message type. The
+    /// failure then surfaces one message later as an unrelated protocol
+    /// violation, so the invariant is enforced at both ends instead — nothing
+    /// outside this set is ever advertised, and the parsers refuse anything
+    /// outside it that arrives regardless.
+    ///
+    /// `.appleH264` qualifies because its pixels ride the UDP media path; the
+    /// RFB channel only carries a marker rectangle the parsers skip.
+    ///
+    /// Keep this in step with the `switch rect.encoding` in
+    /// `TransportSession.handleFramebufferUpdate` and its encrypted-channel
+    /// twin `drainAppleDecryptedFramebufferUpdate`.
+    public var hasKnownFramebufferFraming: Bool {
+        switch self {
+        case .raw, .copyRect, .zlib, .zrle, .tight,
+             .appleMultiVariantScreenshare, .appleH264:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Content encodings that must never be advertised or accepted, because
+    /// their payload cannot be framed. Empty for everything that is not
+    /// framebuffer content.
+    public var isUnframeableContent: Bool {
+        isFramebufferContent && !hasKnownFramebufferFraming
+    }
+
     /// Human-readable name for diagnostics UI. Technical proper nouns,
     /// deliberately not localized.
     public var displayName: String {
