@@ -41,6 +41,25 @@ public struct AppleRemoteSessionState: Sendable, Equatable {
     }
 }
 
+/// One RTCP Sender Report mapping a remote RTP source onto the server's shared
+/// NTP media clock. Audio and video use different RTP epochs and rates; this
+/// mapping is the common clock needed for synchronized presentation.
+public struct AppleMediaSenderClockMapping: Sendable, Equatable {
+    public let remoteSSRC: UInt32
+    public let ntpTimestamp: UInt64
+    public let rtpTimestamp: UInt32
+
+    public init(
+        remoteSSRC: UInt32,
+        ntpTimestamp: UInt64,
+        rtpTimestamp: UInt32
+    ) {
+        self.remoteSSRC = remoteSSRC
+        self.ntpTimestamp = ntpTimestamp
+        self.rtpTimestamp = rtpTimestamp
+    }
+}
+
 /// Decode the session-wide flags in Apple's DisplayInfo2 (encoding 1105).
 /// The RFB payload includes a two-byte length prefix, so the structure's
 /// version and screen-flags fields begin at byte offsets 2 and 16.
@@ -352,6 +371,8 @@ public actor TransportSession {
     /// this beside the RTP sink so its decoder reset is queued before any RTP
     /// from the new keys/SSRC can overtake it.
     private var appleMediaGenerationSink: (@Sendable (UInt64, Int) -> Void)?
+    private var appleMediaSenderClockSink:
+        (@Sendable (AppleMediaSenderClockMapping) -> Void)?
     private var appleRemoteDisplaySizeSink: (@Sendable (UInt16, UInt16) -> Void)?
     private var appleRemoteDisplayResizeSettledSink:
         (@Sendable (Bool) -> Void)?
@@ -1242,6 +1263,22 @@ public actor TransportSession {
         appleMediaGenerationSink = sink
     }
 
+    public func setAppleMediaSenderClockSink(
+        _ sink: (@Sendable (AppleMediaSenderClockMapping) -> Void)?
+    ) {
+        appleMediaSenderClockSink = sink
+        guard let sink else { return }
+        // Sink installation can race the first Sender Report during stream
+        // bootstrap. Replay the latest per-source mappings so exact A/V sync
+        // does not wait for the server's next reporting interval.
+        for timing in appleMediaSenderReports.values {
+            sink(AppleMediaSenderClockMapping(
+                remoteSSRC: timing.remoteSSRC,
+                ntpTimestamp: timing.ntpTimestamp,
+                rtpTimestamp: timing.rtpTimestamp))
+        }
+    }
+
     public func setAppleRemoteDisplaySizeSink(
         _ sink: (@Sendable (UInt16, UInt16) -> Void)?
     ) {
@@ -1404,6 +1441,7 @@ public actor TransportSession {
         framebufferCreditWaiter?.resume()
         framebufferCreditWaiter = nil
         appleMediaGenerationSink = nil
+        appleMediaSenderClockSink = nil
         appleRemoteDisplaySizeSink = nil
         appleRemoteDisplayResizeSettledSink = nil
         await stopAppleMediaUDP()
@@ -5795,6 +5833,10 @@ public actor TransportSession {
                 from: rtcp,
                 arrivalNanos: arrivalNanos) else { return }
         appleMediaSenderReports[timing.remoteSSRC] = timing
+        appleMediaSenderClockSink?(AppleMediaSenderClockMapping(
+            remoteSSRC: timing.remoteSSRC,
+            ntpTimestamp: timing.ntpTimestamp,
+            rtpTimestamp: timing.rtpTimestamp))
     }
 
     /// Native's feedback-only screen profile does not layer periodic RFC 3550

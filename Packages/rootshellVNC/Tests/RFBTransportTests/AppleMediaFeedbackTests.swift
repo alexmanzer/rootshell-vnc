@@ -122,6 +122,8 @@ final class AppleMediaFeedbackTests: XCTestCase {
 
         XCTAssertEqual(audioReply.lsr, 0xccdd_eeff)
         XCTAssertEqual(audioReply.dlsr, 98_304)
+        XCTAssertEqual(audioTiming.ntpTimestamp, 0xaabb_ccdd_eeff_0001)
+        XCTAssertEqual(audioTiming.rtpTimestamp, 0)
         XCTAssertEqual(videoReply.lsr, 0x3040_5060)
         XCTAssertEqual(videoReply.dlsr, 32_768)
         XCTAssertEqual(

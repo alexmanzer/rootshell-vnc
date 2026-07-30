@@ -117,5 +117,25 @@ final class AppleRemoteAudioPlayerTests: XCTestCase {
             diagnostics.prerollAccessUnitTarget,
             AppleRemoteAudioPlayer.basePrerollAccessUnitTarget,
             "clean playback must decay the cushion back to its base")
+        XCTAssertEqual(
+            player.recommendedVideoDelayNanos,
+            240_000_000,
+            "steady playback retains its established cushion until the next timeline")
+
+        player.reset()
+        _ = player.diagnosticsSnapshot()
+        XCTAssertEqual(player.recommendedVideoDelayNanos, 100_000_000)
+    }
+
+    func testRecommendedVideoDelayTracksAdaptiveAudioPreroll() throws {
+        let player = try AppleRemoteAudioPlayer()
+        defer { player.stop() }
+
+        XCTAssertEqual(player.recommendedVideoDelayNanos, 100_000_000)
+
+        player.setPrerollTargetForTesting(
+            AppleRemoteAudioPlayer.maximumPrerollAccessUnitTarget)
+
+        XCTAssertEqual(player.recommendedVideoDelayNanos, 240_000_000)
     }
 }

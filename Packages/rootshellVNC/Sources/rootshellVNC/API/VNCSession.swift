@@ -289,46 +289,240 @@ struct AppleDCTRefinementTracker {
     }
 }
 
+/// Public-framework equivalent of AVConference's audio sync source for video.
+/// RTCP Sender Reports place both RTP streams on the server's NTP clock, while
+/// `AppleRemoteAudioPlayer` supplies the corresponding local playback point.
+/// The result is an absolute deadline for each compressed video packet.
+final class AppleMediaPlaybackSynchronizer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var senderClocks: [UInt32: AppleMediaSenderClockMapping] = [:]
+    private var audioTiming: AppleRemoteAudioPlaybackTiming?
+
+    /// Feed compressed video shortly before its synchronized presentation
+    /// point, leaving VideoToolbox and the main-thread renderer their measured
+    /// decode/presentation lead.
+    static let videoPipelineLeadNanos: UInt64 = 8_000_000
+    private static let maximumSynchronizedDelayNanos: UInt64 = 500_000_000
+    private static let ntpFractionScale = 4_294_967_296.0
+
+    func reset() {
+        lock.lock()
+        senderClocks.removeAll(keepingCapacity: true)
+        audioTiming = nil
+        lock.unlock()
+    }
+
+    func noteSenderClock(_ mapping: AppleMediaSenderClockMapping) {
+        lock.lock()
+        senderClocks[mapping.remoteSSRC] = mapping
+        lock.unlock()
+    }
+
+    func noteAudioPlayback(_ timing: AppleRemoteAudioPlaybackTiming) {
+        lock.lock()
+        audioTiming = timing
+        lock.unlock()
+    }
+
+    func videoDelayNanos(
+        for packet: Data,
+        fallbackNanos: UInt64,
+        nowNanos: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> UInt64 {
+        guard let header = Self.rtpHeader(packet) else { return fallbackNanos }
+
+        lock.lock()
+        let videoClock = senderClocks[header.ssrc]
+        let timing = audioTiming
+        let audioClock = timing.flatMap { senderClocks[$0.ssrc] }
+        lock.unlock()
+
+        guard let videoClock, let timing, let audioClock else {
+            return fallbackNanos
+        }
+        let audioMediaTime = Self.mediaTimeSeconds(
+            rtpTimestamp: timing.rtpTimestamp,
+            clockRate: Double(AppleRemoteAudioRTPDepacketizer.sampleRate),
+            senderClock: audioClock)
+        let videoMediaTime = Self.mediaTimeSeconds(
+            rtpTimestamp: header.timestamp,
+            clockRate: 24_000,
+            senderClock: videoClock)
+        let mediaDeltaNanos = (videoMediaTime - audioMediaTime) * 1_000_000_000
+        guard mediaDeltaNanos.isFinite,
+              mediaDeltaNanos >= Double(Int64.min),
+              mediaDeltaNanos <= Double(Int64.max) else {
+            return fallbackNanos
+        }
+
+        let target = Int64(clamping: timing.hostTimeNanos)
+            + Int64(mediaDeltaNanos.rounded())
+            - Int64(Self.videoPipelineLeadNanos)
+        let now = Int64(clamping: nowNanos)
+        guard target > now else { return 0 }
+        let delay = UInt64(target - now)
+        guard delay <= Self.maximumSynchronizedDelayNanos else {
+            return fallbackNanos
+        }
+        return delay
+    }
+
+    private static func mediaTimeSeconds(
+        rtpTimestamp: UInt32,
+        clockRate: Double,
+        senderClock: AppleMediaSenderClockMapping
+    ) -> Double {
+        let ntp = Double(senderClock.ntpTimestamp) / ntpFractionScale
+        let delta = Int32(bitPattern: rtpTimestamp &- senderClock.rtpTimestamp)
+        return ntp + Double(delta) / clockRate
+    }
+
+    private static func rtpHeader(
+        _ packet: Data
+    ) -> (timestamp: UInt32, ssrc: UInt32)? {
+        guard packet.count >= 12 else { return nil }
+        let base = packet.startIndex
+        guard packet[base] >> 6 == 2 else { return nil }
+        let timestamp = UInt32(packet[base + 4]) << 24
+            | UInt32(packet[base + 5]) << 16
+            | UInt32(packet[base + 6]) << 8
+            | UInt32(packet[base + 7])
+        let ssrc = UInt32(packet[base + 8]) << 24
+            | UInt32(packet[base + 9]) << 16
+            | UInt32(packet[base + 10]) << 8
+            | UInt32(packet[base + 11])
+        return (timestamp, ssrc)
+    }
+}
+
 /// Coalesces the transport's per-packet callback into ordered media-queue
 /// batches. A fullscreen reference picture can contain thousands of RTP
 /// packets; scheduling one Dispatch block for each packet creates avoidable
 /// allocator and queue pressure before the demuxer does any useful work.
 final class OrderedMediaPacketCoalescer: @unchecked Sendable {
+    private struct PendingPacket {
+        let deadlineNanos: UInt64
+        let data: Data
+    }
+
     private let queue: DispatchQueue
     private let consume: @Sendable ([Data]) -> Void
+    private let delayNanos: @Sendable (Data) -> UInt64
     private let lock = NSLock()
-    private var pending: [Data] = []
+    private var pending: [PendingPacket] = []
+    /// Logical start of the live queue. Removing the first element from a
+    /// Swift Array shifts every remaining packet, which is particularly
+    /// expensive while holding 100–240 ms of a multi-thousand-packet stream.
+    /// Advance this cursor for ordinary drains and compact only occasionally.
+    private var pendingHead = 0
     private var drainScheduled = false
+    private var lastDeadlineNanos: UInt64 = 0
+    private var scheduleGeneration: UInt64 = 0
+    /// Packet callbacks for one access unit arrive in a tight burst. Treat
+    /// deadlines within 1 ms as one batch rather than scheduling thousands of
+    /// individual dispatch timers per second.
+    private static let deadlineToleranceNanos: UInt64 = 1_000_000
 
-    init(queue: DispatchQueue, consume: @escaping @Sendable ([Data]) -> Void) {
+    init(
+        queue: DispatchQueue,
+        delayNanos: @escaping @Sendable (Data) -> UInt64 = { _ in 0 },
+        consume: @escaping @Sendable ([Data]) -> Void
+    ) {
         self.queue = queue
+        self.delayNanos = delayNanos
         self.consume = consume
     }
 
     func enqueue(_ packet: Data) {
+        let candidateDeadline = DispatchTime.now().uptimeNanoseconds
+            &+ delayNanos(packet)
         lock.lock()
-        pending.append(packet)
+        // A changing adaptive cushion must not allow a newer RTP packet to
+        // overtake an older one whose longer deadline was already assigned.
+        let deadline = max(candidateDeadline, lastDeadlineNanos)
+        lastDeadlineNanos = deadline
+        pending.append(PendingPacket(deadlineNanos: deadline, data: packet))
         let shouldSchedule = !drainScheduled
         if shouldSchedule { drainScheduled = true }
+        let generation = scheduleGeneration
+        let firstDeadline = pending[pendingHead].deadlineNanos
         lock.unlock()
 
         if shouldSchedule {
-            queue.async { [self] in drain() }
+            scheduleDrain(at: firstDeadline, generation: generation)
         }
     }
 
-    private func drain() {
-        while true {
-            lock.lock()
-            guard !pending.isEmpty else {
-                drainScheduled = false
-                lock.unlock()
-                return
-            }
-            let batch = pending
-            pending.removeAll(keepingCapacity: true)
+    /// Drop packets belonging to a retired media generation. Any already
+    /// scheduled drain becomes a no-op; the next enqueue establishes a fresh
+    /// ordered timeline.
+    func discardPending() {
+        lock.lock()
+        pending.removeAll(keepingCapacity: true)
+        pendingHead = 0
+        drainScheduled = false
+        lastDeadlineNanos = 0
+        scheduleGeneration &+= 1
+        lock.unlock()
+    }
+
+    private func scheduleDrain(at deadline: UInt64, generation: UInt64) {
+        queue.asyncAfter(
+            deadline: DispatchTime(uptimeNanoseconds: deadline)
+        ) { [self] in
+            drain(generation: generation)
+        }
+    }
+
+    private func drain(generation: UInt64) {
+        lock.lock()
+        guard generation == scheduleGeneration else {
             lock.unlock()
-            consume(batch)
+            return
+        }
+        guard pendingHead < pending.count else {
+            pending.removeAll(keepingCapacity: true)
+            pendingHead = 0
+            drainScheduled = false
+            lastDeadlineNanos = 0
+            lock.unlock()
+            return
+        }
+
+        let cutoff = DispatchTime.now().uptimeNanoseconds
+            &+ Self.deadlineToleranceNanos
+        var dueEnd = pendingHead
+        while dueEnd < pending.count,
+              pending[dueEnd].deadlineNanos <= cutoff {
+            dueEnd += 1
+        }
+        guard dueEnd > pendingHead else {
+            let nextDeadline = pending[pendingHead].deadlineNanos
+            lock.unlock()
+            scheduleDrain(at: nextDeadline, generation: generation)
+            return
+        }
+
+        let batch = pending[pendingHead..<dueEnd].map(\.data)
+        pendingHead = dueEnd
+        let nextDeadline = pendingHead < pending.count
+            ? pending[pendingHead].deadlineNanos
+            : nil
+        if nextDeadline == nil {
+            pending.removeAll(keepingCapacity: true)
+            pendingHead = 0
+            drainScheduled = false
+            lastDeadlineNanos = 0
+        } else if pendingHead >= 4_096,
+                  pendingHead * 2 >= pending.count {
+            pending.removeFirst(pendingHead)
+            pendingHead = 0
+        }
+        lock.unlock()
+
+        consume(batch)
+        if let nextDeadline {
+            scheduleDrain(at: nextDeadline, generation: generation)
         }
     }
 }
@@ -590,6 +784,8 @@ public final class VNCSession {
     private var secondaryVideoStreamManager: VideoStreamManager?
     @ObservationIgnored
     private var remoteAudioPlayer: AppleRemoteAudioPlayer?
+    @ObservationIgnored
+    private var appleMediaPlaybackSynchronizer: AppleMediaPlaybackSynchronizer?
     private var eventTask: Task<Void, Never>?
     @ObservationIgnored
     private var remoteDisplayResizeTask: Task<Void, Never>?
@@ -803,6 +999,7 @@ public final class VNCSession {
         diagnostics.connectionStartTime = Date()
         remoteAudioPlayer?.stop()
         remoteAudioPlayer = nil
+        appleMediaPlaybackSynchronizer = nil
 
         if configuration.enableProtocolTrace {
             diagnostics.protocolTrace = ProtocolTrace()
@@ -893,6 +1090,7 @@ public final class VNCSession {
         secondaryVideoStreamManager = nil
         remoteAudioPlayer?.stop()
         remoteAudioPlayer = nil
+        appleMediaPlaybackSynchronizer = nil
 
         connectionPhaseDescription = nil
         connectionState = .disconnected
@@ -2038,6 +2236,7 @@ public final class VNCSession {
         secondaryVideoStreamManager = nil
         remoteAudioPlayer?.stop()
         remoteAudioPlayer = nil
+        appleMediaPlaybackSynchronizer = nil
     }
 
     /// Adopt the server's authoritative curtain facts and settle any request
@@ -3107,9 +3306,15 @@ public final class VNCSession {
         secondaryVideoBandRenderer.reset()
 
         if configuration.effectiveRemoteAudioPlaybackEnabled {
+            let synchronizationClock =
+                appleMediaPlaybackSynchronizer ?? AppleMediaPlaybackSynchronizer()
+            appleMediaPlaybackSynchronizer = synchronizationClock
             if remoteAudioPlayer == nil {
                 do {
-                    remoteAudioPlayer = try AppleRemoteAudioPlayer()
+                    remoteAudioPlayer = try AppleRemoteAudioPlayer {
+                        [weak synchronizationClock] timing in
+                        synchronizationClock?.noteAudioPlayback(timing)
+                    }
                 } catch {
                         logger.error("Could not initialize remote audio: \(error.localizedDescription)")
                 }
@@ -3117,6 +3322,7 @@ public final class VNCSession {
         } else {
             remoteAudioPlayer?.stop()
             remoteAudioPlayer = nil
+            appleMediaPlaybackSynchronizer = nil
         }
 
         let fallbackWidth = framebufferWidth > 0 ? framebufferWidth : Int(offer.width)
@@ -3510,9 +3716,19 @@ public final class VNCSession {
             let queue = mediaQueue
             let sinkManager = manager // VideoStreamManager is Sendable
             let sinkAudioPlayer = remoteAudioPlayer
+            let playbackSynchronizer = appleMediaPlaybackSynchronizer
             let generationCoalescer = coalescer
             let generationLog = logger
-            let videoPacketCoalescer = OrderedMediaPacketCoalescer(queue: queue) { packets in
+            let videoDelay: @Sendable (Data) -> UInt64 = { packet in
+                let fallback = sinkAudioPlayer?.recommendedVideoDelayNanos ?? 0
+                return playbackSynchronizer?.videoDelayNanos(
+                    for: packet,
+                    fallbackNanos: fallback) ?? fallback
+            }
+            let videoPacketCoalescer = OrderedMediaPacketCoalescer(
+                queue: queue,
+                delayNanos: videoDelay
+            ) { packets in
                 if let stats = RenderCommitStats.shared {
                     for packet in packets {
                         stats.noteVideoPacket(bytes: packet.count)
@@ -3526,7 +3742,10 @@ public final class VNCSession {
                 }
             }
             let secondaryVideoPacketCoalescer = secondaryManager.map { manager in
-                OrderedMediaPacketCoalescer(queue: queue) { packets in
+                OrderedMediaPacketCoalescer(
+                    queue: queue,
+                    delayNanos: videoDelay
+                ) { packets in
                     for packet in packets {
                         manager.feedRTPData(packet)
                     }
@@ -3550,8 +3769,15 @@ public final class VNCSession {
                     session?.noteAppleMediaGenerationTransitionForLoginSend()
                 }
             }
+            await transport.setAppleMediaSenderClockSink {
+                [weak playbackSynchronizer] mapping in
+                playbackSynchronizer?.noteSenderClock(mapping)
+            }
             await transport.setAppleMediaGenerationSink { generation, numberOfTiles in
                 generationTransitionKick()
+                playbackSynchronizer?.reset()
+                videoPacketCoalescer.discardPending()
+                secondaryVideoPacketCoalescer?.discardPending()
                 queue.async {
                     sinkManager.prepareForStreamReconfiguration(
                         mediaGeneration: generation,

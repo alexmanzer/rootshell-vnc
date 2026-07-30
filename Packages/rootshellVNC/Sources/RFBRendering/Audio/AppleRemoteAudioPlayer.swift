@@ -25,6 +25,25 @@ public enum AppleRemoteAudioPlayerError: Error, Sendable, LocalizedError {
     }
 }
 
+/// A point on the audio renderer's active RTP-to-local-host presentation
+/// timeline. Consumers can combine this with the stream's RTCP Sender Report
+/// to synchronize a separately rendered video stream.
+public struct AppleRemoteAudioPlaybackTiming: Sendable, Equatable {
+    public let ssrc: UInt32
+    public let rtpTimestamp: UInt32
+    public let hostTimeNanos: UInt64
+
+    public init(
+        ssrc: UInt32,
+        rtpTimestamp: UInt32,
+        hostTimeNanos: UInt64
+    ) {
+        self.ssrc = ssrc
+        self.rtpTimestamp = rtpTimestamp
+        self.hostTimeNanos = hostTimeNanos
+    }
+}
+
 /// Public-framework playback for the system-audio stream negotiated by Apple
 /// Remote Desktop. RTP/AAC packet parsing runs on a dedicated serial queue and
 /// compressed samples are rendered by AVSampleBufferAudioRenderer, which keeps
@@ -37,6 +56,8 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     private let synchronizer = AVSampleBufferRenderSynchronizer()
     private let formatDescription: CMAudioFormatDescription
     private let log = VNCLogger(category: "Audio")
+    private let playbackTimingSink:
+        (@Sendable (AppleRemoteAudioPlaybackTiming) -> Void)?
 
     private var reorderBuffer = AppleRemoteAudioRTPReorderBuffer()
     private var activeSSRC: UInt32?
@@ -46,6 +67,9 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     private var enqueuedAccessUnitCount = 0
     private var prerollAccessUnitTarget =
         AppleRemoteAudioPlayer.basePrerollAccessUnitTarget
+    private let videoDelayLock = NSLock()
+    private var _recommendedVideoDelayNanos = UInt64(
+        AppleRemoteAudioPlayer.basePrerollAccessUnitTarget) * 10_000_000
     private var playbackStartHostTime: CMTime?
     /// Preroll cushion bounds, in 10 ms access units. Underruns grow the
     /// cushion for resilience; sustained clean playback decays it back so one
@@ -70,7 +94,23 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
         AppleRemoteAudioRTPDepacketizer.canHandle(data)
     }
 
-    public init() throws {
+    /// Initial delay to apply to the corresponding live video path while RTCP
+    /// Sender Reports have not yet mapped audio and video onto a shared clock.
+    ///
+    /// Once both sender clocks are available, callers should use actual audio
+    /// playback timing for exact synchronization. This adaptive preroll remains
+    /// the safe fallback after a generation change or sender-clock gap.
+    public var recommendedVideoDelayNanos: UInt64 {
+        videoDelayLock.lock()
+        defer { videoDelayLock.unlock() }
+        return _recommendedVideoDelayNanos
+    }
+
+    public init(
+        playbackTimingSink:
+            (@Sendable (AppleRemoteAudioPlaybackTiming) -> Void)? = nil
+    ) throws {
+        self.playbackTimingSink = playbackTimingSink
         var asbd = AudioStreamBasicDescription(
             mSampleRate: Double(AppleRemoteAudioRTPDepacketizer.sampleRate),
             mFormatID: kAudioFormatMPEG4AAC_ELD_SBR,
@@ -175,6 +215,7 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
             if let decayIntervalNanos {
                 cushionDecayIntervalNanos = decayIntervalNanos
             }
+            updateRecommendedVideoDelay()
             lastCushionAdjustmentNanos = DispatchTime.now().uptimeNanoseconds
         }
     }
@@ -232,6 +273,7 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
         let base = baseRTPTimestamp ?? packet.timestamp
         if baseRTPTimestamp == nil { baseRTPTimestamp = base }
         var packetOffset = packet.timestamp &- base
+        var firstPresentationTime: CMTime?
 
         for (index, accessUnit) in packet.accessUnits.enumerated() {
             guard !accessUnit.isEmpty else { continue }
@@ -239,6 +281,9 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
                 value: Int64(packetOffset)
                     + Int64(index) * AppleRemoteAudioRTPDepacketizer.framesPerAccessUnit,
                 timescale: AppleRemoteAudioRTPDepacketizer.sampleRate)
+            if firstPresentationTime == nil {
+                firstPresentationTime = presentationTime
+            }
             let duration = CMTime(
                 value: AppleRemoteAudioRTPDepacketizer.framesPerAccessUnit,
                 timescale: AppleRemoteAudioRTPDepacketizer.sampleRate)
@@ -257,6 +302,7 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
                 prerollAccessUnitTarget = min(
                     prerollAccessUnitTarget + Self.prerollGrowthStep,
                     Self.maximumPrerollAccessUnitTarget)
+                updateRecommendedVideoDelay()
                 lastCushionAdjustmentNanos = DispatchTime.now().uptimeNanoseconds
                 let lateMilliseconds = Int(
                     (CMTimeSubtract(renderTime, presentationTime).seconds * 1000)
@@ -279,6 +325,9 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
                 presentationTime = CMTime(
                     value: Int64(packetOffset) + Int64(index) * framesPerAccessUnit,
                     timescale: AppleRemoteAudioRTPDepacketizer.sampleRate)
+                if index == 0 {
+                    firstPresentationTime = presentationTime
+                }
             }
             let sampleBuffer = try makeSampleBuffer(
                 accessUnit: accessUnit,
@@ -312,13 +361,37 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
         // ordinary Wi-Fi scheduling bursts; after a measured underrun the
         // target grows in 40 ms steps, capped at 240 ms.
         if !isRunning, enqueuedAccessUnitCount >= prerollAccessUnitTarget {
+            let hostTimeNanos = DispatchTime.now().uptimeNanoseconds
             playbackStartHostTime = CMClockGetTime(CMClockGetHostTimeClock())
             synchronizer.setRate(1, time: .zero)
             isRunning = true
             lastCushionAdjustmentNanos = DispatchTime.now().uptimeNanoseconds
+            if let activeSSRC, let baseRTPTimestamp {
+                playbackTimingSink?(AppleRemoteAudioPlaybackTiming(
+                    ssrc: activeSSRC,
+                    rtpTimestamp: baseRTPTimestamp,
+                    hostTimeNanos: hostTimeNanos))
+            }
             log.info(
                 "Remote audio playback started with "
                     + "\(prerollAccessUnitTarget * 10) ms preroll")
+        }
+
+        if isRunning,
+           let activeSSRC,
+           let firstPresentationTime,
+           let renderTime = trustedRenderTime() {
+            let nowNanos = DispatchTime.now().uptimeNanoseconds
+            let untilPresentation = CMTimeSubtract(
+                firstPresentationTime,
+                renderTime).seconds
+            let targetNanos = untilPresentation > 0
+                ? nowNanos &+ UInt64((untilPresentation * 1_000_000_000).rounded())
+                : nowNanos
+            playbackTimingSink?(AppleRemoteAudioPlaybackTiming(
+                ssrc: activeSSRC,
+                rtpTimestamp: packet.timestamp,
+                hostTimeNanos: targetNanos))
         }
 
         decayPrerollCushionIfClean()
@@ -475,11 +548,19 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     private func resetRendererTimeline(flushRenderer: Bool) {
         synchronizer.setRate(0, time: .invalid)
         if flushRenderer { renderer.flush() }
+        updateRecommendedVideoDelay()
         baseRTPTimestamp = nil
         playbackStartHostTime = nil
         enqueuedAccessUnitCount = 0
         isRunning = false
         hasLoggedRendererFailure = false
+    }
+
+    private func updateRecommendedVideoDelay() {
+        let delay = UInt64(prerollAccessUnitTarget) * 10_000_000
+        videoDelayLock.lock()
+        _recommendedVideoDelayNanos = delay
+        videoDelayLock.unlock()
     }
 
     private func activateAudioSessionIfNeeded() {

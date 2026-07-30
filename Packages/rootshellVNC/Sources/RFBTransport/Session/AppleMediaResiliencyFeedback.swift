@@ -128,6 +128,8 @@ func appleMediaReceiverReportCompound(
 /// reply the sender cannot correlate with any report it transmitted.
 struct AppleMediaSenderReportTiming: Sendable, Equatable {
     let remoteSSRC: UInt32
+    let ntpTimestamp: UInt64
+    let rtpTimestamp: UInt32
     let lsr: UInt32
     let arrivalNanos: UInt64
 }
@@ -146,12 +148,26 @@ func appleMediaSenderReportTiming(
         | UInt32(rtcp[base + 5]) << 16
         | UInt32(rtcp[base + 6]) << 8
         | UInt32(rtcp[base + 7])
+    let ntpTimestamp = UInt64(rtcp[base + 8]) << 56
+        | UInt64(rtcp[base + 9]) << 48
+        | UInt64(rtcp[base + 10]) << 40
+        | UInt64(rtcp[base + 11]) << 32
+        | UInt64(rtcp[base + 12]) << 24
+        | UInt64(rtcp[base + 13]) << 16
+        | UInt64(rtcp[base + 14]) << 8
+        | UInt64(rtcp[base + 15])
     let lsr = UInt32(rtcp[base + 10]) << 24
         | UInt32(rtcp[base + 11]) << 16
         | UInt32(rtcp[base + 12]) << 8
         | UInt32(rtcp[base + 13])
+    let rtpTimestamp = UInt32(rtcp[base + 16]) << 24
+        | UInt32(rtcp[base + 17]) << 16
+        | UInt32(rtcp[base + 18]) << 8
+        | UInt32(rtcp[base + 19])
     return AppleMediaSenderReportTiming(
         remoteSSRC: remoteSSRC,
+        ntpTimestamp: ntpTimestamp,
+        rtpTimestamp: rtpTimestamp,
         lsr: lsr,
         arrivalNanos: arrivalNanos)
 }
