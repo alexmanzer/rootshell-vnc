@@ -400,16 +400,16 @@ final class VNCConfigurationTests: XCTestCase {
             displaySizingMode: .matchClient,
             enableRemoteAudio: true)
         XCTAssertTrue(config.supportsRemoteAudio)
-        XCTAssertTrue(config.effectiveRemoteAudioEnabled)
+        XCTAssertTrue(config.effectiveRemoteAudioPlaybackEnabled)
 
         config.displaySizingMode = .remoteDisplay
         XCTAssertFalse(config.supportsRemoteAudio)
-        XCTAssertFalse(config.effectiveRemoteAudioEnabled)
+        XCTAssertFalse(config.effectiveRemoteAudioPlaybackEnabled)
 
         config.videoQualityMode = .standard
         config.enableRemoteAudio = true
         XCTAssertFalse(config.supportsRemoteAudio)
-        XCTAssertFalse(config.effectiveRemoteAudioEnabled)
+        XCTAssertFalse(config.effectiveRemoteAudioPlaybackEnabled)
     }
 
     func testDisplayCountClamping() {

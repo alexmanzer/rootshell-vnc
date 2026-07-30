@@ -543,8 +543,11 @@ public actor TransportSession {
     /// Per-SSRC reception stats for Receiver Reports sent back through the
     /// matching display feedback route.
     private var appleMediaReceptionStats: [UInt32: AppleMediaReceptionStats] = [:]
-    private var appleMediaLastSRLSR: UInt32 = 0
-    private var appleMediaLastSRArrivalNanos: UInt64 = 0
+    /// Sender Report timing is scoped to its remote SSRC. Audio and every
+    /// video source have independent RTCP timelines and must never
+    /// acknowledge one another's reports.
+    private var appleMediaSenderReports:
+        [UInt32: AppleMediaSenderReportTiming] = [:]
     /// Low-precision form of the standard RTP timestamp echoed by RCTL.
     /// This is unrelated to the RTP media-control extension and RTCP LSR.
     private var appleMediaLastRTPEchoTimestampQ10: UInt16 = 0
@@ -4415,6 +4418,12 @@ public actor TransportSession {
     }
 
     private func appleMediaServerConfigurationMessage() throws -> Data {
+        // Apple's compound media configuration requires a mode-8 receiver in
+        // its first slot. This is a wire-protocol requirement, independent of
+        // whether the client renders the received audio. Playback policy
+        // belongs to VNCSession and must not change this offer: omitting or
+        // disabling the slot causes the server to reject the whole compound
+        // configuration, including UDP HEVC video.
         let generatedAudioOffer = try appleAVCMediaStreamOffer(mode: 8)
         let generatedVideoOffer = try appleAVCMediaStreamOffer(
             mode: 7,
@@ -4696,8 +4705,7 @@ public actor TransportSession {
         appleMediaReceptionStats.removeAll(keepingCapacity: true)
         appleMediaLastFrameLossFeedback.removeAll(keepingCapacity: true)
         appleMediaMostRecentFrameLossSSRC = nil
-        appleMediaLastSRLSR = 0
-        appleMediaLastSRArrivalNanos = 0
+        appleMediaSenderReports.removeAll(keepingCapacity: true)
         appleMediaLastRTPEchoTimestampQ10 = 0
         appleRCTLPreviousRTPTimestamp = nil
         appleRCTLTotalPacketsReceived = 0
@@ -4914,6 +4922,7 @@ public actor TransportSession {
         appleMediaLTRFrameCompletionTracker.reset()
         appleMediaLTRAcknowledgementsSinceDiagnostic = 0
         appleMediaReceptionStats.removeAll()
+        appleMediaSenderReports.removeAll()
         appleMediaLastFrameLossFeedback.removeAll()
         appleMediaMostRecentFrameLossSSRC = nil
         appleMediaPreKeyDatagrams.removeAll()
@@ -5166,7 +5175,9 @@ public actor TransportSession {
         dumpAppleMediaUDPDatagramIfRequested(datagram)
 
         if isAppleMediaRTCPPacket(datagram) {
-            handleAppleMediaServerSenderReport(datagram)
+            handleAppleMediaServerSenderReport(
+                datagram,
+                arrivalNanos: arrivalNanos)
             continuation?.yield(.udpDatagram(datagram))
             return
         }
@@ -5764,22 +5775,26 @@ public actor TransportSession {
 
     /// Parse the server's SRTCP Sender Report to capture the LSR/DLSR round-trip
     /// timestamp the server needs to estimate RTT.
-    private func handleAppleMediaServerSenderReport(_ datagram: Data) {
+    private func handleAppleMediaServerSenderReport(
+        _ datagram: Data,
+        arrivalNanos: UInt64
+    ) {
         var decoded: Data?
-        for route in appleMediaFeedbackRoutes {
+        var routes = appleMediaFeedbackRoutes
+        if let appleMediaAudioFeedbackRoute {
+            routes.append(appleMediaAudioFeedbackRoute)
+        }
+        for route in routes {
             if let rtcp = try? route.receiveRTCPContext.unprotect(datagram) {
                 decoded = rtcp
                 break
             }
         }
-        guard let rtcp = decoded, rtcp.count >= 20 else { return }
-        let base = rtcp.startIndex
-        guard rtcp[base + 1] == 200 else { return } // PT = Sender Report
-        // NTP timestamp is 8 bytes at offset 8; LSR is its middle 32 bits.
-        let lsr = UInt32(rtcp[base + 10]) << 24 | UInt32(rtcp[base + 11]) << 16
-            | UInt32(rtcp[base + 12]) << 8 | UInt32(rtcp[base + 13])
-        appleMediaLastSRLSR = lsr
-        appleMediaLastSRArrivalNanos = DispatchTime.now().uptimeNanoseconds
+        guard let rtcp = decoded,
+              let timing = appleMediaSenderReportTiming(
+                from: rtcp,
+                arrivalNanos: arrivalNanos) else { return }
+        appleMediaSenderReports[timing.remoteSSRC] = timing
     }
 
     /// Native's feedback-only screen profile does not layer periodic RFC 3550
@@ -6136,13 +6151,6 @@ public actor TransportSession {
         guard !sources.isEmpty else { return nil }
 
         let now = DispatchTime.now().uptimeNanoseconds
-        let dlsr: UInt32
-        if appleMediaLastSRArrivalNanos > 0 {
-            let elapsed = now &- appleMediaLastSRArrivalNanos
-            dlsr = UInt32(truncatingIfNeeded: (elapsed &* 65_536) / 1_000_000_000)
-        } else {
-            dlsr = 0
-        }
 
         let reportCount = min(sources.count, 31)
         let lengthWords = 1 + 6 * reportCount // total 32-bit words - 1
@@ -6156,6 +6164,10 @@ public actor TransportSession {
 
         for (ssrc, original) in sources.prefix(reportCount) {
             var stats = original
+            let srTiming = appleMediaReceiverReportTiming(
+                for: ssrc,
+                senderReports: appleMediaSenderReports,
+                nowNanos: now)
             let extendedMax = stats.cycles | UInt32(stats.maxSeq)
             let expected = extendedMax &- stats.baseSeq &+ 1
             let expectedInterval = expected &- stats.expectedPrior
@@ -6176,8 +6188,8 @@ public actor TransportSession {
             appendUInt32BE((UInt32(fraction) << 24) | cumulativeLost, to: &rr)
             appendUInt32BE(extendedMax, to: &rr)
             appendUInt32BE(0, to: &rr) // interarrival jitter (RTP timestamps are 0; not meaningful)
-            appendUInt32BE(appleMediaLastSRLSR, to: &rr)
-            appendUInt32BE(dlsr, to: &rr)
+            appendUInt32BE(srTiming.lsr, to: &rr)
+            appendUInt32BE(srTiming.dlsr, to: &rr)
         }
         return rr
     }

@@ -1,4 +1,5 @@
 import CoreGraphics
+import RFBProtocol
 import XCTest
 @testable import rootshellVNC
 
@@ -71,6 +72,17 @@ final class LiveDisplaySelectionTests: XCTestCase {
         guard environment["VNC_TEST_DISPLAY_SELECTION"] == "1" else {
             throw XCTSkip("Set VNC_TEST_DISPLAY_SELECTION=1 to run the live display probe")
         }
+        let relaysLogs = environment["VNC_TEST_LOGS"] == "1"
+        if relaysLogs {
+            VNCLogRelay.install(minimumLevel: .debug) { level, category, message in
+                print("[\(level.name)] [\(category)] \(message)")
+            }
+        }
+        defer {
+            if relaysLogs {
+                VNCLogRelay.install(sink: nil)
+            }
+        }
         guard let host = environment["VNC_TEST_HOST"], !host.isEmpty,
               let password = environment["VNC_TEST_PASSWORD"], !password.isEmpty else {
             throw XCTSkip("Set VNC_TEST_HOST and VNC_TEST_PASSWORD")
@@ -105,11 +117,12 @@ final class LiveDisplaySelectionTests: XCTestCase {
         let adaptiveDisplayCount = min(
             2,
             max(1, Int(environment["VNC_TEST_DISPLAY_COUNT"] ?? "2") ?? 2))
+        let enablesRemoteAudio = environment["VNC_TEST_REMOTE_AUDIO"] == "1"
         let adaptive = VNCSession(configuration: VNCConfiguration(
             videoQualityMode: .adaptive,
             displaySizingMode: adaptiveSizingMode,
             displayCount: adaptiveDisplayCount,
-            enableRemoteAudio: false,
+            enableRemoteAudio: enablesRemoteAudio,
             reconnectionPolicy: VNCReconnectionPolicy(
                 isEnabled: false,
                 maximumAttempts: 0)))
@@ -146,6 +159,7 @@ final class LiveDisplaySelectionTests: XCTestCase {
         let receiverIndexes = await adaptive.activeTransportVideoReceiverIndexes()
         let answerLengths = await adaptive.activeTransportMediaAnswerStreamLengths()
         let controlDiagnostic = await adaptive.activeTransportMediaControlDiagnostic()
+        let statistics = await adaptive.currentStatistics()
         print("DISPLAY PROBE adaptive framebuffer=\(adaptiveWidth)x\(adaptiveHeight)")
         print("DISPLAY PROBE adaptive regions=\(adaptiveRegions)")
         print(
@@ -156,6 +170,7 @@ final class LiveDisplaySelectionTests: XCTestCase {
                 + "receivers=\(receiverIndexes) "
                 + "answerLengths=\(answerLengths) "
                 + "control=\(controlDiagnostic ?? "none") "
+                + "audioPackets=\(statistics?.transport.audioPacketsReceived ?? 0) "
                 + "primaryProgress=\(String(describing: primaryProgress))")
         print(
             "DISPLAY PROBE adaptive secondaryProgress="
@@ -163,6 +178,12 @@ final class LiveDisplaySelectionTests: XCTestCase {
         XCTAssertEqual(
             adaptive.activeVideoDisplayCount,
             expectedActiveDisplayCount)
+        if !enablesRemoteAudio {
+            XCTAssertGreaterThan(
+                answerLengths.first ?? 0,
+                0,
+                "Apple requires an audio receiver offer even when playback is disabled")
+        }
         XCTAssertGreaterThan(adaptive.videoBandRenderer.frameCommitCount, 0)
         if adaptive.activeVideoDisplayCount > 1 {
             XCTAssertGreaterThan(

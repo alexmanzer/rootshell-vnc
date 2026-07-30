@@ -121,6 +121,57 @@ func appleMediaReceiverReportCompound(
     return compound
 }
 
+/// The most recent Sender Report timing for one remote RTP source.
+///
+/// RTCP LSR/DLSR values are scoped to an SSRC. Reusing a report from another
+/// stream (for example, acknowledging a video SR in the audio RR) produces a
+/// reply the sender cannot correlate with any report it transmitted.
+struct AppleMediaSenderReportTiming: Sendable, Equatable {
+    let remoteSSRC: UInt32
+    let lsr: UInt32
+    let arrivalNanos: UInt64
+}
+
+/// Extract the sender identity and LSR value from an unprotected RTCP Sender
+/// Report. The middle 32 bits of its 64-bit NTP timestamp are the LSR echoed by
+/// a Receiver Report.
+func appleMediaSenderReportTiming(
+    from rtcp: Data,
+    arrivalNanos: UInt64
+) -> AppleMediaSenderReportTiming? {
+    guard rtcp.count >= 20 else { return nil }
+    let base = rtcp.startIndex
+    guard rtcp[base] >> 6 == 2, rtcp[base + 1] == 200 else { return nil }
+    let remoteSSRC = UInt32(rtcp[base + 4]) << 24
+        | UInt32(rtcp[base + 5]) << 16
+        | UInt32(rtcp[base + 6]) << 8
+        | UInt32(rtcp[base + 7])
+    let lsr = UInt32(rtcp[base + 10]) << 24
+        | UInt32(rtcp[base + 11]) << 16
+        | UInt32(rtcp[base + 12]) << 8
+        | UInt32(rtcp[base + 13])
+    return AppleMediaSenderReportTiming(
+        remoteSSRC: remoteSSRC,
+        lsr: lsr,
+        arrivalNanos: arrivalNanos)
+}
+
+/// Build the LSR/DLSR pair for one report block. A missing per-source Sender
+/// Report is represented by the RFC 3550 zero pair.
+func appleMediaReceiverReportTiming(
+    for remoteSSRC: UInt32,
+    senderReports: [UInt32: AppleMediaSenderReportTiming],
+    nowNanos: UInt64
+) -> (lsr: UInt32, dlsr: UInt32) {
+    guard let report = senderReports[remoteSSRC] else {
+        return (0, 0)
+    }
+    let elapsed = nowNanos &- report.arrivalNanos
+    let dlsr = UInt32(
+        truncatingIfNeeded: (elapsed &* 65_536) / 1_000_000_000)
+    return (report.lsr, dlsr)
+}
+
 private func appendUInt16BE(_ value: UInt16, to data: inout Data) {
     data.append(UInt8(value >> 8))
     data.append(UInt8(value & 0xff))

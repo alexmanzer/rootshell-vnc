@@ -238,7 +238,11 @@ public struct VNCConfiguration: Sendable {
         }
     }
 
-    /// Whether negotiated remote system audio should play on this device.
+    /// Whether remote system audio should play on this device.
+    ///
+    /// Apple High Performance mode still negotiates its protocol-mandated
+    /// audio receiver when this is `false`; the client discards those packets
+    /// instead of creating an audio player.
     public var enableRemoteAudio: Bool
 
     /// Whether an Apple Login Window or visually detected lock screen should
@@ -252,8 +256,8 @@ public struct VNCConfiguration: Sendable {
         videoQualityMode == .adaptive && displaySizingMode == .matchClient
     }
 
-    /// Whether remote system audio should be negotiated for this session.
-    var effectiveRemoteAudioEnabled: Bool {
+    /// Whether this session should create a remote-audio playback sink.
+    var effectiveRemoteAudioPlaybackEnabled: Bool {
         supportsRemoteAudio && enableRemoteAudio
     }
 

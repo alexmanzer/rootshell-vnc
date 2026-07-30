@@ -83,6 +83,55 @@ final class AppleMediaFeedbackTests: XCTestCase {
         ]))
     }
 
+    func testSenderReportTimingRemainsScopedToItsRemoteSSRC() throws {
+        let audioSSRC: UInt32 = 0x1122_3344
+        let videoSSRC: UInt32 = 0x5566_7788
+        let audioReport = Data([
+            0x80, 0xc8, 0x00, 0x04,
+            0x11, 0x22, 0x33, 0x44,
+            0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00,
+        ])
+        let videoReport = Data([
+            0x80, 0xc8, 0x00, 0x04,
+            0x55, 0x66, 0x77, 0x88,
+            0x10, 0x20, 0x30, 0x40,
+            0x50, 0x60, 0x70, 0x80,
+            0x00, 0x00, 0x00, 0x00,
+        ])
+        let audioTiming = try XCTUnwrap(appleMediaSenderReportTiming(
+            from: audioReport,
+            arrivalNanos: 1_000_000_000))
+        let videoTiming = try XCTUnwrap(appleMediaSenderReportTiming(
+            from: videoReport,
+            arrivalNanos: 2_000_000_000))
+        let timings = [
+            audioTiming.remoteSSRC: audioTiming,
+            videoTiming.remoteSSRC: videoTiming,
+        ]
+
+        let audioReply = appleMediaReceiverReportTiming(
+            for: audioSSRC,
+            senderReports: timings,
+            nowNanos: 2_500_000_000)
+        let videoReply = appleMediaReceiverReportTiming(
+            for: videoSSRC,
+            senderReports: timings,
+            nowNanos: 2_500_000_000)
+
+        XCTAssertEqual(audioReply.lsr, 0xccdd_eeff)
+        XCTAssertEqual(audioReply.dlsr, 98_304)
+        XCTAssertEqual(videoReply.lsr, 0x3040_5060)
+        XCTAssertEqual(videoReply.dlsr, 32_768)
+        XCTAssertEqual(
+            appleMediaReceiverReportTiming(
+                for: 0x9999_9999,
+                senderReports: timings,
+                nowNanos: 2_500_000_000).lsr,
+            0)
+    }
+
     func testNativeScreenRateProfileIsTwentyToSixtyMegabits() {
         XCTAssertEqual(AppleMediaRateController.nativeScreenMinimumBitrateBps, 20_000_000)
         XCTAssertEqual(AppleMediaRateController.nativeScreenMaximumBitrateBps, 60_000_000)
