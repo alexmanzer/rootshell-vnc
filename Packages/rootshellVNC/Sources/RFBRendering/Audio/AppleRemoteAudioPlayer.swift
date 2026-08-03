@@ -85,6 +85,21 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     private var underrunCount: UInt64 = 0
     private var isRunning = false
     private var hasActivatedAudioSession = false
+
+    /// Backoff for audio-session activation.
+    ///
+    /// Activation is attempted from `enqueueAccessUnits`, which runs once per
+    /// remote-audio RTP packet. When it fails the flag above stays false, so
+    /// without a backoff every subsequent packet retried it: one capture
+    /// logged 1375 activation failures, in bursts at roughly 100 Hz.
+    /// Activation also legitimately fails for as long as the app is
+    /// backgrounded (the host declares no `audio` background mode), which is
+    /// exactly when the retries are both loudest and most pointless.
+    private var nextAudioSessionAttemptNanos: UInt64 = 0
+    private var audioSessionFailureCount: UInt64 = 0
+    private static let audioSessionRetryFloorNanos: UInt64 = 250_000_000
+    private static let audioSessionRetryCeilingNanos: UInt64 = 5_000_000_000
+
     private var hasLoggedFirstPacket = false
     private var hasLoggedRendererFailure = false
     private var malformedPacketCount: UInt64 = 0
@@ -566,13 +581,38 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     private func activateAudioSessionIfNeeded() {
         guard !hasActivatedAudioSession else { return }
         #if os(iOS)
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now >= nextAudioSessionAttemptNanos else { return }
+
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
             try session.setActive(true)
             hasActivatedAudioSession = true
+            if audioSessionFailureCount > 0 {
+                let failures = audioSessionFailureCount
+                log.info("Audio output session activated after \(failures) failed attempt(s)")
+            }
+            nextAudioSessionAttemptNanos = 0
+            audioSessionFailureCount = 0
         } catch {
-            log.error("Could not activate the audio output session: \(error.localizedDescription)")
+            audioSessionFailureCount &+= 1
+            let failures = audioSessionFailureCount
+            // Double the wait per consecutive failure up to the ceiling, so a
+            // whole background window costs a handful of attempts rather than
+            // one per audio packet.
+            let shift = min(failures &- 1, 8)
+            let backoff = min(
+                Self.audioSessionRetryCeilingNanos,
+                Self.audioSessionRetryFloorNanos << shift)
+            nextAudioSessionAttemptNanos = now &+ backoff
+            // First failure names the cause; after that only occasional
+            // reminders, since a backgrounded app fails every single time.
+            if failures == 1 || failures.isMultiple(of: 32) {
+                log.error(
+                    "Could not activate the audio output session "
+                        + "(attempt \(failures)): \(error.localizedDescription)")
+            }
         }
         #else
         hasActivatedAudioSession = true
@@ -580,6 +620,13 @@ public final class AppleRemoteAudioPlayer: @unchecked Sendable {
     }
 
     private func deactivateAudioSessionIfNeeded() {
+        // Cleared ahead of the guard on purpose: a player that never managed
+        // to activate still carries a backoff, and a teardown (reconnect,
+        // stream restart) is exactly when it should get a clean attempt
+        // instead of inheriting the wait from the previous session.
+        nextAudioSessionAttemptNanos = 0
+        audioSessionFailureCount = 0
+
         guard hasActivatedAudioSession else { return }
         #if os(iOS)
         do {

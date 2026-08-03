@@ -1201,12 +1201,27 @@ public actor TransportSession {
             let elapsed = Double(nowNanos &- previous.nanos) / 1_000_000_000
             if elapsed >= 0.25 {
                 recentInterval = elapsed
-                recentBitrateKbps = Double(totalBytes &- previous.bytes) * 8 / elapsed / 1_000
-                let packetDelta = mediaPackets &- previous.packets
-                let lostDelta = lostCumulative &- previous.lost
-                let expected = packetDelta &+ lostDelta
-                if expected > 0 {
-                    recentPacketLossPercent = Double(lostDelta) / Double(expected) * 100
+                // These counters are not monotonic across a media restart:
+                // a renegotiation or a teardown re-anchors them at zero. The
+                // deltas were computed with wrapping subtraction, so a reset
+                // between two samples produced a near-UInt64.max difference
+                // and one capture logged bitrate=89769818264695kbps next to a
+                // disconnect. Treat any backwards step as a re-anchor and
+                // publish no rate for that window rather than a fictional one.
+                let didReset = totalBytes < previous.bytes
+                    || mediaPackets < previous.packets
+                    || lostCumulative < previous.lost
+                if !didReset {
+                    recentBitrateKbps =
+                        Double(totalBytes - previous.bytes) * 8 / elapsed / 1_000
+                    let packetDelta = mediaPackets - previous.packets
+                    let lostDelta = lostCumulative - previous.lost
+                    let expected = packetDelta + lostDelta
+                    if expected > 0 {
+                        recentPacketLossPercent = Double(lostDelta) / Double(expected) * 100
+                    }
+                } else {
+                    recentInterval = nil
                 }
                 statsPreviousSample = (nowNanos, totalBytes, mediaPackets, lostCumulative)
             }
@@ -4433,7 +4448,16 @@ public actor TransportSession {
     public func restartAppleMediaStream() async {
         guard sentAppleMediaStreamConfiguration else { return }
         do {
-            try await sendControlChannel(ClientMessage.appleMediaStreamRequest.serialize())
+            // Must go through the payload dispatcher, not the raw channel.
+            // Once the media stream is accepted the control channel carries
+            // length-framed ComCryption records, so writing a bare client
+            // message into it desynchronizes the stream: the server does not
+            // see a restart request, and may drop the session outright.
+            // `sendClientPayload` picks plaintext or encrypted from
+            // `acceptedAppleMediaStream`, which is exactly the distinction
+            // that matters here, and matches how the equivalent
+            // renegotiation request is sent.
+            try await sendClientPayload(ClientMessage.appleMediaStreamRequest.serialize())
             log.warning("Re-requested Apple media stream (bootstrap recovery)")
         } catch {
             log.error("Could not re-request Apple media stream: \(error.localizedDescription)")

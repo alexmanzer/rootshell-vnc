@@ -52,6 +52,19 @@ public actor TCPConnection: RFBConnection {
     private var connected = false
     private var isClosing = false
 
+    /// Last known path, captured while the channel was alive.
+    ///
+    /// ``pathCharacteristics()`` reads the option off the channel, and the
+    /// disconnect summary runs after the channel is gone, so every teardown
+    /// line in a debug capture reported `interface=unknown`: the one field
+    /// that would separate "Wi-Fi went away" from every other cause was never
+    /// populated at the only moment it mattered.
+    private var lastKnownPath: NetworkPathCharacteristics?
+
+    /// Peer selected by Network.framework for the live connection, captured at
+    /// connect time for the same reason.
+    private var lastKnownRemoteEndpoint: String?
+
     /// User-space read buffer. RFB parsing does many small field-sized reads,
     /// so a single channel read is shared across subsequent parser requests.
     private var receiveBuffer = Data()
@@ -196,12 +209,22 @@ public actor TCPConnection: RFBConnection {
             inboundHandler = handler
             inboundQueue = handler.queue
             connected = true
+            // Both of these populate the caches above as a side effect, which
+            // is the point: the teardown summary runs after the channel is
+            // dead and needs a value captured while it was not.
+            let pathDescription = await pathCharacteristics()
+                .map { String(describing: $0.interface) } ?? "unknown"
+            let peerDescription = await remoteEndpointHost() ?? "unknown"
             log.info(
                 "Connected to \(host):\(port) "
                     + "(keepalive idle=\(keepalive.idleSeconds)s "
                     + "interval=\(keepalive.intervalSeconds)s "
                     + "count=\(keepalive.probeCount), "
                     + "dead-peer verdict after ~\(keepalive.deadPeerDetectionSeconds)s of silence)")
+            // Peer and interface on the record at connect time. Which of the
+            // server's addresses Happy Eyeballs picked for a Bonjour name is
+            // otherwise only inferable from the media path's own log line.
+            log.info("Selected peer \(peerDescription) over \(pathDescription)")
         } catch {
             let protocolError = VNCProtocolError.ioError(
                 "Connection failed: \(error.localizedDescription)")
@@ -291,6 +314,11 @@ public actor TCPConnection: RFBConnection {
         connected = false
         receiveBuffer.removeAll()
         receiveOffset = 0
+        // Callers that want these read them from the teardown summary, which
+        // runs before close. Past this point they would describe a connection
+        // that no longer exists.
+        lastKnownPath = nil
+        lastKnownRemoteEndpoint = nil
     }
 
     public var isConnected: Bool { connected }
@@ -307,11 +335,15 @@ public actor TCPConnection: RFBConnection {
         disconnectHandler?(error)
     }
 
+    /// Current path if the channel is still alive, otherwise the last one seen
+    /// while it was. A teardown summary asks for this after the channel has
+    /// been torn down, and "the interface this connection was actually using"
+    /// is still the answer it needs.
     public func pathCharacteristics() async -> NetworkPathCharacteristics? {
-        guard let channel else { return nil }
+        guard let channel else { return lastKnownPath }
         guard let path = try? await channel
             .getOption(NIOTSChannelOptions.currentPath)
-            .get() else { return nil }
+            .get() else { return lastKnownPath }
         let interface: NetworkPathInterfaceKind
         if path.usesInterfaceType(.cellular) {
             interface = .cellular
@@ -324,11 +356,15 @@ public actor TCPConnection: RFBConnection {
         } else {
             interface = .other
         }
-        return NetworkPathCharacteristics(
+        let characteristics = NetworkPathCharacteristics(
             interface: interface,
             usesOtherInterface: path.usesInterfaceType(.other),
             isExpensive: path.isExpensive,
             isConstrained: path.isConstrained)
+        // Refresh on every successful read so a mid-session path change is
+        // what the teardown summary reports, not the connect-time snapshot.
+        lastKnownPath = characteristics
+        return characteristics
     }
 
     /// Return the concrete peer selected by Network.framework. In particular,
@@ -339,9 +375,13 @@ public actor TCPConnection: RFBConnection {
               let path = try? await channel
                 .getOption(NIOTSChannelOptions.currentPath)
                 .get()
-        else { return nil }
+        else { return lastKnownRemoteEndpoint }
 
-        return Self.numericHost(from: path.remoteEndpoint)
+        guard let host = Self.numericHost(from: path.remoteEndpoint) else {
+            return lastKnownRemoteEndpoint
+        }
+        lastKnownRemoteEndpoint = host
+        return host
     }
 
     static func numericHost(from endpoint: NWEndpoint?) -> String? {

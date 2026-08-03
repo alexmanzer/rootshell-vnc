@@ -889,6 +889,20 @@ public final class VNCSession {
     /// loop the user experiences as repeated "Connection interrupted". See
     /// ``failAfterMediaBootstrapExhausted(reason:)`` for what happens instead.
     private static let maximumConsecutiveMediaBootstrapReconnects = 2
+
+    /// Media-stream restarts attempted on the live connection before falling
+    /// back to a reconnect. One is enough to tell a damaged startup burst
+    /// (which a fresh offer fixes) from a server that will not produce a
+    /// decodable stream on this connection at all.
+    private static let maximumConsecutiveMediaStreamRestarts = 1
+    private var consecutiveMediaStreamRestarts = 0
+
+    /// Set when automatic recovery gave up on purpose rather than running out
+    /// of road: a non-retryable error, an exhausted media-bootstrap cap, or a
+    /// policy that disables reconnection. Those failures are the user's to
+    /// resolve through Retry, and nothing that merely happens to the app
+    /// afterwards, an app switch included, may undo them.
+    private var automaticRecoveryDeclined = false
     #if canImport(UIKit)
     @ObservationIgnored
     private var backgroundLifecycleTask: Task<Void, Never>?
@@ -896,6 +910,37 @@ public final class VNCSession {
     private var foregroundLifecycleTask: Task<Void, Never>?
     @ObservationIgnored
     private var mediaWasBackgrounded = false
+
+    /// Whether the session still had a live or recovering connection at the
+    /// moment the app was backgrounded.
+    ///
+    /// This is the evidence that a terminal state found on the next foreground
+    /// edge was produced *by* the background window: the session was not
+    /// terminal going in and is terminal coming out, so the transition
+    /// happened in between. Without it, resume recovery would revive any
+    /// parked failure, including ones the user had already seen and left
+    /// alone, simply because they switched apps.
+    @ObservationIgnored
+    private var wasLiveWhenBackgrounded = false
+
+    /// Uptime deadline until which a connection loss is attributed to the
+    /// process having been suspended rather than to the network.
+    ///
+    /// iOS reclaims the socket of a process it suspends, so the transport is
+    /// already dead when the app comes back; the read loop just has not
+    /// noticed yet. Discovering that a moment later and then serving the
+    /// standard backoff spends about a second doing nothing, and burns a
+    /// `retry n/8` slot on a failure the network had no part in. While this
+    /// deadline is in the future, the first loss reconnects immediately and
+    /// does not consume an attempt.
+    @ObservationIgnored
+    private var suspensionResumeDeadlineNanos: UInt64 = 0
+
+    /// How long after a foreground edge a loss still counts as suspension
+    /// fallout. The read loop typically surfaces the aborted socket within
+    /// tens of milliseconds of resuming; this is deliberately generous
+    /// without being long enough to swallow a genuine mid-use drop.
+    private static let suspensionResumeGraceNanos: UInt64 = 3_000_000_000
     #endif
 
     // MARK: - Init
@@ -960,6 +1005,8 @@ public final class VNCSession {
         intentionallyDisconnected = false
         hasEstablishedConnection = false
         consecutiveMediaBootstrapReconnects = 0
+        consecutiveMediaStreamRestarts = 0
+        automaticRecoveryDeclined = false
         connectionState = .connecting
         connectionPhaseDescription = String(localized: "Opening connection…", bundle: .module)
         activeCredentials = credentials
@@ -1106,6 +1153,10 @@ public final class VNCSession {
         // session parked by `failAfterMediaBootstrapExhausted` would re-trip
         // the cap on its first watchdog and never get a real second chance.
         consecutiveMediaBootstrapReconnects = 0
+        consecutiveMediaStreamRestarts = 0
+        // The user asking for a retry is the resolution the declined states
+        // were waiting for.
+        automaticRecoveryDeclined = false
         scheduleReconnect(immediate: true)
     }
 
@@ -1130,6 +1181,8 @@ public final class VNCSession {
         // Handshake-level options changed (often precisely to escape a failing
         // video profile), so the media-recovery budget starts over.
         consecutiveMediaBootstrapReconnects = 0
+        consecutiveMediaStreamRestarts = 0
+        automaticRecoveryDeclined = false
 
         // Mirror the proven media-bootstrap recovery path: close the old
         // transport while the reconnect task performs ordered cleanup and
@@ -2191,6 +2244,25 @@ public final class VNCSession {
             connectionState = .disconnected
             return
         }
+
+        // A loss surfacing right after a foreground edge is the suspended
+        // socket being noticed, not a network fault. Sleeping out the backoff
+        // before redialing a server that was never unreachable just adds a
+        // second of dead time to every app switch.
+        #if canImport(UIKit)
+        if consumeSuspensionResumeWindow() {
+            // Uncounted for the same reason as the resume dial above: this
+            // socket was reclaimed by iOS while the app was not running, so
+            // charging the redial to the recovery budget would spend it on a
+            // failure the network had no part in.
+            scheduleReconnect(
+                immediate: true,
+                freeLeadingAttempt: true,
+                cause: "app resumed; the suspended session's socket was reclaimed")
+            return
+        }
+        #endif
+
         scheduleReconnect()
     }
 
@@ -2889,16 +2961,50 @@ public final class VNCSession {
     /// Escalation of last resort for a video bootstrap that never produced a
     /// decoded frame: some servers never re-send an IRAP for FIR, so a
     /// startup burst damaged by packet loss leaves the stream permanently
-    /// dead. Only a fresh connection renegotiates media. (Deliberately no
-    /// capacity reduction on retry: the server ignores our advertised rate
-    /// during bootstrap, and a lowered controller origin destabilizes large
-    /// framebuffers.)
+    /// dead. (Deliberately no capacity reduction on retry: the server ignores
+    /// our advertised rate during bootstrap, and a lowered controller origin
+    /// destabilizes large framebuffers.)
     private func noteMediaBootstrapHealthy() {
+        if consecutiveMediaStreamRestarts > 0 {
+            logger.info(
+                "Media bootstrap healthy after \(consecutiveMediaStreamRestarts) "
+                    + "stream restart(s); clearing the restart count")
+            consecutiveMediaStreamRestarts = 0
+        }
         guard consecutiveMediaBootstrapReconnects > 0 else { return }
         logger.info(
             "Media bootstrap healthy after \(consecutiveMediaBootstrapReconnects) "
                 + "forced reconnect(s); clearing the escalation count")
         consecutiveMediaBootstrapReconnects = 0
+    }
+
+    /// Re-request the media stream on the connection we already have.
+    ///
+    /// A dead video bootstrap used to go straight to `forceMediaBootstrapReconnect`,
+    /// which throws away a perfectly healthy control channel, re-runs the RFB
+    /// handshake and authentication, and shows the user "Connection
+    /// interrupted" to fix a video problem. Every stream offer bootstraps a
+    /// fresh generation with its own parameter sets and IRAP, so asking for
+    /// one is the same repair at a fraction of the cost.
+    ///
+    /// Returns whether a restart was issued. The fresh offer spawns a new
+    /// startup watchdog, and the caller's generation check stands it down, so
+    /// escalation to a reconnect still happens if the new generation fails
+    /// too. `consecutiveMediaStreamRestarts` bounds the loop.
+    private func requestMediaStreamRestart(reason: String) -> Bool {
+        guard connectionState.isConnected,
+              reconnectTask == nil,
+              isHighPerformanceMode,
+              let transport = transportSession else { return false }
+        guard consecutiveMediaStreamRestarts
+                < Self.maximumConsecutiveMediaStreamRestarts else { return false }
+
+        consecutiveMediaStreamRestarts += 1
+        logger.warning(
+            "Video bootstrap failed (\(reason)); re-requesting the media "
+                + "stream before dropping the connection")
+        Task { await transport.restartAppleMediaStream() }
+        return true
     }
 
     /// Stop automatic media recovery and hand the decision back to the user.
@@ -2925,6 +3031,9 @@ public final class VNCSession {
         let transport = transportSession
         cleanupTransport(clearCredentials: false)
         Task { await transport?.disconnect() }
+        // This cap exists to stop a reconnect loop. Reviving it on the next
+        // foreground edge would restart the very loop it just broke.
+        automaticRecoveryDeclined = true
         connectionState = .failed(String(
             localized: "The remote video stream could not start after \(attempts) attempts. Try again, or switch this connection to Standard mode.",
             bundle: .module))
@@ -3009,32 +3118,69 @@ public final class VNCSession {
         try await transport.connect()
     }
 
+    /// - Parameters:
+    ///   - immediate: Drop the backoff before the first counted attempt.
+    ///   - minimumAttempts: Floor on the policy's attempt count, for dials the
+    ///     user asked for explicitly and which must happen even under a policy
+    ///     that disables automatic recovery.
+    ///   - freeLeadingAttempt: Run one dial *before* the counted attempts that
+    ///     does not consume the policy's budget. This exists for the dial made
+    ///     on returning to the foreground: iOS reclaimed the socket while the
+    ///     process was suspended, so redialing is bookkeeping, not recovery
+    ///     from a network fault. Charging it to `maximumAttempts` would let a
+    ///     one-attempt policy exhaust itself on a dial made before the network
+    ///     had come back, leaving nothing for the real failure. It is a
+    ///     supplement to the budget, never a substitute: it is only offered
+    ///     when the policy already permits at least one attempt.
+    ///   - cause: Overrides the reported reason when the transport error would
+    ///     misattribute the drop.
     private func scheduleReconnect(
         immediate: Bool = false,
-        minimumAttempts: Int = 0
+        minimumAttempts: Int = 0,
+        freeLeadingAttempt: Bool = false,
+        cause: String? = nil
     ) {
         guard reconnectTask == nil, let credentials = activeCredentials else { return }
         let policy = configuration.reconnectionPolicy
         let maximumAttempts = max(policy.maximumAttempts, minimumAttempts)
         guard maximumAttempts > 0 else {
+            automaticRecoveryDeclined = true
             connectionState = .failed(String(
                 localized: "Reconnection is disabled for this session.",
                 bundle: .module))
             return
         }
 
+        // Attempt 0 is the uncounted one; the policy's own budget is 1...max.
+        let firstAttempt = freeLeadingAttempt ? 0 : 1
+
         reconnectTask = Task { [weak self] in
             guard let self else { return }
             defer { self.reconnectTask = nil }
 
-            for attempt in 1...maximumAttempts {
+            for attempt in firstAttempt...maximumAttempts {
                 guard !Task.isCancelled, !self.intentionallyDisconnected else { return }
-                let delay = immediate && attempt == 1 ? 0 : policy.delay(forAttempt: attempt)
-                self.connectionState = .reconnecting(attempt: attempt, delay: delay)
-                let cause = self.lastError?.localizedDescription ?? "no transport error recorded"
-                self.logger.warning(
-                    "Connection lost (\(cause)); retry \(attempt)/\(maximumAttempts) in "
-                        + String(format: "%.1f", delay) + "s")
+                let isUncountedAttempt = attempt == 0
+                let delay = isUncountedAttempt || (immediate && attempt == 1)
+                    ? 0
+                    : policy.delay(forAttempt: attempt)
+                // The uncounted dial still reports as attempt 1 to the UI,
+                // which only needs to know that recovery is under way.
+                self.connectionState = .reconnecting(
+                    attempt: max(1, attempt),
+                    delay: delay)
+                let reportedCause = cause
+                    ?? self.lastError?.localizedDescription
+                    ?? "no transport error recorded"
+                if isUncountedAttempt {
+                    self.logger.warning(
+                        "Connection lost (\(reportedCause)); reconnecting now "
+                            + "without consuming the \(maximumAttempts)-attempt budget")
+                } else {
+                    self.logger.warning(
+                        "Connection lost (\(reportedCause)); retry \(attempt)/\(maximumAttempts) in "
+                            + String(format: "%.1f", delay) + "s")
+                }
 
                 do {
                     if delay > 0 {
@@ -3047,6 +3193,9 @@ public final class VNCSession {
                     try Task.checkCancellation()
                     self.cleanupTransport(clearCredentials: false)
                     try await self.establishTransport(credentials: credentials)
+                    // A connection that came back is not a declined one,
+                    // whatever gave up before it.
+                    self.automaticRecoveryDeclined = false
                     self.logger.info("Reconnected successfully")
                     return
                 } catch is CancellationError {
@@ -3061,6 +3210,10 @@ public final class VNCSession {
                     }
                     if !Self.isRetryableConnectionError(error) {
                         self.cleanupTransport(clearCredentials: false)
+                        // A bad password or an unsupported version does not
+                        // become correct by dialing again, so this failure is
+                        // the user's to resolve and must survive an app switch.
+                        self.automaticRecoveryDeclined = true
                         self.connectionState = .failed(error.localizedDescription)
                         return
                     }
@@ -3251,6 +3404,12 @@ public final class VNCSession {
             ) {
                 guard !Task.isCancelled, let self else { return }
                 mediaWasBackgrounded = true
+                switch connectionState {
+                case .connected, .connecting, .reconnecting:
+                    wasLiveWhenBackgrounded = true
+                case .idle, .disconnecting, .disconnected, .failed:
+                    wasLiveWhenBackgrounded = false
+                }
                 noteMediaInterruptionBoundary(requestRefresh: false)
             }
         }
@@ -3261,9 +3420,80 @@ public final class VNCSession {
                 guard !Task.isCancelled, let self else { return }
                 guard mediaWasBackgrounded else { continue }
                 mediaWasBackgrounded = false
+                let wasLive = wasLiveWhenBackgrounded
+                wasLiveWhenBackgrounded = false
+                // Only a session that went into the background alive can have
+                // been killed by the background.
+                if wasLive { armSuspensionResumeWindow() }
                 noteMediaInterruptionBoundary(requestRefresh: true)
+                if wasLive { resumeReconnectIfTransportAlreadyLost() }
             }
         }
+    }
+
+    /// Attribute the next connection loss to the suspension we just came back
+    /// from. See ``suspensionResumeDeadlineNanos``.
+    private func armSuspensionResumeWindow() {
+        suspensionResumeDeadlineNanos =
+            DispatchTime.now().uptimeNanoseconds &+ Self.suspensionResumeGraceNanos
+    }
+
+    /// True while a loss should be treated as suspension fallout. Reading it
+    /// consumes the window: one resume explains one drop, and a second drop
+    /// moments later is a real failure that deserves the normal backoff.
+    private func consumeSuspensionResumeWindow() -> Bool {
+        guard suspensionResumeDeadlineNanos != 0,
+              DispatchTime.now().uptimeNanoseconds < suspensionResumeDeadlineNanos else {
+            suspensionResumeDeadlineNanos = 0
+            return false
+        }
+        suspensionResumeDeadlineNanos = 0
+        return true
+    }
+
+    /// A session suspended long enough for iOS to reclaim its socket is
+    /// already dead on the foreground edge, but nothing has run to observe it.
+    /// `noteMediaInterruptionBoundary` cannot help here: it requires
+    /// `connectionState.isConnected`, which is exactly what a session parked
+    /// mid-recovery across the background window no longer is. Start the
+    /// replacement now rather than waiting for a watchdog.
+    ///
+    /// Only called when the session was still live going into the background,
+    /// so a terminal state found here was necessarily reached during that
+    /// window. That is the whole licence for reviving it: a failure the user
+    /// already saw, and left parked, is not made stale by an app switch.
+    private func resumeReconnectIfTransportAlreadyLost() {
+        guard !intentionallyDisconnected,
+              hasEstablishedConnection,
+              activeCredentials != nil,
+              reconnectTask == nil,
+              configuration.reconnectionPolicy.isEnabled,
+              // The dial is a supplement to the policy's budget, never a way
+              // around a policy that permits no attempts at all.
+              configuration.reconnectionPolicy.maximumAttempts > 0 else { return }
+
+        // Recovery that stopped on purpose stays stopped. Running out of
+        // attempts while the process was suspended is not that: those dials
+        // were spent on a network the app was not running to reach.
+        guard !automaticRecoveryDeclined else {
+            logger.info(
+                "App resumed with the session parked by a declined recovery; "
+                    + "leaving it for the user to retry")
+            return
+        }
+
+        switch connectionState {
+        case .disconnected, .failed:
+            break
+        case .idle, .connecting, .connected, .reconnecting, .disconnecting:
+            return
+        }
+
+        _ = consumeSuspensionResumeWindow()
+        scheduleReconnect(
+            immediate: true,
+            freeLeadingAttempt: true,
+            cause: "app resumed; the suspended session's socket was reclaimed")
     }
 
     private func noteMediaInterruptionBoundary(requestRefresh: Bool) {
@@ -3450,6 +3680,12 @@ public final class VNCSession {
         }
 
         let streamGeneration = manager.decodeProgress.streamGeneration
+        // Ownership takes two counters, not one. A replacement stream bumps
+        // `streamGeneration`; an in-session renegotiation arrives through the
+        // generation sink, which bumps only `mediaGeneration` and starts its
+        // own per-generation watchdog. Checking `streamGeneration` alone lets
+        // this watchdog act on a stream that a successor already owns.
+        let startingMediaGeneration = manager.currentMediaGeneration
         let recoveryCoordinator = MediaRecoveryCoordinator()
 
         // Startup liveness watchdog. Recovery stays in the negotiated media
@@ -3503,10 +3739,57 @@ public final class VNCSession {
                 }
                 guard let self,
                       let m = watchdogManager, m.isStreamActive,
-                      m.decodeProgress.streamGeneration == streamGeneration else { return }
+                      m.decodeProgress.streamGeneration == streamGeneration,
+                      m.currentMediaGeneration == startingMediaGeneration else { return }
+                let reason = "\(lastStatus.decoded)/\(lastStatus.sources) bands decoding "
+                    + "after \(firAttempts) FIR attempts"
+
+                // Try the cheap repair first. A fresh stream offer carries new
+                // parameter sets and an IRAP, which is what a damaged startup
+                // burst actually needs; dropping the whole connection for it
+                // costs a handshake, authentication and a media renegotiation,
+                // and surfaces to the user as a dropped session. If the new
+                // generation fails too, its own watchdog escalates from here.
+                if self.requestMediaStreamRestart(reason: reason) {
+                    // A server that simply ignores the re-request produces
+                    // neither, so no replacement watchdog is ever spawned.
+                    // Returning unconditionally here would leave the session
+                    // `.connected` on a blank screen with nothing retrying,
+                    // which is the exact failure `failAfterMediaBootstrapExhausted`
+                    // exists to avoid. Hold the escalation open until a
+                    // successor actually takes ownership.
+                    for _ in 1...5 {
+                        try? await Task.sleep(for: .seconds(1))
+                        guard let current = watchdogManager,
+                              current.isStreamActive else { return }
+                        // Either counter moving means a successor owns this
+                        // stream and will escalate on its own if it fails. A
+                        // whole new stream offer bumps `streamGeneration`; an
+                        // in-session renegotiation bumps only `mediaGeneration`
+                        // and starts its own per-generation watchdog, whose FIR
+                        // ladder runs longer than the wait here.
+                        guard current.decodeProgress.streamGeneration == streamGeneration,
+                              current.currentMediaGeneration == startingMediaGeneration
+                        else { return }
+                        // The re-request can also be answered with a fresh
+                        // IRAP inside the current generation, in which case
+                        // the bands simply start decoding and there is
+                        // nothing left to escalate.
+                        if lastStatus.sources > 0, decodedBands.count >= lastStatus.sources {
+                            log.info(
+                                "Dead-band watchdog: recovered after a media "
+                                    + "stream re-request")
+                            self.noteMediaBootstrapHealthy()
+                            return
+                        }
+                    }
+                    log.error(
+                        "Media stream re-request produced no replacement "
+                            + "generation; escalating to a reconnect")
+                }
+
                 self.forceMediaBootstrapReconnect(
-                    reason: "\(lastStatus.decoded)/\(lastStatus.sources) bands decoding "
-                        + "after \(firAttempts) FIR attempts",
+                    reason: reason,
                     retryTilesPerFrame:
                         lastStatus.sources == 1 && lastStatus.decoded == 0 ? 4 : nil)
             }
