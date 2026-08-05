@@ -71,6 +71,15 @@ public actor TCPConnection: RFBConnection {
     private var receiveOffset = 0
     private static let compactionThreshold = 64 * 1024
 
+    /// Backstop against a desynchronized or hostile RFB stream. The largest
+    /// legitimate exact read is a raw full-screen rectangle (a 6K display at
+    /// 4 bytes per pixel is ~100 MB), so anything past this is a garbage
+    /// length field, and honoring it grows `receiveBuffer` until the Data
+    /// reallocation fails with a fatal assertion rather than a throwable
+    /// error. Refusing here turns that crash into a protocol violation the
+    /// session teardown path already knows how to report.
+    static let maxExactReadBytes = 256 * 1024 * 1024
+
     /// Dial retry tuning; injectable so tests don't sit through real backoffs.
     private let maxDialAttempts: Int
     private let dialRetryBackoffNanos: UInt64
@@ -236,6 +245,11 @@ public actor TCPConnection: RFBConnection {
     public func read(exactly count: Int) async throws -> Data {
         guard count >= 0 else {
             throw VNCProtocolError.protocolViolation("Negative read length")
+        }
+        guard count <= Self.maxExactReadBytes else {
+            throw VNCProtocolError.protocolViolation(
+                "Server demanded a \(count)-byte read; refusing "
+                    + "(stream desynchronized or hostile)")
         }
         while bufferedByteCount < count {
             try await fillBuffer()

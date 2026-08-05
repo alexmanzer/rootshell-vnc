@@ -312,6 +312,83 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    /// The build-130 field crash: a zlib rect whose length prefix decodes to
+    /// ~1.47 GB. The session must reject it as a protocol violation and tear
+    /// down cleanly instead of buffering gigabytes until Data's reallocation
+    /// dies with a fatal assertion.
+    func testGiantZlibLengthPrefixTerminatesWithProtocolViolation() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_8.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 800, height: 600, name: "desynced"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "desynced.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.zlib, .raw],
+            connection: connection)
+        try await session.connect()
+
+        var update = Data([0, 0, 0, 1]) // type, padding, one rectangle
+        update.append(Self.rectangleHeader(
+            x: 0, y: 0, width: 800, height: 600,
+            encoding: Encoding.zlib.rawValue))
+        // The exact garbage length observed in the field crash report.
+        update.append(contentsOf: [0x57, 0xff, 0xf9, 0xc3])
+        await connection.enqueueServerBytes(update)
+
+        let observedError = await Self.withTimeout(seconds: 2) {
+            () -> VNCProtocolError? in
+            for await event in session.events {
+                if case .error(let error) = event { return error }
+            }
+            return nil
+        }
+        guard case .protocolViolation = observedError else {
+            return XCTFail("Expected protocolViolation, got \(String(describing: observedError))")
+        }
+        await session.disconnect()
+    }
+
+    func testGiantServerCutTextLengthTerminatesWithProtocolViolation() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_8.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 640, height: 480, name: "hostile"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "hostile.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            connection: connection)
+        try await session.connect()
+
+        // ServerCutText declaring a ~4 GB clipboard payload.
+        var cutText = Data([3, 0, 0, 0]) // type + padding(3)
+        cutText.append(contentsOf: [0xff, 0xff, 0xff, 0xfe])
+        await connection.enqueueServerBytes(cutText)
+
+        let observedError = await Self.withTimeout(seconds: 2) {
+            () -> VNCProtocolError? in
+            for await event in session.events {
+                if case .error(let error) = event { return error }
+            }
+            return nil
+        }
+        guard case .protocolViolation = observedError else {
+            return XCTFail("Expected protocolViolation, got \(String(describing: observedError))")
+        }
+        await session.disconnect()
+    }
+
     func testAppleStandardOneDisplayActivatesAutoUpdatesAfterEitherInitialRectangleOrder() async throws {
         let width: UInt16 = 2
         let height: UInt16 = 1

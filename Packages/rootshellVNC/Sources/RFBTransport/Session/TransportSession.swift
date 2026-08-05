@@ -1714,6 +1714,10 @@ public actor TransportSession {
         let pf = try reader.readPixelFormat()
         let nameLen = try reader.readUInt32()
 
+        guard Int(nameLen) <= Self.maxTextFieldBytes else {
+            throw oversizedPayloadError(
+                Int(nameLen), limit: Self.maxTextFieldBytes, context: "ServerInit name")
+        }
         let serverInitNameField = try await readControlChannel(exactly: Int(nameLen))
         var nameData = serverInitNameField
         if stateMachine.negotiatedVersion?.isApple == true,
@@ -1779,9 +1783,13 @@ public actor TransportSession {
     private func readReasonString() async throws -> String {
         let lenData = try await readControlChannel(exactly: 4)
         var reader = MessageReader(data: lenData)
-        let len = try reader.readUInt32()
+        let len = Int(try reader.readUInt32())
         guard len > 0 else { return "Unknown error" }
-        let textData = try await readControlChannel(exactly: Int(len))
+        guard len <= Self.maxTextFieldBytes else {
+            throw oversizedPayloadError(
+                len, limit: Self.maxTextFieldBytes, context: "Server failure reason")
+        }
+        let textData = try await readControlChannel(exactly: len)
         return String(data: textData, encoding: .utf8) ?? "Unknown error"
     }
 
@@ -1865,6 +1873,36 @@ public actor TransportSession {
         noteControlChannelActivity(byteCount: data.count)
         return data
     }
+
+    /// Every server-declared payload length is bounds-checked (a plain
+    /// integer comparison) before it turns into a `read(exactly:)`. A garbage
+    /// 32-bit length (from a stream desync or a hostile server) otherwise
+    /// makes the connection buffer gigabytes until the Data reallocation dies
+    /// with a fatal assertion instead of a throwable error. This factory only
+    /// runs in the failure branch, where the teardown path wants an error
+    /// naming the offending message.
+    private func oversizedPayloadError(
+        _ length: Int,
+        limit: Int,
+        context: String
+    ) -> VNCProtocolError {
+        .protocolViolation(
+            "\(context) declared \(length) payload bytes (limit \(limit)); "
+                + "treating as stream desynchronization")
+    }
+
+    /// Framebuffer payloads scale with the negotiated screen, so the limit
+    /// does too: twice the current full-screen raw size, floored generously
+    /// for the pre-ServerInit window and mid-negotiation format changes.
+    private var maxFramebufferPayloadBytes: Int {
+        max(64 * 1024 * 1024, Int(fbWidth) * Int(fbHeight) * pixelFormat.bytesPerPixel * 2)
+    }
+
+    /// Cursors, cursor caches, and cut text are small auxiliary payloads.
+    private static let maxAuxiliaryPayloadBytes = 16 * 1024 * 1024
+
+    /// Reason strings and desktop names are short human-readable text.
+    private static let maxTextFieldBytes = 64 * 1024
 
     /// Outbound counterpart. TCP keepalive probes only start once the socket
     /// has been idle in *both* directions, so an inbound-only measure would
@@ -1974,6 +2012,11 @@ public actor TransportSession {
             switch rect.encoding {
             case .raw:
                 let byteCount = Int(rect.width) * Int(rect.height) * pixelFormat.bytesPerPixel
+                guard byteCount <= maxFramebufferPayloadBytes else {
+                    throw oversizedPayloadError(
+                        byteCount, limit: maxFramebufferPayloadBytes,
+                        context: "Raw rect \(rect.width)x\(rect.height)")
+                }
                 if byteCount > 0 {
                     pixelData = try await readControlChannel(exactly: byteCount)
                 } else {
@@ -1989,6 +2032,11 @@ public actor TransportSession {
                     | Int(lenData[lenData.startIndex + 1]) << 16
                     | Int(lenData[lenData.startIndex + 2]) << 8
                     | Int(lenData[lenData.startIndex + 3])
+                guard compressedLen <= maxFramebufferPayloadBytes else {
+                    throw oversizedPayloadError(
+                        compressedLen, limit: maxFramebufferPayloadBytes,
+                        context: "\(rect.encoding.displayName) rect")
+                }
                 let compressedData = compressedLen > 0
                     ? try await readControlChannel(exactly: compressedLen)
                     : Data()
@@ -2009,6 +2057,11 @@ public actor TransportSession {
                     | Int(lengthData[lengthData.startIndex + 1]) << 16
                     | Int(lengthData[lengthData.startIndex + 2]) << 8
                     | Int(lengthData[lengthData.startIndex + 3])
+                guard length <= maxFramebufferPayloadBytes else {
+                    throw oversizedPayloadError(
+                        length, limit: maxFramebufferPayloadBytes,
+                        context: "Apple Adaptive DCT record")
+                }
                 var fullPayload = lengthData
                 if length > 0 {
                     fullPayload.append(try await readControlChannel(exactly: length))
@@ -2072,6 +2125,11 @@ public actor TransportSession {
                 let pixelBytes = Int(rect.width) * Int(rect.height) * pixelFormat.bytesPerPixel
                 let maskBytes = Int((Int(rect.width) + 7) / 8) * Int(rect.height)
                 let totalBytes = pixelBytes + maskBytes
+                guard totalBytes <= Self.maxAuxiliaryPayloadBytes else {
+                    throw oversizedPayloadError(
+                        totalBytes, limit: Self.maxAuxiliaryPayloadBytes,
+                        context: "Cursor rect \(rect.width)x\(rect.height)")
+                }
                 if totalBytes > 0 {
                     pixelData = try await readControlChannel(exactly: totalBytes)
                 } else {
@@ -2084,6 +2142,11 @@ public actor TransportSession {
                 let rowBytes = (Int(rect.width) + 7) / 8
                 let bitmapBytes = rowBytes * Int(rect.height)
                 let totalBytes = bitmapBytes == 0 ? 0 : 6 + bitmapBytes * 2
+                guard totalBytes <= Self.maxAuxiliaryPayloadBytes else {
+                    throw oversizedPayloadError(
+                        totalBytes, limit: Self.maxAuxiliaryPayloadBytes,
+                        context: "XCursor rect \(rect.width)x\(rect.height)")
+                }
                 if totalBytes > 0 {
                     pixelData = try await readControlChannel(exactly: totalBytes)
                 } else {
@@ -2113,6 +2176,11 @@ public actor TransportSession {
                     | Int(payload[payload.startIndex + 5]) << 16
                     | Int(payload[payload.startIndex + 6]) << 8
                     | Int(payload[payload.startIndex + 7])
+                guard length <= Self.maxAuxiliaryPayloadBytes else {
+                    throw oversizedPayloadError(
+                        length, limit: Self.maxAuxiliaryPayloadBytes,
+                        context: "Apple cursor cache record")
+                }
                 if length > 0 {
                     payload.append(try await readControlChannel(exactly: length))
                 }
@@ -2358,6 +2426,11 @@ public actor TransportSession {
                    | UInt32(headerData[headerData.startIndex + 5]) << 8
                    | UInt32(headerData[headerData.startIndex + 6])
 
+        guard Int(length) <= Self.maxAuxiliaryPayloadBytes else {
+            throw oversizedPayloadError(
+                Int(length), limit: Self.maxAuxiliaryPayloadBytes,
+                context: "ServerCutText")
+        }
         let textData = try await readControlChannel(exactly: Int(length))
         let text = String(data: textData, encoding: .utf8)
             ?? String(data: textData, encoding: .isoLatin1)
