@@ -703,6 +703,40 @@ public final class VNCSession {
         }
     }
 
+    /// While `true`, decoded frames are not presented: the Apple media band
+    /// renderers stop committing to their display layers and the classic path
+    /// stops publishing framebuffer snapshots. Container apps set this while
+    /// the device may be locked, where any layer commit lands in the
+    /// secure-mode lock snapshot and FrontBoard kills the process
+    /// (0x2BAD45EC). Decoding continues so codec state stays warm; clearing
+    /// suspension presents one reconciling frame.
+    @ObservationIgnored
+    public var suspendsDisplayPresentation: Bool = false {
+        didSet {
+            guard oldValue != suspendsDisplayPresentation else { return }
+            videoBandRenderer.setPresentationSuspended(suspendsDisplayPresentation)
+            secondaryVideoBandRenderer.setPresentationSuspended(suspendsDisplayPresentation)
+            if !suspendsDisplayPresentation, renderer != nil {
+                scheduleTrailingSnapshot(interval: 0)
+            }
+        }
+    }
+
+    /// Clear suspension AND present anything retained while the host's global
+    /// presentation gate was armed. Needed for sessions created while the gate
+    /// was already up (background launch on a locked device): their instance
+    /// flag was never set, so clearing it is a `didSet` no-op and the retained
+    /// frames would otherwise sit unpresented until the next network delta,
+    /// which on a static remote screen never comes.
+    public func reconcileDisplayPresentation() {
+        suspendsDisplayPresentation = false
+        videoBandRenderer.presentPendingBandsIfAny()
+        secondaryVideoBandRenderer.presentPendingBandsIfAny()
+        if renderer != nil, trailingSnapshotTask == nil {
+            scheduleTrailingSnapshot(interval: 0)
+        }
+    }
+
     // MARK: - Internal
 
     private var transportSession: TransportSession?
@@ -2025,7 +2059,9 @@ public final class VNCSession {
         let awaitsDCTRefinement = dctRefinementTracker.ingest(rects)
         let completedDCTRefinement =
             wasAwaitingDCTRefinement && !awaitsDCTRefinement
-        let takeSnapshot = publishDue && !awaitsDCTRefinement
+        let displaySuspended = suspendsDisplayPresentation
+            || VNCPresentationPolicy.isPresentationProhibited()
+        let takeSnapshot = publishDue && !awaitsDCTRefinement && !displaySuspended
         let result = await withCheckedContinuation { continuation in
             framebufferRenderQueue.async {
                 continuation.resume(
@@ -2055,7 +2091,13 @@ public final class VNCSession {
            let height = result.resizedHeight {
             applyDesktopResizeMetadata(width: width, height: height)
         }
-        if let image = result.image {
+        // Delivery-time recheck: the device can lock while applyBatch runs on
+        // the render queue, making the pre-render gate sample stale. A
+        // suppressed image falls through to the trailing-snapshot path, whose
+        // task re-gates itself at publish time.
+        if let image = result.image,
+           !suspendsDisplayPresentation,
+           !VNCPresentationPolicy.isPresentationProhibited() {
             trailingSnapshotTask?.cancel()
             trailingSnapshotTask = nil
             currentImage = image
@@ -3348,8 +3390,14 @@ public final class VNCSession {
         let delay = max(cadenceDelay, minimumDelay)
         trailingSnapshotTask = Task { [weak self] in
             try? await Task.sleep(for: .nanoseconds(Int64(delay)))
-            guard let self, !Task.isCancelled,
-                  let renderer = self.renderer else { return }
+            guard let self, !Task.isCancelled else { return }
+            // Not cancelled, so this handle is still the stored one; a
+            // renderer-less exit must release it or no trailing snapshot can
+            // ever be scheduled again for this session.
+            guard let renderer = self.renderer else {
+                self.trailingSnapshotTask = nil
+                return
+            }
             let queue = self.framebufferRenderQueue
             let image = await withCheckedContinuation { continuation in
                 queue.async {
@@ -3357,6 +3405,14 @@ public final class VNCSession {
                 }
             }
             guard !Task.isCancelled else { return }
+            // Delivery-time presentation check: the device may have locked
+            // while this task slept. The suspension-clear reconcile schedules
+            // a fresh trailing snapshot.
+            guard !self.suspendsDisplayPresentation,
+                  !VNCPresentationPolicy.isPresentationProhibited() else {
+                self.trailingSnapshotTask = nil
+                return
+            }
             if let image {
                 self.currentImage = image
                 self.lastImagePublishNanos = DispatchTime.now().uptimeNanoseconds

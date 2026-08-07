@@ -96,18 +96,30 @@ public final class VideoBandLayerRenderer {
     }
 
     public func reset() {
-        displayLayer.sampleBufferRenderer.flush(
-            removingDisplayedImage: true,
-            completionHandler: nil)
         bandBuffers.removeAll()
         previousBandBuffers.removeAll()
         displayedBuffer = nil
         previousDisplayedBuffer = nil
+        compositor.reset()
+        replaceLayersOnNextFrame = false
+        hasPendingSuspendedBands = false
+        if isPresentationSuspended || VNCPresentationPolicy.isPresentationProhibited() {
+            // Connection setup/teardown can run while the device is locked
+            // (background launch, reconnect). The flush and brightness or
+            // presentation-path mutations are layer commits the secure gate
+            // must cover too, so they wait for resume.
+            pendingDisplayFlush = true
+            pendingPresenterReset = true
+            return
+        }
+        pendingDisplayFlush = false
+        pendingPresenterReset = false
+        displayLayer.sampleBufferRenderer.flush(
+            removingDisplayedImage: true,
+            completionHandler: nil)
         brightnessPresenter.reset()
         brightnessPresenter.setGain(brightnessGain)
         reconcilePresentationPath()
-        compositor.reset()
-        replaceLayersOnNextFrame = false
     }
 
     public func beginStreamGeneration(
@@ -123,11 +135,16 @@ public final class VideoBandLayerRenderer {
     /// retained static bands and dirty bands into a single atomic frame.
     public func setBands(_ buffers: [UInt32: CVPixelBuffer]) {
         guard !buffers.isEmpty else { return }
+        if isPresentationSuspended || VNCPresentationPolicy.isPresentationProhibited() {
+            recordBandsWhileSuspended(buffers)
+            return
+        }
         frameCommitCount &+= 1
         lastCommitBandCount = buffers.count
         if buffers.count != expectedBandCount {
             partialCommitCount &+= 1
         }
+        performPendingDisplayFlushIfNeeded()
         if replaceLayersOnNextFrame {
             displayLayer.sampleBufferRenderer.flush(
                 removingDisplayedImage: true,
@@ -143,7 +160,96 @@ public final class VideoBandLayerRenderer {
             previousBandBuffers[ssrc] = bandBuffers[ssrc]
             bandBuffers[ssrc] = pixelBuffer
         }
+        hasPendingSuspendedBands = false
+        presentComposedFrame()
+    }
 
+    /// Stop committing frames to the display while the host is in a state
+    /// where presentation could land inside the secure-mode lock snapshot.
+    /// Decoded bands keep accumulating so the codec and generation state stay
+    /// warm; clearing suspension composes one reconciling frame so the screen
+    /// is fresh at unlock instead of stale until the next delta.
+    public private(set) var isPresentationSuspended = false
+    private var pendingDisplayFlush = false
+    private var pendingPresenterReset = false
+    private var hasPendingSuspendedBands = false
+
+    public func setPresentationSuspended(_ suspended: Bool) {
+        guard isPresentationSuspended != suspended else { return }
+        isPresentationSuspended = suspended
+        if suspended {
+            // Discard queued-but-unpresented samples. Best-effort narrowing:
+            // samples carry display-immediately timing so at most ~one frame
+            // is in flight, mirroring the terminal path's accepted post-drain
+            // residual window. The displayed image stays: removing it would
+            // itself be a visible commit.
+            displayLayer.sampleBufferRenderer.flush(
+                removingDisplayedImage: false,
+                completionHandler: nil)
+        } else {
+            presentPendingBandsAfterResume()
+        }
+    }
+
+    /// Present bands retained while presentation was blocked by the host's
+    /// global gate alone. Renderers on panes created while the gate was
+    /// already armed never see a true-to-false transition of the instance
+    /// flag, so `setPresentationSuspended(false)` is a guarded no-op there.
+    public func presentPendingBandsIfAny() {
+        guard !isPresentationSuspended else { return }
+        presentPendingBandsAfterResume()
+    }
+
+    private func recordBandsWhileSuspended(_ buffers: [UInt32: CVPixelBuffer]) {
+        if replaceLayersOnNextFrame {
+            // Pure-state part of the renegotiation reset; the display-layer
+            // flush is itself a layer commit, so it waits for resume.
+            bandBuffers.removeAll()
+            previousBandBuffers.removeAll()
+            compositor.reset()
+            replaceLayersOnNextFrame = false
+            pendingDisplayFlush = true
+        }
+        for (ssrc, pixelBuffer) in buffers {
+            previousBandBuffers[ssrc] = bandBuffers[ssrc]
+            bandBuffers[ssrc] = pixelBuffer
+        }
+        hasPendingSuspendedBands = true
+    }
+
+    private func presentPendingBandsAfterResume() {
+        // The instance flag can clear while the host-level gate is still
+        // armed (a tab switch driven by remote traffic on a locked device).
+        // Leave the pending state set; the next setBands that passes the
+        // gate composes from the full retained band set.
+        guard !VNCPresentationPolicy.isPresentationProhibited() else { return }
+        performPendingDisplayFlushIfNeeded()
+        guard hasPendingSuspendedBands, !bandBuffers.isEmpty else { return }
+        hasPendingSuspendedBands = false
+        frameCommitCount &+= 1
+        lastCommitBandCount = bandBuffers.count
+        presentComposedFrame()
+    }
+
+    /// Display-layer half of a renegotiation or full reset that arrived while
+    /// suspended, deferred because the flush is itself a layer commit.
+    private func performPendingDisplayFlushIfNeeded() {
+        guard pendingDisplayFlush else { return }
+        displayLayer.sampleBufferRenderer.flush(
+            removingDisplayedImage: true,
+            completionHandler: nil)
+        displayedBuffer = nil
+        previousDisplayedBuffer = nil
+        pendingDisplayFlush = false
+        if pendingPresenterReset {
+            brightnessPresenter.reset()
+            brightnessPresenter.setGain(brightnessGain)
+            reconcilePresentationPath()
+            pendingPresenterReset = false
+        }
+    }
+
+    private func presentComposedFrame() {
         let width = Int(screenWidth)
         let height = Int(screenHeight)
         guard width > 0, height > 0,
