@@ -517,7 +517,7 @@ final class TransportSessionScriptedTests: XCTestCase {
                 guard case .framebufferUpdate = event else { continue }
                 updateCount += 1
                 try? await session.finishFramebufferUpdate()
-                if updateCount == 2 { return updateCount }
+                if updateCount == 3 { return updateCount }
             }
             return updateCount
         }
@@ -578,16 +578,34 @@ final class TransportSessionScriptedTests: XCTestCase {
             intervalMilliseconds: 0,
             x: 0, y: 0, width: width, height: height
         ).serialize()
+        let requestedPixelBootstrap = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return Self.occurrenceCount(of: fullRequest, in: sent) == 3
+                && Self.occurrenceCount(of: autoUpdate, in: sent) == 1
+        }
+        XCTAssertTrue(requestedPixelBootstrap)
+        sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 1)
+
+        await connection.enqueueServerBytes(Self.framebufferUpdate([
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: width, height: height,
+                    encoding: Encoding.appleMultiVariantScreenshare.rawValue),
+                Data([0, 0, 0, 1, 0])
+            ),
+        ]))
+
         let enabledAutoUpdates = await Self.waitUntil {
             let sent = await connection.sentBytes()
             return Self.occurrenceCount(of: autoUpdate, in: sent) == 1
         }
         XCTAssertTrue(enabledAutoUpdates)
         let updateCount = await updateTask.value
-        XCTAssertEqual(updateCount, 2)
+        XCTAssertEqual(updateCount, 3)
 
         sent = await connection.sentBytes()
-        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 2)
+        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 3)
         XCTAssertEqual(Self.occurrenceCount(of: setDisplay, in: sent), 0)
         XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 1)
         await session.disconnect()
@@ -690,13 +708,14 @@ final class TransportSessionScriptedTests: XCTestCase {
             intervalMilliseconds: 0,
             x: 0, y: 0, width: width, height: height
         ).serialize()
-        let enabledAutoUpdates = await Self.waitUntil {
+        let requestedPixelBootstrap = await Self.waitUntil {
             let sent = await connection.sentBytes()
-            return Self.occurrenceCount(of: autoUpdate, in: sent) == 1
+            return Self.occurrenceCount(of: fullRequest, in: sent) == 2
+                && Self.occurrenceCount(of: autoUpdate, in: sent) == 1
         }
-        XCTAssertTrue(enabledAutoUpdates)
+        XCTAssertTrue(requestedPixelBootstrap)
         var sent = await connection.sentBytes()
-        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 1)
 
         await connection.enqueueServerBytes(Self.framebufferUpdate([
             (
@@ -707,11 +726,17 @@ final class TransportSessionScriptedTests: XCTestCase {
             ),
         ]))
 
+        let enabledAutoUpdates = await Self.waitUntil {
+            let sent = await connection.sentBytes()
+            return Self.occurrenceCount(of: autoUpdate, in: sent) == 1
+        }
+        XCTAssertTrue(enabledAutoUpdates)
+
         let updateCount = await updateTask.value
         XCTAssertEqual(updateCount, 2)
 
         sent = await connection.sentBytes()
-        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: fullRequest, in: sent), 2)
         XCTAssertEqual(Self.occurrenceCount(of: autoUpdate, in: sent), 1)
         await session.disconnect()
     }

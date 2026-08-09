@@ -427,11 +427,12 @@ public actor TransportSession {
     /// events at the transport boundary.
     private var lastAppleRemoteSessionState: AppleRemoteSessionState?
     /// A type-2 quantization update commonly precedes the initial DCT image.
-    /// Receipt of the complete control record is the protocol handoff from
-    /// the one-shot type-3 bootstrap request to the type-9 image stream.
+    /// It makes the decoder ready for the type-9 stream; the activation path
+    /// follows that subscription with one explicit full-frame request.
     private var awaitingAppleDCTBootstrap: Bool
     private var appleDCTInitialUncoveredRegions: [AppleDCTCoverageRegion] = []
     private var pendingAppleDCTAutoUpdateActivation = false
+    private var pendingAppleDCTInitialFullFrameRequest = false
     private var pendingAppleClassicAutoUpdateActivation = false
     private var appleAutoUpdateActive = false
     private var appleAutoUpdateRefreshTask: Task<Void, Never>?
@@ -1320,6 +1321,12 @@ public actor TransportSession {
             try await sendAppleAutoFrameUpdate()
             return
         }
+        try await sendOneShotFramebufferUpdateRequest(incremental: incremental)
+    }
+
+    private func sendOneShotFramebufferUpdateRequest(
+        incremental: Bool
+    ) async throws {
         let msg = ClientMessage.framebufferUpdateRequest(
             incremental: incremental,
             x: 0, y: 0,
@@ -1342,13 +1349,25 @@ public actor TransportSession {
 
         if pendingAppleDCTAutoUpdateActivation {
             pendingAppleDCTAutoUpdateActivation = false
+            let requestInitialFullFrame = pendingAppleDCTInitialFullFrameRequest
+            pendingAppleDCTInitialFullFrameRequest = false
             deferredUpdateRequest = false
             appleAutoUpdateActive = true
             do {
                 try await sendAppleAutoFrameUpdate()
+                // Type 9 is change-gated and may initially emit only dirty
+                // regions. Once it is active, a non-incremental type-3 request
+                // produces the reference image that initializes untouched
+                // framebuffer pixels as well.
+                if requestInitialFullFrame {
+                    try await sendOneShotFramebufferUpdateRequest(
+                        incremental: false)
+                }
             } catch {
                 appleAutoUpdateActive = false
                 pendingAppleDCTAutoUpdateActivation = true
+                pendingAppleDCTInitialFullFrameRequest =
+                    requestInitialFullFrame
                 throw error
             }
             startAppleAutoUpdateRefreshTask()
@@ -2998,6 +3017,7 @@ public actor TransportSession {
         guard appleDCTRequested, fbWidth > 0, fbHeight > 0 else { return }
         awaitingAppleDCTBootstrap = true
         pendingAppleDCTAutoUpdateActivation = false
+        pendingAppleDCTInitialFullFrameRequest = false
         appleDCTInitialUncoveredRegions = [AppleDCTCoverageRegion(
             minX: 0,
             minY: 0,
@@ -3022,11 +3042,11 @@ public actor TransportSession {
             if messageType == 2, payload.count == 133 {
                 // Type 2 only installs the connection-wide luma and chroma
                 // quantization tables. Apple legitimately sends this control
-                // record as a 0x0 rectangle; it marks codec readiness, not
-                // framebuffer coverage. The image itself follows on the
-                // adaptive type-9 subscription.
+                // record as a 0x0 rectangle. Activate the change-gated stream
+                // first; its activation path then requests the complete base.
                 awaitingAppleDCTBootstrap = false
                 pendingAppleDCTAutoUpdateActivation = true
+                pendingAppleDCTInitialFullFrameRequest = true
                 log.debug("Received Apple DCT bootstrap quantization tables")
                 return
             }

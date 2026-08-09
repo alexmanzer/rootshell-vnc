@@ -309,6 +309,134 @@ enum StandardFramebufferPresentationPolicy {
     }
 }
 
+/// Prevents a newly allocated framebuffer from being presented after only a
+/// regional DCT bootstrap update. The decoder still applies every rectangle in
+/// wire order; this gate affects only the first snapshot. Once initial type-0
+/// or portable-pixel coverage spans the framebuffer, normal progressive
+/// presentation remains enabled for the lifetime of the connection.
+struct StandardInitialFramePresentationTracker {
+    private(set) var uncoveredRegions: [CGRect] = []
+    private var detectedDCTBootstrap = false
+    private var completedInitialFrame = false
+    private var trackedSize: CGSize = .zero
+
+    var suppressesPresentation: Bool {
+        detectedDCTBootstrap && !completedInitialFrame
+    }
+
+    mutating func reset() {
+        uncoveredRegions.removeAll(keepingCapacity: true)
+        detectedDCTBootstrap = false
+        completedInitialFrame = false
+        trackedSize = .zero
+    }
+
+    mutating func ingest(
+        _ rects: [(FramebufferRect, Data)],
+        framebufferWidth: Int,
+        framebufferHeight: Int
+    ) -> Bool {
+        guard !completedInitialFrame else { return true }
+
+        let resized = rects.compactMap { rect, _ -> CGSize? in
+            guard (rect.encoding == .desktopSize
+                    || rect.encoding == .extendedDesktopSize),
+                  rect.isSuccessfulDesktopResize,
+                  rect.width > 0, rect.height > 0 else { return nil }
+            return CGSize(width: Int(rect.width), height: Int(rect.height))
+        }.last
+        let size = resized ?? CGSize(
+            width: framebufferWidth,
+            height: framebufferHeight)
+        guard size.width > 0, size.height > 0 else {
+            return !suppressesPresentation
+        }
+
+        let containsDCTBootstrap = rects.contains { rect, payload in
+            guard rect.encoding == .appleMultiVariantScreenshare,
+                  payload.count >= 5 else { return false }
+            let type = payload[payload.startIndex + 4]
+            return type == 0 || type == 1 || type == 2
+        }
+        if !detectedDCTBootstrap {
+            guard containsDCTBootstrap else { return true }
+            detectedDCTBootstrap = true
+            trackedSize = size
+            uncoveredRegions = [CGRect(origin: .zero, size: size)]
+        } else if trackedSize != size {
+            trackedSize = size
+            uncoveredRegions = [CGRect(origin: .zero, size: size)]
+        }
+
+        for (rect, payload) in rects {
+            let establishesPixels: Bool
+            if rect.encoding == .appleMultiVariantScreenshare {
+                establishesPixels = payload.count >= 5
+                    && payload[payload.startIndex + 4] == 0
+            } else {
+                switch rect.encoding {
+                case .raw, .zlib, .zrle, .tight:
+                    establishesPixels = true
+                default:
+                    establishesPixels = false
+                }
+            }
+            guard establishesPixels else { continue }
+            let coverage = CGRect(
+                x: Int(rect.x), y: Int(rect.y),
+                width: Int(rect.width), height: Int(rect.height))
+                .intersection(CGRect(origin: .zero, size: trackedSize))
+            guard !coverage.isNull, !coverage.isEmpty else { continue }
+            uncoveredRegions = uncoveredRegions.flatMap {
+                Self.subtract(coverage, from: $0)
+            }
+        }
+
+        if uncoveredRegions.isEmpty {
+            completedInitialFrame = true
+        }
+        return completedInitialFrame
+    }
+
+    private static func subtract(
+        _ coverage: CGRect,
+        from source: CGRect
+    ) -> [CGRect] {
+        let intersection = source.intersection(coverage)
+        guard !intersection.isNull, !intersection.isEmpty else {
+            return [source]
+        }
+        guard intersection != source else { return [] }
+
+        var remainder: [CGRect] = []
+        if source.minY < intersection.minY {
+            remainder.append(CGRect(
+                x: source.minX, y: source.minY,
+                width: source.width,
+                height: intersection.minY - source.minY))
+        }
+        if intersection.maxY < source.maxY {
+            remainder.append(CGRect(
+                x: source.minX, y: intersection.maxY,
+                width: source.width,
+                height: source.maxY - intersection.maxY))
+        }
+        if source.minX < intersection.minX {
+            remainder.append(CGRect(
+                x: source.minX, y: intersection.minY,
+                width: intersection.minX - source.minX,
+                height: intersection.height))
+        }
+        if intersection.maxX < source.maxX {
+            remainder.append(CGRect(
+                x: intersection.maxX, y: intersection.minY,
+                width: source.maxX - intersection.maxX,
+                height: intersection.height))
+        }
+        return remainder
+    }
+}
+
 /// Public-framework equivalent of AVConference's audio sync source for video.
 /// RTCP Sender Reports place both RTP streams on the server's NTP clock, while
 /// `AppleRemoteAudioPlayer` supplies the corresponding local playback point.
@@ -916,6 +1044,8 @@ public final class VNCSession {
     @ObservationIgnored
     private var trailingSnapshotTask: Task<Void, Never>?
     @ObservationIgnored
+    private var initialFramePresentationTracker =
+        StandardInitialFramePresentationTracker()
     /// Rejects late geometry callbacks from a decoder retired by a newer AVC
     /// negotiation generation.
     @ObservationIgnored
@@ -1087,6 +1217,7 @@ public final class VNCSession {
         remoteDisplayRegionOrder = []
         trailingSnapshotTask?.cancel()
         trailingSnapshotTask = nil
+        initialFramePresentationTracker.reset()
         lastImagePublishNanos = 0
         remoteDisplayResizeTask?.cancel()
         remoteDisplayResizeTask = nil
@@ -1179,6 +1310,7 @@ public final class VNCSession {
         remoteDisplayRegionOrder = []
         trailingSnapshotTask?.cancel()
         trailingSnapshotTask = nil
+        initialFramePresentationTracker.reset()
         lastImagePublishNanos = 0
         videoBandRenderer.reset()
         secondaryVideoBandRenderer.reset()
@@ -2073,10 +2205,16 @@ public final class VNCSession {
         let publishDue = renderStarted &- lastImagePublishNanos >= publishInterval
         let carriesFramebufferPixels = StandardFramebufferPresentationPolicy
             .carriesFramebufferPixels(rects)
+        let initialFramePresentationAllowed = initialFramePresentationTracker
+            .ingest(
+                rects,
+                framebufferWidth: framebufferWidth,
+                framebufferHeight: framebufferHeight)
         let displaySuspended = suspendsDisplayPresentation
             || VNCPresentationPolicy.isPresentationProhibited()
         let takeSnapshot = publishDue
             && carriesFramebufferPixels
+            && initialFramePresentationAllowed
             && !displaySuspended
         let result = await withCheckedContinuation { continuation in
             framebufferRenderQueue.async {
@@ -2123,7 +2261,8 @@ public final class VNCSession {
             considerAppleLoginVisionFrame(
                 .image(image),
                 source: "Standard framebuffer snapshot")
-        } else if carriesFramebufferPixels || displaySuspended {
+        } else if (carriesFramebufferPixels && initialFramePresentationAllowed)
+                    || displaySuspended {
             // Control-only DCT type 2 carries quantization tables, not pixels.
             // It must never publish the newly allocated black framebuffer or
             // anchor an image timer before the first image arrives.
@@ -3390,7 +3529,8 @@ public final class VNCSession {
     }
 
     private func scheduleTrailingSnapshot(interval: UInt64) {
-        guard trailingSnapshotTask == nil else { return }
+        guard trailingSnapshotTask == nil,
+              !initialFramePresentationTracker.suppressesPresentation else { return }
         let cadenceDelay = interval &- min(
             interval,
             DispatchTime.now().uptimeNanoseconds &- lastImagePublishNanos)

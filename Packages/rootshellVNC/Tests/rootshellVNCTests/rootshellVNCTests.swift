@@ -169,6 +169,61 @@ final class StandardFramebufferPipelineTests: XCTestCase {
                 .carriesFramebufferPixels([(cursor, Data())]))
     }
 
+    func testInitialDCTPresentationWaitsForCompleteBaseCoverage() {
+        var tracker = StandardInitialFramePresentationTracker()
+        let control = dctRect(
+            x: 0, y: 0, width: 0, height: 0, type: 2)
+        XCTAssertFalse(tracker.ingest(
+            [control], framebufferWidth: 16, framebufferHeight: 8))
+        XCTAssertTrue(tracker.suppressesPresentation)
+
+        XCTAssertFalse(tracker.ingest([
+            dctRect(x: 0, y: 0, width: 8, height: 8, type: 0),
+        ], framebufferWidth: 16, framebufferHeight: 8))
+        XCTAssertEqual(tracker.uncoveredRegions, [
+            CGRect(x: 8, y: 0, width: 8, height: 8),
+        ])
+
+        XCTAssertTrue(tracker.ingest([
+            dctRect(x: 8, y: 0, width: 8, height: 8, type: 0),
+        ], framebufferWidth: 16, framebufferHeight: 8))
+        XCTAssertFalse(tracker.suppressesPresentation)
+    }
+
+    func testInitialFullDCTBasePresentsWithoutExtraDelay() {
+        var tracker = StandardInitialFramePresentationTracker()
+        XCTAssertTrue(tracker.ingest([
+            dctRect(x: 0, y: 0, width: 16, height: 8, type: 0),
+        ], framebufferWidth: 16, framebufferHeight: 8))
+        XCTAssertFalse(tracker.suppressesPresentation)
+    }
+
+    func testDCTRefinementDoesNotClaimMissingInitialCoverage() {
+        var tracker = StandardInitialFramePresentationTracker()
+        XCTAssertFalse(tracker.ingest([
+            dctRect(x: 0, y: 0, width: 16, height: 8, type: 2),
+            dctRect(x: 0, y: 0, width: 16, height: 8, type: 1),
+        ], framebufferWidth: 16, framebufferHeight: 8))
+        XCTAssertEqual(tracker.uncoveredRegions, [
+            CGRect(x: 0, y: 0, width: 16, height: 8),
+        ])
+    }
+
+    func testPortableInitialRectangleDoesNotEnterDCTPresentationGate() {
+        for encoding in [Encoding.raw, .tight, .zlib, .zrle, .copyRect] {
+            var tracker = StandardInitialFramePresentationTracker()
+            let rect = FramebufferRect(
+                x: 0, y: 0, width: 8, height: 8,
+                encoding: encoding)
+            XCTAssertTrue(tracker.ingest(
+                [(rect, Data())],
+                framebufferWidth: 16,
+                framebufferHeight: 8),
+                "Portable \(encoding) must preserve immediate presentation")
+            XCTAssertFalse(tracker.suppressesPresentation)
+        }
+    }
+
     func testProgressiveDCTPublishesEachDecodedRectangleDirectly() throws {
         let framebuffer = Framebuffer(
             width: 8, height: 8, pixelFormat: .bgra8888)
