@@ -176,6 +176,38 @@ crypto, TCP/UDP transport behavior, Apple media negotiation and resiliency,
 frame ordering and decoding, clipboard synchronization, viewport behavior, and
 reconnection.
 
+### Standard-mode network benchmark
+
+The opt-in live benchmark runs Standard adaptive DCT through a deterministic,
+unprivileged loopback conditioner. It covers baseline, good WAN, typical WAN,
+and adverse WAN profiles while reporting update cadence, bandwidth, decoder
+time, DCT base/refinement mix, and simulated recovery events. Packet loss is
+modeled as a TCP head-of-line retransmission stall, so the conditioner never
+discards or corrupts bytes in the RFB stream.
+
+Every transport run also evaluates 0, 8, 16, 25, 33, and 50 ms presentation
+holds against the same DCT event stream. The `TRADEOFF` records report the
+client delay, fully refined frame rate, and refined rectangle-area percentage
+for each candidate.
+
+```sh
+export VNC_TEST_HOST=192.0.2.10
+export VNC_TEST_USERNAME=test-user
+export VNC_TEST_PASSWORD='test-password'
+Tools/Diagnostics/run_standard_network_matrix.sh
+```
+
+Set `VNC_NETWORK_SCENARIOS=baseline,typical-wan` to select profiles,
+`VNC_PROBE_SECONDS=20` for longer samples, or `VNC_NETWORK_MATRIX_OUT` to choose
+the result directory. Each profile also measures the app-level image publication
+cadence; set `VNC_PROBE_INCLUDE_PRESENTATION=0` for a transport-only run. The
+`VNC_PROBE_PRESENTATION_HOLDS=8,16,25` setting runs app-level A/B samples for
+multiple holds; use `default` in that list to exercise the production policy
+without an override. `VNC_PROBE_INCLUDE_TRANSPORT=0` skips the transport probe
+when only app-level presentation comparisons are needed. The script keeps
+credentials in the environment and does not write them to source or result
+files.
+
 ## Related project
 
 - [rootshell](https://github.com/kitknox/rootshell) — the free,

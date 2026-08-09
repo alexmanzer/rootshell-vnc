@@ -1,8 +1,8 @@
 import Foundation
 
 /// A local, conflict-resistant shortcut that expands to a familiar command on
-/// the remote computer. These defaults mirror Screens 5 so hardware keyboard
-/// and touch users share one command vocabulary.
+/// the remote computer. These defaults follow common VNC viewer conventions,
+/// so hardware keyboard and touch users share one command vocabulary.
 enum RemoteCommand: String, CaseIterable, Identifiable, Sendable {
     case missionControl
     case applicationWindows

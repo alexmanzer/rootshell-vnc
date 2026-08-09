@@ -6,6 +6,7 @@ import Darwin
 @testable import RFBProtocol
 @testable import RFBTransport
 @testable import RFBRendering
+@testable import rootshellVNC
 
 /// Live probe for the classic (standard) RFB path against a real server.
 ///
@@ -20,7 +21,10 @@ import Darwin
 ///     swift test --filter LiveStandardModeProbeTests
 ///
 /// Optional: VNC_PROBE_SECONDS=N (motion phase length, default 12),
-/// ROOTSHELL_VNC_FRAME_OUT_DIR=<dir> (dump decoded PNGs).
+/// VNC_PROBE_RTT_MS, VNC_PROBE_JITTER_MS, VNC_PROBE_LOSS_PERCENT,
+/// VNC_PROBE_LOSS_RECOVERY_MS, VNC_PROBE_BANDWIDTH_KBPS, and
+/// VNC_PROBE_UPSTREAM_KBPS apply deterministic loopback conditioning.
+/// ROOTSHELL_VNC_FRAME_OUT_DIR=<dir> dumps decoded PNGs.
 final class LiveStandardModeProbeTests: XCTestCase {
 
     func testCapturedAppleDCTReplay() throws {
@@ -92,23 +96,48 @@ final class LiveStandardModeProbeTests: XCTestCase {
         let user = env["VNC_TEST_USERNAME"] ?? ""
         let port = UInt16(env["VNC_TEST_PORT"] ?? "5900") ?? 5900
         let motionSeconds = Int(env["VNC_PROBE_SECONDS"] ?? "12") ?? 12
+        let scenario = env["VNC_PROBE_SCENARIO"] ?? "custom"
         let outDir = env["ROOTSHELL_VNC_FRAME_OUT_DIR"]
-        var bandwidthProxy: LiveBandwidthProxy?
+        let downstreamRate = Int(env["VNC_PROBE_BANDWIDTH_KBPS"] ?? "")
+            .flatMap { $0 > 0 ? max(1, $0 * 1_000 / 8) : nil }
+        let upstreamRate = Int(env["VNC_PROBE_UPSTREAM_KBPS"] ?? "")
+            .flatMap { $0 > 0 ? max(1, $0 * 1_000 / 8) : nil }
+        let rttMilliseconds = max(0, Int(env["VNC_PROBE_RTT_MS"] ?? "0") ?? 0)
+        let networkConditions = LiveNetworkConditions(
+            downstreamBytesPerSecond: downstreamRate,
+            upstreamBytesPerSecond: upstreamRate,
+            oneWayDelayMilliseconds: (rttMilliseconds + 1) / 2,
+            jitterMilliseconds: max(
+                0, Int(env["VNC_PROBE_JITTER_MS"] ?? "0") ?? 0),
+            lossPercent: max(
+                0, Double(env["VNC_PROBE_LOSS_PERCENT"] ?? "0") ?? 0),
+            lossRecoveryMilliseconds: max(
+                0, Int(env["VNC_PROBE_LOSS_RECOVERY_MS"] ?? "200") ?? 200),
+            seed: UInt64(env["VNC_PROBE_SEED"] ?? "12648430") ?? 12_648_430)
+        var networkProxy: LiveNetworkConditioningProxy?
         let connectionHost: String
         let connectionPort: UInt16
-        if let kbps = Int(env["VNC_PROBE_BANDWIDTH_KBPS"] ?? ""), kbps > 0 {
-            let proxy = try LiveBandwidthProxy(
+        if networkConditions.isImpaired {
+            let proxy = try LiveNetworkConditioningProxy(
                 remoteHost: host, remotePort: port,
-                downstreamBytesPerSecond: max(1, kbps * 1_000 / 8))
-            bandwidthProxy = proxy
+                conditions: networkConditions)
+            networkProxy = proxy
             connectionHost = "127.0.0.1"
             connectionPort = proxy.localPort
-            print("PROBE downstream limit=\(kbps)kbps port=\(proxy.localPort)")
+            let downstreamLabel = env["VNC_PROBE_BANDWIDTH_KBPS"] ?? "unlimited"
+            let upstreamLabel = env["VNC_PROBE_UPSTREAM_KBPS"] ?? "unlimited"
+            print(
+                "PROBE network rtt=\(rttMilliseconds)ms "
+                    + "jitter=\(networkConditions.jitterMilliseconds)ms "
+                    + "loss=\(networkConditions.lossPercent)% "
+                    + "downstream=\(downstreamLabel)kbps "
+                    + "upstream=\(upstreamLabel)kbps "
+                    + "port=\(proxy.localPort)")
         } else {
             connectionHost = host
             connectionPort = port
         }
-        defer { bandwidthProxy?.stop() }
+        defer { networkProxy?.stop() }
 
         // Mirror VNCConfiguration(videoQualityMode: .standard).effectiveEncodings.
         // VNC_PROBE_ENCODING=zlib/zrle selects a lossless A/B comparison.
@@ -146,17 +175,31 @@ final class LiveStandardModeProbeTests: XCTestCase {
             var payloadSizes: [Int] = []
             var issues: [String] = []
             var interUpdateGapsMs: [Double] = []
+            var renderTimesMs: [Double] = []
             var lastUpdateNanos: UInt64 = 0
             var sawCursor = false
+            var dctTypeCounts: [UInt8: Int] = [:]
+            var refinementTracker = AppleDCTRefinementTracker()
+            var refinementStartedNanos: UInt64 = 0
+            var refinementTimesMs: [Double] = []
+            var presentationSimulations = [0, 8, 16, 25, 33, 50].map {
+                DCTPresentationTradeoffSimulation(holdMilliseconds: $0)
+            }
             var firstDCT: Data?
             var firstDCTImage: Data?
             var dctCapture = Data("ADCTCAP1".utf8)
             var dctCaptureCount: UInt32 = 0
 
             func record(rects rectsWithData: [(FramebufferRect, Data)]) {
+                let now = DispatchTime.now().uptimeNanoseconds
+                for index in presentationSimulations.indices {
+                    presentationSimulations[index].ingest(
+                        rectsWithData, nowNanos: now)
+                }
                 updates += 1
                 rects += rectsWithData.count
                 var updateBytes = 0
+                var containsDCTBase = false
                 for (rect, data) in rectsWithData {
                     updateBytes += data.count
                     encodingCounts[String(describing: rect.encoding), default: 0] += 1
@@ -171,16 +214,33 @@ final class LiveStandardModeProbeTests: XCTestCase {
                         firstDCTImage = data
                     }
                     if rect.encoding == .appleMultiVariantScreenshare {
+                        if data.count > 4 {
+                            let type = data[data.startIndex + 4]
+                            dctTypeCounts[type, default: 0] += 1
+                            if type == 0 { containsDCTBase = true }
+                        }
                         appendDCTCapture(rect: rect, payload: data)
                     }
                 }
+                if containsDCTBase {
+                    refinementStartedNanos = now
+                }
+                let awaitsRefinement = refinementTracker.ingest(rectsWithData)
+                if !awaitsRefinement, refinementStartedNanos != 0 {
+                    refinementTimesMs.append(
+                        Double(now &- refinementStartedNanos) / 1e6)
+                    refinementStartedNanos = 0
+                }
                 bytes += updateBytes
                 payloadSizes.append(updateBytes)
-                let now = DispatchTime.now().uptimeNanoseconds
                 if lastUpdateNanos != 0 {
                     interUpdateGapsMs.append(Double(now - lastUpdateNanos) / 1e6)
                 }
                 lastUpdateNanos = now
+            }
+
+            func recordRender(milliseconds: Double) {
+                renderTimesMs.append(milliseconds)
             }
 
             func note(issues newIssues: [String]) {
@@ -194,19 +254,61 @@ final class LiveStandardModeProbeTests: XCTestCase {
                 let maxPayload = sorted.last ?? 0
                 let gaps = interUpdateGapsMs.sorted()
                 let medGap = gaps.isEmpty ? 0 : gaps[gaps.count / 2]
+                let gapP95 = Self.percentile(gaps, percent: 95)
+                let renderP95 = Self.percentile(renderTimesMs, percent: 95)
+                let refinementP95 = Self.percentile(refinementTimesMs, percent: 95)
                 return """
                 [\(label)] updates=\(updates) rects=\(rects) totalKB=\(bytes / 1024) \
                 payload median=\(median)B p95=\(p95)B max=\(maxPayload)B \
                 interUpdate median=\(String(format: "%.1f", medGap))ms \
-                encodings=\(encodingCounts) cursorRect=\(sawCursor) \
+                p95=\(String(format: "%.1f", gapP95))ms \
+                renderP95=\(String(format: "%.1f", renderP95))ms \
+                refinementP95=\(String(format: "%.1f", refinementP95))ms \
+                encodings=\(encodingCounts) dctTypes=\(dctTypeCounts) cursorRect=\(sawCursor) \
                 issues=\(Array(Set(issues)).sorted())
                 """
+            }
+
+            func resultFields(durationSeconds: Int) -> String {
+                let gaps = interUpdateGapsMs.sorted()
+                let refinement = refinementTimesMs.sorted()
+                let render = renderTimesMs.sorted()
+                let kilobitsPerSecond = durationSeconds > 0
+                    ? Double(bytes * 8) / Double(durationSeconds * 1_000) : 0
+                return String(
+                    format: "updates=%d kbps=%.0f gapP50Ms=%.1f gapP95Ms=%.1f "
+                        + "renderP95Ms=%.1f refineP50Ms=%.1f refineP95Ms=%.1f "
+                        + "dct0=%d dct1=%d dct2=%d",
+                    updates, kilobitsPerSecond,
+                    Self.percentile(gaps, percent: 50),
+                    Self.percentile(gaps, percent: 95),
+                    Self.percentile(render, percent: 95),
+                    Self.percentile(refinement, percent: 50),
+                    Self.percentile(refinement, percent: 95),
+                    dctTypeCounts[0, default: 0],
+                    dctTypeCounts[1, default: 0],
+                    dctTypeCounts[2, default: 0])
+            }
+
+            func presentationTradeoffFields() -> String {
+                let now = DispatchTime.now().uptimeNanoseconds
+                return presentationSimulations.indices.map { index in
+                    presentationSimulations[index].resultFields(
+                        nowNanos: now)
+                }.joined(separator: " ")
             }
 
             func reset() {
                 updates = 0; bytes = 0; rects = 0
                 encodingCounts = [:]; payloadSizes = []
                 interUpdateGapsMs = []; lastUpdateNanos = 0
+                renderTimesMs = []; dctTypeCounts = [:]
+                refinementTracker.reset()
+                refinementStartedNanos = 0
+                refinementTimesMs = []
+                presentationSimulations = [0, 8, 16, 25, 33, 50].map {
+                    DCTPresentationTradeoffSimulation(holdMilliseconds: $0)
+                }
             }
 
             func firstDCTPayload() -> Data? {
@@ -239,6 +341,16 @@ final class LiveStandardModeProbeTests: XCTestCase {
             private static func bigEndianBytes<T: FixedWidthInteger>(_ value: T) -> [UInt8] {
                 withUnsafeBytes(of: value.bigEndian) { Array($0) }
             }
+
+            private static func percentile(
+                _ sorted: [Double], percent: Int
+            ) -> Double {
+                guard !sorted.isEmpty else { return 0 }
+                let index = min(
+                    sorted.count - 1,
+                    max(0, sorted.count * percent / 100))
+                return sorted[index]
+            }
         }
 
         let stats = ProbeStats()
@@ -267,9 +379,13 @@ final class LiveStandardModeProbeTests: XCTestCase {
                         }
                     }
                     await stats.record(rects: rectsWithData)
+                    let renderStarted = DispatchTime.now().uptimeNanoseconds
                     if let result = rendererBox.apply(
                         rectsWithData,
                         includeDCT: env["VNC_PROBE_RENDER_DCT"] == "1") {
+                        let renderFinished = DispatchTime.now().uptimeNanoseconds
+                        await stats.recordRender(
+                            milliseconds: Double(renderFinished &- renderStarted) / 1e6)
                         await stats.note(issues: result.issues)
                     }
                     try? await session.finishFramebufferUpdate()
@@ -288,12 +404,16 @@ final class LiveStandardModeProbeTests: XCTestCase {
         // Phase 1: idle screen.
         try await Task.sleep(for: .seconds(4))
         let idleSummary = await stats.summary(label: "idle")
+        let idleTradeoff = await stats.presentationTradeoffFields()
         print("PROBE \(idleSummary)")
+        print(
+            "PROBE TRADEOFF scenario=\(scenario) phase=idle "
+                + idleTradeoff)
         await stats.reset()
 
         if let kbps = Int(env["VNC_PROBE_BANDWIDTH_AFTER_KBPS"] ?? ""),
-           kbps > 0, let bandwidthProxy {
-            bandwidthProxy.setDownstreamBytesPerSecond(
+           kbps > 0, let networkProxy {
+            networkProxy.setDownstreamBytesPerSecond(
                 max(1, kbps * 1_000 / 8))
             print("PROBE downstream limit changed to \(kbps)kbps")
         }
@@ -332,7 +452,13 @@ final class LiveStandardModeProbeTests: XCTestCase {
             i += 1
         }
         let motionSummary = await stats.summary(label: "motion")
+        let motionResultFields = await stats.resultFields(
+            durationSeconds: motionSeconds)
+        let motionTradeoff = await stats.presentationTradeoffFields()
         print("PROBE \(motionSummary)")
+        print(
+            "PROBE TRADEOFF scenario=\(scenario) phase=motion "
+                + motionTradeoff)
         await stats.reset()
 
         if encoding == "dct" {
@@ -356,6 +482,22 @@ final class LiveStandardModeProbeTests: XCTestCase {
                 rendererBox.dumpPNG(to: outDir + "/standard_probe_final.png")
             }
             let issues = await stats.issues
+            let proxyFields: String
+            if let snapshot = networkProxy?.snapshot() {
+                proxyFields = "proxyDownPackets=\(snapshot.downstreamPackets) "
+                    + "proxyDownLoss=\(snapshot.downstreamSimulatedLosses) "
+                    + "proxyUpPackets=\(snapshot.upstreamPackets) "
+                    + "proxyUpLoss=\(snapshot.upstreamSimulatedLosses)"
+            } else {
+                proxyFields = "proxyDownPackets=0 proxyDownLoss=0 "
+                    + "proxyUpPackets=0 proxyUpLoss=0"
+            }
+            print(
+                "PROBE RESULT scenario=\(scenario) "
+                    + "rttMs=\(rttMilliseconds) "
+                    + "jitterMs=\(networkConditions.jitterMilliseconds) "
+                    + "lossPercent=\(networkConditions.lossPercent) "
+                    + motionResultFields + " " + proxyFields)
             eventTask.cancel()
             await session.disconnect()
             XCTAssertTrue(issues.isEmpty, "decode issues (desync canary): \(issues.prefix(5))")
@@ -401,196 +543,279 @@ final class LiveStandardModeProbeTests: XCTestCase {
 
         XCTAssertTrue(issues.isEmpty, "decode issues (desync canary): \(issues.prefix(5))")
     }
+
+    /// Measures the actual high-level `currentImage` publication cadence. This
+    /// complements the transport probe above by exercising the progressive DCT
+    /// clarity hold and trailing-snapshot logic used by the app.
+    @MainActor
+    func testConditionedStandardPresentationCadence() async throws {
+        let env = ProcessInfo.processInfo.environment
+        guard env["VNC_PROBE_PRESENTATION"] == "1" else {
+            throw XCTSkip("Set VNC_PROBE_PRESENTATION=1 to run the presentation probe")
+        }
+        guard let host = env["VNC_TEST_HOST"], !host.isEmpty,
+              let password = env["VNC_TEST_PASSWORD"], !password.isEmpty else {
+            throw XCTSkip("Set VNC_TEST_HOST and VNC_TEST_PASSWORD")
+        }
+        let remotePort = UInt16(env["VNC_TEST_PORT"] ?? "5900") ?? 5900
+        let rtt = max(0, Int(env["VNC_PROBE_RTT_MS"] ?? "0") ?? 0)
+        let downstreamRate = Int(env["VNC_PROBE_BANDWIDTH_KBPS"] ?? "")
+            .flatMap { $0 > 0 ? max(1, $0 * 1_000 / 8) : nil }
+        let conditions = LiveNetworkConditions(
+            downstreamBytesPerSecond: downstreamRate,
+            upstreamBytesPerSecond: nil,
+            oneWayDelayMilliseconds: (rtt + 1) / 2,
+            jitterMilliseconds: max(
+                0, Int(env["VNC_PROBE_JITTER_MS"] ?? "0") ?? 0),
+            lossPercent: max(
+                0, Double(env["VNC_PROBE_LOSS_PERCENT"] ?? "0") ?? 0),
+            lossRecoveryMilliseconds: max(
+                0, Int(env["VNC_PROBE_LOSS_RECOVERY_MS"] ?? "200") ?? 200),
+            seed: UInt64(env["VNC_PROBE_SEED"] ?? "12648430") ?? 12_648_430)
+        let proxy = conditions.isImpaired
+            ? try LiveNetworkConditioningProxy(
+                remoteHost: host, remotePort: remotePort,
+                conditions: conditions)
+            : nil
+        defer { proxy?.stop() }
+
+        let credentials = VNCCredentials(
+            host: proxy == nil ? host : "127.0.0.1",
+            port: proxy?.localPort ?? remotePort,
+            password: password,
+            username: env["VNC_TEST_USERNAME"])
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .standard,
+            displaySizingMode: .remoteDisplay,
+            displayCount: 1,
+            enableRemoteAudio: false,
+            targetFrameRate: 60,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0)))
+        try await session.connect(credentials: credentials)
+        defer { session.disconnect() }
+
+        let firstFrameDeadline = Date().addingTimeInterval(15)
+        while session.currentImage == nil, Date() < firstFrameDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertNotNil(session.currentImage, "Standard mode did not publish its first frame")
+
+        let seconds = max(2, Int(env["VNC_PROBE_SECONDS"] ?? "6") ?? 6)
+        let deadline = Date().addingTimeInterval(TimeInterval(seconds))
+        var lastImage = session.currentImage
+        var lastPublishNanos = DispatchTime.now().uptimeNanoseconds
+        var publishGapsMs: [Double] = []
+        var iteration = 0
+        while Date() < deadline {
+            if iteration.isMultiple(of: 10) {
+                let step = (iteration / 10) % 40
+                session.sendPointerEvent(
+                    buttonMask: 0,
+                    x: UInt16(200 + step * 64),
+                    y: UInt16(200 + step * 36))
+            }
+            if let image = session.currentImage, image !== lastImage {
+                let now = DispatchTime.now().uptimeNanoseconds
+                publishGapsMs.append(Double(now &- lastPublishNanos) / 1e6)
+                lastPublishNanos = now
+                lastImage = image
+            }
+            iteration += 1
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        let sorted = publishGapsMs.sorted()
+        func percentile(_ percent: Int) -> Double {
+            guard !sorted.isEmpty else { return 0 }
+            return sorted[min(sorted.count - 1, sorted.count * percent / 100)]
+        }
+        let scenario = env["VNC_PROBE_SCENARIO"] ?? "custom"
+        let holdMilliseconds = AppleDCTPresentationPolicy
+            .refinementHoldNanos(environment: env) / 1_000_000
+        print(String(
+            format: "PROBE PRESENTATION scenario=%@ holdMs=%llu publishes=%d "
+                + "gapP50Ms=%.1f gapP95Ms=%.1f gapMaxMs=%.1f",
+            scenario, holdMilliseconds, sorted.count,
+            percentile(50), percentile(95),
+            sorted.last ?? 0))
+        XCTAssertGreaterThan(
+            sorted.count, 1,
+            "Standard presentation stalled under the configured network conditions")
+    }
 }
 
-/// Single-connection loopback proxy used only by the opt-in live probe. The
-/// downstream relay reads in small chunks and does not read the next chunk
-/// until its byte budget is available, so TCP backpressure reaches the remote
-/// encoder instead of accumulating a large user-space queue.
-private final class LiveBandwidthProxy: @unchecked Sendable {
-    let localPort: UInt16
-
-    private let remoteHost: String
-    private let remotePort: UInt16
-    private var downstreamBytesPerSecond: Int
-    private let lock = NSLock()
-    private var listenerFD: Int32
-    private var clientFD: Int32 = -1
-    private var serverFD: Int32 = -1
-    private var stopped = false
-
-    init(
-        remoteHost: String,
-        remotePort: UInt16,
-        downstreamBytesPerSecond: Int
-    ) throws {
-        self.remoteHost = remoteHost
-        self.remotePort = remotePort
-        self.downstreamBytesPerSecond = downstreamBytesPerSecond
-
-        let listener = Darwin.socket(AF_INET, SOCK_STREAM, 0)
-        guard listener >= 0 else { throw Self.posixError("socket") }
-        listenerFD = listener
-
-        var reuse: Int32 = 1
-        _ = setsockopt(
-            listener, SOL_SOCKET, SO_REUSEADDR,
-            &reuse, socklen_t(MemoryLayout.size(ofValue: reuse)))
-        var address = sockaddr_in()
-        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = 0
-        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-        let bindResult = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard bindResult == 0, Darwin.listen(listener, 1) == 0 else {
-            let error = Self.posixError("bind/listen")
-            Darwin.close(listener)
-            throw error
-        }
-        var bound = sockaddr_in()
-        var boundLength = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let nameResult = withUnsafeMutablePointer(to: &bound) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                getsockname(listener, $0, &boundLength)
-            }
-        }
-        guard nameResult == 0 else {
-            let error = Self.posixError("getsockname")
-            Darwin.close(listener)
-            throw error
-        }
-        localPort = UInt16(bigEndian: bound.sin_port)
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.acceptAndRelay()
-        }
+/// Replays one real DCT event stream against a candidate presentation hold.
+/// `quality` is the fraction of the base rectangle area covered by refinement
+/// before presentation; it is a protocol-level clarity proxy, not a PSNR score.
+private struct DCTPresentationTradeoffSimulation {
+    private struct Sample {
+        let delayMilliseconds: Double
+        let quality: Double
+        let fullyRefined: Bool
     }
 
-    deinit { stop() }
+    let holdMilliseconds: Int
+    private var tracker = AppleDCTRefinementTracker()
+    private var pendingStartNanos: UInt64?
+    private var deadlineNanos: UInt64 = 0
+    private var maximumUnrefinedArea: Double = 0
+    private var samples: [Sample] = []
 
-    func setDownstreamBytesPerSecond(_ value: Int) {
-        lock.withLock {
-            downstreamBytesPerSecond = max(1, value)
-        }
+    init(holdMilliseconds: Int) {
+        self.holdMilliseconds = holdMilliseconds
     }
 
-    func stop() {
-        let descriptors: (Int32, Int32, Int32)? = lock.withLock {
-            guard !stopped else { return nil }
-            stopped = true
-            let result = (listenerFD, clientFD, serverFD)
-            listenerFD = -1
-            clientFD = -1
-            serverFD = -1
-            return result
-        }
-        guard let descriptors else { return }
-        for descriptor in [descriptors.0, descriptors.1, descriptors.2]
-            where descriptor >= 0 {
-            Darwin.shutdown(descriptor, SHUT_RDWR)
-            Darwin.close(descriptor)
-        }
-    }
-
-    private func acceptAndRelay() {
-        let accepted = Darwin.accept(listenerFD, nil, nil)
-        guard accepted >= 0 else { return }
-        let upstream = Darwin.socket(AF_INET, SOCK_STREAM, 0)
-        guard upstream >= 0 else {
-            Darwin.close(accepted)
-            return
-        }
-        var receiveBuffer: Int32 = 8 * 1_024
-        _ = setsockopt(
-            upstream, SOL_SOCKET, SO_RCVBUF,
-            &receiveBuffer, socklen_t(MemoryLayout.size(ofValue: receiveBuffer)))
-        var remote = sockaddr_in()
-        remote.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        remote.sin_family = sa_family_t(AF_INET)
-        remote.sin_port = remotePort.bigEndian
-        guard inet_pton(AF_INET, remoteHost, &remote.sin_addr) == 1 else {
-            Darwin.close(accepted)
-            Darwin.close(upstream)
-            return
-        }
-        let connected = withUnsafePointer(to: &remote) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.connect(upstream, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard connected == 0 else {
-            Darwin.close(accepted)
-            Darwin.close(upstream)
-            return
-        }
-        let shouldRelay = lock.withLock {
-            guard !stopped else { return false }
-            clientFD = accepted
-            serverFD = upstream
-            return true
-        }
-        guard shouldRelay else {
-            Darwin.close(accepted)
-            Darwin.close(upstream)
-            return
-        }
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.relay(from: accepted, to: upstream, usesDownstreamLimit: false)
-        }
-        relay(
-            from: upstream, to: accepted,
-            usesDownstreamLimit: true)
-    }
-
-    private func relay(
-        from source: Int32, to destination: Int32,
-        usesDownstreamLimit: Bool
+    mutating func ingest(
+        _ rects: [(FramebufferRect, Data)],
+        nowNanos: UInt64
     ) {
-        var buffer = [UInt8](repeating: 0, count: 4 * 1_024)
-        var nextReadNanos = DispatchTime.now().uptimeNanoseconds
-        while true {
-            let bytesPerSecond: Int? = usesDownstreamLimit
-                ? lock.withLock { downstreamBytesPerSecond }
-                : nil
-            if bytesPerSecond != nil {
-                let now = DispatchTime.now().uptimeNanoseconds
-                if nextReadNanos > now {
-                    let delay = nextReadNanos - now
-                    usleep(useconds_t(min(delay / 1_000, UInt64(UInt32.max))))
-                }
-            }
-            let count = Darwin.recv(source, &buffer, buffer.count, 0)
-            guard count > 0 else { break }
-            var sent = 0
-            while sent < count {
-                let written = buffer.withUnsafeBytes { raw in
-                    Darwin.send(
-                        destination, raw.baseAddress!.advanced(by: sent),
-                        count - sent, 0)
-                }
-                guard written > 0 else { stop(); return }
-                sent += written
-            }
-            if let bytesPerSecond {
-                let duration = UInt64(count) * 1_000_000_000
-                    / UInt64(bytesPerSecond)
-                nextReadNanos = max(
-                    nextReadNanos, DispatchTime.now().uptimeNanoseconds) + duration
-            }
+        expireIfNeeded(nowNanos: nowNanos)
+        let wasAwaiting = tracker.isAwaitingRefinement
+        let awaitsRefinement = tracker.ingest(rects)
+
+        if !wasAwaiting, awaitsRefinement {
+            pendingStartNanos = nowNanos
+            deadlineNanos = nowNanos
+                &+ UInt64(holdMilliseconds) * 1_000_000
+            maximumUnrefinedArea = uncoveredArea
+            expireIfNeeded(nowNanos: nowNanos)
+            return
         }
-        stop()
+
+        guard pendingStartNanos != nil else { return }
+        maximumUnrefinedArea = max(maximumUnrefinedArea, uncoveredArea)
+        if wasAwaiting, !awaitsRefinement {
+            present(nowNanos: nowNanos, fullyRefined: true)
+        }
     }
 
-    private static func posixError(_ operation: String) -> NSError {
-        NSError(
-            domain: NSPOSIXErrorDomain, code: Int(errno),
-            userInfo: [NSLocalizedDescriptionKey:
-                "\(operation) failed: \(String(cString: strerror(errno)))"])
+    mutating func resultFields(nowNanos: UInt64) -> String {
+        expireIfNeeded(nowNanos: nowNanos)
+        let delays = samples.map(\.delayMilliseconds).sorted()
+        let averageQuality = samples.isEmpty
+            ? 0 : samples.reduce(0) { $0 + $1.quality } / Double(samples.count)
+        let fullPercent = samples.isEmpty
+            ? 0
+            : Double(samples.filter(\.fullyRefined).count) * 100
+                / Double(samples.count)
+        return String(
+            format: "h%dN=%d h%dDelayP95=%.1f h%dFullPct=%.0f h%dQualityPct=%.0f",
+            holdMilliseconds, samples.count,
+            holdMilliseconds, percentile(delays, percent: 95),
+            holdMilliseconds, fullPercent,
+            holdMilliseconds, averageQuality * 100)
+    }
+
+    private var uncoveredArea: Double {
+        tracker.uncoveredRegions.reduce(0) { result, region in
+            result + max(0, region.width) * max(0, region.height)
+        }
+    }
+
+    private mutating func expireIfNeeded(nowNanos: UInt64) {
+        guard pendingStartNanos != nil,
+              nowNanos >= deadlineNanos else { return }
+        present(nowNanos: deadlineNanos, fullyRefined: false)
+        // Production presents the best available pixels and stops treating
+        // later refinement bands as a reason to withhold another snapshot.
+        tracker.reset()
+    }
+
+    private mutating func present(
+        nowNanos: UInt64,
+        fullyRefined: Bool
+    ) {
+        guard let start = pendingStartNanos else { return }
+        let quality: Double
+        if fullyRefined {
+            quality = 1
+        } else if maximumUnrefinedArea > 0 {
+            quality = max(
+                0, min(1, 1 - uncoveredArea / maximumUnrefinedArea))
+        } else {
+            quality = 0
+        }
+        samples.append(Sample(
+            delayMilliseconds: Double(nowNanos &- start) / 1e6,
+            quality: quality,
+            fullyRefined: fullyRefined))
+        pendingStartNanos = nil
+        deadlineNanos = 0
+        maximumUnrefinedArea = 0
+    }
+
+    private func percentile(
+        _ sorted: [Double],
+        percent: Int
+    ) -> Double {
+        guard !sorted.isEmpty else { return 0 }
+        return sorted[min(
+            sorted.count - 1,
+            max(0, sorted.count * percent / 100))]
+    }
+}
+
+final class DCTPresentationTradeoffSimulationTests: XCTestCase {
+    func testCompletionInsideHoldPresentsFullyRefinedFrame() {
+        var simulation = DCTPresentationTradeoffSimulation(
+            holdMilliseconds: 25)
+        simulation.ingest(
+            [dctRect(y: 0, height: 100, type: 0)],
+            nowNanos: 0)
+        simulation.ingest(
+            [dctRect(y: 0, height: 100, type: 1)],
+            nowNanos: 10_000_000)
+
+        let result = simulation.resultFields(nowNanos: 30_000_000)
+        XCTAssertTrue(result.contains("h25N=1"))
+        XCTAssertTrue(result.contains("h25DelayP95=10.0"))
+        XCTAssertTrue(result.contains("h25FullPct=100"))
+        XCTAssertTrue(result.contains("h25QualityPct=100"))
+    }
+
+    func testTimeoutReportsPartialRefinementCoverage() {
+        var simulation = DCTPresentationTradeoffSimulation(
+            holdMilliseconds: 25)
+        simulation.ingest(
+            [dctRect(y: 0, height: 100, type: 0)],
+            nowNanos: 0)
+        simulation.ingest(
+            [dctRect(y: 0, height: 50, type: 1)],
+            nowNanos: 10_000_000)
+
+        let result = simulation.resultFields(nowNanos: 30_000_000)
+        XCTAssertTrue(result.contains("h25N=1"))
+        XCTAssertTrue(result.contains("h25DelayP95=25.0"))
+        XCTAssertTrue(result.contains("h25FullPct=0"))
+        XCTAssertTrue(result.contains("h25QualityPct=50"))
+    }
+
+    func testZeroHoldPresentsBaseWithoutArtificialDelay() {
+        var simulation = DCTPresentationTradeoffSimulation(
+            holdMilliseconds: 0)
+        simulation.ingest(
+            [dctRect(y: 0, height: 100, type: 0)],
+            nowNanos: 1_000_000)
+
+        let result = simulation.resultFields(nowNanos: 1_000_000)
+        XCTAssertTrue(result.contains("h0N=1"))
+        XCTAssertTrue(result.contains("h0DelayP95=0.0"))
+        XCTAssertTrue(result.contains("h0QualityPct=0"))
+    }
+
+    private func dctRect(
+        y: UInt16,
+        height: UInt16,
+        type: UInt8
+    ) -> (FramebufferRect, Data) {
+        (
+            FramebufferRect(
+                x: 0, y: y, width: 100, height: height,
+                encoding: .appleMultiVariantScreenshare),
+            Data([0, 0, 0, 0, type])
+        )
     }
 }
 

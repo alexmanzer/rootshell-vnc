@@ -289,6 +289,47 @@ struct AppleDCTRefinementTracker {
     }
 }
 
+/// Chooses how progressive DCT updates interact with the trailing snapshot.
+/// The clarity hold is anchored to the first coarse base; refinement progress
+/// must never slide that deadline later and turn a busy slow link into a
+/// frozen-looking display.
+struct AppleDCTPresentationPolicy {
+    enum Action: Equatable {
+        case beginBoundedHold
+        case preserveBoundedHold
+        case usePresentationCadence(resetExisting: Bool)
+    }
+
+    /// About one frame at 60 fps: enough time to absorb the common immediate
+    /// refinement burst without making coarse feedback feel unresponsive.
+    static let maximumRefinementHoldNanos: UInt64 = 16_000_000
+
+    static func refinementHoldNanos(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> UInt64 {
+        #if DEBUG
+        if let value = environment["ROOTSHELL_VNC_DCT_REFINEMENT_HOLD_MS"],
+           let milliseconds = Int(value) {
+            return UInt64(max(0, min(100, milliseconds))) * 1_000_000
+        }
+        #endif
+        return maximumRefinementHoldNanos
+    }
+
+    static func action(
+        wasAwaitingRefinement: Bool,
+        awaitsRefinement: Bool
+    ) -> Action {
+        if awaitsRefinement {
+            return wasAwaitingRefinement
+                ? .preserveBoundedHold
+                : .beginBoundedHold
+        }
+        return .usePresentationCadence(
+            resetExisting: wasAwaitingRefinement)
+    }
+}
+
 /// Public-framework equivalent of AVConference's audio sync source for video.
 /// RTCP Sender Reports place both RTP streams on the server's NTP clock, while
 /// `AppleRemoteAudioPlayer` supplies the corresponding local playback point.
@@ -2057,8 +2098,6 @@ public final class VNCSession {
         let wasAwaitingDCTRefinement =
             dctRefinementTracker.isAwaitingRefinement
         let awaitsDCTRefinement = dctRefinementTracker.ingest(rects)
-        let completedDCTRefinement =
-            wasAwaitingDCTRefinement && !awaitsDCTRefinement
         let displaySuspended = suspendsDisplayPresentation
             || VNCPresentationPolicy.isPresentationProhibited()
         let takeSnapshot = publishDue && !awaitsDCTRefinement && !displaySuspended
@@ -2106,17 +2145,33 @@ public final class VNCSession {
                 .image(image),
                 source: "Standard framebuffer snapshot")
         } else {
-            if awaitsDCTRefinement || completedDCTRefinement {
-                // Pending bases replace cadence-only snapshots so they cannot
-                // publish coarse pixels. Completion replaces the longer
-                // safety timeout with the ordinary presentation cadence.
+            switch AppleDCTPresentationPolicy.action(
+                wasAwaitingRefinement: wasAwaitingDCTRefinement,
+                awaitsRefinement: awaitsDCTRefinement
+            ) {
+            case .beginBoundedHold:
+                // Replace a cadence-only snapshot once, anchoring the maximum
+                // clarity wait to this base frame.
                 trailingSnapshotTask?.cancel()
                 trailingSnapshotTask = nil
+                scheduleTrailingSnapshot(
+                    interval: publishInterval,
+                    minimumDelay: AppleDCTPresentationPolicy
+                        .refinementHoldNanos(),
+                    resetsDCTRefinement: true)
+            case .preserveBoundedHold:
+                // Refinement progress improves the pending image but must not
+                // move its already-scheduled presentation deadline.
+                break
+            case .usePresentationCadence(let resetExisting):
+                if resetExisting {
+                    // Completion replaces the clarity hold with the normal
+                    // target-frame-rate cadence.
+                    trailingSnapshotTask?.cancel()
+                    trailingSnapshotTask = nil
+                }
+                scheduleTrailingSnapshot(interval: publishInterval)
             }
-            scheduleTrailingSnapshot(
-                interval: publishInterval,
-                minimumDelay: awaitsDCTRefinement ? 50_000_000 : 0,
-                resetsDCTRefinement: awaitsDCTRefinement)
         }
         switch result.cursorUpdate {
         case .shape(let cursor):

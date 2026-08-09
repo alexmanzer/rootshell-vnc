@@ -148,6 +148,50 @@ final class TightVNCCursorTests: XCTestCase {
 }
 
 final class StandardFramebufferPipelineTests: XCTestCase {
+    func testDCTPresentationDeadlineStartsWithBaseAndDoesNotSlide() {
+        XCTAssertEqual(
+            AppleDCTPresentationPolicy.action(
+                wasAwaitingRefinement: false,
+                awaitsRefinement: true),
+            .beginBoundedHold)
+        XCTAssertEqual(
+            AppleDCTPresentationPolicy.action(
+                wasAwaitingRefinement: true,
+                awaitsRefinement: true),
+            .preserveBoundedHold)
+        XCTAssertEqual(
+            AppleDCTPresentationPolicy.maximumRefinementHoldNanos,
+            16_000_000)
+        XCTAssertEqual(
+            AppleDCTPresentationPolicy.refinementHoldNanos(environment: [:]),
+            16_000_000)
+        #if DEBUG
+        XCTAssertEqual(
+            AppleDCTPresentationPolicy.refinementHoldNanos(environment: [
+                "ROOTSHELL_VNC_DCT_REFINEMENT_HOLD_MS": "8",
+            ]),
+            8_000_000)
+        XCTAssertEqual(
+            AppleDCTPresentationPolicy.refinementHoldNanos(environment: [
+                "ROOTSHELL_VNC_DCT_REFINEMENT_HOLD_MS": "999",
+            ]),
+            100_000_000)
+        #endif
+    }
+
+    func testDCTRefinementCompletionReturnsToPresentationCadence() {
+        XCTAssertEqual(
+            AppleDCTPresentationPolicy.action(
+                wasAwaitingRefinement: true,
+                awaitsRefinement: false),
+            .usePresentationCadence(resetExisting: true))
+        XCTAssertEqual(
+            AppleDCTPresentationPolicy.action(
+                wasAwaitingRefinement: false,
+                awaitsRefinement: false),
+            .usePresentationCadence(resetExisting: false))
+    }
+
     func testAppleDCTBaseWaitsForEveryRefinementBand() {
         var tracker = AppleDCTRefinementTracker()
         XCTAssertTrue(tracker.ingest([
