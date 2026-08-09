@@ -148,48 +148,58 @@ final class TightVNCCursorTests: XCTestCase {
 }
 
 final class StandardFramebufferPipelineTests: XCTestCase {
-    func testDCTPresentationDeadlineStartsWithBaseAndDoesNotSlide() {
-        XCTAssertEqual(
-            AppleDCTPresentationPolicy.action(
-                wasAwaitingRefinement: false,
-                awaitsRefinement: true),
-            .beginBoundedHold)
-        XCTAssertEqual(
-            AppleDCTPresentationPolicy.action(
-                wasAwaitingRefinement: true,
-                awaitsRefinement: true),
-            .preserveBoundedHold)
-        XCTAssertEqual(
-            AppleDCTPresentationPolicy.maximumRefinementHoldNanos,
-            16_000_000)
-        XCTAssertEqual(
-            AppleDCTPresentationPolicy.refinementHoldNanos(environment: [:]),
-            16_000_000)
-        #if DEBUG
-        XCTAssertEqual(
-            AppleDCTPresentationPolicy.refinementHoldNanos(environment: [
-                "ROOTSHELL_VNC_DCT_REFINEMENT_HOLD_MS": "8",
-            ]),
-            8_000_000)
-        XCTAssertEqual(
-            AppleDCTPresentationPolicy.refinementHoldNanos(environment: [
-                "ROOTSHELL_VNC_DCT_REFINEMENT_HOLD_MS": "999",
-            ]),
-            100_000_000)
-        #endif
+    func testPortableEncodingsRemainPixelBearingForPresentation() {
+        let pixelEncodings: [Encoding] = [
+            .raw, .tight, .zlib, .zrle, .copyRect,
+        ]
+        for encoding in pixelEncodings {
+            let rect = FramebufferRect(
+                x: 0, y: 0, width: 8, height: 8,
+                encoding: encoding)
+            XCTAssertTrue(
+                StandardFramebufferPresentationPolicy
+                    .carriesFramebufferPixels([(rect, Data())]),
+                "Expected \(encoding) to schedule framebuffer presentation")
+        }
+
+        let cursor = FramebufferRect(
+            x: 0, y: 0, width: 8, height: 8, encoding: .cursor)
+        XCTAssertFalse(
+            StandardFramebufferPresentationPolicy
+                .carriesFramebufferPixels([(cursor, Data())]))
     }
 
-    func testDCTRefinementCompletionReturnsToPresentationCadence() {
-        XCTAssertEqual(
-            AppleDCTPresentationPolicy.action(
-                wasAwaitingRefinement: true,
-                awaitsRefinement: false),
-            .usePresentationCadence(resetExisting: true))
-        XCTAssertEqual(
-            AppleDCTPresentationPolicy.action(
-                wasAwaitingRefinement: false,
-                awaitsRefinement: false),
-            .usePresentationCadence(resetExisting: false))
+    func testProgressiveDCTPublishesEachDecodedRectangleDirectly() throws {
+        let framebuffer = Framebuffer(
+            width: 8, height: 8, pixelFormat: .bgra8888)
+        let renderer = FramebufferRenderer(
+            framebuffer: framebuffer, pixelFormat: .bgra8888)
+        let rect = FramebufferRect(
+            x: 0, y: 0, width: 8, height: 8,
+            encoding: .appleMultiVariantScreenshare)
+
+        // Type 0 writes directly to the presented framebuffer.
+        let whiteBase = Data([
+            0, 0, 0, 8, 0, 15, 25, 0, 0, 7, 0, 0,
+        ])
+        XCTAssertTrue(renderer.applyBatch(
+            [(rect, whiteBase)], snapshot: false).issues.isEmpty)
+        XCTAssertEqual(snapshotPixel(renderer, x: 0, y: 0), [255, 255, 255, 255])
+
+        // A later type-0 base replaces the same region immediately.
+        let blackBase = Data([
+            0, 0, 0, 16, 0, 15, 25, 0, 0, 7, 0x30,
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ])
+        XCTAssertTrue(renderer.applyBatch(
+            [(rect, blackBase)], snapshot: false).issues.isEmpty)
+        XCTAssertEqual(snapshotPixel(renderer, x: 0, y: 0), [0, 0, 0, 0])
+
+        // Type 1 also writes directly; command zero leaves the base unchanged.
+        let completion = Data([0, 0, 0, 4, 1, 0, 0, 0])
+        XCTAssertTrue(renderer.applyBatch(
+            [(rect, completion)], snapshot: false).issues.isEmpty)
+        XCTAssertEqual(snapshotPixel(renderer, x: 0, y: 0), [0, 0, 0, 0])
     }
 
     func testAppleDCTBaseWaitsForEveryRefinementBand() {
@@ -264,6 +274,18 @@ final class StandardFramebufferPipelineTests: XCTestCase {
                 0x00, 0x00, 0xff, 0xff,
                 0xff, 0x00, 0x00, 0xff,
             ]))
+    }
+
+    private func snapshotPixel(
+        _ renderer: FramebufferRenderer,
+        x: Int,
+        y: Int
+    ) -> [UInt8] {
+        guard let image = renderer.snapshot(),
+              let data = image.dataProvider?.data,
+              let bytes = CFDataGetBytePtr(data) else { return [] }
+        let offset = y * image.bytesPerRow + x * 4
+        return Array(UnsafeBufferPointer(start: bytes + offset, count: 4))
     }
 
     func testAppleControlRectanglesDoNotBecomeRenderingIssues() {
@@ -912,6 +934,33 @@ final class AppleAdaptiveDCTDecoderTests: XCTestCase {
             Data(repeating: 0xff, count: 16 * 16 * 4))
     }
 
+    func testPreviousTileAtPartialRectRowUsesPreviousCommandTilePixels() throws {
+        let framebuffer = Framebuffer(
+            width: 24, height: 16, pixelFormat: .bgra8888)
+        // The source for (8,8) is the preceding tile in command order,
+        // (16,0), rather than the framebuffer tile immediately to its left.
+        framebuffer.fillRect(
+            x: 0, y: 8, width: 8, height: 8,
+            pixel: Data([0x11, 0x22, 0x33, 0xff]))
+        let rect = FramebufferRect(
+            x: 8, y: 0, width: 16, height: 16,
+            encoding: .appleMultiVariantScreenshare)
+        // One white tile followed by three command-1 tiles.
+        var payload = Data([0, 0, 0, 9, 0, 15, 25, 0, 0, 8])
+        payload.append(contentsOf: [0x01, 0x88, 0x00])
+
+        try AppleAdaptiveDCTDecoder().render(
+            rect: rect, payload: payload, to: framebuffer)
+
+        let expected = Data(repeating: 0xff, count: 8 * 8 * 4)
+        XCTAssertEqual(
+            framebuffer.getPixels(x: 8, y: 8, width: 8, height: 8),
+            expected)
+        XCTAssertEqual(
+            framebuffer.getPixels(x: 16, y: 8, width: 8, height: 8),
+            framebuffer.getPixels(x: 8, y: 8, width: 8, height: 8))
+    }
+
     func testSolidReuseUsesIndependentSolidColorCache() throws {
         let framebuffer = Framebuffer(
             width: 16, height: 8, pixelFormat: .bgra8888)
@@ -984,6 +1033,200 @@ final class AppleAdaptiveDCTDecoderTests: XCTestCase {
             ]))
         XCTAssertEqual(first, framebuffer.getPixels(x: 8, y: 0, width: 8, height: 8))
         XCTAssertEqual(first, framebuffer.getPixels(x: 16, y: 0, width: 8, height: 8))
+    }
+
+    func testCachedCoefficientCopyDoesNotBecomeDestinationRefinementState() throws {
+        let framebuffer = Framebuffer(
+            width: 24, height: 8, pixelFormat: .bgra8888)
+        let decoder = AppleAdaptiveDCTDecoder()
+        func rect(_ x: UInt16) -> FramebufferRect {
+            FramebufferRect(
+                x: x, y: 0, width: 8, height: 8,
+                encoding: .appleMultiVariantScreenshare)
+        }
+
+        // Install a base tile, then refine it into cache key 1. Zero chroma
+        // thresholds deliberately leave the cached tile eligible for another
+        // refinement after it is copied elsewhere.
+        try decoder.render(
+            rect: rect(0),
+            payload: Data([0, 0, 0, 9, 0, 1, 1, 0, 0, 7, 0x50, 0, 0x10]),
+            to: framebuffer)
+        let minimalRefinement = Data([0, 0, 0, 5, 1, 0, 0, 0x40, 0])
+        try decoder.render(
+            rect: rect(0), payload: minimalRefinement, to: framebuffer)
+
+        // Copy key 1 to tile 1. Cache drawing does not install that cached
+        // coefficient map as the destination tile's refinement state.
+        try decoder.render(
+            rect: rect(8),
+            payload: Data([0, 0, 0, 8, 0, 1, 1, 0, 0, 7, 0x70, 0]),
+            to: framebuffer)
+        XCTAssertThrowsError(try decoder.render(
+            rect: rect(8), payload: minimalRefinement, to: framebuffer)
+        )
+    }
+
+    func testCacheDrawDoesNotReplacePreviousCoefficientPixels() throws {
+        let framebuffer = Framebuffer(
+            width: 32, height: 8, pixelFormat: .bgra8888)
+        let decoder = AppleAdaptiveDCTDecoder()
+        func rect(_ x: UInt16, width: UInt16 = 8) -> FramebufferRect {
+            FramebufferRect(
+                x: x, y: 0, width: width, height: 8,
+                encoding: .appleMultiVariantScreenshare)
+        }
+
+        // Reserve coefficient-cache key 1 with a visibly refined tile.
+        try decoder.render(
+            rect: rect(0),
+            payload: Data([0, 0, 0, 9, 0, 1, 1, 0, 0, 7, 0x50, 0, 0x10]),
+            to: framebuffer)
+        try decoder.render(
+            rect: rect(0),
+            payload: Data([0, 0, 0, 5, 1, 0, 0, 0x40, 0xa8]),
+            to: framebuffer)
+
+        // Decode a new command-5 tile, draw cache key 1, then reuse the
+        // command-5 tile. The cache draw between them must not replace the
+        // command-5 pixel predictor.
+        try decoder.render(
+            rect: rect(8, width: 24),
+            payload: Data([
+                0, 0, 0, 10, 0, 1, 1, 0, 0, 8,
+                0x57, 0x50, 0, 0x14,
+            ]),
+            to: framebuffer)
+
+        let first = framebuffer.getPixels(x: 8, y: 0, width: 8, height: 8)
+        let cached = framebuffer.getPixels(x: 16, y: 0, width: 8, height: 8)
+        let reused = framebuffer.getPixels(x: 24, y: 0, width: 8, height: 8)
+        XCTAssertNotEqual(first, cached)
+        XCTAssertEqual(first, reused)
+    }
+
+    func testPreviousTileCopyDoesNotInventDestinationCoefficientState() throws {
+        let framebuffer = Framebuffer(
+            width: 16, height: 8, pixelFormat: .bgra8888)
+        let decoder = AppleAdaptiveDCTDecoder()
+
+        // Command 5 installs a coefficient tile, then command 1 copies it to
+        // the following tile in command order.
+        try decoder.render(
+            rect: FramebufferRect(
+                x: 0, y: 0, width: 16, height: 8,
+                encoding: .appleMultiVariantScreenshare),
+            payload: Data([
+                0, 0, 0, 10, 0, 1, 1, 0, 0, 8,
+                0x51, 0, 0, 0x10,
+            ]),
+            to: framebuffer)
+
+        // Pixel-copy commands do not install the source coefficient record at
+        // the destination. A synthetic refinement that assumes they did is
+        // therefore invalid.
+        XCTAssertThrowsError(try decoder.render(
+            rect: FramebufferRect(
+                x: 8, y: 0, width: 8, height: 8,
+                encoding: .appleMultiVariantScreenshare),
+            payload: Data([0, 0, 0, 5, 1, 0, 0, 0x40, 0]),
+            to: framebuffer))
+    }
+
+    func testType1CopyCommandRepeatsRefinedSourcePixels() throws {
+        let framebuffer = Framebuffer(
+            width: 16, height: 8, pixelFormat: .bgra8888)
+        let decoder = AppleAdaptiveDCTDecoder()
+        let fullRect = FramebufferRect(
+            x: 0, y: 0, width: 16, height: 8,
+            encoding: .appleMultiVariantScreenshare)
+
+        // Define one coefficient tile, then make the second tile a type-0
+        // previous-tile reference to it.
+        try decoder.render(
+            rect: fullRect,
+            payload: Data([
+                0, 0, 0, 10, 0, 1, 1, 0, 0, 8,
+                0x51, 0, 0, 0x10,
+            ]),
+            to: framebuffer)
+        XCTAssertEqual(
+            framebuffer.getPixels(x: 0, y: 0, width: 8, height: 8),
+            framebuffer.getPixels(x: 8, y: 0, width: 8, height: 8))
+
+        // Refine tile 0 with nonzero chroma adjustments, then command 2 for
+        // tile 1. The latter must recopy tile 0 after its refinement.
+        try decoder.render(
+            rect: fullRect,
+            payload: Data([0, 0, 0, 5, 1, 0, 0, 0x40, 0xa8]),
+            to: framebuffer)
+
+        XCTAssertEqual(
+            framebuffer.getPixels(x: 0, y: 0, width: 8, height: 8),
+            framebuffer.getPixels(x: 8, y: 0, width: 8, height: 8))
+    }
+
+    func testType1CopyAtPartialRectRowUsesPreviousCommandTileGeneration() throws {
+        let framebuffer = Framebuffer(
+            width: 24, height: 16, pixelFormat: .bgra8888)
+        let decoder = AppleAdaptiveDCTDecoder()
+        let rect = FramebufferRect(
+            x: 8, y: 0, width: 16, height: 16,
+            encoding: .appleMultiVariantScreenshare)
+
+        // One coefficient tile followed by three previous-command-tile
+        // copies. The third tile crosses the rectangle's local row boundary.
+        try decoder.render(
+            rect: rect,
+            payload: Data([
+                0, 0, 0, 10, 0, 1, 1, 0, 0, 8,
+                0x51, 0x88, 0, 0x10,
+            ]),
+            to: framebuffer)
+
+        // Refine the first tile and repeat that result through all three copy
+        // tiles. The row-boundary tile must validate against the preceding
+        // command tile at (16,0), not the unrelated tile at (0,8).
+        try decoder.render(
+            rect: rect,
+            payload: Data([0, 0, 0, 6, 1, 0, 0, 0x40, 0xaa, 0x80]),
+            to: framebuffer)
+
+        let expected = framebuffer.getPixels(
+            x: 8, y: 0, width: 8, height: 8)
+        XCTAssertEqual(
+            expected,
+            framebuffer.getPixels(x: 16, y: 0, width: 8, height: 8))
+        XCTAssertEqual(
+            expected,
+            framebuffer.getPixels(x: 8, y: 8, width: 8, height: 8))
+        XCTAssertEqual(
+            expected,
+            framebuffer.getPixels(x: 16, y: 8, width: 8, height: 8))
+    }
+
+    func testVerticalTileCopyDoesNotInventDestinationCoefficientState() throws {
+        let framebuffer = Framebuffer(
+            width: 8, height: 16, pixelFormat: .bgra8888)
+        let decoder = AppleAdaptiveDCTDecoder()
+        func rect(_ y: UInt16) -> FramebufferRect {
+            FramebufferRect(
+                x: 0, y: y, width: 8, height: 8,
+                encoding: .appleMultiVariantScreenshare)
+        }
+
+        try decoder.render(
+            rect: rect(0),
+            payload: Data([0, 0, 0, 9, 0, 1, 1, 0, 0, 7, 0x50, 0, 0x10]),
+            to: framebuffer)
+        try decoder.render(
+            rect: rect(8),
+            payload: Data([0, 0, 0, 8, 0, 1, 1, 0, 0, 7, 0x20, 0]),
+            to: framebuffer)
+        XCTAssertThrowsError(try decoder.render(
+            rect: rect(8),
+            payload: Data([0, 0, 0, 5, 1, 0, 0, 0x40, 0]),
+            to: framebuffer))
     }
 
     func testReusedType0TilePreservesMapForLaterRefinement() throws {

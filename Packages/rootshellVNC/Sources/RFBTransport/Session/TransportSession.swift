@@ -426,9 +426,9 @@ public actor TransportSession {
     /// this metadata with every layout/control refresh, so suppress identical
     /// events at the transport boundary.
     private var lastAppleRemoteSessionState: AppleRemoteSessionState?
-    /// A full-screen type-2 quantization update commonly precedes the initial
-    /// DCT image. Treat that control rectangle, or complete type-0 coverage,
-    /// as the handoff from the full type-3 request to the type-9 stream.
+    /// A type-2 quantization update commonly precedes the initial DCT image.
+    /// Receipt of the complete control record is the protocol handoff from
+    /// the one-shot type-3 bootstrap request to the type-9 image stream.
     private var awaitingAppleDCTBootstrap: Bool
     private var appleDCTInitialUncoveredRegions: [AppleDCTCoverageRegion] = []
     private var pendingAppleDCTAutoUpdateActivation = false
@@ -3022,10 +3022,9 @@ public actor TransportSession {
             if messageType == 2, payload.count == 133 {
                 // Type 2 only installs the connection-wide luma and chroma
                 // quantization tables. Apple legitimately sends this control
-                // record as a 0x0 rectangle after waking a display. Its
-                // geometry carries no coverage information; receipt of the
-                // complete table record means the codec is ready for the
-                // type-9 image subscription.
+                // record as a 0x0 rectangle; it marks codec readiness, not
+                // framebuffer coverage. The image itself follows on the
+                // adaptive type-9 subscription.
                 awaitingAppleDCTBootstrap = false
                 pendingAppleDCTAutoUpdateActivation = true
                 log.debug("Received Apple DCT bootstrap quantization tables")

@@ -289,44 +289,23 @@ struct AppleDCTRefinementTracker {
     }
 }
 
-/// Chooses how progressive DCT updates interact with the trailing snapshot.
-/// The clarity hold is anchored to the first coarse base; refinement progress
-/// must never slide that deadline later and turn a busy slow link into a
-/// frozen-looking display.
-struct AppleDCTPresentationPolicy {
-    enum Action: Equatable {
-        case beginBoundedHold
-        case preserveBoundedHold
-        case usePresentationCadence(resetExisting: Bool)
-    }
-
-    /// About one frame at 60 fps: enough time to absorb the common immediate
-    /// refinement burst without making coarse feedback feel unresponsive.
-    static let maximumRefinementHoldNanos: UInt64 = 16_000_000
-
-    static func refinementHoldNanos(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> UInt64 {
-        #if DEBUG
-        if let value = environment["ROOTSHELL_VNC_DCT_REFINEMENT_HOLD_MS"],
-           let milliseconds = Int(value) {
-            return UInt64(max(0, min(100, milliseconds))) * 1_000_000
+enum StandardFramebufferPresentationPolicy {
+    static func carriesFramebufferPixels(
+        _ rects: [(FramebufferRect, Data)]
+    ) -> Bool {
+        rects.contains { rect, payload in
+            if rect.encoding == .appleMultiVariantScreenshare {
+                guard payload.count >= 5 else { return false }
+                let messageType = payload[payload.startIndex + 4]
+                return messageType == 0 || messageType == 1
+            }
+            switch rect.encoding {
+            case .raw, .zlib, .zrle, .tight, .copyRect:
+                return true
+            default:
+                return false
+            }
         }
-        #endif
-        return maximumRefinementHoldNanos
-    }
-
-    static func action(
-        wasAwaitingRefinement: Bool,
-        awaitsRefinement: Bool
-    ) -> Action {
-        if awaitsRefinement {
-            return wasAwaitingRefinement
-                ? .preserveBoundedHold
-                : .beginBoundedHold
-        }
-        return .usePresentationCadence(
-            resetExisting: wasAwaitingRefinement)
     }
 }
 
@@ -937,7 +916,6 @@ public final class VNCSession {
     @ObservationIgnored
     private var trailingSnapshotTask: Task<Void, Never>?
     @ObservationIgnored
-    private var dctRefinementTracker = AppleDCTRefinementTracker()
     /// Rejects late geometry callbacks from a decoder retired by a newer AVC
     /// negotiation generation.
     @ObservationIgnored
@@ -1109,7 +1087,6 @@ public final class VNCSession {
         remoteDisplayRegionOrder = []
         trailingSnapshotTask?.cancel()
         trailingSnapshotTask = nil
-        dctRefinementTracker.reset()
         lastImagePublishNanos = 0
         remoteDisplayResizeTask?.cancel()
         remoteDisplayResizeTask = nil
@@ -1202,7 +1179,6 @@ public final class VNCSession {
         remoteDisplayRegionOrder = []
         trailingSnapshotTask?.cancel()
         trailingSnapshotTask = nil
-        dctRefinementTracker.reset()
         lastImagePublishNanos = 0
         videoBandRenderer.reset()
         secondaryVideoBandRenderer.reset()
@@ -2095,16 +2071,19 @@ public final class VNCSession {
             1_000_000_000 / max(1, configuration.targetFrameRate))
         let renderStarted = DispatchTime.now().uptimeNanoseconds
         let publishDue = renderStarted &- lastImagePublishNanos >= publishInterval
-        let wasAwaitingDCTRefinement =
-            dctRefinementTracker.isAwaitingRefinement
-        let awaitsDCTRefinement = dctRefinementTracker.ingest(rects)
+        let carriesFramebufferPixels = StandardFramebufferPresentationPolicy
+            .carriesFramebufferPixels(rects)
         let displaySuspended = suspendsDisplayPresentation
             || VNCPresentationPolicy.isPresentationProhibited()
-        let takeSnapshot = publishDue && !awaitsDCTRefinement && !displaySuspended
+        let takeSnapshot = publishDue
+            && carriesFramebufferPixels
+            && !displaySuspended
         let result = await withCheckedContinuation { continuation in
             framebufferRenderQueue.async {
                 continuation.resume(
-                    returning: renderer.applyBatch(rects, snapshot: takeSnapshot))
+                    returning: renderer.applyBatch(
+                        rects,
+                        snapshot: takeSnapshot))
             }
         }
         let renderFinished = DispatchTime.now().uptimeNanoseconds
@@ -2144,34 +2123,11 @@ public final class VNCSession {
             considerAppleLoginVisionFrame(
                 .image(image),
                 source: "Standard framebuffer snapshot")
-        } else {
-            switch AppleDCTPresentationPolicy.action(
-                wasAwaitingRefinement: wasAwaitingDCTRefinement,
-                awaitsRefinement: awaitsDCTRefinement
-            ) {
-            case .beginBoundedHold:
-                // Replace a cadence-only snapshot once, anchoring the maximum
-                // clarity wait to this base frame.
-                trailingSnapshotTask?.cancel()
-                trailingSnapshotTask = nil
-                scheduleTrailingSnapshot(
-                    interval: publishInterval,
-                    minimumDelay: AppleDCTPresentationPolicy
-                        .refinementHoldNanos(),
-                    resetsDCTRefinement: true)
-            case .preserveBoundedHold:
-                // Refinement progress improves the pending image but must not
-                // move its already-scheduled presentation deadline.
-                break
-            case .usePresentationCadence(let resetExisting):
-                if resetExisting {
-                    // Completion replaces the clarity hold with the normal
-                    // target-frame-rate cadence.
-                    trailingSnapshotTask?.cancel()
-                    trailingSnapshotTask = nil
-                }
-                scheduleTrailingSnapshot(interval: publishInterval)
-            }
+        } else if carriesFramebufferPixels || displaySuspended {
+            // Control-only DCT type 2 carries quantization tables, not pixels.
+            // It must never publish the newly allocated black framebuffer or
+            // anchor an image timer before the first image arrives.
+            scheduleTrailingSnapshot(interval: publishInterval)
         }
         switch result.cursorUpdate {
         case .shape(let cursor):
@@ -3433,18 +3389,13 @@ public final class VNCSession {
         }
     }
 
-    private func scheduleTrailingSnapshot(
-        interval: UInt64,
-        minimumDelay: UInt64 = 0,
-        resetsDCTRefinement: Bool = false
-    ) {
+    private func scheduleTrailingSnapshot(interval: UInt64) {
         guard trailingSnapshotTask == nil else { return }
         let cadenceDelay = interval &- min(
             interval,
             DispatchTime.now().uptimeNanoseconds &- lastImagePublishNanos)
-        let delay = max(cadenceDelay, minimumDelay)
         trailingSnapshotTask = Task { [weak self] in
-            try? await Task.sleep(for: .nanoseconds(Int64(delay)))
+            try? await Task.sleep(for: .nanoseconds(Int64(cadenceDelay)))
             guard let self, !Task.isCancelled else { return }
             // Not cancelled, so this handle is still the stored one; a
             // renderer-less exit must release it or no trailing snapshot can
@@ -3474,9 +3425,6 @@ public final class VNCSession {
                 self.considerAppleLoginVisionFrame(
                     .image(image),
                     source: "Standard trailing snapshot")
-                if resetsDCTRefinement {
-                    self.dctRefinementTracker.reset()
-                }
             }
             self.trailingSnapshotTask = nil
         }

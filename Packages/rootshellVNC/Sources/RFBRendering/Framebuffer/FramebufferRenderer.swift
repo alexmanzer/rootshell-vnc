@@ -155,8 +155,8 @@ public final class FramebufferRenderer: @unchecked Sendable {
                 where value == 1100 || value == 1101
                     || value == 1105 || value == 1107
                     || value == 1109 || value == 1110:
-                // Apple Screen Sharing capability/control rectangles are
-                // consumed by TransportSession and carry no framebuffer pixels.
+                // Capability/control rectangles are consumed by
+                // TransportSession and carry no framebuffer pixels.
                 break
 
             default:

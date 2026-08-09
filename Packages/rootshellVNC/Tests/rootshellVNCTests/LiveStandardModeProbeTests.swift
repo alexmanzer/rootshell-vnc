@@ -60,6 +60,11 @@ final class LiveStandardModeProbeTests: XCTestCase {
             capturedCount,
             Int(env["VNC_DCT_LIMIT"] ?? "\(capturedCount)") ?? capturedCount)
         let drawPixels = env["VNC_DCT_PARSE_ONLY"] != "1"
+        let dumpIndices = Set(
+            (env["VNC_DCT_DUMP_INDICES"] ?? "")
+                .split(separator: ",")
+                .compactMap { Int($0) })
+        let dumpDirectory = env["VNC_DCT_DUMP_DIR"]
         let framebuffer = Framebuffer(width: width, height: height, pixelFormat: .bgra8888)
         let decoder = AppleAdaptiveDCTDecoder()
         for index in 0..<count {
@@ -68,10 +73,28 @@ final class LiveStandardModeProbeTests: XCTestCase {
                 width: try readUInt16(), height: try readUInt16(),
                 encoding: .appleMultiVariantScreenshare)
             let payload = try read(Int(try readUInt32()))
-            print("DCT REPLAY rect=\(index) \(rect.width)x\(rect.height) bytes=\(payload.count)")
+            let messageType = payload.count > 4
+                ? String(payload[payload.startIndex + 4])
+                : "truncated"
+            print(
+                "DCT REPLAY rect=\(index) type=\(messageType) "
+                    + "xy=\(rect.x),\(rect.y) \(rect.width)x\(rect.height) "
+                    + "bytes=\(payload.count)")
             try decoder.render(
                 rect: rect, payload: payload, to: framebuffer,
                 drawPixels: drawPixels)
+            if dumpIndices.contains(index), let dumpDirectory,
+               let image = framebuffer.createImage() {
+                try FileManager.default.createDirectory(
+                    atPath: dumpDirectory, withIntermediateDirectories: true)
+                let url = URL(fileURLWithPath: dumpDirectory)
+                    .appendingPathComponent("frame-\(index).png")
+                if let destination = CGImageDestinationCreateWithURL(
+                    url as CFURL, UTType.png.identifier as CFString, 1, nil) {
+                    CGImageDestinationAddImage(destination, image, nil)
+                    XCTAssertTrue(CGImageDestinationFinalize(destination))
+                }
+            }
         }
         if let output = env["VNC_DCT_REPLAY_RAW"] {
             try framebuffer.getPixels(
@@ -442,14 +465,33 @@ final class LiveStandardModeProbeTests: XCTestCase {
         // dirty the framebuffer).
         let deadline = Date().addingTimeInterval(TimeInterval(motionSeconds))
         var i = 0
+        let exerciseScrolling = env["VNC_PROBE_SCROLL"] == "1"
         while Date() < deadline {
-            let t = i % 40
-            try? await session.sendPointerEvent(
-                buttonMask: 0,
-                x: UInt16(200 + t * 64),
-                y: UInt16(200 + t * 36))
+            if exerciseScrolling {
+                try? await session.sendScrollEvent(AppleScrollEvent(
+                    deltaY: -3,
+                    fixedDeltaY: -3 << 16,
+                    pointDeltaY: -24,
+                    scrollPhase: i == 0 ? .began : .changed,
+                    flags: [.continuous],
+                    x: 1488,
+                    y: 930))
+            } else {
+                let t = i % 40
+                try? await session.sendPointerEvent(
+                    buttonMask: 0,
+                    x: UInt16(200 + t * 64),
+                    y: UInt16(200 + t * 36))
+            }
             try? await Task.sleep(for: .milliseconds(50))
             i += 1
+        }
+        if exerciseScrolling {
+            try? await session.sendScrollEvent(AppleScrollEvent(
+                scrollPhase: .ended,
+                flags: [.continuous],
+                x: 1488,
+                y: 930))
         }
         let motionSummary = await stats.summary(label: "motion")
         let motionResultFields = await stats.resultFields(
@@ -545,8 +587,8 @@ final class LiveStandardModeProbeTests: XCTestCase {
     }
 
     /// Measures the actual high-level `currentImage` publication cadence. This
-    /// complements the transport probe above by exercising the progressive DCT
-    /// clarity hold and trailing-snapshot logic used by the app.
+    /// complements the transport probe above by exercising the coalesced DCT
+    /// trailing-snapshot logic used by the app.
     @MainActor
     func testConditionedStandardPresentationCadence() async throws {
         let env = ProcessInfo.processInfo.environment
@@ -608,8 +650,18 @@ final class LiveStandardModeProbeTests: XCTestCase {
         var lastPublishNanos = DispatchTime.now().uptimeNanoseconds
         var publishGapsMs: [Double] = []
         var iteration = 0
+        let exerciseScrolling = env["VNC_PROBE_SCROLL"] == "1"
         while Date() < deadline {
-            if iteration.isMultiple(of: 10) {
+            if exerciseScrolling, iteration.isMultiple(of: 4) {
+                session.sendScrollEvent(AppleScrollEvent(
+                    deltaY: -3,
+                    fixedDeltaY: -3 << 16,
+                    pointDeltaY: -24,
+                    scrollPhase: iteration == 0 ? .began : .changed,
+                    flags: [.continuous],
+                    x: 1488,
+                    y: 930))
+            } else if !exerciseScrolling, iteration.isMultiple(of: 10) {
                 let step = (iteration / 10) % 40
                 session.sendPointerEvent(
                     buttonMask: 0,
@@ -625,6 +677,13 @@ final class LiveStandardModeProbeTests: XCTestCase {
             iteration += 1
             try await Task.sleep(for: .milliseconds(5))
         }
+        if exerciseScrolling {
+            session.sendScrollEvent(AppleScrollEvent(
+                scrollPhase: .ended,
+                flags: [.continuous],
+                x: 1488,
+                y: 930))
+        }
 
         let sorted = publishGapsMs.sorted()
         func percentile(_ percent: Int) -> Double {
@@ -632,12 +691,10 @@ final class LiveStandardModeProbeTests: XCTestCase {
             return sorted[min(sorted.count - 1, sorted.count * percent / 100)]
         }
         let scenario = env["VNC_PROBE_SCENARIO"] ?? "custom"
-        let holdMilliseconds = AppleDCTPresentationPolicy
-            .refinementHoldNanos(environment: env) / 1_000_000
         print(String(
-            format: "PROBE PRESENTATION scenario=%@ holdMs=%llu publishes=%d "
+            format: "PROBE PRESENTATION scenario=%@ publishes=%d "
                 + "gapP50Ms=%.1f gapP95Ms=%.1f gapMaxMs=%.1f",
-            scenario, holdMilliseconds, sorted.count,
+            scenario, sorted.count,
             percentile(50), percentile(95),
             sorted.last ?? 0))
         XCTAssertGreaterThan(
