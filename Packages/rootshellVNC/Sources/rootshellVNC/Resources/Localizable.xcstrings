@@ -5859,7 +5859,158 @@
       }
     },
     "Display" : {
-
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "الشاشة"
+          }
+        },
+        "ca" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pantalla"
+          }
+        },
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Displej"
+          }
+        },
+        "da" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Skærm"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Display"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pantalla"
+          }
+        },
+        "fi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Näyttö"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Écran"
+          }
+        },
+        "he" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "צג"
+          }
+        },
+        "hu" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kijelző"
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Schermo"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ディスプレイ"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "디스플레이"
+          }
+        },
+        "nb" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Skjerm"
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Beeldscherm"
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ekran"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tela"
+          }
+        },
+        "pt-PT" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ecrã"
+          }
+        },
+        "ro" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ecran"
+          }
+        },
+        "sl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zaslon"
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Skärm"
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Дисплей"
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Màn hình"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "显示器"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "顯示器"
+          }
+        }
+      }
     },
     "Display Mode" : {
       "localizations" : {
@@ -17277,7 +17428,158 @@
       }
     },
     "The remote video stream could not start after %lld attempts. Try again, or switch this connection to Standard mode." : {
-
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تعذّر بدء بث الفيديو البعيد بعد %lld محاولات. حاول مرة أخرى، أو بدّل هذا الاتصال إلى الوضع القياسي."
+          }
+        },
+        "ca" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No s'ha pogut iniciar el flux de vídeo remot després de %lld intents. Torna-ho a provar o canvia aquesta connexió al mode Estàndard."
+          }
+        },
+        "cs" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vzdálený video stream se po %lld pokusech nepodařilo spustit. Zkuste to znovu, nebo přepněte toto připojení do standardního režimu."
+          }
+        },
+        "da" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Den eksterne videostrøm kunne ikke starte efter %lld forsøg. Prøv igen, eller skift denne forbindelse til standardtilstand."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der entfernte Videostream konnte nach %lld Versuchen nicht gestartet werden. Erneut versuchen oder diese Verbindung auf den Modus „Standard“ umstellen."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se ha podido iniciar el flujo de vídeo remoto tras %lld intentos. Inténtalo de nuevo o cambia esta conexión al modo Estándar."
+          }
+        },
+        "fi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Etävideovirtaa ei saatu käynnistettyä %lld yrityksen jälkeen. Yritä uudelleen tai vaihda tämä yhteys Vakio-tilaan."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le flux vidéo distant n’a pas pu démarrer après %lld tentatives. Réessayez ou basculez cette connexion en mode Standard."
+          }
+        },
+        "he" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "לא ניתן היה להתחיל את זרם הווידאו המרוחק לאחר %lld ניסיונות. יש לנסות שוב או להעביר את החיבור הזה למצב רגיל."
+          }
+        },
+        "hu" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A távoli videostream %lld próbálkozás után sem indult el. Próbálja újra, vagy váltsa át ezt a kapcsolatot Normál módba."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Non è stato possibile avviare il flusso video remoto dopo %lld tentativi. Riprova oppure passa questa connessione alla modalità Standard."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld回試行しましたが、リモートのビデオストリームを開始できませんでした。やり直すか、この接続を標準モードに切り替えてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld번 시도 후에도 원격 비디오 스트림을 시작하지 못했습니다. 다시 시도하거나 이 연결을 표준 모드로 전환하십시오."
+          }
+        },
+        "nb" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Den eksterne videostrømmen kunne ikke starte etter %lld forsøk. Prøv på nytt, eller bytt denne tilkoblingen til standardmodus."
+          }
+        },
+        "nl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "De externe videostream kon na %lld pogingen niet worden gestart. Probeer het opnieuw of schakel deze verbinding over naar de modus ‘Standaard’."
+          }
+        },
+        "pl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nie udało się uruchomić zdalnego strumienia wideo po %lld próbach. Spróbuj ponownie lub przełącz to połączenie na tryb Standard."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não foi possível iniciar o fluxo de vídeo remoto após %lld tentativas. Tente novamente ou mude esta conexão para o modo Padrão."
+          }
+        },
+        "pt-PT" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não foi possível iniciar o fluxo de vídeo remoto após %lld tentativas. Tente novamente ou mude esta ligação para o modo Padrão."
+          }
+        },
+        "ro" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fluxul video la distanță nu a putut porni după %lld încercări. Încercați din nou sau comutați această conexiune la modul Standard."
+          }
+        },
+        "sl" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Oddaljenega videotoka po %lld poskusih ni bilo mogoče zagnati. Poskusite znova ali preklopite to povezavo v standardni način."
+          }
+        },
+        "sv" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Det gick inte att starta fjärrvideoströmmen efter %lld försök. Försök igen eller växla den här anslutningen till läget Standard."
+          }
+        },
+        "uk" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не вдалося запустити віддалений відеопотік після %lld спроб. Спробуйте ще раз або перемкніть це підключення на стандартний режим."
+          }
+        },
+        "vi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Không thể bắt đầu luồng video từ xa sau %lld lần thử. Hãy thử lại hoặc chuyển kết nối này sang chế độ Tiêu chuẩn."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "尝试 %lld 次后仍无法启动远程视频流。请重试，或将此连接切换为标准模式。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "嘗試 %lld 次後仍無法啟動遠端影像串流。請再試一次，或將此連線切換為「標準」模式。"
+          }
+        }
+      }
     },
     "The saved Keychain item did not contain credential data." : {
       "localizations" : {
