@@ -439,6 +439,13 @@ public struct RemoteDesktopView: View {
     @ViewBuilder
     private var hudMenu: some View {
         Menu {
+            Button {
+                requestPasswordSend()
+            } label: {
+                Label(String(localized: "Type User Password", bundle: .module), systemImage: "key.fill")
+            }
+            .disabled(!session.canSendLoginPassword)
+
             #if canImport(UIKit)
             if !hardwareKeyboardAttached {
                 Button {
@@ -458,65 +465,120 @@ public struct RemoteDesktopView: View {
                 hudMenuExtras
             }
 
-            if keyboardCapture.hasReservedHostShortcuts {
-                if hardwareKeyboardAttached {
-                    Toggle(isOn: Binding(
-                        get: { keyboardCapture.routesReservedHostShortcutsToVNC },
-                        set: { keyboardCapture.routeReservedHostShortcutsToVNC($0) }
-                    )) {
-                        Label(String(localized: "Route Reserved Shortcuts to VNC", bundle: .module), systemImage: "keyboard.badge.ellipsis")
-                    }
-                }
-            } else {
-                Button {
-                    keyboardCapture.toggle()
-                    if !keyboardCapture.isCaptured {
-                        keyboardActive = false
-                    }
-                } label: {
+            keyboardCaptureControl
+            remoteCommandsMenu
+            #endif
+
+            displayMenu
+
+            if let toggleFullScreen {
+                Button(action: toggleFullScreen) {
                     Label(
-                        keyboardCapture.isCaptured
-                            ? String(localized: "Release Keyboard Capture", bundle: .module)
-                            : String(localized: "Capture Keyboard", bundle: .module),
-                        systemImage: keyboardCapture.isCaptured
-                            ? "keyboard.badge.ellipsis" : "keyboard")
+                        isFullScreen
+                            ? String(localized: "Exit Full Screen", bundle: .module)
+                            : String(localized: "Enter Full Screen", bundle: .module),
+                        systemImage: isFullScreen
+                            ? "arrow.down.right.and.arrow.up.left"
+                            : "arrow.up.left.and.arrow.down.right")
                 }
             }
 
-            Menu {
-                Section(String(localized: "Mac Specific", bundle: .module)) {
-                    ForEach(RemoteCommand.macSpecific) { command in
-                        Button(command.title) {
-                            keyboardHandler.handleRemoteCommand(command)
-                        }
-                    }
+            if let clipboardSynchronizer {
+                VNCClipboardMenu(
+                    synchronizer: clipboardSynchronizer,
+                    onSharedClipboardUserChange: onSharedClipboardUserChange
+                )
+            }
+
+            Divider()
+
+            Button(role: .destructive) {
+                session.disconnect()
+            } label: {
+                Label(String(localized: "Close Connection", bundle: .module), systemImage: "xmark.circle")
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.body.weight(.bold))
+                .frame(width: 46, height: 46)
+                .modifier(HUDButtonChromeModifier())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.primary)
+        .accessibilityLabel(String(localized: "Remote Desktop Controls", bundle: .module))
+        .help(String(localized: "Remote Desktop Controls", bundle: .module))
+    }
+
+    #if canImport(UIKit)
+    @ViewBuilder
+    private var keyboardCaptureControl: some View {
+        if keyboardCapture.hasReservedHostShortcuts {
+            if hardwareKeyboardAttached {
+                Toggle(isOn: Binding(
+                    get: { keyboardCapture.routesReservedHostShortcutsToVNC },
+                    set: { keyboardCapture.routeReservedHostShortcutsToVNC($0) }
+                )) {
+                    Label(String(localized: "Route Reserved Shortcuts to VNC", bundle: .module), systemImage: "keyboard.badge.ellipsis")
                 }
-
-                Section(String(localized: "Other Commands", bundle: .module)) {
-                    Button(String(localized: "Dictate", bundle: .module)) {
-                        requestDictation()
-                    }
-
-                    ForEach(RemoteCommand.otherCommands) { command in
-                        Button(command.title) {
-                            keyboardHandler.handleRemoteCommand(command)
-                        }
-                    }
-
-                    Button(String(localized: "Command-H", bundle: .module)) {
-                        keyboardHandler.handleCommandTap("h")
-                    }
-                    Button(String(localized: "Command-M", bundle: .module)) {
-                        keyboardHandler.handleCommandTap("m")
-                    }
+            }
+        } else {
+            Button {
+                keyboardCapture.toggle()
+                if !keyboardCapture.isCaptured {
+                    keyboardActive = false
                 }
             } label: {
                 Label(
-                    String(localized: "Commands", bundle: .module),
-                    systemImage: "command")
+                    keyboardCapture.isCaptured
+                        ? String(localized: "Release Keyboard Capture", bundle: .module)
+                        : String(localized: "Capture Keyboard", bundle: .module),
+                    systemImage: keyboardCapture.isCaptured
+                        ? "keyboard.badge.ellipsis" : "keyboard")
             }
-            #endif
+        }
+    }
 
+    private var remoteCommandsMenu: some View {
+        Menu {
+            Section(String(localized: "Mac Specific", bundle: .module)) {
+                ForEach(RemoteCommand.macSpecific) { command in
+                    Button(command.title) {
+                        keyboardHandler.handleRemoteCommand(command)
+                    }
+                }
+            }
+
+            Section(String(localized: "Other Commands", bundle: .module)) {
+                Button(String(localized: "Dictate", bundle: .module)) {
+                    requestDictation()
+                }
+
+                ForEach(RemoteCommand.otherCommands) { command in
+                    Button(command.title) {
+                        keyboardHandler.handleRemoteCommand(command)
+                    }
+                }
+
+                Button(String(localized: "Command-H", bundle: .module)) {
+                    keyboardHandler.handleCommandTap("h")
+                }
+                Button(String(localized: "Command-M", bundle: .module)) {
+                    keyboardHandler.handleCommandTap("m")
+                }
+            }
+        } label: {
+            Label(
+                String(localized: "Commands", bundle: .module),
+                systemImage: "command")
+        }
+    }
+    #endif
+
+    /// Viewport controls and remote-display privacy belong together. Grouping
+    /// them keeps the top level short without hiding any capability.
+    @ViewBuilder
+    private var displayMenu: some View {
+        Menu {
             Menu {
                 ForEach(RemoteViewportPanningMode.allCases, id: \.self) { mode in
                     Button {
@@ -543,18 +605,6 @@ public struct RemoteDesktopView: View {
             }
             .disabled(viewport.isIdentity)
 
-            if let toggleFullScreen {
-                Button(action: toggleFullScreen) {
-                    Label(
-                        isFullScreen
-                            ? String(localized: "Exit Full Screen", bundle: .module)
-                            : String(localized: "Enter Full Screen", bundle: .module),
-                        systemImage: isFullScreen
-                            ? "arrow.down.right.and.arrow.up.left"
-                            : "arrow.up.left.and.arrow.down.right")
-                }
-            }
-
             if session.supportsCurtainMode {
                 Toggle(isOn: curtainBinding) {
                     Label(
@@ -564,40 +614,11 @@ public struct RemoteDesktopView: View {
                             : "eye.slash")
                 }
             }
-
-            if let clipboardSynchronizer {
-                VNCClipboardMenu(
-                    synchronizer: clipboardSynchronizer,
-                    onSharedClipboardUserChange: onSharedClipboardUserChange
-                )
-            }
-
-            Divider()
-
-            Button {
-                requestPasswordSend()
-            } label: {
-                Label(String(localized: "Type User Password", bundle: .module), systemImage: "key.fill")
-            }
-            .disabled(!session.canSendLoginPassword)
-
-            Divider()
-
-            Button(role: .destructive) {
-                session.disconnect()
-            } label: {
-                Label(String(localized: "Close Connection", bundle: .module), systemImage: "xmark.circle")
-            }
         } label: {
-            Image(systemName: "ellipsis")
-                .font(.body.weight(.bold))
-                .frame(width: 46, height: 46)
-                .modifier(HUDButtonChromeModifier())
+            Label(
+                String(localized: "Display", bundle: .module),
+                systemImage: "display")
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(.primary)
-        .accessibilityLabel(String(localized: "Remote Desktop Controls", bundle: .module))
-        .help(String(localized: "Remote Desktop Controls", bundle: .module))
     }
 
     private func requestPasswordSend() {
