@@ -198,6 +198,24 @@ final class StandardFramebufferPipelineTests: XCTestCase {
         XCTAssertFalse(tracker.suppressesPresentation)
     }
 
+    func testReplacementConnectionStartsWithFreshDCTCoverage() {
+        var tracker = StandardInitialFramePresentationTracker()
+        XCTAssertTrue(tracker.ingest([
+            dctRect(x: 0, y: 0, width: 16, height: 8, type: 0),
+        ], framebufferWidth: 16, framebufferHeight: 8))
+
+        tracker.reset()
+
+        XCTAssertFalse(tracker.ingest([
+            dctRect(x: 0, y: 0, width: 0, height: 0, type: 2),
+            dctRect(x: 0, y: 0, width: 8, height: 8, type: 0),
+        ], framebufferWidth: 16, framebufferHeight: 8))
+        XCTAssertTrue(tracker.suppressesPresentation)
+        XCTAssertEqual(tracker.uncoveredRegions, [
+            CGRect(x: 8, y: 0, width: 8, height: 8),
+        ])
+    }
+
     func testDCTRefinementDoesNotClaimMissingInitialCoverage() {
         var tracker = StandardInitialFramePresentationTracker()
         XCTAssertFalse(tracker.ingest([

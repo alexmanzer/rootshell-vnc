@@ -49,13 +49,25 @@ private actor SuccessfulRFBConnection: RFBConnection {
     private var readOffset = 0
     private var closed = false
     private var readWaiters: [CheckedContinuation<Void, Never>] = []
+    private var sentFramebufferUpdateRequests = 0
+    private let recordsFramebufferUpdateRequests: Bool
 
-    init(name: String) {
+    init(
+        name: String,
+        width: UInt16 = 1024,
+        height: UInt16 = 768,
+        recordsFramebufferUpdateRequests: Bool = false
+    ) {
         var script = Data("RFB 003.008\n".utf8)
         script.append(contentsOf: [1, SecurityType.none.rawValue])
         script.append(contentsOf: [0, 0, 0, 0])
-        script.append(Self.serverInitMessage(width: 1024, height: 768, name: name))
+        script.append(Self.serverInitMessage(
+            width: width,
+            height: height,
+            name: name))
         self.serverBytes = script
+        self.recordsFramebufferUpdateRequests =
+            recordsFramebufferUpdateRequests
     }
 
     func connect() async throws {
@@ -83,6 +95,9 @@ private actor SuccessfulRFBConnection: RFBConnection {
 
     func send(_ data: Data) async throws {
         if closed { throw VNCProtocolError.connectionClosed }
+        if recordsFramebufferUpdateRequests, data.first == 3 {
+            sentFramebufferUpdateRequests += 1
+        }
     }
 
     func close() {
@@ -101,6 +116,10 @@ private actor SuccessfulRFBConnection: RFBConnection {
         let waiters = readWaiters
         readWaiters = []
         for waiter in waiters { waiter.resume() }
+    }
+
+    func framebufferUpdateRequestCount() -> Int {
+        sentFramebufferUpdateRequests
     }
 
     private func consume(_ count: Int) -> Data {
@@ -135,19 +154,47 @@ private actor SuccessfulRFBConnection: RFBConnection {
 private final class SuccessfulProviderRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var calls: [(host: String, port: UInt16)] = []
+    private var connections: [SuccessfulRFBConnection] = []
+    private let width: UInt16
+    private let height: UInt16
+    private let recordsFramebufferUpdateRequests: Bool
+
+    init(
+        width: UInt16 = 1024,
+        height: UInt16 = 768,
+        recordsFramebufferUpdateRequests: Bool = false
+    ) {
+        self.width = width
+        self.height = height
+        self.recordsFramebufferUpdateRequests =
+            recordsFramebufferUpdateRequests
+    }
 
     func makeConnection(host: String, port: UInt16) -> any RFBConnection {
         lock.lock()
         calls.append((host, port))
         let attempt = calls.count
+        let connection = SuccessfulRFBConnection(
+            name: "attempt-\(attempt)",
+            width: width,
+            height: height,
+            recordsFramebufferUpdateRequests:
+                recordsFramebufferUpdateRequests)
+        connections.append(connection)
         lock.unlock()
-        return SuccessfulRFBConnection(name: "attempt-\(attempt)")
+        return connection
     }
 
     var recorded: [(host: String, port: UInt16)] {
         lock.lock()
         defer { lock.unlock() }
         return calls
+    }
+
+    var createdConnections: [SuccessfulRFBConnection] {
+        lock.lock()
+        defer { lock.unlock() }
+        return connections
     }
 }
 
@@ -388,6 +435,133 @@ final class VNCConfigurationTransportTests: XCTestCase {
         session.disconnect()
     }
 
+    @MainActor
+    func testReconnectWaitsForReplacementInitialFramebufferCoverage() async throws {
+        let width: UInt16 = 16
+        let height: UInt16 = 8
+        let recorder = SuccessfulProviderRecorder(
+            width: width,
+            height: height,
+            recordsFramebufferUpdateRequests: true)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            targetFrameRate: 1,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0))
+        configuration.transportProvider = { host, port in
+            recorder.makeConnection(host: host, port: port)
+        }
+
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "frame-generation.test",
+            port: 5900,
+            password: ""))
+        var completed = await waitUntil {
+            session.connectionState.isConnected
+        }
+        XCTAssertTrue(completed)
+        let firstConnection = try XCTUnwrap(
+            recorder.createdConnections.first)
+
+        var requestCount = await firstConnection
+            .framebufferUpdateRequestCount()
+        await firstConnection.enqueueServerBytes(
+            Self.dctQuantizationFramebufferUpdate())
+        completed = await waitForFramebufferRequest(
+            after: requestCount,
+            on: firstConnection)
+        XCTAssertTrue(completed)
+        XCTAssertNil(session.currentImage)
+
+        requestCount = await firstConnection.framebufferUpdateRequestCount()
+        await firstConnection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0,
+            width: width, height: height,
+            byte: 0x33))
+        completed = await waitForFramebufferRequest(
+            after: requestCount,
+            on: firstConnection)
+        XCTAssertTrue(completed)
+        completed = await waitUntil { session.currentImage != nil }
+        XCTAssertTrue(completed)
+        let firstImage = try XCTUnwrap(session.currentImage)
+
+        // Leave a cadence-delayed snapshot owned by the first connection.
+        // It must be cancelled or generation-rejected after the reconnect.
+        requestCount = await firstConnection.framebufferUpdateRequestCount()
+        await firstConnection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0,
+            width: width, height: height,
+            byte: 0x44))
+        completed = await waitForFramebufferRequest(
+            after: requestCount,
+            on: firstConnection)
+        XCTAssertTrue(completed)
+
+        XCTAssertTrue(session.reconnect(with: session.configuration))
+        completed = await waitUntil {
+            recorder.createdConnections.count == 2
+                && session.connectionState.isConnected
+        }
+        XCTAssertTrue(completed)
+        let secondConnection = try XCTUnwrap(
+            recorder.createdConnections.last)
+        XCTAssertTrue(session.currentImage === firstImage)
+
+        // A replacement renderer exists after ServerInit, but no pixels from
+        // its generation do. Neither explicit reconciliation nor the
+        // suspension edge may snapshot its zero-filled framebuffer.
+        session.reconcileDisplayPresentation()
+        session.suspendsDisplayPresentation = true
+        session.suspendsDisplayPresentation = false
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertTrue(session.currentImage === firstImage)
+
+        requestCount = await secondConnection.framebufferUpdateRequestCount()
+        await secondConnection.enqueueServerBytes(
+            Self.dctQuantizationFramebufferUpdate())
+        completed = await waitForFramebufferRequest(
+            after: requestCount,
+            on: secondConnection)
+        XCTAssertTrue(completed)
+
+        // Half of the replacement base must neither satisfy the fresh gate nor
+        // let the old connection's delayed snapshot publish the new buffer.
+        requestCount = await secondConnection.framebufferUpdateRequestCount()
+        await secondConnection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0,
+            width: width / 2, height: height,
+            byte: 0x66))
+        completed = await waitForFramebufferRequest(
+            after: requestCount,
+            on: secondConnection)
+        XCTAssertTrue(completed)
+        session.reconcileDisplayPresentation()
+        session.suspendsDisplayPresentation = true
+        session.suspendsDisplayPresentation = false
+        try? await Task.sleep(for: .milliseconds(1_100))
+        XCTAssertTrue(session.currentImage === firstImage)
+
+        requestCount = await secondConnection.framebufferUpdateRequestCount()
+        await secondConnection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: width / 2, y: 0,
+            width: width / 2, height: height,
+            byte: 0x77))
+        completed = await waitForFramebufferRequest(
+            after: requestCount,
+            on: secondConnection)
+        XCTAssertTrue(completed)
+        completed = await waitUntil {
+            guard let image = session.currentImage else { return false }
+            return image !== firstImage
+        }
+        XCTAssertTrue(completed)
+
+        session.disconnect()
+    }
+
     private static func appleLoginFramebufferUpdate(
         screenFlags: UInt32
     ) -> Data {
@@ -408,6 +582,53 @@ final class VNCConfigurationTransportTests: XCTestCase {
         ])
         update.append(payload)
         return update
+    }
+
+    private static func dctQuantizationFramebufferUpdate() -> Data {
+        var update = Data([0, 0, 0, 1])
+        update.append(rectangleHeader(
+            x: 0, y: 0, width: 0, height: 0,
+            encoding: Encoding.appleMultiVariantScreenshare.rawValue))
+        update.append(contentsOf: [0, 0, 0, 129, 2])
+        update.append(Data(repeating: 0, count: 128))
+        return update
+    }
+
+    private static func rawFramebufferUpdate(
+        x: UInt16,
+        y: UInt16,
+        width: UInt16,
+        height: UInt16,
+        byte: UInt8
+    ) -> Data {
+        var update = Data([0, 0, 0, 1])
+        update.append(rectangleHeader(
+            x: x, y: y, width: width, height: height,
+            encoding: Encoding.raw.rawValue))
+        update.append(Data(
+            repeating: byte,
+            count: Int(width) * Int(height) * 4))
+        return update
+    }
+
+    private static func rectangleHeader(
+        x: UInt16,
+        y: UInt16,
+        width: UInt16,
+        height: UInt16,
+        encoding: Int32
+    ) -> Data {
+        let rawEncoding = UInt32(bitPattern: encoding)
+        return Data([
+            UInt8(x >> 8), UInt8(x & 0xff),
+            UInt8(y >> 8), UInt8(y & 0xff),
+            UInt8(width >> 8), UInt8(width & 0xff),
+            UInt8(height >> 8), UInt8(height & 0xff),
+            UInt8((rawEncoding >> 24) & 0xff),
+            UInt8((rawEncoding >> 16) & 0xff),
+            UInt8((rawEncoding >> 8) & 0xff),
+            UInt8(rawEncoding & 0xff),
+        ])
     }
 
     @MainActor
@@ -433,5 +654,24 @@ final class VNCConfigurationTransportTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(10))
         }
         return condition()
+    }
+
+    @MainActor
+    private func waitForFramebufferRequest(
+        after previousCount: Int,
+        on connection: SuccessfulRFBConnection,
+        timeout: Duration = .seconds(2)
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await connection.framebufferUpdateRequestCount()
+                > previousCount {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await connection.framebufferUpdateRequestCount()
+            > previousCount
     }
 }

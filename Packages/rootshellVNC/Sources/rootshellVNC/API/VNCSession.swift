@@ -1046,6 +1046,17 @@ public final class VNCSession {
     @ObservationIgnored
     private var initialFramePresentationTracker =
         StandardInitialFramePresentationTracker()
+    /// True only after this framebuffer generation has applied a pixel-bearing
+    /// batch that satisfies its initial-coverage gate. Reconciliation must not
+    /// snapshot a merely allocated (or retained retired) renderer before then.
+    @ObservationIgnored
+    private var standardFramebufferHasPresentablePixels = false
+    /// Invalidates framebuffer render and snapshot work when a transport or
+    /// renderer is replaced. The last complete `currentImage` may remain
+    /// visible during reconnect, but no work from its retired generation may
+    /// publish into the replacement connection.
+    @ObservationIgnored
+    private var framebufferPresentationGeneration: UInt64 = 0
     /// Rejects late geometry callbacks from a decoder retired by a newer AVC
     /// negotiation generation.
     @ObservationIgnored
@@ -1215,10 +1226,7 @@ public final class VNCSession {
         remoteDisplayRegions = []
         remoteDisplayRegionByID = [:]
         remoteDisplayRegionOrder = []
-        trailingSnapshotTask?.cancel()
-        trailingSnapshotTask = nil
-        initialFramePresentationTracker.reset()
-        lastImagePublishNanos = 0
+        invalidateStandardFramebufferPresentation()
         remoteDisplayResizeTask?.cancel()
         remoteDisplayResizeTask = nil
         lastRequestedClientDisplaySize = nil
@@ -1308,10 +1316,7 @@ public final class VNCSession {
         remoteDisplayRegions = []
         remoteDisplayRegionByID = [:]
         remoteDisplayRegionOrder = []
-        trailingSnapshotTask?.cancel()
-        trailingSnapshotTask = nil
-        initialFramePresentationTracker.reset()
-        lastImagePublishNanos = 0
+        invalidateStandardFramebufferPresentation()
         videoBandRenderer.reset()
         secondaryVideoBandRenderer.reset()
         videoStreamManager?.stopStream()
@@ -1895,11 +1900,14 @@ public final class VNCSession {
             // Returning the credit below requests the next incremental frame.
             // Keeping one update in flight prevents stale reference frames
             // from queueing while decode/presentation is busy.
-            await handleFramebufferUpdate(rects)
+            await handleFramebufferUpdate(rects, from: transport)
 
             do {
-                guard let updateTransport = transportSession else { break }
-                try await updateTransport.finishFramebufferUpdate()
+                // Applying a batch yields to the render queue. A reconnect can
+                // replace the transport while that work is in flight, so only
+                // return credit to the transport that emitted this update.
+                guard transportSession === transport else { return }
+                try await transport.finishFramebufferUpdate()
             } catch is CancellationError {
                 break
             } catch {
@@ -2031,6 +2039,11 @@ public final class VNCSession {
 
     private func handleServerInit(_ serverInit: ServerInit) {
         logger.info("Connected: \(serverInit.name) (\(serverInit.framebufferWidth)x\(serverInit.framebufferHeight))")
+
+        // ServerInit allocates a new framebuffer even when a reconnect kept
+        // the previous complete image on screen. Its initial-frame coverage
+        // and all queued presentation work are therefore a new generation.
+        invalidateStandardFramebufferPresentation()
 
         serverName = serverInit.name
         framebufferWidth = Int(serverInit.framebufferWidth)
@@ -2172,9 +2185,11 @@ public final class VNCSession {
     }
 
     private func handleFramebufferUpdate(
-        _ rects: [(FramebufferRect, Data)]
+        _ rects: [(FramebufferRect, Data)],
+        from transport: TransportSession
     ) async {
-        guard let renderer else { return }
+        guard transportSession === transport, let renderer else { return }
+        let presentationGeneration = framebufferPresentationGeneration
 
         for (rect, data) in rects {
             if isTraceEnabled {
@@ -2223,6 +2238,14 @@ public final class VNCSession {
                         rects,
                         snapshot: takeSnapshot))
             }
+        }
+        // The old renderer must finish its serial codec work, but a transport
+        // replacement while it ran retires every observable result from it.
+        guard transportSession === transport,
+              framebufferPresentationGeneration == presentationGeneration,
+              self.renderer === renderer else { return }
+        if carriesFramebufferPixels && initialFramePresentationAllowed {
+            standardFramebufferHasPresentablePixels = true
         }
         let renderFinished = DispatchTime.now().uptimeNanoseconds
         let renderMilliseconds = (renderFinished &- renderStarted) / 1_000_000
@@ -2468,6 +2491,7 @@ public final class VNCSession {
         lastRequestedClientDisplaySize = nil
         invalidateInputQueue()
         transportSession = nil
+        invalidateStandardFramebufferPresentation()
         if clearCredentials {
             activeCredentials = nil
         }
@@ -3530,17 +3554,21 @@ public final class VNCSession {
 
     private func scheduleTrailingSnapshot(interval: UInt64) {
         guard trailingSnapshotTask == nil,
-              !initialFramePresentationTracker.suppressesPresentation else { return }
+              !initialFramePresentationTracker.suppressesPresentation,
+              standardFramebufferHasPresentablePixels,
+              let renderer else { return }
+        let presentationGeneration = framebufferPresentationGeneration
         let cadenceDelay = interval &- min(
             interval,
             DispatchTime.now().uptimeNanoseconds &- lastImagePublishNanos)
         trailingSnapshotTask = Task { [weak self] in
             try? await Task.sleep(for: .nanoseconds(Int64(cadenceDelay)))
             guard let self, !Task.isCancelled else { return }
-            // Not cancelled, so this handle is still the stored one; a
-            // renderer-less exit must release it or no trailing snapshot can
-            // ever be scheduled again for this session.
-            guard let renderer = self.renderer else {
+            guard self.framebufferPresentationGeneration
+                    == presentationGeneration,
+                  self.renderer === renderer else { return }
+            guard !self.initialFramePresentationTracker.suppressesPresentation
+            else {
                 self.trailingSnapshotTask = nil
                 return
             }
@@ -3550,7 +3578,15 @@ public final class VNCSession {
                     continuation.resume(returning: renderer.snapshot())
                 }
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  self.framebufferPresentationGeneration
+                    == presentationGeneration,
+                  self.renderer === renderer else { return }
+            guard !self.initialFramePresentationTracker.suppressesPresentation
+            else {
+                self.trailingSnapshotTask = nil
+                return
+            }
             // Delivery-time presentation check: the device may have locked
             // while this task slept. The suspension-clear reconcile schedules
             // a fresh trailing snapshot.
@@ -3568,6 +3604,18 @@ public final class VNCSession {
             }
             self.trailingSnapshotTask = nil
         }
+    }
+
+    /// Retire all standard-framebuffer presentation work without clearing the
+    /// last complete image. Reconnect uses that image as a placeholder until
+    /// the replacement generation establishes complete initial coverage.
+    private func invalidateStandardFramebufferPresentation() {
+        framebufferPresentationGeneration &+= 1
+        trailingSnapshotTask?.cancel()
+        trailingSnapshotTask = nil
+        initialFramePresentationTracker.reset()
+        standardFramebufferHasPresentablePixels = false
+        lastImagePublishNanos = 0
     }
 
     private static func batchableInputEvent(
