@@ -498,7 +498,7 @@ public struct RemoteDesktopView: View {
                 Label(String(localized: "Close Connection", bundle: .module), systemImage: "xmark.circle")
             }
         } label: {
-            Image(systemName: "ellipsis")
+            Image(systemName: "line.3.horizontal")
                 .font(.body.weight(.bold))
                 .frame(width: 46, height: 46)
                 .modifier(HUDButtonChromeModifier())
