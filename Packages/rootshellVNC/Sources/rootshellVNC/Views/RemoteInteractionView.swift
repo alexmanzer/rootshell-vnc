@@ -140,8 +140,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var edgeScrollLastTimestamp: CFTimeInterval = 0
     private var edgeScrollIsDragging = false
     private var edgeScrollDisplayLink: CADisplayLink?
-    private var hoverUsesIndirectPointer = true
-    private var pointerDragUsesIndirectPointer = true
+    private var pointerDragIsPencil = false
+    /// Last pencil drag position and time, for barrel-tap right-clicks on
+    /// non-hover-capable hardware. Deliberately separate from lastPointerPoint,
+    /// which mouse/trackpad input also writes.
+    private var lastPencilFramebufferPoint: (x: UInt16, y: UInt16)?
+    private var lastPencilContactTimestamp: CFTimeInterval = 0
+    /// The view that saw the most recent pencil contact, process-wide. UIKit
+    /// delivers a barrel tap to every visible UIPencilInteraction, so without
+    /// hover data only the last-touched pane may respond.
+    private static weak var lastPencilContactView: RemoteInputUIView?
     /// A direct touch that lands during a fling catches it, exactly like
     /// touching a decelerating native scroll view: the fling stops and that
     /// touch must never click or hold-drag. Set at the catching touch-down,
@@ -210,6 +218,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         target: self,
         action: #selector(handleHover(_:)))
     private lazy var pointerInteraction = UIPointerInteraction(delegate: self)
+    #if !targetEnvironment(macCatalyst) && !os(visionOS)
+    private lazy var pencilInteraction = UIPencilInteraction(delegate: self)
+    #endif
     #if targetEnvironment(macCatalyst)
     private lazy var secondaryClickInteraction = UIContextMenuInteraction(delegate: self)
     private var catalystCursor: NSCursor?
@@ -524,6 +535,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         addInteraction(secondaryClickInteraction)
         #else
         addInteraction(pointerInteraction)
+        #if !os(visionOS)
+        // Barrel double-tap (Pencil 2/Pro) = remote right-click
+        addInteraction(pencilInteraction)
+        #endif
         addSubview(remoteCursorImageView)
         #endif
         NotificationCenter.default.addObserver(
@@ -2087,12 +2102,27 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             // sending a zero-button pointer event that would release the item.
             updateRemoteCursorImage(at: location)
             #endif
-            if pointerDragUsesIndirectPointer {
+            // The initial pencil contact must press at the content visibly
+            // under the tip: panning first would shift the continuous-mode
+            // viewport and press at the post-pan coordinate. Later drag events
+            // pan normally for zoomed-in edge reach.
+            let isInitialPencilContact = pointerDragIsPencil && !pointerDragActive
+            if !isInitialPencilContact {
                 updatePointerPanning(at: location, isDragging: true)
-            } else {
-                stopEdgeScrolling()
             }
             guard let point = framebufferPoint(for: location) else { return }
+            if isInitialPencilContact {
+                // Sync the server pointer before the button goes down so
+                // remote UIs hit-test the landing spot, mirroring the scroll
+                // path. The trackpad pointer already streams moves via
+                // UIPointerInteraction.
+                touchHandler.handleMove(x: point.x, y: point.y)
+            }
+            if pointerDragIsPencil {
+                lastPencilFramebufferPoint = point
+                lastPencilContactTimestamp = CACurrentMediaTime()
+                Self.lastPencilContactView = self
+            }
             lastPointerPoint = point
             pointerDragActive = true
             touchHandler.handleDrag(x: point.x, y: point.y)
@@ -2265,12 +2295,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         }
         #endif
 
-        if !hoverUsesIndirectPointer {
-            stopEdgeScrolling()
-        } else if !directScrollPhaseActive,
-                  !momentumScrollPhaseActive,
-                  !pointerDragActive,
-                  recognizer.state == .began || recognizer.state == .changed {
+        if !directScrollPhaseActive,
+           !momentumScrollPhaseActive,
+           !pointerDragActive,
+           recognizer.state == .began || recognizer.state == .changed {
             updatePointerPanning(
                 at: recognizer.location(in: self),
                 isDragging: false)
@@ -2496,11 +2524,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             }
             return accepted
         case .hover:
-            guard gestureRecognizer === hoverRecognizer else { return false }
-            hoverUsesIndirectPointer = event.allTouches?.contains {
-                $0.type == .pencil
-            } != true
-            return true
+            return gestureRecognizer === hoverRecognizer
         default:
             if gestureRecognizer === scrollRecognizer {
                 return false
@@ -2512,9 +2536,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                     // consumed by the zero-delay primary drag recognizer.
                     return false
                 }
-                pointerDragUsesIndirectPointer = event.allTouches?.contains {
+                pointerDragIsPencil = event.allTouches?.contains {
                     $0.type == .pencil
-                } != true
+                } == true
             }
             return true
         }
@@ -2767,6 +2791,35 @@ extension RemoteInputUIView: UIContextMenuInteractionDelegate {
         touchHandler.handleRightClick(x: point.x, y: point.y)
         // The remote desktop owns the contextual action; suppress a local menu.
         return nil
+    }
+}
+#endif
+
+#if !targetEnvironment(macCatalyst) && !os(visionOS)
+extension RemoteInputUIView: UIPencilInteractionDelegate {
+    private static let pencilBarrelTapRecency: CFTimeInterval = 5
+
+    func pencilInteraction(
+        _ interaction: UIPencilInteraction,
+        didReceiveTap tap: UIPencilInteraction.Tap
+    ) {
+        guard UIPencilInteraction.preferredTapAction != .ignore,
+              !pointerDragActive else { return }
+        if let hoverLocation = tap.hoverPose?.location {
+            // Hover-capable hardware reports the pencil's position in this
+            // view's coordinates; outside our bounds means another pane owns
+            // the tap.
+            guard bounds.contains(hoverLocation),
+                  let point = framebufferPoint(for: hoverLocation) else { return }
+            touchHandler.handleRightClick(x: point.x, y: point.y)
+            return
+        }
+        // No hover data: only the most recently pencil-touched view responds,
+        // at the pencil's own last position, and only near the touch in time.
+        guard Self.lastPencilContactView === self,
+              CACurrentMediaTime() - lastPencilContactTimestamp <= Self.pencilBarrelTapRecency,
+              let point = lastPencilFramebufferPoint else { return }
+        touchHandler.handleRightClick(x: point.x, y: point.y)
     }
 }
 #endif
