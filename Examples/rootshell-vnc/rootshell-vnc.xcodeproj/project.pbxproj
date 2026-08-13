@@ -70,7 +70,6 @@
 		47265FBC2F69C6CE005C1D3E = {
 			isa = PBXGroup;
 			children = (
-				AABB00032F69D000005C1D3E /* Packages */,
 				47265FC72F69C6CE005C1D3E /* rootshell-vnc */,
 				47265FC62F69C6CE005C1D3E /* Products */,
 			);
@@ -84,13 +83,6 @@
 				47265FDC2F69C6CF005C1D3E /* rootshell-vncUITests.xctest */,
 			);
 			name = Products;
-			sourceTree = "<group>";
-		};
-		AABB00032F69D000005C1D3E /* Packages */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = Packages;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
