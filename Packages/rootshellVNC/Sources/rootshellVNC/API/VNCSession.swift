@@ -437,7 +437,7 @@ struct StandardInitialFramePresentationTracker {
     }
 }
 
-/// Public-framework equivalent of AVConference's audio sync source for video.
+/// Synchronizes video presentation with the remote audio playback clock.
 /// RTCP Sender Reports place both RTP streams on the server's NTP clock, while
 /// `AppleRemoteAudioPlayer` supplies the corresponding local playback point.
 /// The result is an absolute deadline for each compressed video packet.

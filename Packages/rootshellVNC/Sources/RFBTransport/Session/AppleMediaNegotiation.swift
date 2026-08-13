@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 import RFBProtocol
 
-/// Tracks the AVC message-1/answer lifecycle across in-session media
+/// Tracks the media message-1/answer lifecycle across in-session
 /// reconfigurations. The protocol permits one pending offer at a time; message
 /// 2 completes that exchange, and a display resize starts a new cycle.
 struct AppleMediaNegotiationGenerationTracker {
@@ -109,7 +109,7 @@ public enum AppleMediaVideoMode {
     }
 
     public static var negotiatedTilesPerFrame: UInt64 {
-        // A/B diagnostic override. Viceroy negotiates the minimum of the
+        // A/B diagnostic override. The peer negotiates the minimum of the
         // peers' values, so this can only lower or restore the native mode-7
         // four-tile decoder capability.
         if let override = ProcessInfo.processInfo.environment[
@@ -163,7 +163,7 @@ public enum AppleMediaVideoMode {
     }
 }
 
-/// Portable encoder for the Viceroy v1 media-negotiation message used by
+/// Portable encoder for the version-1 media-negotiation message used by
 /// Apple's RFB media-stream extension.
 ///
 /// The message is generated per session so its creation timestamp, RTP SSRC,
@@ -172,14 +172,14 @@ public enum AppleMediaVideoMode {
 /// media session.
 struct AppleMediaNegotiationProfile: Sendable {
     /// Screen Sharing supplies this app-specific access-network override when
-    /// constructing its mode-7 negotiator. A bare AVCMediaStreamNegotiator
-    /// defaults to zero, but the resulting native server-side video config is
-    /// consistently one for real Screen Sharing sessions.
+    /// constructing its mode-7 negotiator. The default wire value is zero,
+    /// but the resulting native server-side video config is consistently one
+    /// for real Screen Sharing sessions.
     private static let screenAccessNetworkType: UInt64 = 1
     private static let screenVideoTransportType: UInt64 = 1
 
-    /// Viceroy negotiates the minimum of the peers' values. Prefer its ordinary
-    /// one-picture profile when that picture fits a 60-fps level-5.1 stream;
+    /// The peers negotiate the minimum of their values. Prefer the ordinary
+    /// one-picture profile when it fits a 60-fps level-5.1 stream;
     /// retain four-source capture for larger desktops.
     static func publicDecoderTilesPerFrame(
         pixelWidth: Int,
@@ -414,10 +414,10 @@ struct AppleMediaNegotiationProfile: Sendable {
     /// Both legacy and extended bandwidth modes are included because the peer
     /// selects one according to its connection/profile type. Legacy maxima are
     /// in kbps; extended maxima are in bps.
-    /// Preserve AVConference's wire order. These are repeated protobuf values,
-    /// not a dictionary: Viceroy walks the ordered capability list while
-    /// selecting the active bandwidth mode. Reordering an equivalent set can
-    /// select a different screen rate-controller profile on the peer.
+    /// Preserve the peer-compatible wire order. These are repeated protobuf
+    /// values, not a dictionary: the peer walks the ordered capability list
+    /// while selecting the active bandwidth mode. Reordering an equivalent set
+    /// can select a different screen rate-controller profile on the peer.
     private static let bandwidthSettings: [BandwidthSetting] = [
         .init(legacyMode: 4_074, maximum: 0, extendedMode: 16_384),          // FaceTime 5G
         .init(legacyMode: 4, maximum: 6_500),                                // FaceTime Wi-Fi
@@ -479,9 +479,9 @@ struct AppleMediaNegotiationProfile: Sendable {
             if written > 0 {
                 output.count = written
                 // Apple's Compression framework emits a raw DEFLATE payload
-                // for COMPRESSION_ZLIB. Viceroy's `newDecompressedBlob:`
-                // expects the complete RFC 1950 stream: CMF/FLG, DEFLATE data,
-                // and the Adler-32 of the uncompressed protobuf.
+                // for COMPRESSION_ZLIB. The peer expects the complete RFC 1950
+                // stream: CMF/FLG, DEFLATE data, and the Adler-32 of the
+                // uncompressed protobuf.
                 var zlib = Data([0x78, 0xda]) // deflate, 32 KiB window, max-level hint
                 zlib.append(output)
                 let checksum = adler32(input)

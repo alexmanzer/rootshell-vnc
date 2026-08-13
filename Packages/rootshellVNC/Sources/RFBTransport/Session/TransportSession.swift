@@ -6267,9 +6267,10 @@ public actor TransportSession {
         }
     }
 
-    /// Match AVConference's compound generation bootstrap: each dependent
-    /// source gets a one-source Receiver Report followed by the 12-byte
-    /// empty-CNAME SDES packet. Standalone aggregate RCTL then runs at 20 Hz.
+    /// Match the peer-compatible compound generation bootstrap: each
+    /// dependent source gets a one-source Receiver Report followed by the
+    /// 12-byte empty-CNAME SDES packet. Standalone aggregate RCTL then runs at
+    /// 20 Hz.
     private func sendAppleMediaBootstrapReceiverReports(
         mediaSSRCs: [UInt32]
     ) async {

@@ -72,7 +72,7 @@ final class AppleMediaRateController {
                 minimumCapacity: minimum,
                 maximumCapacity: max(minimum, maximum),
                 initialCapacity: min(maximum, max(minimum, initial)),
-                // The negotiated Viceroy profile already owns its codec
+                // The negotiated media profile already owns its codec
                 // headroom. Applying another factor here kept feedback below
                 // the profile's real 20/40/60/75/100 Mbps tiers.
                 targetUtilization: value("ROOTSHELL_VNC_RC_TARGET_UTILIZATION", default: 1.0),
@@ -145,7 +145,7 @@ final class AppleMediaRateController {
     // 90 kHz RTP clock; receive time is truncated to a 1 kHz clock. OWRD is
     // the positive difference between a 10% short EMA and a 0.01% long EMA
     // of that clock drift. Keeping this state here reproduces the algorithm
-    // with ordinary RTP metadata and no private framework dependency.
+    // using ordinary RTP metadata.
     private var owrdPreviousRTPTimestamp: UInt32?
     private var owrdFirstSendTimestamp: UInt32?
     private var owrdFirstReceiveTimestamp: UInt32?

@@ -21,7 +21,7 @@ private enum AppleMediaResiliencyWire {
     static let payloadSpecificFeedbackType: UInt8 = 206
     static let frameLossApplicationType: UInt32 = 6
     static let frameLossLengthInWordsMinusOne: UInt16 = 5
-    /// AVConference's public RTCP APP wire identifier for an LTR decode
+    /// RTCP APP wire identifier required for a compatible LTR decode
     /// acknowledgement. This is a network-order integer, not a fourcc.
     static let ltrAcknowledgementApplicationType: UInt32 = 5
     static let ltrAcknowledgementLengthInWordsMinusOne: UInt16 = 3
@@ -100,8 +100,8 @@ func appleMediaLTRAcknowledgementPacket(
     return packet
 }
 
-/// Append the minimal SDES packet emitted by AVConference to an ordinary
-/// receiver report. Its CNAME item is present with a zero-length value, making
+/// Append the minimal peer-compatible SDES packet to an ordinary receiver
+/// report. Its CNAME item is present with a zero-length value, making
 /// the SDES packet exactly 12 bytes. After the 14-byte SRTCP trailer, a
 /// 32-byte one-source RR plus this SDES is the native capture's distinctive
 /// 58-byte UDP control payload.
@@ -115,7 +115,7 @@ func appleMediaReceiverReportCompound(
     appendUInt16BE(2, to: &compound) // 12 bytes total
     appendUInt32BE(senderSSRC, to: &compound)
     compound.append(1) // CNAME item
-    compound.append(0) // zero-length CNAME, matching AVConference
+    compound.append(0) // zero-length CNAME required for wire compatibility
     compound.append(0) // END
     compound.append(0) // 32-bit padding
     return compound
