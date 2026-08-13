@@ -50,7 +50,8 @@ small standalone viewer used to develop it.
 - `VNCSession`, an observable high-level API for connection lifecycle, display
   state, input, clipboard, resizing, reconnection, and statistics
 - Reusable `ConnectionView` and `RemoteDesktopView` SwiftUI components
-- Touch input for pointer movement, clicking, dragging, scrolling, and gestures
+- Touch, mouse, trackpad, and Apple Pencil input for pointer movement, clicking,
+  dragging, scrolling, hover, and gestures
 - Software and hardware keyboard capture with host-reserved shortcut routing
 - Zooming, panning, viewport controls, fullscreen integration, and keyboard-aware
   layout
@@ -75,8 +76,13 @@ viewer and integration harness for the package.
 ## Requirements
 
 - Swift 6
-- iOS 18 or later
-- macOS 15 or later
+- iOS 18 or later for the package
+- macOS 15 or later for the package
+
+The standalone viewer currently has an iOS and iPadOS 26.2 deployment target
+and also supports Mac Catalyst. It therefore requires an Xcode installation
+with the corresponding platform SDK, even though the reusable package supports
+the older OS versions above.
 
 The package uses system frameworks including SwiftUI, Network, VideoToolbox,
 Core Media, and AVFoundation. Its external Swift dependencies are BigInt,
@@ -214,3 +220,7 @@ files.
   Metal-accelerated terminal app that uses this package
 - [rootshell.com](https://www.rootshell.com) — downloads, screenshots, release
   notes, and documentation for the rootshell app
+
+## License
+
+rootshellVNC is available under the [MIT License](LICENSE).
