@@ -6,7 +6,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "${script_dir}/../.." && pwd)"
-package_dir="${repo_dir}/Packages/rootshellVNC"
+package_dir="${repo_dir}"
 timestamp="$(date +%Y%m%d-%H%M%S)"
 output_dir="${VNC_NETWORK_MATRIX_OUT:-${package_dir}/.build/network-benchmarks/${timestamp}}"
 mkdir -p "${output_dir}"
@@ -43,18 +43,18 @@ for row in "${scenarios[@]}"; do
     export VNC_PROBE_RENDER_DCT=1
     export VNC_PROBE_SECONDS="${VNC_PROBE_SECONDS:-8}"
     if [[ "${VNC_PROBE_INCLUDE_TRANSPORT:-1}" == "1" ]]; then
-      swift test \
+      swift test -c release \
         --filter 'LiveStandardModeProbeTests/testStandardModeUpdateCadenceAndDecodeHealth'
     fi
     if [[ "${VNC_PROBE_INCLUDE_PRESENTATION:-1}" == "1" ]]; then
       IFS=',' read -ra holds <<< "${VNC_PROBE_PRESENTATION_HOLDS:-default}"
       for hold in "${holds[@]}"; do
         if [[ "${hold}" == "default" ]]; then
-          VNC_PROBE_PRESENTATION=1 swift test \
+          VNC_PROBE_PRESENTATION=1 swift test -c release \
             --filter 'LiveStandardModeProbeTests/testConditionedStandardPresentationCadence'
         else
           ROOTSHELL_VNC_DCT_REFINEMENT_HOLD_MS="${hold}" \
-          VNC_PROBE_PRESENTATION=1 swift test \
+          VNC_PROBE_PRESENTATION=1 swift test -c release \
             --filter 'LiveStandardModeProbeTests/testConditionedStandardPresentationCadence'
         fi
       done

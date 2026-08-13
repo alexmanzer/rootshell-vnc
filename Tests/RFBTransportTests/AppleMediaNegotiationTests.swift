@@ -487,7 +487,7 @@ final class AppleMediaNegotiationTests: XCTestCase {
                 usesOtherInterface: false,
                 isExpensive: false,
                 isConstrained: false),
-            remoteHost: "192.168.46.111")
+            remoteHost: "192.0.2.10")
         XCTAssertEqual(wired.initialCapacityBps, 60_000_000)
 
         let wifi = AppleMediaNetworkProfile.detect(
@@ -496,7 +496,7 @@ final class AppleMediaNegotiationTests: XCTestCase {
                 usesOtherInterface: false,
                 isExpensive: false,
                 isConstrained: false),
-            remoteHost: "192.168.46.111")
+            remoteHost: "192.0.2.10")
         XCTAssertEqual(wifi.initialCapacityBps, 20_000_000)
     }
 

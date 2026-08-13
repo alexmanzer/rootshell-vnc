@@ -16,7 +16,7 @@ import RFBProtocol
 /// (decoder concealment output with no valid reference). This reproduces the
 /// connect-time green garbage that offline decode of a full capture cannot.
 ///
-///   VNC_TEST_HOST=192.168.46.111 VNC_TEST_USERNAME=kknox VNC_TEST_PASSWORD='...' \
+///   VNC_TEST_HOST=192.0.2.10 VNC_TEST_USERNAME=test-user VNC_TEST_PASSWORD='...' \
 ///   swift test --filter WiFiRealtimeBandTests
 final class WiFiRealtimeBandTests: XCTestCase {
 

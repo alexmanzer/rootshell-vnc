@@ -2,28 +2,25 @@ import XCTest
 import Foundation
 @testable import RFBTransport
 
-/// Regression test for Apple's SRTCP (cipher suite 5 = AES-256-CM / HMAC-SHA1-80,
-/// SRTCP variant with labels 3/4/5). The interoperability vector contains a
-/// 46-byte server-to-viewer media key and one protected
-/// Sender Report (SSRC 0x11812aa6).
+/// Regression tests for Apple's SRTCP (cipher suite 5 = AES-256-CM /
+/// HMAC-SHA1-80, SRTCP labels 3/4/5). These vectors were generated from
+/// deterministic byte sequences and contain no captured session data.
 final class AppleSRTCPContextTests: XCTestCase {
 
-    private let keyB64 = "HHaIVDCPzAyi04iw/piEeO3LR2K0LYtbynsgwnfmBGOIeR7JCvdy2JWwBPnnQg=="
-    private let srtcpB64 = "gcgADBGBKqYS5tQnMkrW6BLr0ApANZwXLefHrCAXWEMZ0M1dztueZYRw2vrEbXNQv8TDWbDaZ4/auStfRLy2roAAAAEwHmd9h6rpbzlR"
+    // Synthetic 32-byte AES-256 master key + 14-byte master salt: 0x00...0x2d.
+    private let keyB64 = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLQ=="
+    private let srtcpB64 = "gMgABhEiM0R6CmmE9ckW/5A4cfEBYtI0A5xbwIAAAAHrkmPXe5xJQHrm"
+    private let expectedB64 = "gMgABhEiM0QBAgMEBQYHCAkKCwwAAAACAAAAQA=="
 
-    func testUnprotectsServerSenderReport() throws {
+    func testUnprotectsSyntheticSenderReport() throws {
         let key = Data(base64Encoded: keyB64)!
         let srtcp = Data(base64Encoded: srtcpB64)!
+        let expected = Data(base64Encoded: expectedB64)!
         XCTAssertEqual(key.count, 46)
-        XCTAssertEqual(srtcp.count, 78)
+        XCTAssertEqual(srtcp.count, expected.count + 4 + 10)
 
         let context = try AppleSRTCPContext(mediaKey: key)
-        // If the auth tag verifies and decryption runs, the crypto is correct.
-        let rtcp = try context.unprotect(srtcp)
-
-        // First 8 bytes (header + sender SSRC) are unchanged.
-        XCTAssertEqual(Array(rtcp.prefix(4)), [0x81, 0xc8, 0x00, 0x0c])
-        XCTAssertEqual(rtcp.count, 64) // SR(52) + SDES(12), index word + tag stripped
+        XCTAssertEqual(try context.unprotect(srtcp), expected)
     }
 
     func testProtectRoundTrips() throws {

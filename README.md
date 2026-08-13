@@ -61,7 +61,7 @@ small standalone viewer used to develop it.
 
 ## Package structure
 
-The Swift package lives in [`Packages/rootshellVNC`](Packages/rootshellVNC).
+The Swift package manifest, sources, and tests live at the repository root.
 
 | Product | Responsibility |
 | --- | --- |
@@ -70,8 +70,10 @@ The Swift package lives in [`Packages/rootshellVNC`](Packages/rootshellVNC).
 | `RFBTransport` | TCP/UDP I/O, authentication, encryption, tunneling hooks, and Apple media negotiation |
 | `RFBRendering` | Framebuffer composition, cursor rendering, VideoToolbox HEVC decoding, and remote audio |
 
-The root Xcode project, `rootshell-vnc.xcodeproj`, is a lightweight standalone
-viewer and integration harness for the package.
+[`Examples/rootshell-vnc`](Examples/rootshell-vnc) contains a lightweight
+standalone viewer and integration harness. Its Xcode project uses the repository
+root as a local package, so changes to the library are immediately available to
+the viewer.
 
 ## Requirements
 
@@ -90,29 +92,52 @@ SwiftNIO, SwiftNIO SSL, and SwiftNIO Transport Services.
 
 ## Add the package to an app
 
-This repository currently keeps its package manifest below the repository root.
-Clone or vendor the repository, then add `Packages/rootshellVNC` as a local Swift
-package in Xcode:
+In Xcode, choose **File → Add Package Dependencies** and enter:
 
-1. Choose **File → Add Package Dependencies**.
-2. Choose **Add Local…**.
-3. Select `Packages/rootshellVNC`.
-4. Add the `rootshellVNC` product to the application target.
+```text
+https://github.com/kitknox/rootshell-vnc.git
+```
 
-A neighboring Swift package can use the same checkout by path:
+Add the `rootshellVNC` product to the application target. Until the adaptive DCT
+hot path no longer needs target-level Debug optimization, Swift packages should
+track a branch or revision:
 
 ```swift
 dependencies: [
     .package(
-        name: "rootshellVNC",
-        path: "../rootshell-vnc/Packages/rootshellVNC"
+        url: "https://github.com/kitknox/rootshell-vnc.git",
+        branch: "main"
     ),
 ],
 targets: [
     .target(
         name: "MyApp",
         dependencies: [
-            .product(name: "rootshellVNC", package: "rootshellVNC"),
+            .product(name: "rootshellVNC", package: "rootshell-vnc"),
+        ]
+    ),
+]
+```
+
+For local development, clone the repository and add its root as a local Swift
+package in Xcode:
+
+1. Choose **File → Add Package Dependencies**.
+2. Choose **Add Local…**.
+3. Select the `rootshell-vnc` repository root.
+4. Add the `rootshellVNC` product to the application target.
+
+A neighboring Swift package can use the same checkout by path:
+
+```swift
+dependencies: [
+    .package(path: "../rootshell-vnc"),
+],
+targets: [
+    .target(
+        name: "MyApp",
+        dependencies: [
+            .product(name: "rootshellVNC", package: "rootshell-vnc"),
         ]
     ),
 ]
@@ -169,13 +194,18 @@ and is automatically unavailable when a custom transport provider is installed.
 
 ## Developing
 
-Open `rootshell-vnc.xcodeproj` to run the standalone viewer, or build and test
-the package from the command line:
+Open `Examples/rootshell-vnc/rootshell-vnc.xcodeproj` to run the standalone
+viewer, or build and test the package from the repository root:
 
 ```sh
-cd Packages/rootshellVNC
 swift test
 ```
+
+Rendering benchmarks should use `swift test -c release`. Debug builds also
+optimize the `RFBRendering` and `RFBRenderingC` targets because the adaptive DCT
+decoder is not usable at Retina resolutions under `-Onone`. SwiftPM permits
+these flags for local, branch, and revision dependencies, but rejects the
+product when it is selected through a semantic-version requirement.
 
 The test suites cover protocol parsing and state transitions, authentication and
 crypto, TCP/UDP transport behavior, Apple media negotiation and resiliency,

@@ -5,6 +5,7 @@
 .build/
 **/.build/
 **/.swiftpm/xcode/xcuserdata/
+/Package.resolved
 .swift-module-cache/
 
 # Xcode

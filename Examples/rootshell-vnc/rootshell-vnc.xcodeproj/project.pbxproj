@@ -217,7 +217,7 @@
 			mainGroup = 47265FBC2F69C6CE005C1D3E;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				AABB00012F69D000005C1D3E /* XCLocalSwiftPackageReference "Packages/rootshellVNC" */,
+				AABB00012F69D000005C1D3E /* XCLocalSwiftPackageReference "../.." */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 47265FC62F69C6CE005C1D3E /* Products */;
@@ -610,9 +610,9 @@
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */
-		AABB00012F69D000005C1D3E /* XCLocalSwiftPackageReference "Packages/rootshellVNC" */ = {
+		AABB00012F69D000005C1D3E /* XCLocalSwiftPackageReference "../.." */ = {
 			isa = XCLocalSwiftPackageReference;
-			relativePath = Packages/rootshellVNC;
+			relativePath = ../..;
 		};
 /* End XCLocalSwiftPackageReference section */
 
