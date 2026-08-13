@@ -2005,6 +2005,13 @@ public final class VNCSession {
         if reconnectTask != nil {
             guard newState == .connected else { return }
         }
+        // TransportSession emits its operational state before the ServerInit
+        // event that publishes handshake metadata and creates the framebuffer.
+        // Let handleServerInit own the public connected transition so observers
+        // never see a partially initialized session.
+        if newState == .connected {
+            return
+        }
         if hasEstablishedConnection, !intentionallyDisconnected,
            case .failed = newState {
             return
