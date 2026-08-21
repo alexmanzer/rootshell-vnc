@@ -53,6 +53,42 @@ final class AppleLoginScreenDetectorTests: XCTestCase {
         XCTAssertEqual(result.evidence, "weak password text only")
     }
 
+    func testRejectsBareLowerCenterPasswordField() {
+        let result = AppleLoginScreenDetector.analyze([
+            AppleLoginTextLine(
+                text: "Password",
+                confidence: 0.90,
+                bounds: CGRect(
+                    x: 0.44, y: 0.31, width: 0.12, height: 0.03)),
+        ])
+
+        XCTAssertFalse(result.isLoginScreen)
+        XCTAssertEqual(result.evidence, "weak password text only")
+    }
+
+    func testRejectsOrdinaryWebsitePasswordForm() {
+        let result = AppleLoginScreenDetector.analyze([
+            AppleLoginTextLine(
+                text: "Email",
+                confidence: 0.94,
+                bounds: CGRect(
+                    x: 0.40, y: 0.39, width: 0.20, height: 0.03)),
+            AppleLoginTextLine(
+                text: "Password",
+                confidence: 0.96,
+                bounds: CGRect(
+                    x: 0.40, y: 0.32, width: 0.20, height: 0.03)),
+            AppleLoginTextLine(
+                text: "Sign In",
+                confidence: 0.95,
+                bounds: CGRect(
+                    x: 0.45, y: 0.24, width: 0.10, height: 0.03)),
+        ])
+
+        XCTAssertFalse(result.isLoginScreen)
+        XCTAssertEqual(result.evidence, "weak password text only")
+    }
+
     func testGenericPasswordNeedsMultipleLoginActions() {
         let result = AppleLoginScreenDetector.analyze([
             AppleLoginTextLine(
@@ -148,6 +184,22 @@ final class TightVNCCursorTests: XCTestCase {
 }
 
 final class StandardFramebufferPipelineTests: XCTestCase {
+
+    func testSameSizeFramebufferResizePreservesPixels() {
+        let framebuffer = Framebuffer(
+            width: 2, height: 1, pixelFormat: .bgra8888)
+        let pixels = Data([
+            0x10, 0x20, 0x30, 0xff,
+            0x40, 0x50, 0x60, 0xff,
+        ])
+        framebuffer.update(x: 0, y: 0, width: 2, height: 1, data: pixels)
+
+        framebuffer.resize(width: 2, height: 1)
+
+        XCTAssertEqual(
+            framebuffer.getPixels(x: 0, y: 0, width: 2, height: 1),
+            pixels)
+    }
     func testPortableEncodingsRemainPixelBearingForPresentation() {
         let pixelEncodings: [Encoding] = [
             .raw, .tight, .zlib, .zrle, .copyRect,
@@ -2474,7 +2526,7 @@ final class VNCConnectionStateTests: XCTestCase {
 final class VideoBandGeometryTests: XCTestCase {
 
     @MainActor
-    func testAcceptedMatchClientGeometryUpdatesSessionAndGPUAspectTogether() throws {
+    func testAcceptedMatchClientGeometryUpdatesSessionAndGPUAspectTogether() async throws {
         let session = VNCSession(configuration: VNCConfiguration(
             videoQualityMode: .adaptive,
             displaySizingMode: .matchClient))
@@ -2486,7 +2538,7 @@ final class VideoBandGeometryTests: XCTestCase {
         let requested = try XCTUnwrap(RemoteDisplaySize.matching(
             viewSize: CGSize(width: 1024, height: 1366)))
 
-        session.applyRequestedRemoteDisplayGeometry(requested)
+        await session.applyRequestedRemoteDisplayGeometry(requested)
 
         XCTAssertEqual(session.framebufferWidth, Int(requested.pixelWidth))
         XCTAssertEqual(session.framebufferHeight, Int(requested.pixelHeight))
@@ -2496,6 +2548,98 @@ final class VideoBandGeometryTests: XCTestCase {
             CGFloat(requested.pixelWidth) / CGFloat(requested.pixelHeight),
             accuracy: 0.0001,
             "The GUI must aspect-fit using the accepted Match Client geometry")
+    }
+
+    @MainActor
+    func testAdaptiveAuthoritativeGeometryCreatesAndResizesCursorFramebuffer() async throws {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .adaptive,
+            displaySizingMode: .matchClient))
+        XCTAssertNil(session.standardFramebufferSize)
+
+        let initial = try XCTUnwrap(RemoteDisplaySize.matching(
+            viewSize: CGSize(width: 1024, height: 1366)))
+        await session.applyRequestedRemoteDisplayGeometry(initial)
+
+        XCTAssertEqual(
+            session.standardFramebufferSize,
+            CGSize(width: Int(initial.pixelWidth), height: Int(initial.pixelHeight)),
+            "Authoritative geometry must install the renderer used by cursor updates")
+
+        let resized = try XCTUnwrap(RemoteDisplaySize.matching(
+            viewSize: CGSize(width: 1366, height: 1024)))
+        await session.applyRequestedRemoteDisplayGeometry(resized)
+
+        XCTAssertEqual(
+            session.standardFramebufferSize,
+            CGSize(width: Int(resized.pixelWidth), height: Int(resized.pixelHeight)),
+            "A live Adaptive resize must keep the cursor framebuffer in sync")
+    }
+
+    @MainActor
+    func testAdaptiveAllDisplaysGeometryInstallsUnionCursorFramebuffer() async {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .adaptive,
+            displayCount: 2,
+            displayMode: .allDisplaysCombined))
+        await session.updateRemoteDisplayRegions([
+            RFBScreenLayout(
+                id: 1, x: 0, y: 0,
+                width: 16, height: 8, flags: 0),
+            RFBScreenLayout(
+                id: 2, x: 16, y: 0,
+                width: 16, height: 8, flags: 0),
+        ])
+        XCTAssertNil(session.standardFramebufferSize)
+
+        await session.applyAcceptedMediaStreamGeometry(VideoFrameGeometry(
+            width: 16,
+            height: 8,
+            mediaGeneration: 1))
+
+        XCTAssertEqual(session.framebufferWidth, 32)
+        XCTAssertEqual(session.framebufferHeight, 8)
+        XCTAssertEqual(
+            session.standardFramebufferSize,
+            CGSize(width: 32, height: 8),
+            "All Displays must install the union renderer used by cursor updates")
+    }
+
+    @MainActor
+    func testAdaptiveDeferredDisplayLayoutInstallsFallbackFramebuffer() async {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .adaptive,
+            displayCount: 2,
+            displayMode: .allDisplaysCombined))
+        await session.handleServerInit(ServerInit(
+            framebufferWidth: 0,
+            framebufferHeight: 0,
+            pixelFormat: .bgra8888,
+            name: "deferred-adaptive"))
+
+        await session.updateRemoteDisplayRegions([
+            AppleDisplayInfo(
+                displayIndex: 1,
+                originX: 0,
+                originY: 0,
+                width: 16,
+                height: 8,
+                flags: 0),
+            AppleDisplayInfo(
+                displayIndex: 2,
+                originX: 16,
+                originY: 0,
+                width: 16,
+                height: 8,
+                flags: 0),
+        ])
+
+        XCTAssertEqual(session.framebufferWidth, 32)
+        XCTAssertEqual(session.framebufferHeight, 8)
+        XCTAssertEqual(
+            session.standardFramebufferSize,
+            CGSize(width: 32, height: 8),
+            "DisplayInfo must make 2D fallback/cursor updates consumable before HEVC")
     }
 
     @MainActor

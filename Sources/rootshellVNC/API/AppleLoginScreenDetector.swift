@@ -22,8 +22,8 @@ struct AppleLoginTextAnalysis: Equatable, Sendable {
 /// DisplayInfo2 only reports the real Login Window and Login Window's special
 /// lock session. A logged-in user's lock screen is known to AppleVNCServer
 /// (through SACScreenSaverIsRunning) but is not serialized to the viewer. This
-/// detector therefore examines a few initial complete frames and requires a
-/// password/login phrase in the part of the screen where macOS places it.
+/// detector therefore examines complete frames and requires corroborated
+/// password/login evidence in the part of the screen where macOS places it.
 enum AppleLoginScreenDetector {
     static func recognize(cgImage: CGImage) throws -> AppleLoginTextAnalysis {
         try recognize(handler: VNImageRequestHandler(
@@ -45,16 +45,18 @@ enum AppleLoginScreenDetector {
         let usable = lines.filter { line in
             line.confidence >= 0.35 && isCentralLoginRegion(line.bounds)
         }
-        let normalized = usable.map { normalize($0.text) }
+        let normalized = usable.map { line in
+            (text: normalize(line.text), bounds: line.bounds)
+        }
 
-        if normalized.contains(where: containsStrongLoginPhrase) {
+        if normalized.contains(where: { containsStrongLoginPhrase($0.text) }) {
             return AppleLoginTextAnalysis(
                 isLoginScreen: true,
                 recognizedLineCount: lines.count,
                 evidence: "central password-entry phrase")
         }
 
-        let combined = normalized.joined(separator: " ")
+        let combined = normalized.map { $0.text }.joined(separator: " ")
         let hasPassword = containsPasswordWord(combined)
         let hasBiometric = combined.contains("touch id")
             || combined.contains("touchid")

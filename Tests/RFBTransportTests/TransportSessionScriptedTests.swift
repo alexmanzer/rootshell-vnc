@@ -268,6 +268,196 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    func testZeroSizedServerInitRecoversThroughDesktopSizeOnSameConnection() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_8.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 0, height: 0, name: "deferred-capture"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "deferred-capture.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.copyRect, .raw],
+            connection: connection)
+        try await session.connect()
+
+        let initialRequest = ClientMessage.framebufferUpdateRequest(
+            incremental: false, x: 0, y: 0, width: 0, height: 0).serialize()
+        let initialBytes = await connection.sentBytes()
+        XCTAssertTrue(initialBytes.suffix(initialRequest.count)
+            .elementsEqual(initialRequest))
+
+        let width: UInt16 = 1280
+        let height: UInt16 = 720
+        await connection.enqueueServerBytes(Self.framebufferUpdate([(
+            Self.rectangleHeader(
+                x: 0, y: 0, width: width, height: height,
+                encoding: Encoding.desktopSize.rawValue),
+            Data(),
+        )]))
+
+        let resized = await Self.withTimeout(seconds: 2) {
+            for await event in session.events {
+                if case .framebufferUpdate(let rects) = event {
+                    return rects.last?.0.isSuccessfulDesktopResize == true
+                }
+            }
+            return false
+        }
+        XCTAssertEqual(resized, true)
+
+        try await session.finishFramebufferUpdate()
+        let incrementalRequest = ClientMessage.framebufferUpdateRequest(
+            incremental: true,
+            x: 0, y: 0, width: width, height: height).serialize()
+        let sentPositiveRequest = await Self.waitUntil {
+            let bytes = await connection.sentBytes()
+            return bytes.suffix(incrementalRequest.count)
+                .elementsEqual(incrementalRequest)
+        }
+        XCTAssertTrue(sentPositiveRequest)
+        await session.disconnect()
+    }
+
+    func testDesktopSizeDoesNotSuppressAppleDisplayEventsInSameUpdate() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 0, height: 0, name: "apple-deferred"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "apple-deferred.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.serverDisplayInfo, .desktopSize, .raw],
+            connection: connection)
+        try await session.connect()
+
+        let display = AppleDisplayInfo(
+            displayIndex: 7,
+            originX: 0,
+            originY: 0,
+            width: 1280,
+            height: 720,
+            flags: 1)
+        await connection.enqueueServerBytes(Self.framebufferUpdate([
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: 1280, height: 720,
+                    encoding: Encoding.desktopSize.rawValue),
+                Data()
+            ),
+            (
+                Self.rectangleHeader(
+                    x: 0, y: 0, width: 0, height: 0,
+                    encoding: Encoding.serverDisplayInfo.rawValue),
+                Self.appleDisplayInfoPayload(display)
+            ),
+        ]))
+
+        let observed = await Self.withTimeout(seconds: 2) {
+            var record: AppleDisplayInfo?
+            var layout: [AppleDisplayInfo]?
+            for await event in session.events {
+                switch event {
+                case .displayInfo(let info):
+                    record = info
+                case .appleDisplayLayout(let displays):
+                    layout = displays
+                case .framebufferUpdate:
+                    return (record, layout)
+                default:
+                    break
+                }
+            }
+            return (record, layout)
+        }
+        XCTAssertEqual(observed?.0, display)
+        XCTAssertEqual(observed?.1, [display])
+
+        try await session.finishFramebufferUpdate()
+        let sentPositiveRequest = await Self.waitUntil {
+            let request = ClientMessage.framebufferUpdateRequest(
+                incremental: true,
+                x: 0, y: 0, width: 1280, height: 720).serialize()
+            let bytes = await connection.sentBytes()
+            return bytes.suffix(request.count).elementsEqual(request)
+        }
+        XCTAssertTrue(sentPositiveRequest)
+        await session.disconnect()
+    }
+
+    func testStandardDisplayInfo2EmitsLegacyRecordsAndAtomicLayout() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 1920, height: 1080, name: "apple-display-info-2"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "apple-display-info-2.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.unknown(1105), .raw],
+            connection: connection)
+        try await session.connect()
+
+        let displays = [
+            AppleDisplayInfo(
+                displayIndex: 7,
+                originX: 0,
+                originY: 0,
+                width: 1280,
+                height: 720,
+                flags: 1),
+            AppleDisplayInfo(
+                displayIndex: 9,
+                originX: 1280,
+                originY: 0,
+                width: 640,
+                height: 1080,
+                flags: 0),
+        ]
+        await connection.enqueueServerBytes(Self.framebufferUpdate([(
+            Self.rectangleHeader(
+                x: 0, y: 0, width: 0, height: 0,
+                encoding: 1105),
+            appleDisplayInfo2TestPayload(displays: displays)
+        )]))
+
+        let observed = await Self.withTimeout(seconds: 2) {
+            var records: [AppleDisplayInfo] = []
+            var layout: [AppleDisplayInfo]?
+            for await event in session.events {
+                switch event {
+                case .displayInfo(let display):
+                    records.append(display)
+                case .appleDisplayLayout(let displays):
+                    layout = displays
+                case .framebufferUpdate:
+                    return (records, layout)
+                default:
+                    break
+                }
+            }
+            return (records, layout)
+        }
+        XCTAssertEqual(observed?.0, displays)
+        XCTAssertEqual(observed?.1, displays)
+
+        try await session.finishFramebufferUpdate()
+        await session.disconnect()
+    }
+
     func testLastRectTerminatesUnknownLengthUpdateWithoutDesynchronizing() async throws {
         let connection = ScriptedRFBConnection()
         var script = ProtocolVersion.v3_8.wireBytes()
@@ -1225,6 +1415,23 @@ final class TransportSessionScriptedTests: XCTestCase {
             UInt8((value >> 8) & 0xff),
             UInt8(value & 0xff),
         ])
+    }
+
+    private static func appleDisplayInfoPayload(
+        _ display: AppleDisplayInfo
+    ) -> Data {
+        var data = Data()
+        for value in [
+            display.displayIndex,
+            UInt32(bitPattern: display.originX),
+            UInt32(bitPattern: display.originY),
+            display.width,
+            display.height,
+            display.flags,
+        ] {
+            data.append(uint32Bytes(value))
+        }
+        return data
     }
 
     private static func appleDisplayInfo2Payload(

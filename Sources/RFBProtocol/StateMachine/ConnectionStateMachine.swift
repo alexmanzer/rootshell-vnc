@@ -344,4 +344,16 @@ public struct ConnectionStateMachine: Sendable {
             }
         }
     }
+
+    /// Commit usable framebuffer bounds supplied by a negotiated extension.
+    /// Package-scoped so transport implementations can keep request geometry
+    /// coherent without adding an extension-specific public event case.
+    package mutating func acceptFramebufferGeometry(
+        width: UInt16,
+        height: UInt16
+    ) {
+        guard state == .operational, width > 0, height > 0 else { return }
+        framebufferWidth = width
+        framebufferHeight = height
+    }
 }

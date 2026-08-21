@@ -22,6 +22,14 @@ public final class Framebuffer: @unchecked Sendable {
     private let bitmapInfo: UInt32
     private let bitsPerComponent: Int
 
+    /// Take a consistent geometry snapshot while resize may be running on the
+    /// render queue.
+    package var size: CGSize {
+        lock.lock()
+        defer { lock.unlock() }
+        return CGSize(width: width, height: height)
+    }
+
     // MARK: - Init
 
     /// Create a framebuffer with the given dimensions.
@@ -260,6 +268,8 @@ public final class Framebuffer: @unchecked Sendable {
 
         lock.lock()
         defer { lock.unlock() }
+
+        guard newWidth != width || newHeight != height else { return }
 
         let newBytesPerRow = newWidth * bytesPerPixel
         let newByteCount = newBytesPerRow * newHeight

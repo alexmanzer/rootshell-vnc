@@ -1708,6 +1708,34 @@ final class ConnectionStateMachineTests: XCTestCase {
         XCTAssertEqual(nextHeight, 1440)
     }
 
+    func testExtensionGeometryChangesSubsequentUpdateRequestBounds() {
+        var sm = ConnectionStateMachine()
+        _ = sm.handle(event: .connected)
+        _ = sm.handle(event: .receivedProtocolVersion(.v3_8))
+        _ = sm.handle(event: .receivedSecurityTypes([.none]))
+        _ = sm.handle(event: .authenticationSucceeded)
+        _ = sm.handle(event: .receivedServerInit(ServerInit(
+            framebufferWidth: 0,
+            framebufferHeight: 0,
+            pixelFormat: .bgra8888,
+            name: "deferred")))
+
+        sm.acceptFramebufferGeometry(
+            width: 2560,
+            height: 1440)
+        let actions = sm.handle(event: .receivedFramebufferUpdate([]))
+
+        XCTAssertEqual(sm.framebufferWidth, 2560)
+        XCTAssertEqual(sm.framebufferHeight, 1440)
+        guard case .sendFramebufferUpdateRequest(
+            let incremental, let width, let height) = actions.last else {
+            return XCTFail("Expected update request after extension geometry")
+        }
+        XCTAssertTrue(incremental)
+        XCTAssertEqual(width, 2560)
+        XCTAssertEqual(height, 1440)
+    }
+
     func testRejectedExtendedDesktopResizeDoesNotChangeRequestBounds() {
         var sm = ConnectionStateMachine()
         _ = sm.handle(event: .connected)

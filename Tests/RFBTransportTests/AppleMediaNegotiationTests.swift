@@ -45,6 +45,54 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertEqual(state?.requiresLogin, true)
     }
 
+    func testMediaDisplayInfo2EmitsLegacyRecordsAndAtomicLayout() async throws {
+        let connection = ScriptedRFBConnection()
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "secret",
+            preferredEncodings: [.appleH264, .unknown(1105)],
+            connection: connection)
+        let displays = [
+            AppleDisplayInfo(
+                displayIndex: 11,
+                originX: 0,
+                originY: 0,
+                width: 1728,
+                height: 1117,
+                flags: 1),
+            AppleDisplayInfo(
+                displayIndex: 12,
+                originX: 1728,
+                originY: 0,
+                width: 1920,
+                height: 1080,
+                flags: 0),
+        ]
+
+        let eventTask = Task {
+            var records: [AppleDisplayInfo] = []
+            for await event in session.events {
+                switch event {
+                case .displayInfo(let display):
+                    records.append(display)
+                case .appleDisplayLayout(let layout):
+                    return (records, layout)
+                default:
+                    break
+                }
+            }
+            return (records, [])
+        }
+        let handled = try await session.ingestAppleMediaServerControlPayload(
+            appleMediaDisplayInfo2ControlTestPayload(displays: displays))
+        let observed = await eventTask.value
+
+        XCTAssertTrue(handled)
+        XCTAssertEqual(observed.0, displays)
+        XCTAssertEqual(observed.1, displays)
+    }
+
     func testFindsTwoByteWrappedDecryptedRFBUpdate() {
         let update = Data([0, 0, 0, 1])
             + Self.rectangleHeader(encoding: 1104)

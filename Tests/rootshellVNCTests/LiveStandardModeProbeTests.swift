@@ -642,6 +642,15 @@ final class LiveStandardModeProbeTests: XCTestCase {
         while session.currentImage == nil, Date() < firstFrameDeadline {
             try await Task.sleep(for: .milliseconds(10))
         }
+        if session.currentImage == nil {
+            print(
+                "PROBE FIRST_FRAME_TIMEOUT state=\(session.connectionState) "
+                    + "framebuffer=\(session.framebufferWidth)x\(session.framebufferHeight) "
+                    + "renderer=\(String(describing: session.standardFramebufferSize)) "
+                    + "regions=\(session.remoteDisplayRegions) "
+                    + "error=\(String(describing: session.lastError))")
+            print(session.getDiagnostics().summary())
+        }
         XCTAssertNotNil(session.currentImage, "Standard mode did not publish its first frame")
 
         let seconds = max(2, Int(env["VNC_PROBE_SECONDS"] ?? "6") ?? 6)

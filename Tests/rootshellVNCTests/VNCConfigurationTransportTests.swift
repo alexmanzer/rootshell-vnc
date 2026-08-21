@@ -1,4 +1,5 @@
 import XCTest
+import CoreGraphics
 import RFBProtocol
 import RFBTransport
 @testable import rootshellVNC
@@ -42,6 +43,35 @@ private final class ProviderRecorder: @unchecked Sendable {
     }
 }
 
+private final class LockedLoginVisionAnalysis: @unchecked Sendable {
+    private let lock = NSLock()
+    private var detected = false
+    private var invocations = 0
+
+    func setDetected(_ value: Bool) {
+        lock.lock()
+        detected = value
+        lock.unlock()
+    }
+
+    func analyze() -> AppleLoginTextAnalysis {
+        lock.lock()
+        invocations += 1
+        let detected = detected
+        lock.unlock()
+        return AppleLoginTextAnalysis(
+            isLoginScreen: detected,
+            recognizedLineCount: detected ? 1 : 0,
+            evidence: detected ? "test login" : "test desktop")
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return invocations
+    }
+}
+
 /// Successful in-memory RFB 3.8 connection used to exercise session-level
 /// reconnects without exposing or persisting credentials in the test.
 private actor SuccessfulRFBConnection: RFBConnection {
@@ -50,6 +80,7 @@ private actor SuccessfulRFBConnection: RFBConnection {
     private var closed = false
     private var readWaiters: [CheckedContinuation<Void, Never>] = []
     private var sentFramebufferUpdateRequests = 0
+    private var latestFramebufferUpdateRequest: Data?
     private let recordsFramebufferUpdateRequests: Bool
 
     init(
@@ -97,6 +128,7 @@ private actor SuccessfulRFBConnection: RFBConnection {
         if closed { throw VNCProtocolError.connectionClosed }
         if recordsFramebufferUpdateRequests, data.first == 3 {
             sentFramebufferUpdateRequests += 1
+            latestFramebufferUpdateRequest = data
         }
     }
 
@@ -120,6 +152,10 @@ private actor SuccessfulRFBConnection: RFBConnection {
 
     func framebufferUpdateRequestCount() -> Int {
         sentFramebufferUpdateRequests
+    }
+
+    func lastFramebufferUpdateRequest() -> Data? {
+        latestFramebufferUpdateRequest
     }
 
     private func consume(_ count: Int) -> Data {
@@ -318,6 +354,225 @@ final class VNCConfigurationTransportTests: XCTestCase {
     }
 
     @MainActor
+    func testSessionRecoversAllDeferredServerInitDimensionVariants() async throws {
+        let recoveredWidth: UInt16 = 16
+        let recoveredHeight: UInt16 = 8
+
+        for (initialWidth, initialHeight) in [
+            (UInt16(0), UInt16(0)),
+            (recoveredWidth, UInt16(0)),
+            (UInt16(0), recoveredHeight),
+        ] {
+            let connection = SuccessfulRFBConnection(
+                name: "deferred-\(initialWidth)x\(initialHeight)",
+                width: initialWidth,
+                height: initialHeight,
+                recordsFramebufferUpdateRequests: true)
+            var configuration = VNCConfiguration(
+                videoQualityMode: .standard,
+                reconnectionPolicy: VNCReconnectionPolicy(
+                    isEnabled: false,
+                    maximumAttempts: 0))
+            configuration.transportProvider = { _, _ in connection }
+            let session = VNCSession(configuration: configuration)
+
+            try await session.connect(credentials: VNCCredentials(
+                host: "deferred.test",
+                port: 5900,
+                password: ""))
+            var completed = await waitUntil {
+                session.connectionState.isConnected
+            }
+            XCTAssertTrue(completed)
+            XCTAssertNil(session.currentImage)
+
+            var requestCount = await connection
+                .framebufferUpdateRequestCount()
+            await connection.enqueueServerBytes(Self.desktopSizeFramebufferUpdate(
+                width: recoveredWidth,
+                height: recoveredHeight))
+            completed = await waitForFramebufferRequest(
+                after: requestCount,
+                on: connection)
+            XCTAssertTrue(completed)
+            XCTAssertEqual(session.framebufferWidth, Int(recoveredWidth))
+            XCTAssertEqual(session.framebufferHeight, Int(recoveredHeight))
+            XCTAssertNil(session.currentImage)
+
+            requestCount = await connection.framebufferUpdateRequestCount()
+            await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+                x: 0, y: 0,
+                width: recoveredWidth, height: recoveredHeight,
+                byte: 0x5a))
+            completed = await waitForFramebufferRequest(
+                after: requestCount,
+                on: connection)
+            XCTAssertTrue(completed)
+            completed = await waitUntil { session.currentImage != nil }
+            XCTAssertTrue(completed)
+            session.disconnect()
+        }
+    }
+
+    @MainActor
+    func testAppleServerDisplayInfoRecoversZeroServerInit() async throws {
+        let connection = SuccessfulRFBConnection(
+            name: "deferred-apple",
+            width: 0,
+            height: 0,
+            recordsFramebufferUpdateRequests: true)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0))
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+
+        try await session.connect(credentials: VNCCredentials(
+            host: "mac.test",
+            port: 5900,
+            password: ""))
+        var completed = await waitUntil {
+            session.connectionState.isConnected
+        }
+        XCTAssertTrue(completed)
+        XCTAssertNil(session.currentImage)
+
+        let requestCount = await connection.framebufferUpdateRequestCount()
+        await connection.enqueueServerBytes(Self.appleDisplayInfoFramebufferUpdate([
+            AppleDisplayInfo(
+                displayIndex: 0,
+                originX: 0,
+                originY: 0,
+                width: 16,
+                height: 8,
+                flags: 0),
+            AppleDisplayInfo(
+                displayIndex: 1,
+                originX: 16,
+                originY: 0,
+                width: 16,
+                height: 8,
+                flags: 0),
+        ]))
+        completed = await waitForFramebufferRequest(
+            after: requestCount,
+            on: connection)
+        XCTAssertTrue(completed, "DisplayInfo must restart the RFB request loop")
+        completed = await waitUntil {
+            session.framebufferWidth == 32 && session.framebufferHeight == 8
+        }
+        XCTAssertTrue(completed)
+        XCTAssertNil(session.currentImage)
+
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 32, height: 8, byte: 0x6b))
+        completed = await waitUntil { session.currentImage != nil }
+        XCTAssertTrue(completed)
+
+        let resizeRequestCount = await connection.framebufferUpdateRequestCount()
+        await connection.enqueueServerBytes(Self.appleDisplayInfoFramebufferUpdate([
+            AppleDisplayInfo(
+                displayIndex: 0,
+                originX: 0,
+                originY: 0,
+                width: 16,
+                height: 8,
+                flags: 0),
+        ]))
+        completed = await waitForFramebufferRequest(
+            after: resizeRequestCount,
+            on: connection)
+        XCTAssertTrue(completed)
+        completed = await waitUntil {
+            session.framebufferWidth == 16 && session.framebufferHeight == 8
+        }
+        XCTAssertTrue(completed, "A complete classic layout must evict unplugged displays")
+        let latestRequest = await connection.lastFramebufferUpdateRequest()
+        XCTAssertEqual(
+            latestRequest,
+            ClientMessage.framebufferUpdateRequest(
+                incremental: true,
+                x: 0, y: 0,
+                width: 16, height: 8).serialize(),
+            "Transport and state-machine geometry must shrink with the layout")
+        session.disconnect()
+    }
+
+    @MainActor
+    func testPreGeometryCursorIsReplayedAfterDesktopSize() async throws {
+        let connection = SuccessfulRFBConnection(
+            name: "deferred-cursor",
+            width: 0,
+            height: 0)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0))
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+
+        try await session.connect(credentials: VNCCredentials(
+            host: "cursor.test",
+            port: 5900,
+            password: ""))
+        var completed = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(completed)
+
+        var updates = Self.cursorFramebufferUpdate()
+        updates.append(Self.desktopSizeFramebufferUpdate(width: 16, height: 8))
+        await connection.enqueueServerBytes(updates)
+
+        completed = await waitUntil {
+            session.framebufferWidth == 16
+                && session.framebufferHeight == 8
+                && session.remoteCursor != nil
+        }
+        XCTAssertTrue(completed)
+        session.disconnect()
+    }
+
+    @MainActor
+    func testPreGeometryCompressedOverflowTerminatesStream() async throws {
+        let connection = SuccessfulRFBConnection(
+            name: "deferred-zlib-overflow",
+            width: 0,
+            height: 0)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0))
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+
+        try await session.connect(credentials: VNCCredentials(
+            host: "compressed-overflow.test",
+            port: 5900,
+            password: ""))
+        var completed = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(completed)
+
+        // The session's pre-geometry limit is 512 rectangles. Zlib uses a
+        // persistent inflater, so dropping rectangle 513 and continuing would
+        // permanently desynchronize every later compressed update.
+        await connection.enqueueServerBytes(
+            Self.emptyZlibFramebufferUpdate(rectangleCount: 513))
+
+        completed = await waitUntil {
+            guard case .protocolViolation(let detail) = session.lastError else {
+                return false
+            }
+            return detail.contains("persistent compression state")
+        }
+        XCTAssertTrue(completed)
+        completed = await waitUntil { session.connectionState == .disconnected }
+        XCTAssertTrue(completed, "Overflow must terminate instead of returning RFB credit")
+    }
+
+    @MainActor
     func testSessionPublishesAppleLoginPromptFromDisplayInfo2() async throws {
         let connection = SuccessfulRFBConnection(name: "apple-login")
         var configuration = VNCConfiguration(
@@ -346,6 +601,196 @@ final class VNCConfigurationTransportTests: XCTestCase {
         XCTAssertTrue(prompted)
         XCTAssertTrue(session.consumeLoginPasswordPromptRequest())
         XCTAssertFalse(session.consumeLoginPasswordPromptRequest())
+        session.disconnect()
+    }
+
+    @MainActor
+    func testVisionReplaysFrameThatPrecedesAppleMetadata() async throws {
+        let connection = SuccessfulRFBConnection(name: "apple-vision-race")
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            promptForLoginPasswordAtLoginWindow: true,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0))
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        session.appleLoginVisionAnalysisOverrideForTesting = {
+            AppleLoginTextAnalysis(
+                isLoginScreen: true,
+                recognizedLineCount: 1,
+                evidence: "test login")
+        }
+
+        try await session.connect(credentials: VNCCredentials(
+            host: "apple.test",
+            port: 5900,
+            password: "secret"))
+        let connected = await waitUntil {
+            session.connectionState.isConnected
+        }
+        XCTAssertTrue(connected)
+
+        session.considerAppleLoginVisionImageForTesting(Self.visionTestImage())
+        try? await Task.sleep(for: .milliseconds(50))
+        XCTAssertFalse(session.loginPasswordPromptPending)
+
+        await connection.enqueueServerBytes(
+            Self.appleDisplayInfoFramebufferUpdate([
+                AppleDisplayInfo(
+                    displayIndex: 1,
+                    originX: 0,
+                    originY: 0,
+                    width: 1024,
+                    height: 768,
+                    flags: 0),
+            ]))
+
+        let prompted = await waitUntil {
+            session.loginPasswordPromptPending
+        }
+        XCTAssertTrue(prompted)
+        session.disconnect()
+    }
+
+    @MainActor
+    func testVisionStopsAfterInitialAttemptsAreExhausted() async throws {
+        let connection = SuccessfulRFBConnection(name: "apple-vision-bounded")
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            promptForLoginPasswordAtLoginWindow: true,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0))
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        let analysis = LockedLoginVisionAnalysis()
+        session.appleLoginVisionAnalysisOverrideForTesting = {
+            analysis.analyze()
+        }
+
+        try await session.connect(credentials: VNCCredentials(
+            host: "apple.test",
+            port: 5900,
+            password: "secret"))
+        let connected = await waitUntil {
+            session.connectionState.isConnected
+        }
+        XCTAssertTrue(connected)
+        await connection.enqueueServerBytes(
+            Self.appleDisplayInfoFramebufferUpdate([
+                AppleDisplayInfo(
+                    displayIndex: 1,
+                    originX: 0,
+                    originY: 0,
+                    width: 1024,
+                    height: 768,
+                    flags: 0),
+            ]))
+
+        let image = Self.visionTestImage()
+        session.considerAppleLoginVisionImageForTesting(image)
+        let exhausted = await waitUntil(timeout: .seconds(3)) {
+            analysis.count == 3
+        }
+        XCTAssertTrue(exhausted)
+        XCTAssertFalse(session.loginPasswordPromptPending)
+
+        analysis.setDetected(true)
+        session.considerAppleLoginVisionImageForTesting(
+            image,
+            source: "frame after bounded scan")
+        try? await Task.sleep(for: .milliseconds(250))
+        XCTAssertFalse(session.loginPasswordPromptPending)
+        XCTAssertEqual(
+            analysis.count,
+            3,
+            "Vision must not continue scanning newer frames indefinitely")
+        session.disconnect()
+    }
+
+    @MainActor
+    func testVisionPromptsAgainAfterExplicitDisconnectAndReconnect() async throws {
+        let recorder = SuccessfulProviderRecorder()
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            promptForLoginPasswordAtLoginWindow: true,
+            reconnectionPolicy: VNCReconnectionPolicy(
+                isEnabled: false,
+                maximumAttempts: 0))
+        configuration.transportProvider = { host, port in
+            recorder.makeConnection(host: host, port: port)
+        }
+        let session = VNCSession(configuration: configuration)
+        session.appleLoginVisionAnalysisOverrideForTesting = {
+            AppleLoginTextAnalysis(
+                isLoginScreen: true,
+                recognizedLineCount: 1,
+                evidence: "test login")
+        }
+        let credentials = VNCCredentials(
+            host: "apple.test",
+            port: 5900,
+            password: "secret")
+
+        try await session.connect(credentials: credentials)
+        var connected = await waitUntil {
+            recorder.createdConnections.count == 1
+                && session.connectionState.isConnected
+        }
+        XCTAssertTrue(connected)
+        let firstConnection = try XCTUnwrap(
+            recorder.createdConnections.first)
+        await firstConnection.enqueueServerBytes(
+            Self.appleDisplayInfoFramebufferUpdate([
+                AppleDisplayInfo(
+                    displayIndex: 1,
+                    originX: 0,
+                    originY: 0,
+                    width: 1024,
+                    height: 768,
+                    flags: 0),
+            ]))
+        session.considerAppleLoginVisionImageForTesting(Self.visionTestImage())
+        var prompted = await waitUntil {
+            session.loginPasswordPromptPending
+        }
+        XCTAssertTrue(prompted)
+        XCTAssertTrue(session.consumeLoginPasswordPromptRequest())
+        session.sendLoginPassword()
+
+        session.disconnect()
+        XCTAssertEqual(session.connectionState, .disconnected)
+
+        try await session.connect(credentials: credentials)
+        connected = await waitUntil {
+            recorder.createdConnections.count == 2
+                && session.connectionState.isConnected
+        }
+        XCTAssertTrue(connected)
+        let secondConnection = try XCTUnwrap(
+            recorder.createdConnections.last)
+        await secondConnection.enqueueServerBytes(
+            Self.appleDisplayInfoFramebufferUpdate([
+                AppleDisplayInfo(
+                    displayIndex: 1,
+                    originX: 0,
+                    originY: 0,
+                    width: 1024,
+                    height: 768,
+                    flags: 0),
+            ]))
+        session.considerAppleLoginVisionImageForTesting(
+            Self.visionTestImage(),
+            source: "second connection")
+
+        prompted = await waitUntil(timeout: .seconds(2)) {
+            session.loginPasswordPromptPending
+        }
+        XCTAssertTrue(
+            prompted,
+            "A previous connection's delivery debounce must not suppress "
+                + "the next connection's login prompt")
         session.disconnect()
     }
 
@@ -584,6 +1029,41 @@ final class VNCConfigurationTransportTests: XCTestCase {
         return update
     }
 
+    private static func appleDisplayInfoFramebufferUpdate(
+        _ displays: [AppleDisplayInfo]
+    ) -> Data {
+        var update = Data([
+            0, 0,
+            UInt8((displays.count >> 8) & 0xff),
+            UInt8(displays.count & 0xff),
+        ])
+        for display in displays {
+            update.append(rectangleHeader(
+                x: 0, y: 0, width: 0, height: 0,
+                encoding: Encoding.serverDisplayInfo.rawValue))
+            for value in [
+                display.displayIndex,
+                UInt32(bitPattern: display.originX),
+                UInt32(bitPattern: display.originY),
+                display.width,
+                display.height,
+                display.flags,
+            ] {
+                update.append(contentsOf: bigEndianBytes(value))
+            }
+        }
+        return update
+    }
+
+    private static func cursorFramebufferUpdate() -> Data {
+        var update = Data([0, 0, 0, 1])
+        update.append(rectangleHeader(
+            x: 0, y: 0, width: 1, height: 1,
+            encoding: Encoding.cursor.rawValue))
+        update.append(contentsOf: [0x00, 0x00, 0xff, 0xff, 0x80])
+        return update
+    }
+
     private static func dctQuantizationFramebufferUpdate() -> Data {
         var update = Data([0, 0, 0, 1])
         update.append(rectangleHeader(
@@ -591,6 +1071,17 @@ final class VNCConfigurationTransportTests: XCTestCase {
             encoding: Encoding.appleMultiVariantScreenshare.rawValue))
         update.append(contentsOf: [0, 0, 0, 129, 2])
         update.append(Data(repeating: 0, count: 128))
+        return update
+    }
+
+    private static func desktopSizeFramebufferUpdate(
+        width: UInt16,
+        height: UInt16
+    ) -> Data {
+        var update = Data([0, 0, 0, 1])
+        update.append(rectangleHeader(
+            x: 0, y: 0, width: width, height: height,
+            encoding: Encoding.desktopSize.rawValue))
         return update
     }
 
@@ -608,6 +1099,22 @@ final class VNCConfigurationTransportTests: XCTestCase {
         update.append(Data(
             repeating: byte,
             count: Int(width) * Int(height) * 4))
+        return update
+    }
+
+    private static func emptyZlibFramebufferUpdate(
+        rectangleCount: UInt16
+    ) -> Data {
+        var update = Data([0, 0])
+        update.append(contentsOf: bigEndianBytes(rectangleCount))
+        for _ in 0..<rectangleCount {
+            update.append(rectangleHeader(
+                x: 0, y: 0, width: 1, height: 1,
+                encoding: Encoding.zlib.rawValue))
+            // A zero compressed-length is sufficient for transport framing;
+            // no inflater sees it because geometry is deliberately absent.
+            update.append(contentsOf: [0, 0, 0, 0])
+        }
         return update
     }
 
@@ -629,6 +1136,30 @@ final class VNCConfigurationTransportTests: XCTestCase {
             UInt8((rawEncoding >> 8) & 0xff),
             UInt8(rawEncoding & 0xff),
         ])
+    }
+
+    private static func bigEndianBytes<T: FixedWidthInteger>(
+        _ value: T
+    ) -> [UInt8] {
+        withUnsafeBytes(of: value.bigEndian) { Array($0) }
+    }
+
+    private static func visionTestImage() -> CGImage {
+        let bytes = Data([0, 0, 0, 0])
+        let provider = CGDataProvider(data: bytes as CFData)!
+        return CGImage(
+            width: 1,
+            height: 1,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(
+                rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent)!
     }
 
     @MainActor

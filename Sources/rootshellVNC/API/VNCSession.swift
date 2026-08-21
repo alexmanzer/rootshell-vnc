@@ -919,6 +919,9 @@ public final class VNCSession {
     @ObservationIgnored
     private var appleLoginVisionHighPerformanceGeneration: UInt64?
     @ObservationIgnored
+    var appleLoginVisionAnalysisOverrideForTesting:
+        (@Sendable () throws -> AppleLoginTextAnalysis)?
+    @ObservationIgnored
     private var appleServerProtocolObserved = false
     @ObservationIgnored
     private var loginPasswordSendGate = LoginPasswordSendStabilityGate()
@@ -962,6 +965,7 @@ public final class VNCSession {
     private var appleResizeSettledSequenceApplied: UInt64 = 0
     private var framebuffer: Framebuffer?
     private var renderer: FramebufferRenderer?
+    var standardFramebufferSize: CGSize? { framebuffer?.size }
     private var videoStreamManager: VideoStreamManager?
     private var secondaryVideoStreamManager: VideoStreamManager?
     @ObservationIgnored
@@ -1036,6 +1040,8 @@ public final class VNCSession {
         label: "com.rootshell.vnc.framebuffer",
         qos: .userInitiated)
     @ObservationIgnored
+    private var standardFramebufferGeometrySequence: UInt64 = 0
+    @ObservationIgnored
     private var lastFramebufferRenderDiagnosticNanos: UInt64 = 0
     /// When the last framebuffer image was published to `currentImage`;
     /// drives the publish-only targetFrameRate throttle.
@@ -1046,6 +1052,19 @@ public final class VNCSession {
     @ObservationIgnored
     private var initialFramePresentationTracker =
         StandardInitialFramePresentationTracker()
+    /// A zero-sized ServerInit lets Apple display records build the usable
+    /// standard-mode union incrementally until a stronger resize source wins.
+    @ObservationIgnored
+    private var acceptsDeferredAppleDisplayGeometry = false
+    /// Preserve ordered codec/control state that arrives before usable
+    /// geometry. The transport credit is still returned; these rectangles are
+    /// replayed ahead of the first renderable batch on the same generation.
+    @ObservationIgnored
+    private var deferredFramebufferRects: [(FramebufferRect, Data)] = []
+    @ObservationIgnored
+    private var deferredFramebufferBytes = 0
+    private static let maximumDeferredFramebufferBytes = 64 * 1024 * 1024
+    private static let maximumDeferredFramebufferRects = 512
     /// True only after this framebuffer generation has applied a pixel-bearing
     /// batch that satisfies its initial-coverage gate. Reconciliation must not
     /// snapshot a merely allocated (or retained retired) renderer before then.
@@ -1894,13 +1913,16 @@ public final class VNCSession {
             supportsRemoteSharedClipboardControl =
                 await transport.supportsRemoteSharedClipboardControl
             await refreshHandshakeDiagnostics(from: transport)
-            handleServerInit(serverInit)
+            await handleServerInit(serverInit)
 
         case .framebufferUpdate(let rects):
             // Returning the credit below requests the next incremental frame.
             // Keeping one update in flight prevents stale reference frames
             // from queueing while decode/presentation is busy.
-            await handleFramebufferUpdate(rects, from: transport)
+            let streamIsUsable = await handleFramebufferUpdate(
+                rects,
+                from: transport)
+            guard streamIsUsable else { return }
 
             do {
                 // Applying a batch yields to the render queue. A reconnect can
@@ -1938,29 +1960,32 @@ public final class VNCSession {
             handleError(error)
 
         case .encryptionInfo(let info):
+            noteAppleServerProtocolObserved()
             logger.info("Encryption info: cipher=\(info.cipherMode) keyLen=\(info.keyLength)")
             diagnostics.encryptionMode = "Cipher mode \(info.cipherMode), key length \(info.keyLength)"
             await refreshHandshakeDiagnostics(from: transport)
 
         case .displayInfo(let info):
-            appleServerProtocolObserved = true
+            noteAppleServerProtocolObserved()
             logger.info("Display info: \(info.width)x\(info.height) at (\(info.originX),\(info.originY))")
-            updateRemoteDisplayRegion(
-                id: info.displayIndex,
-                x: Int(info.originX),
-                y: Int(info.originY),
-                width: Int(info.width),
-                height: Int(info.height))
+            // TransportSession emits the complete enclosing layout after all
+            // per-record compatibility events. Apply geometry from that one
+            // atomic snapshot so display zero cannot cause an intermediate
+            // allocation before the rest of the topology arrives.
+
+        case .appleDisplayLayout(let displays):
+            noteAppleServerProtocolObserved()
+            await updateRemoteDisplayRegions(displays)
 
         case .appleRemoteSessionState(let state):
-            appleServerProtocolObserved = true
+            noteAppleServerProtocolObserved()
             handleAppleRemoteSessionState(state)
 
         case .desktopLayout(let layout):
-            updateRemoteDisplayRegions(layout.screens)
+            await updateRemoteDisplayRegions(layout.screens)
 
         case .mediaStreamOffer(let offer):
-            appleServerProtocolObserved = true
+            noteAppleServerProtocolObserved()
             logger.info(
                 "Media stream offer: stream=\(offer.streamID) type=\(offer.messageType ?? 0) "
                     + "audioPort=\(offer.audioStreamUDPPort ?? 0) "
@@ -2044,7 +2069,7 @@ public final class VNCSession {
         }
     }
 
-    private func handleServerInit(_ serverInit: ServerInit) {
+    func handleServerInit(_ serverInit: ServerInit) async {
         logger.info("Connected: \(serverInit.name) (\(serverInit.framebufferWidth)x\(serverInit.framebufferHeight))")
 
         // ServerInit allocates a new framebuffer even when a reconnect kept
@@ -2055,49 +2080,53 @@ public final class VNCSession {
         serverName = serverInit.name
         framebufferWidth = Int(serverInit.framebufferWidth)
         framebufferHeight = Int(serverInit.framebufferHeight)
+        acceptsDeferredAppleDisplayGeometry = framebufferWidth == 0
+            || framebufferHeight == 0
 
         // Update diagnostics
         diagnostics.serverInit = serverInit
         diagnostics.handshakeCompleteTime = Date()
 
-        // Must match what the transport sent in SetPixelFormat — decoding
-        // with the server's pre-negotiation format would corrupt every rect.
-        let pixelFormat = configuration.effectivePixelFormat
-
-        // Create framebuffer and renderer
-        let fb = Framebuffer(
-            width: Int(serverInit.framebufferWidth),
-            height: Int(serverInit.framebufferHeight),
-            pixelFormat: pixelFormat
-        )
-        self.framebuffer = fb
-        self.renderer = FramebufferRenderer(framebuffer: fb, pixelFormat: pixelFormat)
+        // A capture backend can finish the RFB handshake before it knows the
+        // desktop geometry (KDE/PipeWire and Apple's media path both do this
+        // in the wild). Retire the previous renderer, but keep the connection
+        // alive until a positive DesktopSize or media geometry arrives.
+        framebuffer = nil
+        renderer = nil
+        if framebufferWidth > 0, framebufferHeight > 0 {
+            _ = await applyStandardFramebufferGeometry(
+                width: serverInit.framebufferWidth,
+                height: serverInit.framebufferHeight)
+        } else {
+            logger.warning(
+                "ServerInit has deferred framebuffer geometry "
+                    + "\(framebufferWidth)x\(framebufferHeight); waiting for resize")
+        }
 
         hasEstablishedConnection = true
         lastError = nil
         connectionState = .connected
     }
 
-    private func updateRemoteDisplayRegion(
-        id: UInt32,
-        x: Int,
-        y: Int,
-        width: Int,
-        height: Int
-    ) {
-        guard width > 0, height > 0 else { return }
-        if remoteDisplayRegionByID[id] == nil {
-            remoteDisplayRegionOrder.append(id)
-        }
-        remoteDisplayRegionByID[id] = CGRect(
-            x: x, y: y, width: width, height: height)
-        remoteDisplayRegions = remoteDisplayRegionOrder.compactMap {
-            remoteDisplayRegionByID[$0]
-        }
-        applyDiscoveredRemoteMediaGeometry()
+    /// A zero-sized ServerInit makes Apple's display layout authoritative for
+    /// classic topology changes until DesktopSize, requested virtual geometry,
+    /// or codec geometry provides a stronger source.
+    private func installDeferredFramebufferFromRemoteDisplayLayoutIfPossible() async {
+        guard acceptsDeferredAppleDisplayGeometry,
+              configuration.displaySizingMode != .matchClient,
+              let union = normalizedSelectedDisplayRegion(
+                remoteDisplayRegions,
+                displayCount: remoteDisplayRegions.count) else { return }
+        let width = Int(union.width)
+        let height = Int(union.height)
+        guard width > 0, height > 0,
+              width <= Int(UInt16.max), height <= Int(UInt16.max) else { return }
+        await applyDesktopResizeMetadata(
+            width: UInt16(width),
+            height: UInt16(height))
     }
 
-    private func updateRemoteDisplayRegions(_ screens: [RFBScreenLayout]) {
+    func updateRemoteDisplayRegions(_ screens: [RFBScreenLayout]) async {
         guard !screens.isEmpty else { return }
         remoteDisplayRegionByID.removeAll(keepingCapacity: true)
         remoteDisplayRegionOrder = screens.map(\.id)
@@ -2108,6 +2137,27 @@ public final class VNCSession {
             remoteDisplayRegionByID[$0.id] = region
             return region
         }
+        await installDeferredFramebufferFromRemoteDisplayLayoutIfPossible()
+        applyDiscoveredRemoteMediaGeometry()
+    }
+
+    func updateRemoteDisplayRegions(
+        _ displays: [AppleDisplayInfo]
+    ) async {
+        guard !displays.isEmpty else { return }
+        remoteDisplayRegionByID.removeAll(keepingCapacity: true)
+        remoteDisplayRegionOrder = displays.map(\.displayIndex)
+        remoteDisplayRegions = displays.compactMap { display in
+            guard display.width > 0, display.height > 0 else { return nil }
+            let region = CGRect(
+                x: Int(display.originX),
+                y: Int(display.originY),
+                width: Int(display.width),
+                height: Int(display.height))
+            remoteDisplayRegionByID[display.displayIndex] = region
+            return region
+        }
+        await installDeferredFramebufferFromRemoteDisplayLayoutIfPossible()
         applyDiscoveredRemoteMediaGeometry()
     }
 
@@ -2194,9 +2244,8 @@ public final class VNCSession {
     private func handleFramebufferUpdate(
         _ rects: [(FramebufferRect, Data)],
         from transport: TransportSession
-    ) async {
-        guard transportSession === transport, let renderer else { return }
-        let presentationGeneration = framebufferPresentationGeneration
+    ) async -> Bool {
+        guard transportSession === transport else { return false }
 
         for (rect, data) in rects {
             if isTraceEnabled {
@@ -2216,6 +2265,49 @@ public final class VNCSession {
             }
         }
 
+        let announcedResize = rects.last(where: {
+            $0.0.isSuccessfulDesktopResize
+        })?.0
+        if let resize = announcedResize {
+            acceptsDeferredAppleDisplayGeometry = false
+            // Publish the authoritative dimensions and install through the
+            // same metadata path before initial-frame tracking sees this
+            // batch. FramebufferRenderer's same-size resize is a locked no-op.
+            if renderer == nil {
+                await applyDesktopResizeMetadata(
+                    width: resize.width,
+                    height: resize.height)
+            }
+        }
+
+        guard let renderer else {
+            do {
+                try deferFramebufferRectsUntilGeometry(rects)
+                return true
+            } catch let error as VNCProtocolError {
+                await transport.terminateFromSessionConsumer(
+                    error,
+                    origin: "pre-geometry-framebuffer-buffer")
+                return false
+            } catch {
+                let protocolError = VNCProtocolError.protocolViolation(
+                    error.localizedDescription)
+                await transport.terminateFromSessionConsumer(
+                    protocolError,
+                    origin: "pre-geometry-framebuffer-buffer")
+                return false
+            }
+        }
+        let renderRects: [(FramebufferRect, Data)]
+        if deferredFramebufferRects.isEmpty {
+            renderRects = rects
+        } else {
+            renderRects = deferredFramebufferRects + rects
+            deferredFramebufferRects.removeAll(keepingCapacity: true)
+            deferredFramebufferBytes = 0
+        }
+        let presentationGeneration = framebufferPresentationGeneration
+
         // Publish-only throttle: rects are always applied (persistent codec
         // state) and the transport credit is always returned, but the
         // full-framebuffer snapshot + image publish is capped at
@@ -2226,10 +2318,10 @@ public final class VNCSession {
         let renderStarted = DispatchTime.now().uptimeNanoseconds
         let publishDue = renderStarted &- lastImagePublishNanos >= publishInterval
         let carriesFramebufferPixels = StandardFramebufferPresentationPolicy
-            .carriesFramebufferPixels(rects)
+            .carriesFramebufferPixels(renderRects)
         let initialFramePresentationAllowed = initialFramePresentationTracker
             .ingest(
-                rects,
+                renderRects,
                 framebufferWidth: framebufferWidth,
                 framebufferHeight: framebufferHeight)
         let displaySuspended = suspendsDisplayPresentation
@@ -2242,7 +2334,7 @@ public final class VNCSession {
             framebufferRenderQueue.async {
                 continuation.resume(
                     returning: renderer.applyBatch(
-                        rects,
+                        renderRects,
                         snapshot: takeSnapshot))
             }
         }
@@ -2250,7 +2342,7 @@ public final class VNCSession {
         // replacement while it ran retires every observable result from it.
         guard transportSession === transport,
               framebufferPresentationGeneration == presentationGeneration,
-              self.renderer === renderer else { return }
+              self.renderer === renderer else { return false }
         if carriesFramebufferPixels && initialFramePresentationAllowed {
             standardFramebufferHasPresentablePixels = true
         }
@@ -2261,12 +2353,12 @@ public final class VNCSession {
                 || renderFinished &- lastFramebufferRenderDiagnosticNanos
                     >= 1_000_000_000) {
             lastFramebufferRenderDiagnosticNanos = renderFinished
-            let payloadBytes = rects.reduce(0) { $0 + $1.1.count }
-            let encodings = rects.map { String(describing: $0.0.encoding) }
+            let payloadBytes = renderRects.reduce(0) { $0 + $1.1.count }
+            let encodings = renderRects.map { String(describing: $0.0.encoding) }
                 .joined(separator: ",")
             logger.info(
                 "Framebuffer decode/snapshot=\(renderMilliseconds)ms "
-                    + "rects=\(rects.count) payload=\(payloadBytes)B "
+                    + "rects=\(renderRects.count) payload=\(payloadBytes)B "
                     + "encodings=\(encodings)")
         }
 
@@ -2275,7 +2367,7 @@ public final class VNCSession {
         }
         if let width = result.resizedWidth,
            let height = result.resizedHeight {
-            applyDesktopResizeMetadata(width: width, height: height)
+            await applyDesktopResizeMetadata(width: width, height: height)
         }
         // Delivery-time recheck: the device can lock while applyBatch runs on
         // the render queue, making the pre-render gate sample stale. A
@@ -2306,6 +2398,42 @@ public final class VNCSession {
         case nil:
             break
         }
+        return true
+    }
+
+    private func deferFramebufferRectsUntilGeometry(
+        _ rects: [(FramebufferRect, Data)]
+    ) throws {
+        guard rects.count <= Self.maximumDeferredFramebufferRects
+                - deferredFramebufferRects.count else {
+            throw VNCProtocolError.protocolViolation(
+                "Pre-geometry framebuffer backlog exceeded "
+                    + "\(Self.maximumDeferredFramebufferRects) rectangles; "
+                    + "terminating to preserve persistent compression state")
+        }
+
+        var resultingBytes = deferredFramebufferBytes
+        for entry in rects {
+            let (bytes, entryOverflow) = FramebufferRect.wireSize
+                .addingReportingOverflow(entry.1.count)
+            let (nextBytes, totalOverflow) = resultingBytes
+                .addingReportingOverflow(bytes)
+            guard !entryOverflow, !totalOverflow,
+                  nextBytes <= Self.maximumDeferredFramebufferBytes else {
+                throw VNCProtocolError.protocolViolation(
+                    "Pre-geometry framebuffer backlog exceeded "
+                        + "\(Self.maximumDeferredFramebufferBytes) bytes; "
+                        + "terminating to preserve persistent compression state")
+            }
+            resultingBytes = nextBytes
+        }
+        deferredFramebufferRects.append(contentsOf: rects)
+        deferredFramebufferBytes = resultingBytes
+        if !rects.isEmpty {
+            logger.debug(
+                "Deferred \(deferredFramebufferRects.count) framebuffer rectangles "
+                    + "until positive geometry arrives")
+        }
     }
 
     /// Apply one live geometry transition to every consumer of framebuffer
@@ -2313,19 +2441,21 @@ public final class VNCSession {
     /// sets reconfigure the public VideoToolbox session when they arrive.
     private func applyDesktopResizeMetadata(
         width: UInt16,
-        height: UInt16
-    ) {
+        height: UInt16,
+        mediaDisplaySizeOverride: (width: Int, height: Int)? = nil
+    ) async {
         let newWidth = Int(width)
         let newHeight = Int(height)
         guard newWidth > 0, newHeight > 0 else { return }
-        guard newWidth != framebufferWidth || newHeight != framebufferHeight else { return }
+        let geometryChanged = await applyStandardFramebufferGeometry(
+            width: width,
+            height: height)
+        guard geometryChanged || mediaDisplaySizeOverride != nil else { return }
 
-        logger.info(
-            "Applying desktop resize \(framebufferWidth)x\(framebufferHeight) "
-                + "-> \(newWidth)x\(newHeight)")
-        framebufferWidth = newWidth
-        framebufferHeight = newHeight
         func mediaDisplaySize(at index: Int) -> (width: Int, height: Int) {
+            if let mediaDisplaySizeOverride {
+                return mediaDisplaySizeOverride
+            }
             if isHighPerformanceMode,
                configuration.displaySizingMode != .matchClient,
                remoteDisplayRegions.indices.contains(index) {
@@ -2375,8 +2505,74 @@ public final class VNCSession {
         }
     }
 
-    func applyRequestedRemoteDisplayGeometry(_ requested: RemoteDisplaySize) {
-        applyDesktopResizeMetadata(
+    /// Keep the lossless framebuffer used for standard pixels, DCT control
+    /// state, and cursor decoding synchronized without changing video decoder
+    /// geometry. The physical All Displays media path needs this separation:
+    /// its framebuffer is the display union while its codec raster may not be.
+    @discardableResult
+    private func applyStandardFramebufferGeometry(
+        width: UInt16,
+        height: UInt16
+    ) async -> Bool {
+        let newWidth = Int(width)
+        let newHeight = Int(height)
+        guard newWidth > 0, newHeight > 0 else { return false }
+        let geometryChanged = newWidth != framebufferWidth
+            || newHeight != framebufferHeight
+
+        standardFramebufferGeometrySequence &+= 1
+        let sequence = standardFramebufferGeometrySequence
+        let presentationGeneration = framebufferPresentationGeneration
+        let existingRenderer = renderer
+        // Must match what the transport sent in SetPixelFormat — decoding
+        // with the server's pre-negotiation format would corrupt every rect.
+        let pixelFormat = configuration.effectivePixelFormat
+        let installation: (Framebuffer, FramebufferRenderer)? =
+            await withCheckedContinuation { continuation in
+                framebufferRenderQueue.async {
+                    if let existingRenderer {
+                        existingRenderer.handleDesktopResize(
+                            width: width,
+                            height: height)
+                        continuation.resume(returning: nil)
+                    } else {
+                        let framebuffer = Framebuffer(
+                            width: newWidth,
+                            height: newHeight,
+                            pixelFormat: pixelFormat)
+                        continuation.resume(returning: (
+                            framebuffer,
+                            FramebufferRenderer(
+                                framebuffer: framebuffer,
+                                pixelFormat: pixelFormat)))
+                    }
+                }
+            }
+        guard sequence == standardFramebufferGeometrySequence,
+              presentationGeneration == framebufferPresentationGeneration else {
+            return false
+        }
+        if let installation {
+            guard renderer == nil else { return false }
+            framebuffer = installation.0
+            renderer = installation.1
+            logger.info("Installed framebuffer at \(newWidth)x\(newHeight)")
+        } else {
+            guard renderer === existingRenderer else { return false }
+        }
+        if geometryChanged {
+            logger.info(
+                "Applying desktop resize \(framebufferWidth)x\(framebufferHeight) "
+                    + "-> \(newWidth)x\(newHeight)")
+            framebufferWidth = newWidth
+            framebufferHeight = newHeight
+        }
+        return geometryChanged
+    }
+
+    func applyRequestedRemoteDisplayGeometry(_ requested: RemoteDisplaySize) async {
+        acceptsDeferredAppleDisplayGeometry = false
+        await applyDesktopResizeMetadata(
             width: requested.pixelWidth,
             height: requested.pixelHeight)
     }
@@ -2388,7 +2584,7 @@ public final class VNCSession {
     private func applyMediaStreamGeometry(
         _ geometry: VideoFrameGeometry,
         from manager: VideoStreamManager
-    ) {
+    ) async {
         guard videoStreamManager === manager else { return }
         guard manager.currentMediaGeneration == geometry.mediaGeneration else { return }
         guard geometry.mediaGeneration >= appliedMediaGeometryGeneration else { return }
@@ -2397,22 +2593,31 @@ public final class VNCSession {
               geometry.height <= Int(UInt16.max) else { return }
 
         appliedMediaGeometryGeneration = geometry.mediaGeneration
+        await applyAcceptedMediaStreamGeometry(geometry)
+    }
+
+    func applyAcceptedMediaStreamGeometry(_ geometry: VideoFrameGeometry) async {
+        guard geometry.width > 0, geometry.height > 0,
+              geometry.width <= Int(UInt16.max),
+              geometry.height <= Int(UInt16.max) else { return }
+        acceptsDeferredAppleDisplayGeometry = false
         if configuration.displaySizingMode != .matchClient,
            configuration.displayCount > 1,
            remoteDisplayRegions.count >= configuration.displayCount {
             // In Apple's physical All Displays mode the codec raster can stay
             // at the primary encoder size. ScreenConfiguration is the native
             // authority for the combined canvas and pointer coordinates.
-            let selected = remoteDisplayRegions.prefix(
-                configuration.displayCount)
-            if let first = selected.first {
-                let union = selected.dropFirst().reduce(first) {
-                    $0.union($1)
-                }
-                videoBandRenderer.setScreenSize(
-                    width: Int(union.width),
-                    height: Int(union.height))
-            }
+            guard let union = normalizedSelectedDisplayRegion(
+                remoteDisplayRegions,
+                displayCount: configuration.displayCount) else { return }
+            let width = Int(union.width)
+            let height = Int(union.height)
+            guard width > 0, height > 0,
+                  width <= Int(UInt16.max), height <= Int(UInt16.max) else { return }
+            videoBandRenderer.setScreenSize(width: width, height: height)
+            await applyStandardFramebufferGeometry(
+                width: UInt16(width),
+                height: UInt16(height))
             return
         }
         videoBandRenderer.setScreenSize(
@@ -2428,18 +2633,16 @@ public final class VNCSession {
         }
         let aggregateWidth = geometry.width * activeVideoDisplayCount
         guard aggregateWidth <= Int(UInt16.max) else { return }
-        guard aggregateWidth != framebufferWidth
-                || geometry.height != framebufferHeight else { return }
 
         logger.info(
-            "Applying HEVC media resize \(framebufferWidth)x\(framebufferHeight) "
-                + "-> \(aggregateWidth)x\(geometry.height) "
+            "Applying HEVC media geometry \(aggregateWidth)x\(geometry.height) "
                 + "generation=\(geometry.mediaGeneration)")
-        renderer?.handleDesktopResize(
+        await applyDesktopResizeMetadata(
             width: UInt16(aggregateWidth),
-            height: UInt16(geometry.height))
-        framebufferWidth = aggregateWidth
-        framebufferHeight = geometry.height
+            height: UInt16(geometry.height),
+            mediaDisplaySizeOverride: (
+                width: geometry.width,
+                height: geometry.height))
     }
 
     private func handleError(_ error: VNCProtocolError) {
@@ -2619,6 +2822,14 @@ public final class VNCSession {
         loginPasswordPromptRecheckTask?.cancel()
         loginPasswordPromptRecheckTask = nil
         lastSessionStateAnnouncementNanos = 0
+        // An explicit disconnect/new connect begins a new logical login
+        // attempt, so a password delivered by the previous connection must
+        // not suppress its prompt. Automatic transport recovery preserves
+        // both the approved pending send and the short post-delivery debounce
+        // because it is still the same remote login attempt.
+        if !preservePendingPasswordSend {
+            lastLoginPasswordDeliveryNanos = 0
+        }
         loginPasswordSendGate.reset(
             preservePendingSend: preservePendingPasswordSend
                 && !(activeCredentials?.password.isEmpty ?? true))
@@ -2968,16 +3179,29 @@ public final class VNCSession {
         loginPasswordSendScheduledToken = nil
     }
 
-    /// Inspect only a few initial, already-composited full frames. The cheap
-    /// guards run on the main actor; Vision itself runs at utility priority.
+    /// Remember that a negotiated Apple-only message has arrived. Media UDP
+    /// can deliver a complete frame before its control-channel layout record;
+    /// replay the retained candidate when that race resolves rather than
+    /// waiting for a second frame a static login screen may never produce.
+    private func noteAppleServerProtocolObserved() {
+        guard !appleServerProtocolObserved else { return }
+        appleServerProtocolObserved = true
+        guard appleLoginVisionLatestFrame != nil else { return }
+        logger.debug(
+            "Apple protocol observed after a retained login Vision candidate")
+        driveAppleLoginVisionFromLatestCandidate()
+    }
+
+    /// Inspect a bounded burst of composited full frames. The cheap guards run
+    /// on the main actor; Vision itself runs at utility priority. A later
+    /// authoritative Apple login-state event does not require OCR.
     private func considerAppleLoginVisionFrame(
         _ frame: AppleLoginVisionFrame,
         source: String,
         highPerformanceGeneration: UInt64? = nil
     ) {
         guard configuration.promptForLoginPasswordAtLoginWindow,
-              canSendLoginPassword,
-              appleServerProtocolObserved else { return }
+              canSendLoginPassword else { return }
 
         if let highPerformanceGeneration {
             let previousGeneration = appleLoginVisionHighPerformanceGeneration
@@ -2993,16 +3217,40 @@ public final class VNCSession {
             guard case .pixelBuffer(let pixelBuffer) = frame,
                   isEligibleHighPerformanceLoginVisionFrame(pixelBuffer)
             else { return }
-
-            appleLoginVisionLatestFrame = (
-                frame, source, highPerformanceGeneration)
-            scheduleAppleLoginVisionAfterHighPerformanceStability(
-                mediaGeneration: highPerformanceGeneration)
-            return
         }
 
-        appleLoginVisionLatestFrame = (frame, source, nil)
-        startAppleLoginVision(frame, source: source)
+        appleLoginVisionLatestFrame = (
+            frame,
+            source,
+            highPerformanceGeneration)
+        guard appleServerProtocolObserved else {
+            logger.debug(
+                "Retaining login Vision candidate until Apple protocol is observed")
+            return
+        }
+        driveAppleLoginVisionFromLatestCandidate()
+    }
+
+    func considerAppleLoginVisionImageForTesting(
+        _ image: CGImage,
+        source: String = "test"
+    ) {
+        considerAppleLoginVisionFrame(.image(image), source: source)
+    }
+
+    private func driveAppleLoginVisionFromLatestCandidate() {
+        guard appleServerProtocolObserved,
+              let latest = appleLoginVisionLatestFrame else { return }
+        guard appleLoginVisionAttemptCount
+                < Self.appleLoginVisionMaximumAttempts else { return }
+        if let mediaGeneration = latest.highPerformanceGeneration {
+            scheduleAppleLoginVisionAfterHighPerformanceStability(
+                mediaGeneration: mediaGeneration)
+        } else {
+            startAppleLoginVision(
+                latest.frame,
+                source: latest.source)
+        }
     }
 
     /// A Match Client resize can publish the old complete surface while a new
@@ -3044,7 +3292,9 @@ public final class VNCSession {
                 return
             }
             self.appleLoginVisionStabilityTask = nil
-            self.startAppleLoginVision(latest.frame, source: latest.source)
+            self.startAppleLoginVision(
+                latest.frame,
+                source: latest.source)
         }
     }
 
@@ -3090,6 +3340,7 @@ public final class VNCSession {
         appleLoginVisionLastAttemptNanos = now
         let attempt = appleLoginVisionAttemptCount
         let generation = appleLoginVisionGeneration
+        let analysisOverride = appleLoginVisionAnalysisOverrideForTesting
         logger.debug(
             "Apple login Vision attempt \(attempt)/"
                 + "\(Self.appleLoginVisionMaximumAttempts) source=\(source)")
@@ -3099,13 +3350,17 @@ public final class VNCSession {
                 let started = DispatchTime.now().uptimeNanoseconds
                 do {
                     let analysis: AppleLoginTextAnalysis
-                    switch frame {
-                    case .image(let image):
-                        analysis = try AppleLoginScreenDetector.recognize(
-                            cgImage: image)
-                    case .pixelBuffer(let pixelBuffer):
-                        analysis = try AppleLoginScreenDetector.recognize(
-                            pixelBuffer: pixelBuffer)
+                    if let analysisOverride {
+                        analysis = try analysisOverride()
+                    } else {
+                        switch frame {
+                        case .image(let image):
+                            analysis = try AppleLoginScreenDetector.recognize(
+                                cgImage: image)
+                        case .pixelBuffer(let pixelBuffer):
+                            analysis = try AppleLoginScreenDetector.recognize(
+                                pixelBuffer: pixelBuffer)
+                        }
                     }
                     return AppleLoginVisionOutcome(
                         analysis: analysis,
@@ -3133,7 +3388,9 @@ public final class VNCSession {
                     "Apple login Vision attempt \(attempt) failed after "
                         + "\(outcome.elapsedMilliseconds)ms: "
                         + errorText)
-                self.scheduleAppleLoginVisionRetry(generation: generation)
+                if attempt < Self.appleLoginVisionMaximumAttempts {
+                    self.scheduleAppleLoginVisionRetry(generation: generation)
+                }
                 return
             }
             self.logger.debug(
@@ -3177,7 +3434,8 @@ public final class VNCSession {
                   let latest = self.appleLoginVisionLatestFrame else { return }
             self.appleLoginVisionRetryTask = nil
             self.startAppleLoginVision(
-                latest.frame, source: latest.source + " retry")
+                latest.frame,
+                source: latest.source + " retry")
         }
     }
 
@@ -3623,6 +3881,8 @@ public final class VNCSession {
         initialFramePresentationTracker.reset()
         standardFramebufferHasPresentablePixels = false
         lastImagePublishNanos = 0
+        deferredFramebufferRects.removeAll(keepingCapacity: true)
+        deferredFramebufferBytes = 0
     }
 
     private static func batchableInputEvent(
@@ -3872,7 +4132,7 @@ public final class VNCSession {
             guard let manager else { return }
             Task { @MainActor [weak self, weak manager] in
                 guard let self, let manager else { return }
-                self.applyMediaStreamGeometry(geometry, from: manager)
+                await self.applyMediaStreamGeometry(geometry, from: manager)
             }
         }
 
@@ -4402,7 +4662,11 @@ public final class VNCSession {
             }
             await transport.setAppleRemoteDisplaySizeSink { [weak self] width, height in
                 Task { @MainActor [weak self] in
-                    self?.applyDesktopResizeMetadata(width: width, height: height)
+                    guard let self else { return }
+                    self.acceptsDeferredAppleDisplayGeometry = false
+                    await self.applyDesktopResizeMetadata(
+                        width: width,
+                        height: height)
                 }
             }
             let settledSequencer = appleResizeSettledSequencer

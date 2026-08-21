@@ -110,6 +110,13 @@ final class LiveLoginProbeTests: XCTestCase {
                         width: Int(display.width),
                         height: Int(display.height))
                     probe.note("EVENT displayInfo \(display.width)x\(display.height)")
+                case .appleDisplayLayout(let displays):
+                    if let display = displays.first {
+                        manager.updateFrameGeometry(
+                            width: Int(display.width),
+                            height: Int(display.height))
+                    }
+                    probe.note("EVENT appleDisplayLayout count=\(displays.count)")
                 default:
                     probe.note("EVENT \(String(describing: event).prefix(120))")
                 }

@@ -216,6 +216,10 @@ public enum SessionEvent: Sendable {
     /// Apple display info pseudo-encoding received.
     case displayInfo(AppleDisplayInfo)
 
+    /// One complete Apple display-layout snapshot. Classic ServerDisplayInfo
+    /// records are accumulated for the enclosing framebuffer update first.
+    case appleDisplayLayout([AppleDisplayInfo])
+
     /// Apple Login Window and lock-screen state changed.
     case appleRemoteSessionState(AppleRemoteSessionState)
 
@@ -381,6 +385,15 @@ public actor TransportSession {
     /// Physical or virtual screen geometry announced by Apple's encrypted
     /// DisplayInfo2 control record, in the server's display order.
     private var appleMediaDisplayInfos: [AppleDisplayInfo] = []
+    /// Classic Apple display records arrive one rectangle at a time. Retain
+    /// them while a zero-sized ServerInit is waiting for a usable union so the
+    /// state machine and request loop advance with the same geometry as the
+    /// session renderer.
+    private var deferredAppleDisplayLayoutByID: [UInt32: AppleDisplayInfo] = [:]
+    /// Remains true for classic servers whose initial 0-sized ServerInit makes
+    /// complete ServerDisplayInfo batches authoritative for later topology
+    /// changes. DesktopSize or requested virtual geometry supersedes it.
+    private var usesDeferredAppleDisplayLayout = false
     /// Aggregate surface of the capture graph currently being negotiated.
     /// Initial media setup uses every physical display announced by
     /// DisplayInfo2. Command 29 replaces that graph with the requested virtual
@@ -1489,6 +1502,17 @@ public actor TransportSession {
         continuation?.finish()
     }
 
+    /// Terminate an operational connection when its session consumer can no
+    /// longer preserve the ordered RFB stream. Unlike a user disconnect, this
+    /// publishes the failure reason and drives the normal reconnect policy.
+    package func terminateFromSessionConsumer(
+        _ error: VNCProtocolError,
+        origin: String
+    ) async {
+        continuation?.yield(.error(error))
+        await terminateUnexpectedConnection(error, origin: origin)
+    }
+
     // MARK: - Handshake
 
     private func performHandshake() async throws {
@@ -1768,6 +1792,8 @@ public actor TransportSession {
 
         self.fbWidth = width
         self.fbHeight = height
+        usesDeferredAppleDisplayLayout = width == 0 || height == 0
+        deferredAppleDisplayLayoutByID.removeAll(keepingCapacity: true)
         resetAppleDCTBootstrapCoverage()
         activeAppleMediaTilesPerFrame = selectedAppleMediaTilesPerFrame(
             pixelWidth: Int(width), pixelHeight: Int(height))
@@ -2012,6 +2038,8 @@ public actor TransportSession {
         var rectsWithData: [(FramebufferRect, Data)] = []
         rectsWithData.reserveCapacity(Int(rectCount))
         var pendingResize: FramebufferRect?
+        var classicAppleDisplayLayout: [AppleDisplayInfo] = []
+        var completeAppleDisplayLayout: [AppleDisplayInfo]?
 
         for _ in 0..<rectCount {
             let rectData = try await readControlChannel(exactly: FramebufferRect.wireSize)
@@ -2126,6 +2154,10 @@ public actor TransportSession {
                 let diData = try await readControlChannel(exactly: 24)
                 var diReader = MessageReader(data: diData)
                 let info = try AppleDisplayInfo(reader: &diReader)
+                classicAppleDisplayLayout.append(info)
+                // Preserve the original public per-record event contract.
+                // The batched layout event below is additive and is used for
+                // atomic topology replacement/geometry recovery.
                 continuation?.yield(.displayInfo(info))
                 try await sendAppleStandardDisplaySelectionIfNeeded(
                     displayID: info.displayIndex)
@@ -2218,9 +2250,8 @@ public actor TransportSession {
                     from: payload,
                     source: "standard RFB 1105")
                 let displayInfos = appleDisplayInfo2Records(payload)
-                for info in displayInfos {
-                    continuation?.yield(.displayInfo(info))
-                }
+                completeAppleDisplayLayout = displayInfos
+                emitAppleDisplayInfoCompatibilityEvents(displayInfos)
                 if let firstDisplay = displayInfos.first {
                     try await sendAppleStandardDisplaySelectionIfNeeded(
                         displayID: firstDisplay.displayIndex,
@@ -2258,7 +2289,31 @@ public actor TransportSession {
         }
 
         if let resize = pendingResize {
+            usesDeferredAppleDisplayLayout = false
             try await acceptFramebufferResize(width: resize.width, height: resize.height)
+        }
+
+        if let completeAppleDisplayLayout,
+           !completeAppleDisplayLayout.isEmpty {
+            // DesktopSize wins geometry when both occur in one update, but
+            // consumers still need the Apple layout metadata (including the
+            // signal that this is an Apple server).
+            if pendingResize == nil {
+                try await commitDeferredAppleDisplayLayout(
+                    completeAppleDisplayLayout,
+                    replacingLayout: true)
+            }
+            continuation?.yield(.appleDisplayLayout(completeAppleDisplayLayout))
+        } else if !classicAppleDisplayLayout.isEmpty {
+            // ServerDisplayInfo records in one framebuffer update are one
+            // complete classic layout snapshot. Commit once after parsing so
+            // control writes cannot interleave with the update payload.
+            if pendingResize == nil {
+                try await commitDeferredAppleDisplayLayout(
+                    classicAppleDisplayLayout,
+                    replacingLayout: true)
+            }
+            continuation?.yield(.appleDisplayLayout(classicAppleDisplayLayout))
         }
 
         let receivedPortableFullFrame = rectsWithData.contains(where: { rect, _ in
@@ -2852,7 +2907,7 @@ public actor TransportSession {
         if control.encoding == 0x450 {
             try await requestAppleMediaReconfigurationIfNeeded()
         } else if control.encoding == 0x451 {
-            handleAppleMediaDisplayInfo2(control.body)
+            try await handleAppleMediaDisplayInfo2(control.body)
         } else if control.encoding == 0x455 {
             try await sendAppleMediaInitialSetDisplayIfNeeded()
             try await sendAppleMediaAutoFrameUpdateIfNeeded()
@@ -2871,12 +2926,14 @@ public actor TransportSession {
         try await handleAppleMediaServerControlIfPresent(payload)
     }
 
-    private func handleAppleMediaDisplayInfo2(_ payload: Data) {
+    private func handleAppleMediaDisplayInfo2(_ payload: Data) async throws {
         emitAppleRemoteSessionState(
             from: payload,
             source: "High Performance 0x451")
         let displays = appleDisplayInfo2Records(payload)
         guard !displays.isEmpty else { return }
+        try await commitDeferredAppleDisplayLayout(
+            displays, replacingLayout: true)
         appleMediaDisplayInfos = displays
         let aggregateLumaSamples = displays.reduce(into: 0) { total, display in
             let width = Int(display.width)
@@ -2898,15 +2955,25 @@ public actor TransportSession {
                 && lastSentRemoteDisplaySize != nil
             ? min(requestedDisplayCount, displays.count)
             : 1
-        for display in displays {
-            continuation?.yield(.displayInfo(display))
-        }
+        emitAppleDisplayInfoCompatibilityEvents(displays)
+        continuation?.yield(.appleDisplayLayout(displays))
         log.info(
             "Apple media DisplayInfo2 announced \(displays.count) screens: "
                 + displays.map { "\($0.width)x\($0.height)" }
                     .joined(separator: ", ")
                 + "; captureLuma=\(aggregateLumaSamples) "
                 + "tiles=\(activeAppleMediaTilesPerFrame)")
+    }
+
+    /// Preserve the original per-record event contract for every source of
+    /// DisplayInfo2. The complete layout event remains additive and gives new
+    /// consumers an atomic topology snapshot.
+    private func emitAppleDisplayInfoCompatibilityEvents(
+        _ displays: [AppleDisplayInfo]
+    ) {
+        for display in displays {
+            continuation?.yield(.displayInfo(display))
+        }
     }
 
     private func emitAppleRemoteSessionState(
@@ -3170,6 +3237,66 @@ public actor TransportSession {
         try await sendAppleEncryptedClientPayload(
             appleAutoFrameUpdateMessage(intervalMilliseconds: interval))
         log.debug("Updated Apple media frame subscription to \(width)x\(height)")
+    }
+
+    /// Promote Apple's display-layout extension into real transport geometry
+    /// when ServerInit could not provide any. Updating both local request
+    /// bounds and the protocol state machine before the enclosing framebuffer
+    /// update completes lets its normal credit return issue the next request.
+    private func commitDeferredAppleDisplayLayout(
+        _ displays: [AppleDisplayInfo],
+        replacingLayout: Bool
+    ) async throws {
+        guard usesDeferredAppleDisplayLayout, !displays.isEmpty else { return }
+        if replacingLayout {
+            deferredAppleDisplayLayoutByID.removeAll(keepingCapacity: true)
+        }
+        for display in displays {
+            deferredAppleDisplayLayoutByID[display.displayIndex] = display
+        }
+
+        // Match Client's requested virtual surface outranks physical
+        // DisplayInfo2 metadata that can still be in flight during setup.
+        if requestsVirtualDisplays,
+           let requested = pendingRemoteDisplaySize ?? lastSentRemoteDisplaySize {
+            try await acceptFramebufferResize(
+                width: requested.pixelWidth,
+                height: requested.pixelHeight)
+            stateMachine.acceptFramebufferGeometry(
+                width: requested.pixelWidth,
+                height: requested.pixelHeight)
+            return
+        }
+
+        let valid = deferredAppleDisplayLayoutByID.values.filter {
+            $0.width > 0 && $0.height > 0
+        }
+        guard let first = valid.first else { return }
+        var minX = Int64(first.originX)
+        var minY = Int64(first.originY)
+        var maxX = minX + Int64(first.width)
+        var maxY = minY + Int64(first.height)
+        for display in valid.dropFirst() {
+            let x = Int64(display.originX)
+            let y = Int64(display.originY)
+            minX = min(minX, x)
+            minY = min(minY, y)
+            maxX = max(maxX, x + Int64(display.width))
+            maxY = max(maxY, y + Int64(display.height))
+        }
+        let width = maxX - minX
+        let height = maxY - minY
+        guard width > 0, height > 0,
+              width <= Int64(UInt16.max), height <= Int64(UInt16.max) else { return }
+
+        let acceptedWidth = UInt16(width)
+        let acceptedHeight = UInt16(height)
+        try await acceptFramebufferResize(
+            width: acceptedWidth,
+            height: acceptedHeight)
+        stateMachine.acceptFramebufferGeometry(
+            width: acceptedWidth,
+            height: acceptedHeight)
     }
 
     private func appleAutoFrameUpdateMessage(intervalMilliseconds: Int32) -> Data {
@@ -3712,7 +3839,7 @@ public actor TransportSession {
                 case 1104:
                     try await requestAppleMediaReconfigurationIfNeeded()
                 case 1105:
-                    handleAppleMediaDisplayInfo2(pixelData)
+                    try await handleAppleMediaDisplayInfo2(pixelData)
                 case 1109:
                     try await sendAppleMediaInitialSetDisplayIfNeeded()
                     try await sendAppleMediaAutoFrameUpdateIfNeeded()
@@ -3732,6 +3859,7 @@ public actor TransportSession {
 
         appleDecryptedRFBBuffer.removeSubrange(base..<offset)
         if let resize = pendingResize {
+            usesDeferredAppleDisplayLayout = false
             try await acceptFramebufferResize(width: resize.width, height: resize.height)
         }
         // Match the ordinary framebuffer path's single-update credit. The
