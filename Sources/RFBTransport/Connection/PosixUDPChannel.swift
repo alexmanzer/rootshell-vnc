@@ -155,7 +155,7 @@ public actor PosixUDPChannel {
 
     // Datagram handoff state, guarded by `stateLock` (NOT actor-isolated: the
     // read source appends from `readQueue`, `receive()` consumes from the
-    // actor). Ordering is load-bearing: the previous design spawned one
+    // actor). Ordering is required: the previous design spawned one
     // unstructured Task per drained batch to hop onto the actor, and Swift
     // gives NO FIFO guarantee between separately-created Tasks — under load,
     // batch N+1 regularly landed before batch N, reordering RTP packets inside

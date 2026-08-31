@@ -513,6 +513,15 @@ public actor TransportSession {
     private var applePreviousMediaServerPacketID: UInt32 = 0
     private var appleMediaServerPacketID: UInt32 = 0
     private var appleMediaClientPacketID: UInt32 = 0
+
+    /// Password-only VNC authentication proves access without producing the
+    /// Apple session key used by the encrypted media control channel. In that
+    /// case the server keeps using ordinary plaintext RFB framing after media
+    /// acceptance. Apple DH/SRP authentication installs one of these channels
+    /// and switches the read loop to length-framed encrypted records.
+    private var hasEncryptedAppleMediaControl: Bool {
+        appleMediaComCryptionChannel != nil || appleEncryptedControlChannel != nil
+    }
     private var pendingAppleMediaRTPStream: PendingAppleMediaRTPStream?
     private var confirmedAppleMediaRTPStream: ConfirmedAppleMediaRTPStream?
     private var appleMediaSRTPKeys: AppleMediaSRTPKeys?
@@ -1735,12 +1744,10 @@ public actor TransportSession {
     }
 
     private func sendClientInit() async throws {
-        // Apple's capability-bearing 0xc1 mode and virtual displays belong to
-        // its media connection, not to a Zlib/ZRLE Standard session. Forcing
-        // 0xc1 without completing media setup leaves the server waiting and the
-        // framebuffer black. Standard uses the ordinary shared-session flag;
-        // its pending Match Client request may still use public SetDesktopSize
-        // when a regular RFB server advertises ExtendedDesktopSize support.
+        // ClientInit mode 0xc1 is required for media connections.
+        // Password-only VNC auth receives an additional length-framed session
+        // list after ServerInit; `readServerInit` consumes it and selects the
+        // console session before ordinary RFB negotiation.
         let flags: UInt8 = requestAppleMediaStream ? 0xc1 : 0x01
         try await sendControlChannel(Data([flags]))
         log.debug("Sent ClientInit flags=0x\(String(flags, radix: 16))")
@@ -1801,6 +1808,11 @@ public actor TransportSession {
 
         log.info("ServerInit: \(width)x\(height) '\(name)'")
 
+        if requestAppleMediaStream,
+           stateMachine.selectedSecurityType == .vncAuthentication {
+            try await selectPasswordOnlyAppleSession()
+        }
+
         // A client-sized request may have been staged before connecting. Send
         // Apple's virtual-display description as soon as ServerInit confirms
         // support and, critically, before SetEncodings starts media setup. This
@@ -1816,13 +1828,98 @@ public actor TransportSession {
 
         let actions = stateMachine.handle(event: .receivedServerInit(serverInit))
         emitState()
-        if requestAppleMediaStream {
-            try await sendAppleMediaStreamSetupIfNeeded()
-        } else {
-            try await executeActions(actions)
-        }
+        // High Performance still begins with the ordinary post-ServerInit
+        // negotiation. `executeActions` flushes SetPixelFormat/SetEncodings
+        // before the authentication-specific media setup. Password-only Pro
+        // Mode then waits for encoding-1010 AVC message 1; keyed Apple auth
+        // sends its legacy media configuration and request. Skipping the
+        // ordinary actions leaves the control stream immediately desynchronized.
+        try await executeActions(actions)
 
         continuation?.yield(.serverInit(serverInit))
+    }
+
+    /// ClientInit mode `0xc1` adds a session-selection
+    /// exchange when authentication type 2 supplied no Apple session key.
+    /// The server advertises fixed-width console-session records, then expects
+    /// the native 74-byte selection command before SetEncodings/media setup.
+    private func selectPasswordOnlyAppleSession() async throws {
+        let lengthData = try await readControlChannel(exactly: 2)
+        let payloadLength = Int(lengthData[lengthData.startIndex]) << 8
+            | Int(lengthData[lengthData.startIndex + 1])
+        guard payloadLength >= 2,
+              payloadLength <= Self.maxAuxiliaryPayloadBytes else {
+            throw oversizedPayloadError(
+                payloadLength,
+                limit: Self.maxAuxiliaryPayloadBytes,
+                context: "Apple session list")
+        }
+        let payload = try await readControlChannel(exactly: payloadLength)
+        let sessionCount = Int(payload[payload.startIndex]) << 8
+            | Int(payload[payload.startIndex + 1])
+        let recordSize = 72
+        guard sessionCount <= (payloadLength - 2) / recordSize else {
+            throw VNCProtocolError.protocolViolation(
+                "Apple session list declares \(sessionCount) records in "
+                    + "\(payloadLength) bytes")
+        }
+
+        var sessionNames: [String] = []
+        for index in 0..<sessionCount {
+            let nameStart = payload.startIndex + 2 + index * recordSize + 8
+            let nameEnd = nameStart + 64
+            let field = payload[nameStart..<nameEnd]
+            let bytes = field.prefix { $0 != 0 }
+            if let name = String(bytes: bytes, encoding: .utf8), !name.isEmpty {
+                sessionNames.append(name)
+            }
+        }
+        // Session selection chooses the authenticated macOS login/console
+        // session. Match Client virtual displays are a separate media-control
+        // operation sent after the initial stream is running; they are not a
+        // second session-selection action. Sending action 2 here leaves the
+        // server waiting indefinitely.
+        let selection: UInt8 = 1
+        guard sessionCount > 0 else {
+            throw VNCProtocolError.protocolViolation(
+                "Apple server offered no console session for password-only High Performance")
+        }
+
+        var request = Data(repeating: 0, count: 74)
+        request[0] = 0x00
+        request[1] = 0x48 // 72-byte payload
+        request[2] = 0x00
+        request[3] = 0x01 // protocol version
+        request[8] = selection // connect to the offered console session
+        // This is only the viewer's display label. Keep it deterministic and
+        // platform-neutral so the wire request is identical on macOS,
+        // Mac Catalyst, iPhone, and iPad.
+        let clientName = Data("rootshell".utf8)
+        request.replaceSubrange(10..<(10 + clientName.count), with: clientName)
+        try await sendControlChannel(request)
+
+        let resultLengthData = try await readControlChannel(exactly: 2)
+        let resultLength = Int(resultLengthData[resultLengthData.startIndex]) << 8
+            | Int(resultLengthData[resultLengthData.startIndex + 1])
+        guard resultLength >= 4,
+              resultLength <= Self.maxAuxiliaryPayloadBytes else {
+            throw oversizedPayloadError(
+                resultLength,
+                limit: Self.maxAuxiliaryPayloadBytes,
+                context: "Apple session selection result")
+        }
+        let result = try await readControlChannel(exactly: resultLength)
+        let version = UInt16(result[result.startIndex]) << 8
+            | UInt16(result[result.startIndex + 1])
+        let status = UInt16(result[result.startIndex + 2]) << 8
+            | UInt16(result[result.startIndex + 3])
+        guard version == 1, status == 0 else {
+            throw VNCProtocolError.protocolViolation(
+                "Apple session selection failed (version=\(version), status=\(status))")
+        }
+        log.info(
+            "Selected password-only Apple console session from "
+                + "\(sessionNames.isEmpty ? "unnamed list" : sessionNames.joined(separator: ", "))")
     }
 
     private func readReasonString() async throws -> String {
@@ -1843,7 +1940,7 @@ public actor TransportSession {
     private func readLoop() async {
         while !Task.isCancelled {
             do {
-                if acceptedAppleMediaStream {
+                if acceptedAppleMediaStream, hasEncryptedAppleMediaControl {
                     try await drainAppleMediaControlRecord()
                     continue
                 }
@@ -2171,6 +2268,35 @@ public actor TransportSession {
                 try await handleAppleMediaStreamOfferPayload(offerData)
                 pixelData = offerData
 
+            case .appleH264:
+                // In password-only capability mode macOS carries the initial
+                // media-stream message 1 inside encoding 1010, prefixed by a
+                // UInt16 payload size. It is not a payload-free marker.
+                var payload = try await readControlChannel(exactly: 2)
+                let length = Int(payload[payload.startIndex]) << 8
+                    | Int(payload[payload.startIndex + 1])
+                guard length <= Self.maxAuxiliaryPayloadBytes else {
+                    throw oversizedPayloadError(
+                        length,
+                        limit: Self.maxAuxiliaryPayloadBytes,
+                        context: "Apple HEVC control rectangle")
+                }
+                if length > 0 {
+                    payload.append(try await readControlChannel(exactly: length))
+                }
+                let offerData = Data(payload.dropFirst(2))
+                var avcPayload = Data([0x00, 0x00, 0x03, 0xf2])
+                avcPayload.append(payload)
+                let handledAVCMessage = try await
+                    handleAppleAVCServerMediaMessageIfPresent(avcPayload)
+                try await sendAppleMediaPostAnswerViewerInfoIfNeeded(for: avcPayload)
+                if !handledAVCMessage,
+                   offerData.count == AppleMediaStreamOffer.wirePayloadSize,
+                   findAppleAVCMediaMessage(in: avcPayload)?.messageType != 2 {
+                    try await handleAppleMediaStreamOfferPayload(offerData)
+                }
+                pixelData = payload
+
             case .cursor:
                 // Cursor pseudo-encoding: pixel data + bitmask
                 let pixelBytes = Int(rect.width) * Int(rect.height) * pixelFormat.bytesPerPixel
@@ -2246,16 +2372,48 @@ public actor TransportSession {
                 if length > 0 {
                     payload.append(try await readControlChannel(exactly: length))
                 }
-                emitAppleRemoteSessionState(
-                    from: payload,
-                    source: "standard RFB 1105")
-                let displayInfos = appleDisplayInfo2Records(payload)
-                completeAppleDisplayLayout = displayInfos
-                emitAppleDisplayInfoCompatibilityEvents(displayInfos)
-                if let firstDisplay = displayInfos.first {
-                    try await sendAppleStandardDisplaySelectionIfNeeded(
-                        displayID: firstDisplay.displayIndex,
-                        announcedDisplayCount: displayInfos.count)
+                if acceptedAppleMediaStream {
+                    try await handleAppleMediaDisplayInfo2(payload)
+                } else {
+                    emitAppleRemoteSessionState(
+                        from: payload,
+                        source: "standard RFB 1105")
+                    let displayInfos = appleDisplayInfo2Records(payload)
+                    completeAppleDisplayLayout = displayInfos
+                    emitAppleDisplayInfoCompatibilityEvents(displayInfos)
+                    if let firstDisplay = displayInfos.first {
+                        try await sendAppleStandardDisplaySelectionIfNeeded(
+                            displayID: firstDisplay.displayIndex,
+                            announcedDisplayCount: displayInfos.count)
+                    }
+                }
+                pixelData = payload
+
+            case .unknown(let value)
+                where value == 1107 || value == 1109 || value == 1110:
+                // Password-only VNC authentication has no Apple session key,
+                // so High Performance control rectangles continue on the
+                // ordinary RFB stream instead of moving into encrypted record
+                // framing. These records use the same UInt16 length prefix as
+                // their decrypted counterparts.
+                var payload = try await readControlChannel(exactly: 2)
+                let length = Int(payload[payload.startIndex]) << 8
+                    | Int(payload[payload.startIndex + 1])
+                guard length <= Self.maxAuxiliaryPayloadBytes else {
+                    throw oversizedPayloadError(
+                        length, limit: Self.maxAuxiliaryPayloadBytes,
+                        context: "Apple media control (value)")
+                }
+                if length > 0 {
+                    payload.append(try await readControlChannel(exactly: length))
+                }
+                if value == 1109 {
+                    try await sendAppleMediaInitialSetDisplayIfNeeded()
+                    try await sendAppleMediaAutoFrameUpdateIfNeeded()
+                } else if value == 1110 {
+                    try await sendAppleMediaInitialSetDisplayIfNeeded()
+                    try await sendAppleMediaAutoFrameUpdateIfNeeded()
+                    try await sendAppleMediaServerConfigurationIfNeeded()
                 }
                 pixelData = payload
 
@@ -2760,7 +2918,7 @@ public actor TransportSession {
     private func sendAppleMediaPostAcceptEncodingsIfNeeded() async throws {
         guard requestAppleMediaStream, !sentAppleMediaPostAcceptEncodings else { return }
         let payload = ClientMessage.setEncodings(appleMediaPostAcceptEncodings()).serialize()
-        try await sendAppleEncryptedClientPayload(payload)
+        try await sendAppleMediaControlPayload(payload)
         sentAppleMediaPostAcceptEncodings = true
         log.debug("Sent Apple media post-accept SetEncodings length=\(payload.count)")
         try await sendAppleMediaPostAcceptViewerInfoIfNeeded()
@@ -2769,7 +2927,7 @@ public actor TransportSession {
     private func sendAppleMediaPostAcceptViewerInfoIfNeeded() async throws {
         guard requestAppleMediaStream, !sentAppleMediaPostAcceptViewerInfo else { return }
         let payload = appleMediaStreamConfiguration(localPort: appleMediaConfigurationUDPPort())
-        try await sendAppleEncryptedClientPayload(payload)
+        try await sendAppleMediaControlPayload(payload)
         sentAppleMediaPostAcceptViewerInfo = true
         log.debug("Sent Apple media post-accept viewer info length=\(payload.count)")
     }
@@ -2786,7 +2944,7 @@ public actor TransportSession {
         _ = appleMediaGenerationTracker.finishMessageTwo()
         guard !sentAppleMediaPostAnswerViewerInfo else { return }
         let viewerInfo = appleMediaStreamConfiguration(localPort: appleMediaConfigurationUDPPort())
-        try await sendAppleEncryptedClientPayload(viewerInfo)
+        try await sendAppleMediaControlPayload(viewerInfo)
         sentAppleMediaPostAnswerViewerInfo = true
         log.debug("Sent Apple media post-answer viewer info length=\(viewerInfo.count)")
 
@@ -3018,7 +3176,7 @@ public actor TransportSession {
               appleDisplayReconfigurationGeneration != nil,
               !sentAppleMediaReconfigurationRequest else { return }
         sentAppleMediaReconfigurationRequest = true
-        try await sendAppleEncryptedClientPayload(
+        try await sendAppleMediaControlPayload(
             ClientMessage.appleMediaStreamRequest.serialize())
         log.info("Requested Apple media renegotiation for virtual displays")
     }
@@ -3049,7 +3207,7 @@ public actor TransportSession {
             displayID = firstDisplay.displayIndex
         }
         sentAppleMediaInitialSetDisplay = true
-        try await sendAppleEncryptedClientPayload(appleSetDisplayMessage(
+        try await sendAppleMediaControlPayload(appleSetDisplayMessage(
             isGlobal: combinesAllDisplays,
             displayID: displayID))
     }
@@ -3148,7 +3306,7 @@ public actor TransportSession {
         // delivery is change-gated regardless, so it does not affect idle bitrate.
         let interval = runtimeEnvironment["ROOTSHELL_VNC_AUTOFRAME_INTERVAL_MS"]
             .flatMap { Int32($0) } ?? 16
-        try await sendAppleEncryptedClientPayload(appleAutoFrameUpdateMessage(intervalMilliseconds: interval))
+        try await sendAppleMediaControlPayload(appleAutoFrameUpdateMessage(intervalMilliseconds: interval))
     }
 
     private func sendAppleAutoFrameUpdate() async throws {
@@ -3234,7 +3392,7 @@ public actor TransportSession {
         guard acceptedAppleMediaStream, sentAppleMediaAutoFrameUpdate else { return }
         let interval = runtimeEnvironment["ROOTSHELL_VNC_AUTOFRAME_INTERVAL_MS"]
             .flatMap { Int32($0) } ?? 16
-        try await sendAppleEncryptedClientPayload(
+        try await sendAppleMediaControlPayload(
             appleAutoFrameUpdateMessage(intervalMilliseconds: interval))
         log.debug("Updated Apple media frame subscription to \(width)x\(height)")
     }
@@ -3467,8 +3625,11 @@ public actor TransportSession {
 
     private func sendClientPayload(_ payload: Data) async throws {
         if acceptedAppleMediaStream {
-            traceAppleMediaClientPayload(label: "client encrypted payload", payload: payload)
-            try await sendAppleEncryptedClientPayload(payload)
+            let label = hasEncryptedAppleMediaControl
+                ? "client encrypted payload"
+                : "client plaintext media payload"
+            traceAppleMediaClientPayload(label: label, payload: payload)
+            try await sendAppleMediaControlPayload(payload)
         } else {
             if requestAppleMediaStream {
                 traceAppleMediaClientPayload(label: "client plaintext payload", payload: payload)
@@ -3477,7 +3638,7 @@ public actor TransportSession {
         }
     }
 
-    private func sendAppleEncryptedClientPayload(_ payload: Data) async throws {
+    private func sendAppleMediaControlPayload(_ payload: Data) async throws {
         dumpAppleMediaClientRecordIfRequested(payload)
         if let channel = appleMediaComCryptionChannel {
             let encrypted = try channel.encryptPayload(payload, packetID: appleMediaClientPacketID)
@@ -3496,9 +3657,20 @@ public actor TransportSession {
             return
         }
 
-        try ensureAppleEncryptedControlChannel()
+        if appleEncryptedControlChannel == nil,
+           stateMachine.selectedSecurityType != .vncAuthentication {
+            try ensureAppleEncryptedControlChannel()
+        }
+
         guard let channel = appleEncryptedControlChannel else {
-            throw VNCProtocolError.protocolViolation("Apple encrypted channel is unavailable")
+            // VNC Authentication (type 2) has no key-exchange step. Apple
+            // servers therefore retain ordinary RFB framing for the media
+            // control messages until/unless an encrypted transition is
+            // explicitly negotiated.
+            traceAppleMediaClientPayload(
+                label: "client plaintext media control", payload: payload)
+            try await sendControlChannel(payload)
+            return
         }
 
         let encrypted = try channel.encrypt(payload)
@@ -3763,6 +3935,13 @@ public actor TransportSession {
                     screenCount: appleDecryptedRFBBuffer[offset])
             case .mediaStreamOffer:
                 pixelDataLength = AppleMediaStreamOffer.wirePayloadSize
+            case .appleH264:
+                guard offset + 2 <= appleDecryptedRFBBuffer.endIndex else {
+                    return false
+                }
+                let length = Int(appleDecryptedRFBBuffer[offset]) << 8
+                    | Int(appleDecryptedRFBBuffer[offset + 1])
+                pixelDataLength = 2 + length
             case .encryptionInfo, .serverDisplayInfo, .mediaStreamAnswer:
                 pixelDataLength = 0
             case .cursor:
@@ -3834,6 +4013,10 @@ public actor TransportSession {
                 try await noteStandardDesktopSizeSupport(layout)
             } else if rect.encoding == .mediaStreamOffer {
                 try await handleAppleMediaStreamOfferPayload(pixelData)
+            } else if rect.encoding == .appleH264,
+                      pixelData.count == AppleMediaStreamOffer.wirePayloadSize + 2 {
+                try await handleAppleMediaStreamOfferPayload(
+                    Data(pixelData.dropFirst(2)))
             } else if case .unknown(let value) = rect.encoding {
                 switch value {
                 case 1104:
@@ -4654,6 +4837,20 @@ public actor TransportSession {
     private func sendAppleMediaStreamSetupIfNeeded() async throws {
         guard !sentAppleMediaStreamConfiguration else { return }
 
+        // VNC Authentication enters Pro Mode through encoding 1010 itself.
+        // After the ClientInit/session-selection exchange,
+        // the native viewer advertises its encodings and requests a frame; the
+        // server then supplies AVC media message 1 in an encoding-1010
+        // rectangle. The legacy 66-byte viewer-info message and 16-byte media
+        // request belong to the keyed Apple authentication handshake. Sending
+        // them here makes a password-only server reject the session before it
+        // can emit message 1.
+        if stateMachine.selectedSecurityType == .vncAuthentication {
+            sentAppleMediaStreamConfiguration = true
+            log.debug("Awaiting password-only Apple AVC media message 1")
+            return
+        }
+
         let mediaUDPPort = appleMediaConfigurationUDPPort()
         try await sendControlChannel(appleMediaStreamConfiguration(localPort: mediaUDPPort))
         try await sendControlChannel(ClientMessage.appleMediaStreamRequest.serialize())
@@ -4694,7 +4891,7 @@ public actor TransportSession {
                 initialTargetBps: appleMediaNetworkProfile.initialCapacityBps)
         }
         rebuildAppleMediaSRTPContexts()
-        try await sendAppleEncryptedClientPayload(configuration)
+        try await sendAppleMediaControlPayload(configuration)
         sentAppleMediaServerConfiguration = true
         log.debug("Sent Apple media server configuration message length=\(configuration.count)")
     }
@@ -4915,11 +5112,26 @@ public actor TransportSession {
         guard let message = findAppleAVCMediaMessage(in: payload) else { return false }
         guard message.messageType == 1 else { return false }
 
+        let isPasswordOnlyBootstrap = !acceptedAppleMediaStream
+            && stateMachine.selectedSecurityType == .vncAuthentication
+
         guard let transition = appleMediaGenerationTracker.beginMessageOne() else {
             log.warning("Ignoring duplicate AVC media message 1 while its answer is pending")
             return true
         }
         beginAppleMediaGeneration(transition)
+
+        // VNC Authentication (type 2) does not have the earlier encrypted
+        // RFBMediaStreamOffer/Answer exchange. Its encoding-1010 message 1 is
+        // the point at which the native viewer enters High Performance mode.
+        // Keep the ordinary RFB stream in that mode while the AVC messages and
+        // UDP media negotiation continue in plaintext.
+        if !acceptedAppleMediaStream {
+            acceptedAppleMediaStream = true
+            emittedAppleMediaControlDiagnostics = 0
+            appleMediaServerPacketID = 0
+            appleMediaClientPacketID = 0
+        }
 
         let ports = configuredAppleMediaPortOverride() ?? appleMediaServerPorts(from: message.body)
         guard !ports.isEmpty else {
@@ -4930,6 +5142,32 @@ public actor TransportSession {
         let bindings = ports.map { AppleMediaUDPBinding(localPort: $0, remotePort: $0) }
         log.debug("Server AVC media type-1 offered UDP ports \(ports); opening symmetric sockets")
         try await startAppleMediaStreamUDPIfNeeded(bindings: bindings)
+
+        if isPasswordOnlyBootstrap {
+            // Keyed Apple authentication publishes an earlier encoding-1103
+            // RFBMediaStreamOffer, which is what creates VNCSession's decoder
+            // and installs its direct RTP sink. Password-only authentication
+            // enters the same media protocol at encoding 1010 message 1 and
+            // never sends 1103. Publish the equivalent semantic event here;
+            // without it transport successfully receives/decrypts RTP while
+            // the UI remains at "Waiting for first screen update" forever.
+            let audioPort = ports.first
+            let videoPort = ports.count > 1 ? ports[1] : ports.first
+            let offer = AppleMediaStreamOffer(
+                streamID: 0,
+                codecType: 0x6876_6331, // 'hvc1'
+                width: UInt32(fbWidth),
+                height: UInt32(fbHeight),
+                frameRate: UInt32(clamping: requestedFrameRate),
+                rawPayload: message.body,
+                messageVersion: 1,
+                messageType: 1,
+                audioStreamUDPPort: audioPort,
+                videoStream1UDPPort: videoPort,
+                videoStreamDisplayCount: appleMediaDisplayCount)
+            continuation?.yield(.mediaStreamOffer(offer))
+            log.info("Published password-only Apple media offer for decoder startup")
+        }
 
         // A type-1 AVC media message is the request for a fresh client media
         // configuration. The client must create its offers and keys, then

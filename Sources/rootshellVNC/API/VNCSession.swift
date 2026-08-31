@@ -764,7 +764,7 @@ public final class VNCSession {
     /// Satisfying the request makes the remote Mac switch console sessions and
     /// restart its capture pipeline, and the confirming DisplayInfo2 only lands
     /// after that settles. Apple's own client schedules an 8s `dispatch_after`
-    /// in `-[SSSession stSetCurtained]` before it re-checks, so anything near
+    /// in the server before it re-checks, so anything near
     /// that budget reports false failures on changes that did work.
     static let curtainConfirmationTimeoutNanoseconds: UInt64 = 20_000_000_000
 

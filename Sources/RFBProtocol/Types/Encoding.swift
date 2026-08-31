@@ -136,8 +136,9 @@ public enum Encoding: Sendable, Equatable, Hashable {
     /// outside this set is ever advertised, and the parsers refuse anything
     /// outside it that arrives regardless.
     ///
-    /// `.appleH264` qualifies because its pixels ride the UDP media path; the
-    /// RFB channel only carries a marker rectangle the parsers skip.
+    /// `.appleH264` qualifies because its pixels ride the UDP media path; its
+    /// RFB rectangle carries a UInt16-framed media-control payload rather than
+    /// framebuffer pixels.
     ///
     /// Keep this in step with the `switch rect.encoding` in
     /// `TransportSession.handleFramebufferUpdate` and its encrypted-channel

@@ -13,6 +13,111 @@ final class TransportSessionScriptedTests: XCTestCase {
         .serverDisplayInfo, .raw,
     ]
 
+    func testPasswordOnlyHighPerformanceSelectsConsoleBeforeMatchClientMedia() async throws {
+        let encodings: [Encoding] = [
+            .appleH264, .mediaStreamOffer, .serverDisplayInfo, .raw,
+        ]
+        var serverBytes = ProtocolVersion.apple.wireBytes()
+        serverBytes.append(contentsOf: [1, SecurityType.vncAuthentication.rawValue])
+        serverBytes.append(Data(repeating: 0x5a, count: 16)) // VNC challenge
+        serverBytes.append(contentsOf: [0, 0, 0, 0]) // SecurityResult OK
+        serverBytes.append(Self.appleServerInitMessage(
+            width: 2880,
+            height: 1800,
+            name: "Password Only Mac"))
+        var sessionList = Data([
+            0x00, 0x4a, // 74-byte payload
+            0x00, 0x01, // one console session
+            0x00, 0x00, 0x00, 0x0f, // session ID
+            0x00, 0x00, 0x00, 0x00, // flags
+        ])
+        var consoleName = Data("Console User".utf8)
+        consoleName.append(Data(repeating: 0, count: 64 - consoleName.count))
+        sessionList.append(consoleName)
+        serverBytes.append(sessionList)
+        serverBytes.append(contentsOf: [
+            0x00, 0x50, // 80-byte result
+            0x00, 0x01, // protocol version
+            0x00, 0x00, // success
+        ])
+        serverBytes.append(Data(repeating: 0, count: 76))
+
+        let fixture = try LoopbackRFBFixture(serverBytes: serverBytes)
+        defer { fixture.close() }
+        let session = TransportSession(
+            host: "127.0.0.1",
+            port: fixture.port,
+            password: "vnc-password",
+            preferredEncodings: encodings,
+            requestsVirtualDisplays: true)
+
+        try await session.connect()
+
+        var expectedAfterAuth = Data([0xc1])
+        expectedAfterAuth.append(Self.appleConsoleSessionSelectionMessage())
+        expectedAfterAuth.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
+        expectedAfterAuth.append(ClientMessage.setEncodings(encodings).serialize())
+        expectedAfterAuth.append(ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0,
+            y: 0,
+            width: 2880,
+            height: 1800).serialize())
+
+        let bytesBeforeClientInit = ProtocolVersion.apple.wireBytes().count
+            + 1 // selected VNC security type
+            + 16 // DES response to the server challenge
+        let expectedCount = bytesBeforeClientInit + expectedAfterAuth.count
+        let captured = await fixture.waitForClientBytes(atLeast: expectedCount)
+        let sent = try XCTUnwrap(captured)
+
+        var expectedPrefix = ProtocolVersion.apple.wireBytes()
+        expectedPrefix.append(SecurityType.vncAuthentication.rawValue)
+        XCTAssertEqual(sent.prefix(expectedPrefix.count), expectedPrefix)
+        XCTAssertEqual(
+            Data(sent.dropFirst(bytesBeforeClientInit).prefix(expectedAfterAuth.count)),
+            expectedAfterAuth)
+        // Password-only Pro Mode is triggered by encoding 1010. The keyed
+        // Apple auth flow's legacy viewer-info/media-request messages would be
+        // extra bytes here and cause the server to close before AVC message 1.
+        let unexpectedExtraBytes = await fixture.waitForClientBytes(
+            atLeast: expectedCount + 1,
+            timeout: .milliseconds(200))
+        XCTAssertNil(unexpectedExtraBytes)
+
+        var mediaMessageOne = Data(repeating: 0, count: 36)
+        mediaMessageOne[1] = 1 // version 1
+        mediaMessageOne[3] = 1 // message 1
+        mediaMessageOne[8] = UInt8(fixture.port >> 8)
+        mediaMessageOne[9] = UInt8(fixture.port & 0xff)
+        mediaMessageOne[14] = UInt8(fixture.port >> 8)
+        mediaMessageOne[15] = UInt8(fixture.port & 0xff)
+        var framedMediaMessage = Data([0, UInt8(mediaMessageOne.count)])
+        framedMediaMessage.append(mediaMessageOne)
+        try fixture.sendServerBytes(Self.framebufferUpdate([(
+            Self.rectangleHeader(
+                x: 0, y: 0, width: 0, height: 0,
+                encoding: Encoding.appleH264.rawValue),
+            framedMediaMessage,
+        )]))
+
+        let observedOffers = await Self.withTimeout(seconds: 2) {
+            for await event in session.events {
+                if case .mediaStreamOffer(let offer) = event {
+                    return [offer]
+                }
+            }
+            return []
+        }
+        let mediaOffer = observedOffers?.first
+        XCTAssertEqual(mediaOffer?.messageType, 1)
+        XCTAssertEqual(mediaOffer?.videoStream1UDPPort, fixture.port)
+        XCTAssertEqual(mediaOffer?.width, 2880)
+        XCTAssertEqual(mediaOffer?.height, 1800)
+
+        await session.disconnect()
+    }
+
     func testStagedRemoteDisplayRequestMarksResizeUnsettled() async throws {
         let states = LockedResizeSettledStates()
         let session = TransportSession(
@@ -1369,6 +1474,39 @@ final class TransportSessionScriptedTests: XCTestCase {
         ])
         data.append(nameBytes)
         return data
+    }
+
+    private static func appleServerInitMessage(
+        width: UInt16,
+        height: UInt16,
+        name: String
+    ) -> Data {
+        var field = Data([
+            0x00, 0x00,             // status/reserved
+            0x00, 0x00, 0x00, 0x54, // Apple server flags
+        ])
+        field.append(Data(repeating: 0, count: 16)) // server-command bitmap
+        field.append(Data(name.utf8))
+
+        var data = Data()
+        data.append(contentsOf: [UInt8(width >> 8), UInt8(width & 0xff)])
+        data.append(contentsOf: [UInt8(height >> 8), UInt8(height & 0xff)])
+        data.append(PixelFormat.bgra8888.wireBytes())
+        data.append(uint32Bytes(UInt32(field.count)))
+        data.append(field)
+        return data
+    }
+
+    private static func appleConsoleSessionSelectionMessage() -> Data {
+        var request = Data(repeating: 0, count: 74)
+        request[0] = 0x00
+        request[1] = 0x48
+        request[2] = 0x00
+        request[3] = 0x01
+        request[8] = 0x01
+        let clientName = Data("rootshell".utf8)
+        request.replaceSubrange(10..<(10 + clientName.count), with: clientName)
+        return request
     }
 
     private static func rectangleHeader(

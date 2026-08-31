@@ -12,6 +12,15 @@ import rootshellVNC
 import UIKit
 #endif
 
+#if targetEnvironment(macCatalyst)
+/// Objective-C declaration for the AppKit responder action exposed through
+/// Catalyst's hosting window. Declaring it here gives `#selector` a symbol it
+/// can validate without importing AppKit, which is unavailable to Catalyst.
+@objc private protocol CatalystFullScreenResponder {
+    @objc optional func toggleFullScreen(_ sender: Any?)
+}
+#endif
+
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var session: VNCSession
@@ -216,7 +225,7 @@ struct ContentView: View {
     @discardableResult
     private func toggleCatalystFullScreen() -> Bool {
         UIApplication.shared.sendAction(
-            Selector(("toggleFullScreen:")),
+            #selector(CatalystFullScreenResponder.toggleFullScreen(_:)),
             to: nil,
             from: nil,
             for: nil)
