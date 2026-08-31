@@ -1746,8 +1746,8 @@ public actor TransportSession {
     private func sendClientInit() async throws {
         // ClientInit mode 0xc1 is required for media connections.
         // Password-only VNC auth receives an additional length-framed session
-        // list after ServerInit; `readServerInit` consumes it and selects the
-        // console session before ordinary RFB negotiation.
+        // action advertisement after ServerInit; `readServerInit` consumes it
+        // before ordinary RFB negotiation.
         let flags: UInt8 = requestAppleMediaStream ? 0xc1 : 0x01
         try await sendControlChannel(Data([flags]))
         log.debug("Sent ClientInit flags=0x\(String(flags, radix: 16))")
@@ -1841,13 +1841,13 @@ public actor TransportSession {
 
     /// ClientInit mode `0xc1` adds a session-selection
     /// exchange when authentication type 2 supplied no Apple session key.
-    /// The server advertises fixed-width console-session records, then expects
-    /// the native 74-byte selection command before SetEncodings/media setup.
+    /// The server advertises the allowed session actions and its machine name,
+    /// then expects a 74-byte selection command before SetEncodings/media setup.
     private func selectPasswordOnlyAppleSession() async throws {
         let lengthData = try await readControlChannel(exactly: 2)
         let payloadLength = Int(lengthData[lengthData.startIndex]) << 8
             | Int(lengthData[lengthData.startIndex + 1])
-        guard payloadLength >= 2,
+        guard payloadLength >= 10,
               payloadLength <= Self.maxAuxiliaryPayloadBytes else {
             throw oversizedPayloadError(
                 payloadLength,
@@ -1855,35 +1855,32 @@ public actor TransportSession {
                 context: "Apple session list")
         }
         let payload = try await readControlChannel(exactly: payloadLength)
-        let sessionCount = Int(payload[payload.startIndex]) << 8
-            | Int(payload[payload.startIndex + 1])
-        let recordSize = 72
-        guard sessionCount <= (payloadLength - 2) / recordSize else {
+        let advertisementVersion = UInt16(payload[payload.startIndex]) << 8
+            | UInt16(payload[payload.startIndex + 1])
+        guard advertisementVersion == 1 else {
             throw VNCProtocolError.protocolViolation(
-                "Apple session list declares \(sessionCount) records in "
-                    + "\(payloadLength) bytes")
+                "Unsupported Apple session selection version \(advertisementVersion)")
         }
-
-        var sessionNames: [String] = []
-        for index in 0..<sessionCount {
-            let nameStart = payload.startIndex + 2 + index * recordSize + 8
-            let nameEnd = nameStart + 64
-            let field = payload[nameStart..<nameEnd]
-            let bytes = field.prefix { $0 != 0 }
-            if let name = String(bytes: bytes, encoding: .utf8), !name.isEmpty {
-                sessionNames.append(name)
-            }
-        }
-        // Session selection chooses the authenticated macOS login/console
-        // session. Match Client virtual displays are a separate media-control
-        // operation sent after the initial stream is running; they are not a
-        // second session-selection action. Sending action 2 here leaves the
-        // server waiting indefinitely.
-        let selection: UInt8 = 1
-        guard sessionCount > 0 else {
+        let actionMask = UInt32(payload[payload.startIndex + 2]) << 24
+            | UInt32(payload[payload.startIndex + 3]) << 16
+            | UInt32(payload[payload.startIndex + 4]) << 8
+            | UInt32(payload[payload.startIndex + 5])
+        // Prefer a direct console connection when the server offers it. Some
+        // login states offer only action 0, which requests the current console
+        // session through the same password-authenticated exchange. Action 2
+        // has a different, larger request body and is not valid here.
+        let selection: UInt8
+        if actionMask & (1 << 1) != 0 {
+            selection = 1
+        } else if actionMask & (1 << 0) != 0 {
+            selection = 0
+        } else {
             throw VNCProtocolError.protocolViolation(
-                "Apple server offered no console session for password-only High Performance")
+                "Apple server offered no supported console action for password-only High Performance")
         }
+        let machineNameField = payload.dropFirst(10).prefix(64)
+        let machineNameBytes = machineNameField.prefix { $0 != 0 }
+        let machineName = String(bytes: machineNameBytes, encoding: .utf8)
 
         var request = Data(repeating: 0, count: 74)
         request[0] = 0x00
@@ -1901,7 +1898,7 @@ public actor TransportSession {
         let resultLengthData = try await readControlChannel(exactly: 2)
         let resultLength = Int(resultLengthData[resultLengthData.startIndex]) << 8
             | Int(resultLengthData[resultLengthData.startIndex + 1])
-        guard resultLength >= 4,
+        guard resultLength >= 3,
               resultLength <= Self.maxAuxiliaryPayloadBytes else {
             throw oversizedPayloadError(
                 resultLength,
@@ -1909,17 +1906,16 @@ public actor TransportSession {
                 context: "Apple session selection result")
         }
         let result = try await readControlChannel(exactly: resultLength)
-        let version = UInt16(result[result.startIndex]) << 8
+        let resultVersion = UInt16(result[result.startIndex]) << 8
             | UInt16(result[result.startIndex + 1])
-        let status = UInt16(result[result.startIndex + 2]) << 8
-            | UInt16(result[result.startIndex + 3])
-        guard version == 1, status == 0 else {
+        let status = result[result.startIndex + 2]
+        guard resultVersion == 1, status == 0 else {
             throw VNCProtocolError.protocolViolation(
-                "Apple session selection failed (version=\(version), status=\(status))")
+                "Apple session selection failed (version=\(resultVersion), status=\(status))")
         }
         log.info(
-            "Selected password-only Apple console session from "
-                + "\(sessionNames.isEmpty ? "unnamed list" : sessionNames.joined(separator: ", "))")
+            "Selected password-only Apple console session with action \(selection)"
+                + "\(machineName.map { " on \($0)" } ?? "")")
     }
 
     private func readReasonString() async throws -> String {

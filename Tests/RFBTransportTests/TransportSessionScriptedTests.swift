@@ -25,16 +25,9 @@ final class TransportSessionScriptedTests: XCTestCase {
             width: 2880,
             height: 1800,
             name: "Password Only Mac"))
-        var sessionList = Data([
-            0x00, 0x4a, // 74-byte payload
-            0x00, 0x01, // one console session
-            0x00, 0x00, 0x00, 0x0f, // session ID
-            0x00, 0x00, 0x00, 0x00, // flags
-        ])
-        var consoleName = Data("Console User".utf8)
-        consoleName.append(Data(repeating: 0, count: 64 - consoleName.count))
-        sessionList.append(consoleName)
-        serverBytes.append(sessionList)
+        serverBytes.append(Self.appleSessionActionAdvertisement(
+            allowedActions: 0x0000_000f,
+            machineName: "Password Only Mac"))
         serverBytes.append(contentsOf: [
             0x00, 0x50, // 80-byte result
             0x00, 0x01, // protocol version
@@ -115,6 +108,103 @@ final class TransportSessionScriptedTests: XCTestCase {
         XCTAssertEqual(mediaOffer?.width, 2880)
         XCTAssertEqual(mediaOffer?.height, 1800)
 
+        await session.disconnect()
+    }
+
+    func testPasswordOnlyHighPerformanceRequestsConsoleWhenDirectConnectIsUnavailable() async throws {
+        let encodings: [Encoding] = [
+            .appleH264, .mediaStreamOffer, .serverDisplayInfo, .raw,
+        ]
+        var serverBytes = ProtocolVersion.apple.wireBytes()
+        serverBytes.append(contentsOf: [1, SecurityType.vncAuthentication.rawValue])
+        serverBytes.append(Data(repeating: 0x5a, count: 16))
+        serverBytes.append(contentsOf: [0, 0, 0, 0])
+        serverBytes.append(Self.appleServerInitMessage(
+            width: 2560,
+            height: 1440,
+            name: "Current Console Mac"))
+        // Actions 0 and 2 are offered. Action 1, the direct-console path used
+        // by some hosts, is deliberately absent.
+        serverBytes.append(Self.appleSessionActionAdvertisement(
+            allowedActions: 0x0000_0005,
+            machineName: "Current Console Mac"))
+        serverBytes.append(contentsOf: [
+            0x00, 0x50,
+            0x00, 0x01,
+            0x00,
+        ])
+        serverBytes.append(Data(repeating: 0, count: 77))
+
+        let fixture = try LoopbackRFBFixture(serverBytes: serverBytes)
+        defer { fixture.close() }
+        let session = TransportSession(
+            host: "127.0.0.1",
+            port: fixture.port,
+            password: "vnc-password",
+            preferredEncodings: encodings)
+
+        try await session.connect()
+
+        let bytesBeforeClientInit = ProtocolVersion.apple.wireBytes().count
+            + 1
+            + 16
+        var expectedAfterAuth = Data([0xc1])
+        expectedAfterAuth.append(Self.appleConsoleSessionSelectionMessage(action: 0))
+        expectedAfterAuth.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
+        expectedAfterAuth.append(ClientMessage.setEncodings(encodings).serialize())
+        expectedAfterAuth.append(ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0,
+            y: 0,
+            width: 2560,
+            height: 1440).serialize())
+        let expectedCount = bytesBeforeClientInit + expectedAfterAuth.count
+        let captured = await fixture.waitForClientBytes(atLeast: expectedCount)
+        let sent = try XCTUnwrap(captured)
+        XCTAssertEqual(
+            Data(sent.dropFirst(bytesBeforeClientInit).prefix(expectedAfterAuth.count)),
+            expectedAfterAuth)
+
+        await session.disconnect()
+    }
+
+    func testPasswordOnlySessionSelectionReadsOneByteResultStatus() async throws {
+        let encodings: [Encoding] = [.appleH264, .mediaStreamOffer, .raw]
+        var serverBytes = ProtocolVersion.apple.wireBytes()
+        serverBytes.append(contentsOf: [1, SecurityType.vncAuthentication.rawValue])
+        serverBytes.append(Data(repeating: 0x5a, count: 16))
+        serverBytes.append(contentsOf: [0, 0, 0, 0])
+        serverBytes.append(Self.appleServerInitMessage(
+            width: 1920,
+            height: 1080,
+            name: "Rejected Session Mac"))
+        serverBytes.append(Self.appleSessionActionAdvertisement(
+            allowedActions: 0x0000_0007,
+            machineName: "Rejected Session Mac"))
+        serverBytes.append(contentsOf: [
+            0x00, 0x50,
+            0x00, 0x01,
+            0x02,
+        ])
+        serverBytes.append(Data(repeating: 0, count: 77))
+
+        let fixture = try LoopbackRFBFixture(serverBytes: serverBytes)
+        defer { fixture.close() }
+        let session = TransportSession(
+            host: "127.0.0.1",
+            port: fixture.port,
+            password: "vnc-password",
+            preferredEncodings: encodings)
+
+        do {
+            try await session.connect()
+            XCTFail("Expected the server to reject session selection")
+        } catch let error as VNCProtocolError {
+            XCTAssertEqual(
+                error,
+                .protocolViolation(
+                    "Apple session selection failed (version=1, status=2)"))
+        }
         await session.disconnect()
     }
 
@@ -1497,13 +1587,32 @@ final class TransportSessionScriptedTests: XCTestCase {
         return data
     }
 
-    private static func appleConsoleSessionSelectionMessage() -> Data {
+    private static func appleSessionActionAdvertisement(
+        allowedActions: UInt32,
+        machineName: String
+    ) -> Data {
+        var message = Data([
+            0x00, 0x4a,
+            0x00, 0x01,
+            UInt8((allowedActions >> 24) & 0xff),
+            UInt8((allowedActions >> 16) & 0xff),
+            UInt8((allowedActions >> 8) & 0xff),
+            UInt8(allowedActions & 0xff),
+            0x00, 0x00, 0x00, 0x00,
+        ])
+        var name = Data(machineName.utf8.prefix(63))
+        name.append(Data(repeating: 0, count: 64 - name.count))
+        message.append(name)
+        return message
+    }
+
+    private static func appleConsoleSessionSelectionMessage(action: UInt8 = 1) -> Data {
         var request = Data(repeating: 0, count: 74)
         request[0] = 0x00
         request[1] = 0x48
         request[2] = 0x00
         request[3] = 0x01
-        request[8] = 0x01
+        request[8] = action
         let clientName = Data("rootshell".utf8)
         request.replaceSubrange(10..<(10 + clientName.count), with: clientName)
         return request
