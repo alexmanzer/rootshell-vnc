@@ -457,6 +457,7 @@ public actor TransportSession {
     private let maxUnacknowledgedUpdates = 1
     private var udpReadTasks: [Task<Void, Never>] = []
     private var udpChannels: [PosixUDPChannel] = []
+    private let udpByteCounter = ConnectionByteCounter()
     private let log = VNCLogger(category: "TransportSession")
     /// The profile requested Apple's accelerated media mode. It becomes active
     /// only after the server proves it is an Apple RFB 3.889 endpoint.
@@ -1288,10 +1289,19 @@ public actor TransportSession {
                 Self.secondsSince(connectionEstablishedNanos, now: nowNanos))
     }
 
-    /// Actual TCP socket payload counters; unavailable for injected transports.
+    /// TCP and UDP socket payload bytes, including retired media channels.
     public func socketByteCounts() async -> ConnectionByteCounts? {
         guard let connection = tcp as? TCPConnection else { return nil }
-        return await connection.socketByteCounts()
+        var counts = await connection.socketByteCounts()
+        let media = udpByteCounter.snapshot()
+        counts.received &+= media.received
+        counts.sent &+= media.sent
+        return counts
+    }
+
+    public var supportsRemoteDisplayResize: Bool {
+        appleServerCapabilities?.supportsServerCommand(
+            AppleServerCapabilities.displayConfigurationCommand) == true || standardDesktopLayout != nil
     }
 
     public var currentAppleMediaTilesPerFrame: Int {
@@ -5360,7 +5370,8 @@ public actor TransportSession {
             remoteHost: appleMediaRemoteHost,
             remotePort: binding.remotePort,
             remoteAddressFamily: appleMediaRemoteAddressFamily,
-            enableReusePort: true
+            enableReusePort: true,
+            byteCounter: udpByteCounter
         )
         try await channel.start()
         udpChannels.append(channel)

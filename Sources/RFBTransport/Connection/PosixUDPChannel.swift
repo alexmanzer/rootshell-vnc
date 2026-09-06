@@ -146,6 +146,7 @@ public actor PosixUDPChannel {
     private let remotePort: UInt16?
     private let remoteAddressFamily: PosixUDPAddressFamily?
     private let enableReusePort: Bool
+    private nonisolated let byteCounter: ConnectionByteCounter
 
     private var fd: Int32 = -1
     private var boundPort: UInt16?
@@ -199,6 +200,7 @@ public actor PosixUDPChannel {
         self.remotePort = remotePort
         self.remoteAddressFamily = nil
         self.enableReusePort = enableReusePort
+        self.byteCounter = ConnectionByteCounter()
     }
 
     init(
@@ -206,13 +208,15 @@ public actor PosixUDPChannel {
         remoteHost: String?,
         remotePort: UInt16?,
         remoteAddressFamily: PosixUDPAddressFamily?,
-        enableReusePort: Bool
+        enableReusePort: Bool,
+        byteCounter: ConnectionByteCounter = ConnectionByteCounter()
     ) {
         self.requestedLocalPort = localPort
         self.remoteHost = remoteHost
         self.remotePort = remotePort
         self.remoteAddressFamily = remoteAddressFamily
         self.enableReusePort = enableReusePort
+        self.byteCounter = byteCounter
     }
 
     // MARK: - Lifecycle
@@ -375,6 +379,7 @@ public actor PosixUDPChannel {
         if sent < 0 {
             throw VNCProtocolError.ioError("UDP send failed: \(errnoString())")
         }
+        byteCounter.send(sent)
     }
 
     public func close() {
@@ -443,6 +448,7 @@ public actor PosixUDPChannel {
     /// under the state lock so socket-drain order is exactly delivery order.
     /// `nonisolated` — runs on the serial read queue, not the actor.
     private nonisolated func publishBatchInOrder(_ batch: [PosixUDPDatagram]) {
+        byteCounter.receive(batch.reduce(0) { $0 + $1.data.count })
         stateLock.lock()
         let dropped = pendingDatagrams.append(contentsOf: batch)
         let queuedBeforeDelivery = pendingDatagrams.count

@@ -125,11 +125,14 @@ final class PosixUDPChannelDualStackTests: XCTestCase {
         }
         defer { peer.close() }
 
+        let counter = ConnectionByteCounter()
         let channel = PosixUDPChannel(
             localPort: nil,
             remoteHost: remoteHost,
             remotePort: peer.port,
-            enableReusePort: false)
+            remoteAddressFamily: nil,
+            enableReusePort: false,
+            byteCounter: counter)
         try await channel.start()
         defer { Task { await channel.close() } }
 
@@ -148,6 +151,10 @@ final class PosixUDPChannelDualStackTests: XCTestCase {
             try await channel.receive()
         }
         XCTAssertEqual(reply, Data("pong".utf8), file: file, line: line)
+        XCTAssertEqual(counter.snapshot().received, 4)
+        XCTAssertEqual(counter.snapshot().sent, 4)
+        await channel.close()
+        XCTAssertEqual(counter.snapshot().received, 4, "Closing must preserve aggregate media counts")
     }
 
     func testIPv4LiteralRoundTrip() async throws {

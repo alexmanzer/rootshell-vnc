@@ -1008,6 +1008,10 @@ public final class VNCSession {
     /// pushing a full-screen CGImage through SwiftUI every frame.
     @ObservationIgnored
     public let videoBandRenderer = VideoBandLayerRenderer()
+
+    /// Actual committed surface geometry, never a requested/advertised size.
+    /// Separate from the renderer's internal login-analysis callback.
+    @ObservationIgnored public var onVideoFrameCommitted: ((CGSize) -> Void)?
     /// Independent renderer for the second Apple media stream. A second
     /// display is a separate HEVC reference chain, not another band of display
     /// one, and must never share its decoder or band compositor.
@@ -1179,6 +1183,8 @@ public final class VNCSession {
                 .pixelBuffer(pixelBuffer),
                 source: "High Performance full frame",
                 highPerformanceGeneration: streamGeneration)
+            self?.onVideoFrameCommitted?(CGSize(width: CVPixelBufferGetWidth(pixelBuffer),
+                height: CVPixelBufferGetHeight(pixelBuffer)))
         }
         #if canImport(UIKit)
         observeApplicationLifecycle()
@@ -1826,6 +1832,29 @@ public final class VNCSession {
                         + error.localizedDescription)
             }
         }
+    }
+
+    /// Stage exact pixels before connect, or send a capability-gated request.
+    /// The returned disposition is not a decoded-frame acknowledgement.
+    public func requestRemotePixelSize(_ pixelSize: CGSize) async throws -> RemoteDisplayResizeDisposition {
+        guard configuration.videoQualityMode == .adaptive,
+              configuration.displaySizingMode == .matchClient,
+              let requested = RemoteDisplaySize.explicit(pixelSize: pixelSize) else {
+            throw VNCProtocolError.protocolViolation("Invalid explicit display size")
+        }
+        preparedClientDisplaySize = requested
+        guard connectionState.isConnected, let transport = transportSession else {
+            return .waitingForServerSupport
+        }
+        return try await transport.requestRemoteDisplaySize(pixelWidth: requested.pixelWidth,
+            pixelHeight: requested.pixelHeight, pointWidth: requested.pointWidth,
+            pointHeight: requested.pointHeight)
+    }
+
+    public func supportsRemotePixelSize() async -> Bool {
+        guard let transport = transportSession else { return false }
+        let supported = await transport.supportsRemoteDisplayResize
+        return transportSession === transport && supported
     }
 
     // MARK: - Diagnostics
