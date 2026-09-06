@@ -143,6 +143,11 @@ public final class VNCKeyboardCapture {
     /// text bytes.
     public var supplementalModifiers: VNCKeyboardModifiers = []
 
+    /// Replace the physical Control+Option chord with remote Command. This
+    /// takes precedence over compatibility/viewer shortcuts using that chord;
+    /// explicit menu commands and toolbar modifiers keep their original meaning.
+    public var controlOptionAsCommand: Bool = true
+
     /// Called after a non-modifier key is successfully dispatched with
     /// nonempty supplemental modifiers. Hosts use this to consume one-shot
     /// state; locked state can remain in ``supplementalModifiers``.

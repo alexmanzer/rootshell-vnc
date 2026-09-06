@@ -76,6 +76,7 @@ struct RemoteInteractionView: UIViewRepresentable {
             keyboardCaptured: keyboardCapture.isCaptured
                 && !suspendsKeyboardCapture,
             inputViewsGeneration: keyboardCapture.inputViewsGeneration,
+            controlOptionAsCommand: keyboardCapture.controlOptionAsCommand,
             framebufferOrigin: framebufferOrigin,
             requestPasswordSend: requestPasswordSend,
             requestDictation: requestDictation,
@@ -115,6 +116,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var viewport = RemoteViewportState()
     private var viewportPanningMode = RemoteViewportPanningMode.edge
     private var softwareKeyboardRequested = false
+    private var acceptsHardwareInput = true
     private var lastSeenInputViewsGeneration: UInt64 = 0
     private var lastPointerPoint: (x: UInt16, y: UInt16)?
     private var remoteCursor: RemoteCursor?
@@ -158,6 +160,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var momentumCatchTimestamp: CFTimeInterval = 0
     private let suppressedInputView = UIView(frame: .zero)
     private var consumedRemoteAliasUsages: Set<UInt32> = []
+    private var universalKeys = UniversalCommandKeyState()
     /// Supplemental toolbar modifiers held around each physical key until its
     /// matching key-up. Reference counts keep overlapping physical presses
     /// from releasing a shared synthetic modifier too early.
@@ -244,20 +247,125 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     override var keyCommands: [UIKeyCommand]? {
         guard keyboardCapture.isCaptured else { return viewerCommandKeyCommands }
         #if targetEnvironment(macCatalyst)
-        return reservedHostKeyCommands
+        let commands = reservedHostKeyCommands
             + standardRemoteKeyCommands
             + remoteNavigationKeyCommands
             + viewerCommandKeyCommands
             + catalystEditingKeyCommands
             + remoteControlKeyCommands
         #else
-        return reservedHostKeyCommands
+        let commands = reservedHostKeyCommands
             + commandCompatibilityKeyCommands
             + standardRemoteKeyCommands
             + remoteNavigationKeyCommands
             + viewerCommandKeyCommands
             + remoteCommandKeyCommands
         #endif
+        guard keyboardCapture.controlOptionAsCommand else { return commands }
+        return universalCommandKeyCommands + commands.filter {
+            !Self.isControlOptionChord($0.modifierFlags)
+        }
+    }
+
+    private static func isControlOptionChord(_ flags: UIKeyModifierFlags) -> Bool {
+        flags.contains([.control, .alternate])
+    }
+
+    private static let hardwareCommandCharacters = "abcdefghijklmnopqrstuvwxyz0123456789 -=[]\\;',./`"
+    // Only non-printable UIKit inputs have a layout-independent HID mapping.
+    // This table translates their value, never a held key's physical identity.
+    private static let universalSpecialInputs: [(String, UInt32)] = [
+        ("\r", 0x28), ("\t", 0x2B), ("\u{8}", 0x2A), ("\u{7F}", 0x4C),
+        (UIKeyCommand.inputEscape, 0x29),
+        (UIKeyCommand.inputUpArrow, 0x52), (UIKeyCommand.inputDownArrow, 0x51),
+        (UIKeyCommand.inputLeftArrow, 0x50), (UIKeyCommand.inputRightArrow, 0x4F),
+        (UIKeyCommand.inputHome, 0x4A), (UIKeyCommand.inputEnd, 0x4D),
+        (UIKeyCommand.inputPageUp, 0x4B), (UIKeyCommand.inputPageDown, 0x4E),
+    ]
+    private static let universalCommandInputs = hardwareCommandCharacters.map(String.init)
+        + universalSpecialInputs.map(\.0)
+
+    private lazy var universalCommandKeyCommands: [UIKeyCommand] = {
+        Self.universalCommandInputs.flatMap { input in
+            let variants: [UIKeyModifierFlags] = [
+                [.control, .alternate], [.control, .alternate, .shift],
+                [.control, .alternate, .command], [.control, .alternate, .command, .shift],
+            ]
+            return variants.map { flags in
+                let command = UIKeyCommand(input: input, modifierFlags: flags,
+                    action: #selector(handleUniversalCommandKey(_:)))
+                command.wantsPriorityOverSystemBehavior = true
+                command.allowsAutomaticLocalization = false
+                return command
+            }
+        }
+    }()
+
+    @objc private func handleUniversalCommandKey(_ command: UIKeyCommand) {
+        guard keyboardCapture.isCaptured, keyboardCapture.controlOptionAsCommand,
+              let input = command.input else { return }
+        let keysym: UInt32
+        if let special = Self.universalSpecialInputs.first(where: { $0.0 == input }) {
+            keysym = KeyboardInputHandler.keysymForHIDUsage(special.1, characters: "")
+        } else if let character = input.lowercased().first {
+            keysym = KeyboardInputHandler.keysymForCharacter(character)
+        } else {
+            return
+        }
+        synchronizeUniversalModifiers(command.modifierFlags)
+        switch universalKeys.routeCommand(keysym: keysym) {
+        case .duplicate:
+            break
+        case .tap:
+            // This identity exists only within this synchronous tap. It never
+            // waits for a hardware release and cannot leave key repeat running.
+            let tapUsage: UInt32 = 0x10000
+            beginSupplementalModifiersIfNeeded(for: tapUsage)
+            _ = hardwareKeyboard.press(usage: tapUsage, keysym: keysym)
+            _ = hardwareKeyboard.release(usage: tapUsage)
+            endSupplementalModifiers(for: tapUsage)
+        }
+    }
+
+    /// UIKit may have selected an action just before the session mode changed.
+    /// Re-check precedence at dispatch as well as when publishing key commands.
+    private func routeUniversalCommandIfNeeded(_ command: UIKeyCommand) -> Bool {
+        guard keyboardCapture.isCaptured, keyboardCapture.controlOptionAsCommand,
+              Self.isControlOptionChord(command.modifierFlags) else { return false }
+        handleUniversalCommandKey(command)
+        return true
+    }
+
+    private static func keyboardModifiers(_ flags: UIKeyModifierFlags) -> VNCKeyboardModifiers {
+        var result: VNCKeyboardModifiers = []
+        if flags.contains(.control) { result.insert(.control) }
+        if flags.contains(.alternate) { result.insert(.option) }
+        if flags.contains(.shift) { result.insert(.shift) }
+        if flags.contains(.command) { result.insert(.command) }
+        return result
+    }
+
+    private func pressUniversalKey(usage: UInt32, characters: String, flags: UIKeyModifierFlags) {
+        synchronizeUniversalModifiers(flags)
+        let keysym = KeyboardInputHandler.keysymForHIDUsage(usage, characters: characters.lowercased())
+        pressUniversalKeysym(usage: usage, keysym: keysym)
+    }
+
+    private func pressUniversalKeysym(usage: UInt32, keysym: UInt32) {
+        guard keysym != 0, universalKeys.beginPhysical(usage: usage, keysym: keysym) else { return }
+        beginSupplementalModifiersIfNeeded(for: usage)
+        _ = hardwareKeyboard.press(usage: usage, keysym: keysym)
+    }
+
+    private func synchronizeUniversalModifiers(_ flags: UIKeyModifierFlags) {
+        hardwareKeyboard.synchronizeModifiers(Self.keyboardModifiers(flags))
+        clearPendingTapsIfChordEnded()
+    }
+
+    private func clearPendingTapsIfChordEnded() {
+        if !hardwareKeyboard.isControlOptionChordActive {
+            universalKeys.endTranslatedChord()
+        }
     }
 
     /// Explicit commands for the small set of chords owned by a containing
@@ -390,7 +498,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     private lazy var remoteControlKeyCommands: [UIKeyCommand] = {
         var commands: [UIKeyCommand] = []
-        let inputs = "abcdefghijklmnopqrstuvwxyz0123456789 -=[]\\;',./`"
+        let inputs = Self.hardwareCommandCharacters
         for input in inputs {
             for modifiers: UIKeyModifierFlags in [.control, [.control, .shift]] {
                 if Self.isReservedViewerShortcut(
@@ -454,7 +562,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     #else
     private lazy var remoteCommandKeyCommands: [UIKeyCommand] = {
         var commands: [UIKeyCommand] = []
-        let inputs = "abcdefghijklmnopqrstuvwxyz0123456789 -=[]\\;',./`"
+        let inputs = Self.hardwareCommandCharacters
         let modifierVariants: [UIKeyModifierFlags] = [
             .command,
             [.command, .shift],
@@ -524,6 +632,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         self.disconnect = disconnect
         self.lastSeenInputViewsGeneration = keyboardCapture.inputViewsGeneration
         super.init(frame: .zero)
+        hardwareKeyboard.controlOptionAsCommand = keyboardCapture.controlOptionAsCommand
         backgroundColor = .clear
         isMultipleTouchEnabled = true
         accessibilityLabel = String(localized: "Remote desktop input", bundle: .module)
@@ -571,9 +680,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             selector: #selector(hardwareKeyboardDidDisconnect(_:)),
             name: .GCKeyboardDidDisconnect,
             object: nil)
-        #if targetEnvironment(macCatalyst)
-        configureCatalystKeyboardMonitor(for: GCKeyboard.coalesced)
-        #endif
     }
 
     @available(*, unavailable)
@@ -590,6 +696,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     override var canBecomeFirstResponder: Bool { true }
+
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        if became { configureHardwareKeyboardMonitor(for: GCKeyboard.coalesced) }
+        return became
+    }
 
     override func resignFirstResponder() -> Bool {
         releaseAllPressedKeys()
@@ -646,6 +758,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         keyboardActive: Bool,
         keyboardCaptured: Bool,
         inputViewsGeneration: UInt64,
+        controlOptionAsCommand: Bool,
         framebufferOrigin: CGPoint,
         requestPasswordSend: @escaping () -> Void,
         requestDictation: @escaping () -> Void,
@@ -653,6 +766,13 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         disconnect: @escaping () -> Void,
         remoteCursor: RemoteCursor?
     ) {
+        if hardwareKeyboard.controlOptionAsCommand != controlOptionAsCommand {
+            releaseAllPressedKeys()
+            consumedRemoteAliasUsages.removeAll()
+            hardwareKeyboard.controlOptionAsCommand = controlOptionAsCommand
+            UIMenuSystem.main.setNeedsRebuild()
+        }
+        acceptsHardwareInput = keyboardCaptured
         self.framebufferSize = framebufferSize
         self.framebufferOrigin = framebufferOrigin
         self.viewport = viewport
@@ -746,6 +866,21 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                 continue
             }
             let usage = UInt32(key.keyCode.rawValue)
+            if keyboardCapture.controlOptionAsCommand {
+                if (0xE0...0xE7).contains(usage) {
+                    _ = hardwareKeyboard.press(usage: usage,
+                        keysym: KeyboardInputHandler.keysymForHIDUsage(usage, characters: "",
+                            appleModifierConvention: keyboardHandler.usesAppleModifierMapping))
+                    clearPendingTapsIfChordEnded()
+                    continue
+                }
+                synchronizeUniversalModifiers(key.modifierFlags)
+                if Self.isControlOptionChord(key.modifierFlags) {
+                    pressUniversalKey(usage: usage,
+                        characters: key.charactersIgnoringModifiers, flags: key.modifierFlags)
+                    continue
+                }
+            }
             // Some UIKit configurations bypass UIKeyCommand arbitration and
             // deliver Command chords directly here. Claim host-owned chords
             // before the generic hardware path can send their target key to
@@ -810,6 +945,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handleReservedHostShortcut(_ command: UIKeyCommand) {
+        if routeUniversalCommandIfNeeded(command) { return }
         guard keyboardCapture.isCaptured,
               let shortcut = reservedHostShortcut(matching: command) else { return }
         releaseAllPressedKeys()
@@ -817,6 +953,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handleStandardRemoteCommand(_ command: UIKeyCommand) {
+        if routeUniversalCommandIfNeeded(command) { return }
         guard keyboardCapture.isCaptured,
               let remoteCommand = Self.remoteCommand(matching: command) else { return }
         releaseAllPressedKeys()
@@ -844,6 +981,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handleCommandCompatibilityAlias(_ command: UIKeyCommand) {
+        if routeUniversalCommandIfNeeded(command) { return }
         guard keyboardCapture.isCaptured,
               let character = command.input?.lowercased().first,
               character == "h" || character == "m" else { return }
@@ -855,6 +993,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         key: UIKey,
         usage: UInt32
     ) -> Bool {
+        guard !keyboardCapture.controlOptionAsCommand else { return false }
         let flags = key.modifierFlags.intersection([
             .control, .alternate, .shift, .command,
         ])
@@ -879,6 +1018,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handleDictationCommand(_ command: UIKeyCommand) {
+        if routeUniversalCommandIfNeeded(command) { return }
         requestDictation()
     }
 
@@ -1034,37 +1174,46 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     @objc private func hardwareKeyboardDidConnect(_ notification: Notification) {
         onHardwareKeyboardAttachedChange?(true)
-        #if targetEnvironment(macCatalyst)
-        configureCatalystKeyboardMonitor(
+        guard isFirstResponder else { return }
+        configureHardwareKeyboardMonitor(
             for: notification.object as? GCKeyboard ?? GCKeyboard.coalesced)
-        #endif
     }
 
     @objc private func hardwareKeyboardDidDisconnect(_ notification: Notification) {
+        releaseAllPressedKeys()
         // GameController may post before `coalesced` drops the disconnected
         // instance. Read it on the next main-loop turn so multiple connected
         // keyboards are handled correctly too.
         DispatchQueue.main.async { [weak self] in
             self?.publishHardwareKeyboardAvailability()
+            if self?.isFirstResponder == true {
+                self?.configureHardwareKeyboardMonitor(for: GCKeyboard.coalesced)
+            }
         }
-        #if targetEnvironment(macCatalyst)
-        if GCKeyboard.coalesced == nil {
-            configureCatalystKeyboardMonitor(for: nil)
-        }
-        #endif
     }
 
-    #if targetEnvironment(macCatalyst)
-    /// UIKit can translate Control-M into Return before delivering it to a
-    /// Catalyst responder. GameController exposes the underlying physical key
-    /// independently, so use it as a narrow fallback for the Command-H/M
-    /// compatibility aliases. All other keys continue through UIKit.
-    private func configureCatalystKeyboardMonitor(for keyboard: GCKeyboard?) {
+    /// Recover modifier/key releases that UIKit may omit for intercepted
+    /// commands. Printable input still uses UIKit's keyboard-layout result.
+    private func configureHardwareKeyboardMonitor(for keyboard: GCKeyboard?) {
         let input = keyboard?.keyboardInput
-        guard monitoredCatalystKeyboardInput !== input else { return }
         monitoredCatalystKeyboardInput?.keyChangedHandler = nil
         monitoredCatalystKeyboardInput = input
         input?.keyChangedHandler = { [weak self] keyboard, _, keyCode, pressed in
+            var flags: UIKeyModifierFlags = []
+            if keyboard.button(forKeyCode: .leftControl)?.isPressed == true
+                || keyboard.button(forKeyCode: .rightControl)?.isPressed == true { flags.insert(.control) }
+            if keyboard.button(forKeyCode: .leftAlt)?.isPressed == true
+                || keyboard.button(forKeyCode: .rightAlt)?.isPressed == true { flags.insert(.alternate) }
+            if keyboard.button(forKeyCode: .leftShift)?.isPressed == true
+                || keyboard.button(forKeyCode: .rightShift)?.isPressed == true { flags.insert(.shift) }
+            if keyboard.button(forKeyCode: .leftGUI)?.isPressed == true
+                || keyboard.button(forKeyCode: .rightGUI)?.isPressed == true { flags.insert(.command) }
+            let snapshot = flags
+            let usage = UInt32(keyCode.rawValue)
+            Task { @MainActor [weak self] in
+                self?.handleMonitoredUniversalKey(usage: usage, pressed: pressed, flags: snapshot)
+            }
+            #if targetEnvironment(macCatalyst)
             // Option/Command+arrow chords: Catalyst consumes these as its own
             // cursor movement and never delivers them via pressesBegan or a
             // UIKeyCommand, so read them straight from GameController — the same
@@ -1126,9 +1275,41 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                     pressed: pressed,
                     isExactAlias: isExactAlias)
             }
+            #endif
         }
     }
 
+    private func handleMonitoredUniversalKey(usage: UInt32, pressed: Bool, flags: UIKeyModifierFlags) {
+        guard acceptsHardwareInput, isFirstResponder, window?.isKeyWindow == true,
+              keyboardCapture.isCaptured, keyboardCapture.controlOptionAsCommand else { return }
+        if (0xE0...0xE7).contains(usage) {
+            if pressed {
+                _ = hardwareKeyboard.press(usage: usage,
+                    keysym: KeyboardInputHandler.keysymForHIDUsage(usage, characters: "",
+                        appleModifierConvention: keyboardHandler.usesAppleModifierMapping))
+            } else {
+                _ = hardwareKeyboard.release(usage: usage)
+            }
+            synchronizeUniversalModifiers(flags)
+            return
+        }
+        if !pressed {
+            if universalKeys.release(usage: usage) {
+                _ = hardwareKeyboard.release(usage: usage)
+                endSupplementalModifiers(for: usage)
+            }
+            return
+        }
+        guard Self.isControlOptionChord(flags) else { return }
+        // Non-printable keys have layout-independent HID keysyms. In
+        // particular, Catalyst can swallow mapped arrows before UIKit.
+        if (0x28...0x73).contains(usage),
+           KeyboardInputHandler.keysymForHIDUsage(usage, characters: "") != 0 {
+            pressUniversalKey(usage: usage, characters: "", flags: flags)
+        }
+    }
+
+    #if targetEnvironment(macCatalyst)
     private func handleCatalystCommandCompatibilityAlias(
         usage: UInt32,
         character: Character,
@@ -1139,7 +1320,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             consumedRemoteAliasUsages.remove(usage)
             return
         }
-        guard keyboardCapture.isCaptured, isExactAlias else { return }
+        guard isFirstResponder, keyboardCapture.isCaptured,
+              !keyboardCapture.controlOptionAsCommand, isExactAlias else { return }
         releaseAllPressedKeys()
         if consumedRemoteAliasUsages.insert(usage).inserted {
             keyboardHandler.handleCommandTap(character)
@@ -1515,11 +1697,19 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                 continue
             }
             let usage = UInt32(key.keyCode.rawValue)
+            if keyboardCapture.controlOptionAsCommand, (0xE0...0xE7).contains(usage) {
+                _ = hardwareKeyboard.release(usage: usage)
+                clearPendingTapsIfChordEnded()
+                continue
+            }
+            let releasedKeysym = KeyboardInputHandler.keysymForHIDUsage(
+                usage, characters: key.charactersIgnoringModifiers.lowercased())
+            let wasUniversalKey = universalKeys.release(usage: usage, keysym: releasedKeysym)
             if consumedRemoteAliasUsages.remove(usage) != nil {
                 continue
             }
             guard hardwareKeyboard.release(usage: usage) else {
-                unhandled.insert(press)
+                if !wasUniversalKey { unhandled.insert(press) }
                 continue
             }
             endSupplementalModifiers(for: usage)
@@ -1528,6 +1718,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     private func releaseAllPressedKeys() {
+        universalKeys.releaseAll()
         hardwareKeyboard.releaseAll()
         releaseAllSupplementalModifiers()
         #if targetEnvironment(macCatalyst)
@@ -1573,6 +1764,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     private func physicalModifierIsPressed(for keysym: UInt32) -> Bool {
+        if keyboardCapture.controlOptionAsCommand {
+            return hardwareKeyboard.emitsModifier(keysym: keysym)
+        }
         switch keysym {
         case KeyboardInputHandler.keysymControlL:
             return hardwareKeyboard.contains(usage: 0xE0)

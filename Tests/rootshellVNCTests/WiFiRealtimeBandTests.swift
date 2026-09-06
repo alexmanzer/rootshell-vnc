@@ -187,10 +187,12 @@ final class WiFiRealtimeBandTests: XCTestCase {
                             if n % 96 == 0, n / 96 < 20 {
                                 let ci = CIImage(cvPixelBuffer: pixelBuffer)
                                 let url = URL(fileURLWithPath: dir).appendingPathComponent("live_\(n)_ssrc\(ssrc).png")
+                                #if canImport(AppKit)
                                 if let cg = ciContext.createCGImage(ci, from: ci.extent) {
                                     let rep = NSBitmapImageRep(cgImage: cg)
                                     try? rep.representation(using: .png, properties: [:])?.write(to: url)
                                 }
+                                #endif
                             }
                         }
                     }

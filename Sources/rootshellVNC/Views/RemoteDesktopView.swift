@@ -466,6 +466,12 @@ public struct RemoteDesktopView: View {
             }
 
             keyboardCaptureControl
+            Toggle(isOn: Binding(
+                get: { keyboardCapture.controlOptionAsCommand },
+                set: { keyboardCapture.controlOptionAsCommand = $0 }
+            )) {
+                Label(String(localized: "Control+Option as Command", bundle: .module), systemImage: "keyboard")
+            }
             remoteCommandsMenu
             #endif
 
@@ -540,6 +546,19 @@ public struct RemoteDesktopView: View {
 
     private var remoteCommandsMenu: some View {
         Menu {
+            Menu(String(localized: "Editing", bundle: .module)) {
+                remoteShortcutButtons(RemoteMenuShortcut.editing)
+            }
+            Menu(String(localized: "Apps and Windows", bundle: .module)) {
+                remoteShortcutButtons(RemoteMenuShortcut.applications)
+            }
+            Menu(String(localized: "Documents and Tabs", bundle: .module)) {
+                remoteShortcutButtons(RemoteMenuShortcut.documents)
+            }
+            Menu(String(localized: "Special Keys", bundle: .module)) {
+                remoteShortcutButtons(RemoteMenuShortcut.keys)
+            }
+
             Section(String(localized: "Mac Specific", bundle: .module)) {
                 ForEach(RemoteCommand.macSpecific) { command in
                     Button(command.title) {
@@ -558,18 +577,19 @@ public struct RemoteDesktopView: View {
                         keyboardHandler.handleRemoteCommand(command)
                     }
                 }
-
-                Button(String(localized: "Command-H", bundle: .module)) {
-                    keyboardHandler.handleCommandTap("h")
-                }
-                Button(String(localized: "Command-M", bundle: .module)) {
-                    keyboardHandler.handleCommandTap("m")
-                }
             }
         } label: {
             Label(
                 String(localized: "Commands", bundle: .module),
                 systemImage: "command")
+        }
+    }
+
+    private func remoteShortcutButtons(_ shortcuts: [RemoteMenuShortcut]) -> some View {
+        ForEach(shortcuts) { shortcut in
+            Button(shortcut.menuTitle) {
+                keyboardHandler.handleShortcutTap(shortcut.character, modifiers: shortcut.modifiers)
+            }
         }
     }
     #endif
