@@ -118,4 +118,21 @@ final class AuthenticatorScriptedTests: XCTestCase {
         let endpoint = await connection.upgradedTLSEndpoint()
         XCTAssertNil(endpoint)
     }
+
+    func testAuthenticatedPolicyRejectsX509NoneBeforeTLSOrCredentials() async throws {
+        let connection = ScriptedRFBConnection()
+        await connection.enqueueServerBytes(Data([0, 2, 0, 1, 0, 0, 1, 4]))
+        do {
+            _ = try await VeNCryptAuthenticator(host: "test.invalid", port: 5900,
+                username: "test", password: "synthetic", requiresUserAuthentication: true)
+                .authenticate(connection: connection)
+            XCTFail("Unauthenticated TLS must not satisfy the authenticated policy")
+        } catch let error as VNCProtocolError {
+            XCTAssertEqual(error, .securityPolicyViolation)
+        }
+        let sent = await connection.sentBytes()
+        let endpoint = await connection.upgradedTLSEndpoint()
+        XCTAssertEqual(sent, Data([0, 2]))
+        XCTAssertNil(endpoint)
+    }
 }

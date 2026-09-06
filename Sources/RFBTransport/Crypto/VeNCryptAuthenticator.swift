@@ -15,6 +15,7 @@ public struct VeNCryptAuthenticator: Authenticator, Sendable {
     private let port: UInt16
     private let username: String?
     private let password: String
+    private let requiresUserAuthentication: Bool
     private let certificateValidationHandler: VNCCertificateValidationHandler?
     private let log = VNCLogger(category: "VeNCrypt")
 
@@ -23,12 +24,14 @@ public struct VeNCryptAuthenticator: Authenticator, Sendable {
         port: UInt16,
         username: String?,
         password: String,
-        certificateValidationHandler: VNCCertificateValidationHandler? = nil
+        certificateValidationHandler: VNCCertificateValidationHandler? = nil,
+        requiresUserAuthentication: Bool = false
     ) {
         self.host = host
         self.port = port
         self.username = username
         self.password = password
+        self.requiresUserAuthentication = requiresUserAuthentication
         self.certificateValidationHandler = certificateValidationHandler
     }
 
@@ -69,6 +72,7 @@ public struct VeNCryptAuthenticator: Authenticator, Sendable {
             offered.append(byte0 | byte1 | byte2 | byte3)
         }
         guard let selected = selectSubtype(from: offered) else {
+            if requiresUserAuthentication { throw VNCProtocolError.securityPolicyViolation }
             let list = offered.map(String.init).joined(separator: ", ")
             throw VNCProtocolError.authenticationFailed(
                 "No supported encrypted VeNCrypt subtype was offered (\(list))")
@@ -101,7 +105,7 @@ public struct VeNCryptAuthenticator: Authenticator, Sendable {
         if offered.contains(Subtype.x509VNC.rawValue) {
             return .x509VNC
         }
-        if offered.contains(Subtype.x509None.rawValue) {
+        if !requiresUserAuthentication, offered.contains(Subtype.x509None.rawValue) {
             return .x509None
         }
         return nil

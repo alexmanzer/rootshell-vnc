@@ -1704,7 +1704,8 @@ public actor TransportSession {
                 port: port,
                 username: username,
                 password: password,
-                certificateValidationHandler: certificateValidationHandler
+                certificateValidationHandler: certificateValidationHandler,
+                requiresUserAuthentication: stateMachine.securityPolicy == .authenticated
             )
         case .srp:
             authenticator = SRPAuthenticator(
