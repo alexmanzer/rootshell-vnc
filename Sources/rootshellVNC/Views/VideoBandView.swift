@@ -39,6 +39,7 @@ public final class VideoBandLayerRenderer {
     private var pixelScale: CGFloat = 2
     private(set) var frameCommitCount: UInt64 = 0
     private(set) var streamGenerationCount: UInt64 = 0
+    private(set) var deliveryGeneration: UInt64 = 0
     private(set) var lastCommitBandCount = 0
     private(set) var partialCommitCount: UInt64 = 0
     private var expectedBandCount = Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
@@ -96,6 +97,7 @@ public final class VideoBandLayerRenderer {
     }
 
     public func reset() {
+        invalidatePendingFrames()
         bandBuffers.removeAll()
         previousBandBuffers.removeAll()
         displayedBuffer = nil
@@ -120,6 +122,11 @@ public final class VideoBandLayerRenderer {
         brightnessPresenter.reset()
         brightnessPresenter.setGain(brightnessGain)
         reconcilePresentationPath()
+    }
+
+    /// Retire queued decoder delivery without discarding the displayed surface.
+    func invalidatePendingFrames() {
+        deliveryGeneration &+= 1
     }
 
     public func beginStreamGeneration(

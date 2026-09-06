@@ -2749,6 +2749,8 @@ public final class VNCSession {
     // MARK: - Private: Helpers
 
     private func cleanupTransport(clearCredentials: Bool) {
+        videoBandRenderer.invalidatePendingFrames()
+        secondaryVideoBandRenderer.invalidatePendingFrames()
         eventTask?.cancel()
         eventTask = nil
         remoteDisplayResizeTask?.cancel()
@@ -5245,16 +5247,18 @@ final class BandFrameCoalescer: @unchecked Sendable {
     private var fallbackHopScheduled = false
     private var streamGeneration: UInt64 = 0
     private let renderer: VideoBandLayerRenderer
+    private let rendererGeneration: UInt64
     /// Half a 60 Hz refresh and roughly one 120 Hz refresh. Normally every
     /// moving band arrives first and is presented immediately; this deadline
     /// applies only when the server suppresses an unchanged band.
     private let fallbackDelay = DispatchTimeInterval.milliseconds(8)
 
-    init(
+    @MainActor init(
         renderer: VideoBandLayerRenderer,
         expectedSourceCount: Int = Int(AppleMediaVideoMode.negotiatedTilesPerFrame)
     ) {
         self.renderer = renderer
+        self.rendererGeneration = renderer.deliveryGeneration
         accumulator = AtomicBandFrameAccumulator(
             expectedSourceCount: expectedSourceCount)
     }
@@ -5275,8 +5279,9 @@ final class BandFrameCoalescer: @unchecked Sendable {
         fallbackHopScheduled = false
         lock.unlock()
 
-        DispatchQueue.main.async { [renderer] in
+        DispatchQueue.main.async { [renderer, rendererGeneration] in
             MainActor.assumeIsolated {
+                guard renderer.deliveryGeneration == rendererGeneration else { return }
                 renderer.beginStreamGeneration(
                     expectedBandCount: expectedSourceCount)
             }
@@ -5307,6 +5312,7 @@ final class BandFrameCoalescer: @unchecked Sendable {
     private func scheduleImmediateRendererHop(generation: UInt64) {
         let scheduledNanos = DispatchTime.now().uptimeNanoseconds
         DispatchQueue.main.async { [self] in
+            guard MainActor.assumeIsolated({ renderer.deliveryGeneration == rendererGeneration }) else { return }
             let hopLatency = DispatchTime.now().uptimeNanoseconds &- scheduledNanos
             lock.lock()
             guard generation == streamGeneration else {
@@ -5348,6 +5354,7 @@ final class BandFrameCoalescer: @unchecked Sendable {
         let deadlineNanos = DispatchTime.now().uptimeNanoseconds
             &+ UInt64(8_000_000)
         DispatchQueue.main.asyncAfter(deadline: .now() + fallbackDelay) { [self] in
+            guard MainActor.assumeIsolated({ renderer.deliveryGeneration == rendererGeneration }) else { return }
             let now = DispatchTime.now().uptimeNanoseconds
             let hopLatency = now > deadlineNanos ? now &- deadlineNanos : 0
             lock.lock()
