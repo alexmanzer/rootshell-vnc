@@ -1012,6 +1012,7 @@ public final class VNCSession {
     /// Actual committed surface geometry, never a requested/advertised size.
     /// Separate from the renderer's internal login-analysis callback.
     @ObservationIgnored public var onVideoFrameCommitted: ((CGSize) -> Void)?
+    @ObservationIgnored public var onAuthenticationRequested: ((SecurityType) -> Void)?
     /// Independent renderer for the second Apple media stream. A second
     /// display is a separate HEVC reference chain, not another band of display
     /// one, and must never share its decoder or band compositor.
@@ -1183,8 +1184,15 @@ public final class VNCSession {
                 .pixelBuffer(pixelBuffer),
                 source: "High Performance full frame",
                 highPerformanceGeneration: streamGeneration)
-            self?.onVideoFrameCommitted?(CGSize(width: CVPixelBufferGetWidth(pixelBuffer),
-                height: CVPixelBufferGetHeight(pixelBuffer)))
+            guard let self else { return }
+            let width = CVPixelBufferGetWidth(pixelBuffer)
+            let height = CVPixelBufferGetHeight(pixelBuffer)
+            let bands = self.videoBandRenderer.renderedBandDimensions
+            // A compositor allocation alone is not evidence of decoded geometry.
+            // Reject partial/mixed-width startup surfaces and allow coded bottom padding.
+            guard !bands.isEmpty, bands.allSatisfy({ $0.width == width }),
+                  bands.reduce(0, { $0 + $1.height }) >= height else { return }
+            self.onVideoFrameCommitted?(CGSize(width: width, height: height))
         }
         #if canImport(UIKit)
         observeApplicationLifecycle()
@@ -1950,6 +1958,9 @@ public final class VNCSession {
         switch event {
         case .stateChanged(let protocolState):
             handleStateChanged(protocolState)
+            if case .authenticating(let security) = protocolState {
+                onAuthenticationRequested?(security)
+            }
 
         case .serverInit(let serverInit):
             supportsRemoteClipboardRequest =

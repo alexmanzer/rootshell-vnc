@@ -22,7 +22,7 @@ final class ExplicitPixelSizeTests: XCTestCase {
         let size = RemoteDisplaySize.explicit(pixelSize: CGSize(width: 1280, height: 720))
         XCTAssertEqual(size?.pixelWidth, 1280)
         XCTAssertEqual(size?.pixelHeight, 720)
-        XCTAssertEqual(size?.pointWidth, 1280)
+        XCTAssertEqual(size?.pointWidth, 640)
     }
 
     func testRejectsInvalidUnalignedAndOverBudgetSizes() {

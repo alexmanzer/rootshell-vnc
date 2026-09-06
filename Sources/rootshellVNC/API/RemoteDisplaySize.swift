@@ -19,6 +19,7 @@ struct RemoteDisplaySize: Sendable, Equatable {
     let pointHeight: UInt16
 
     /// Exact host-selected pixels. No implicit Retina doubling or upward rounding.
+    /// Express Apple's virtual workspace in half as many points (2× backing).
     static func explicit(pixelSize: CGSize) -> RemoteDisplaySize? {
         guard pixelSize.width.isFinite, pixelSize.height.isFinite,
               pixelSize.width >= 16, pixelSize.height >= 16,
@@ -27,8 +28,8 @@ struct RemoteDisplaySize: Sendable, Equatable {
               pixelSize.width.truncatingRemainder(dividingBy: 16) == 0,
               pixelSize.height.truncatingRemainder(dividingBy: 16) == 0 else { return nil }
         return RemoteDisplaySize(pixelWidth: UInt16(pixelSize.width),
-            pixelHeight: UInt16(pixelSize.height), pointWidth: UInt16(pixelSize.width),
-            pointHeight: UInt16(pixelSize.height))
+            pixelHeight: UInt16(pixelSize.height), pointWidth: UInt16(pixelSize.width / 2),
+            pointHeight: UInt16(pixelSize.height / 2))
     }
 
     /// A literal iPhone viewport is too small to be a usable macOS workspace,
