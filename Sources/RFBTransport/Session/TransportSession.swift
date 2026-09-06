@@ -1288,6 +1288,12 @@ public actor TransportSession {
                 Self.secondsSince(connectionEstablishedNanos, now: nowNanos))
     }
 
+    /// Actual TCP socket payload counters; unavailable for injected transports.
+    public func socketByteCounts() async -> ConnectionByteCounts? {
+        guard let connection = tcp as? TCPConnection else { return nil }
+        return await connection.socketByteCounts()
+    }
+
     public var currentAppleMediaTilesPerFrame: Int {
         activeAppleMediaTilesPerFrame
     }

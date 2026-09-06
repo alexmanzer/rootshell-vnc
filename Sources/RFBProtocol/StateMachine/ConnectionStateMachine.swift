@@ -119,8 +119,9 @@ public struct ConnectionStateMachine: Sendable {
             }
 
             guard let selected = selectBestSecurityType(from: types) else {
-                let error = VNCProtocolError.authenticationFailed(
-                    "The server does not offer the requested security method")
+                let error: VNCProtocolError = securityPolicy == .authenticated
+                    ? .securityPolicyViolation : .authenticationFailed(
+                        "The server does not offer the requested security method")
                 state = .failed(error)
                 return [.reportError(error)]
             }
@@ -147,8 +148,9 @@ public struct ConnectionStateMachine: Sendable {
         case (.waitingForSecurityTypes, .receivedServerSelectedSecurityType(let selected)):
             offeredSecurityTypes = [selected]
             guard securityTypeIsAllowed(selected) else {
-                let error = VNCProtocolError.authenticationFailed(
-                    "The server selected a security method that violates the configured policy")
+                let error: VNCProtocolError = securityPolicy == .authenticated
+                    ? .securityPolicyViolation : .authenticationFailed(
+                        "The server selected a security method that violates the configured policy")
                 state = .failed(error)
                 return [.reportError(error)]
             }
@@ -267,12 +269,22 @@ public struct ConnectionStateMachine: Sendable {
     // MARK: - Security type selection
 
     private func selectBestSecurityType(from types: [SecurityType]) -> SecurityType? {
+        if securityPolicy == .authenticated {
+            if negotiatedVersion?.isApple == true, hasUsername {
+                if types.contains(.macAuthentication) { return .macAuthentication }
+                if types.contains(.apple30) { return .apple30 }
+            }
+            if types.contains(.vncAuthentication) { return .vncAuthentication }
+            if types.contains(.vencrypt) { return .vencrypt }
+            return nil
+        }
         // A diagnostic override must never downgrade an explicitly encrypted
         // session. Handle this policy before consulting process state.
         if securityPolicy == .requireEncryption {
             return types.contains(.vencrypt) ? .vencrypt : nil
         }
 
+        #if DEBUG
         if let forced = ProcessInfo.processInfo.environment["ROOTSHELL_VNC_SECURITY_TYPE"] {
             let selected: SecurityType? = {
                 switch forced.lowercased() {
@@ -291,8 +303,11 @@ public struct ConnectionStateMachine: Sendable {
                 return selected
             }
         }
+        #endif
 
         switch securityPolicy {
+        case .authenticated:
+            return nil // Handled before diagnostic overrides.
         case .none:
             return types.contains(.none) ? SecurityType.none : nil
         case .vncAuthentication:
@@ -325,6 +340,11 @@ public struct ConnectionStateMachine: Sendable {
     /// or ClientInit bytes are sent.
     private func securityTypeIsAllowed(_ type: SecurityType) -> Bool {
         switch securityPolicy {
+        case .authenticated:
+            switch type {
+            case .vncAuthentication, .vencrypt, .apple30, .macAuthentication: return true
+            default: return false
+            }
         case .requireEncryption:
             return type == .vencrypt
         case .none:

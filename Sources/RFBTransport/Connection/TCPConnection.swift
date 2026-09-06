@@ -46,6 +46,9 @@ public actor TCPConnection: RFBConnection {
     private let port: UInt16
     private let log = VNCLogger(category: "TCPConnection")
     private var channel: Channel?
+    private let byteCounter = ConnectionByteCounter()
+
+    public func socketByteCounts() -> ConnectionByteCounts { byteCounter.snapshot() }
     private var inboundHandler: InboundByteStreamHandler?
     private var inboundQueue: InboundByteQueue?
     private var disconnectHandler: (@Sendable (VNCProtocolError) -> Void)?
@@ -182,6 +185,7 @@ public actor TCPConnection: RFBConnection {
     }
 
     private func dialOnce() async throws {
+        let counter = byteCounter
         let handler = InboundByteStreamHandler { [weak self] error in
             Task { await self?.notifyUnexpectedDisconnect(error) }
         }
@@ -206,7 +210,7 @@ public actor TCPConnection: RFBConnection {
                 parameters.serviceClass = .responsiveData
             }
             .channelInitializer { channel in
-                channel.pipeline.addHandler(handler)
+                channel.pipeline.addHandlers([SocketByteCountingHandler(counter: counter), handler])
             }
 
         log.info("Connecting to \(host):\(port)")
@@ -473,7 +477,7 @@ public actor TCPConnection: RFBConnection {
             try await channel.eventLoop.submit {
                 try channel.pipeline.syncOperations.addHandler(
                     sendableHandler.value,
-                    position: .first)
+                    position: .before(inboundHandler))
             }.get()
             channel.read()
             try await inboundHandler.waitForTLSHandshake()

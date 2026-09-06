@@ -730,7 +730,12 @@ public final class VNCSession {
     public var framebufferHeight: Int = 0
 
     /// The latest rendered framebuffer image, suitable for display.
-    public var currentImage: CGImage?
+    public var currentImage: CGImage? {
+        didSet { if let currentImage { onFramebuffer?(currentImage) } }
+    }
+
+    /// Decoded TCP images, delivered on the main actor after rendering completes.
+    @ObservationIgnored public var onFramebuffer: ((CGImage) -> Void)?
 
     /// The last protocol error that occurred, if any.
     public var lastError: VNCProtocolError?
@@ -1350,6 +1355,10 @@ public final class VNCSession {
         connectionState = .disconnected
     }
 
+    /// Wait for queued input writes before a host requests a disconnect.
+    /// Hosts must enforce their own deadline and disconnect if the peer stalls.
+    public func flushInput() async { await inputTask?.value }
+
     /// Immediately retry after automatic recovery has exhausted its attempts.
     public func retryConnection() {
         guard reconnectTask == nil,
@@ -1857,6 +1866,12 @@ public final class VNCSession {
             lossGapsDetected: gaps,
             framesDroppedWhileGated: droppedWhileGated,
             capturedAt: Date())
+    }
+
+    public func socketByteCounts() async -> ConnectionByteCounts? {
+        guard let transport = transportSession else { return nil }
+        let counts = await transport.socketByteCounts()
+        return transportSession === transport ? counts : nil
     }
 
     /// Populate handshake-derived diagnostics from the transport. Called on
@@ -3720,7 +3735,7 @@ public final class VNCSession {
         case .connectionClosed, .timeout, .ioError, .protocolViolation,
              .unexpectedMessage:
             return true
-        case .authenticationFailed, .unsupportedVersion, .unsupportedEncoding:
+        case .authenticationFailed, .securityPolicyViolation, .unsupportedVersion, .unsupportedEncoding:
             return false
         }
     }

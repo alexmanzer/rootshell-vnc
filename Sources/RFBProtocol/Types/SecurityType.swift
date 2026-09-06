@@ -72,6 +72,8 @@ public enum SecurityType: Sendable, Equatable, Hashable {
 /// server's only supported authenticated option.
 public enum VNCSecurityPolicy: String, Sendable, Equatable, Hashable, CaseIterable {
     case automatic
+    /// Compatibility negotiation without unauthenticated access or diagnostic overrides.
+    case authenticated
     case requireEncryption
     case none
     case vncAuthentication

@@ -12,6 +12,9 @@ public enum VNCProtocolError: Error, Sendable, Equatable, LocalizedError {
     /// Authentication failed, with an optional reason from the server.
     case authenticationFailed(String)
 
+    /// No offered authentication method satisfies the required security policy.
+    case securityPolicyViolation
+
     /// A generic protocol violation with a human-readable description.
     case protocolViolation(String)
 
@@ -38,6 +41,8 @@ public enum VNCProtocolError: Error, Sendable, Equatable, LocalizedError {
             return "The server's RFB protocol version is not supported."
         case .authenticationFailed(let reason):
             return "Authentication failed: \(reason)"
+        case .securityPolicyViolation:
+            return "The server does not offer an allowed authentication method."
         case .protocolViolation(let detail):
             return "Protocol violation: \(detail)"
         case .unsupportedEncoding(let id):
