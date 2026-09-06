@@ -49,8 +49,9 @@ public final class Framebuffer: @unchecked Sendable {
                 | CGBitmapInfo.byteOrder16Little.rawValue
             self.bitsPerComponent = 5
         } else {
-            // BGRA format native to macOS/iOS
-            self.bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
+            // RFB depth-24 pixels contain padding, not alpha. Raw/Zlib servers
+            // may leave that byte zero; the remote desktop is always opaque.
+            self.bitmapInfo = CGImageAlphaInfo.noneSkipFirst.rawValue
                 | CGBitmapInfo.byteOrder32Little.rawValue
             self.bitsPerComponent = 8
         }
