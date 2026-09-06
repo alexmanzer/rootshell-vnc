@@ -1745,7 +1745,9 @@ public final class VNCSession {
         serverClipboardObservers.removeValue(forKey: id)
     }
 
-    func addConnectionStateObserver(
+    /// Observe transitions synchronously on the main actor. Connected state is
+    /// published after handshake metadata and framebuffer setup are available.
+    public func addConnectionStateObserver(
         _ observer: @escaping (VNCConnectionState) -> Void
     ) -> UUID {
         let id = UUID()
@@ -1753,7 +1755,7 @@ public final class VNCSession {
         return id
     }
 
-    func removeConnectionStateObserver(_ id: UUID) {
+    public func removeConnectionStateObserver(_ id: UUID) {
         connectionStateObservers.removeValue(forKey: id)
     }
 
