@@ -958,60 +958,74 @@ final class VNCReconnectionPolicyTests: XCTestCase {
 final class AppleAdaptiveDCTDecoderTests: XCTestCase {
     func testCommandRunLengthGrammar() throws {
         // 0 => 1, 1+0011 => 5, 1+1111+00000111 => 24.
-        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0x4f, 0xe0, 0xe0]))
-        XCTAssertEqual(try reader.readCommandRunLength(), 1)
-        XCTAssertEqual(try reader.readCommandRunLength(), 5)
-        XCTAssertEqual(try reader.readCommandRunLength(), 24)
+        try Data([0x4f, 0xe0, 0xe0]).withUnsafeBytes { bytes in
+            var reader = AppleAdaptiveDCTDecoder.BitReader(bytes)
+            XCTAssertEqual(try reader.readCommandRunLength(), 1)
+            XCTAssertEqual(try reader.readCommandRunLength(), 5)
+            XCTAssertEqual(try reader.readCommandRunLength(), 24)
+        }
     }
 
     func testExtendedCommandRunLengthUsesBase128Groups() throws {
         // Escape plus 0x81,0x01 encodes 17 + 1 + (1 << 7) = 146.
-        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0xfc, 0x08, 0x08]))
-        XCTAssertEqual(try reader.readCommandRunLength(), 146)
+        try Data([0xfc, 0x08, 0x08]).withUnsafeBytes { bytes in
+            var reader = AppleAdaptiveDCTDecoder.BitReader(bytes)
+            XCTAssertEqual(try reader.readCommandRunLength(), 146)
+        }
     }
 
     func testBitReaderRejectsTruncatedCommand() throws {
-        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0xf8]))
-        XCTAssertThrowsError(try reader.readCommandRunLength())
+        try Data([0xf8]).withUnsafeBytes { bytes in
+            var reader = AppleAdaptiveDCTDecoder.BitReader(bytes)
+            XCTAssertThrowsError(try reader.readCommandRunLength())
+        }
     }
 
     func testSignedDCRiceGrammar() throws {
         // q=0 zero: 00; q=0 +1: 010; q=0 -1: 011;
         // q=1 magnitude 3 negative: 10 11.
-        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0x13, 0xb0]))
-        XCTAssertEqual(try reader.readSignedDCRice(), 0)
-        XCTAssertEqual(try reader.readSignedDCRice(), 1)
-        XCTAssertEqual(try reader.readSignedDCRice(), -1)
-        XCTAssertEqual(try reader.readSignedDCRice(), -3)
+        try Data([0x13, 0xb0]).withUnsafeBytes { bytes in
+            var reader = AppleAdaptiveDCTDecoder.BitReader(bytes)
+            XCTAssertEqual(try reader.readSignedDCRice(), 0)
+            XCTAssertEqual(try reader.readSignedDCRice(), 1)
+            XCTAssertEqual(try reader.readSignedDCRice(), -1)
+            XCTAssertEqual(try reader.readSignedDCRice(), -3)
+        }
     }
 
     func testYCC20ExpandsSixBitChroma() throws {
         // Y=0xab, Cb=0x15, Cr=0x2a.
-        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0xab, 0x56, 0xa0]))
-        let color = try reader.readYCC20()
-        XCTAssertEqual(color.y, 0xab)
-        XCTAssertEqual(color.cb, 0x54)
-        XCTAssertEqual(color.cr, 0xa8)
+        try Data([0xab, 0x56, 0xa0]).withUnsafeBytes { bytes in
+            var reader = AppleAdaptiveDCTDecoder.BitReader(bytes)
+            let color = try reader.readYCC20()
+            XCTAssertEqual(color.y, 0xab)
+            XCTAssertEqual(color.cb, 0x54)
+            XCTAssertEqual(color.cr, 0xa8)
+        }
     }
 
     func testSmallCoefficientAndZeroRunGrammar() throws {
         // 10 => +amplitude; 11 => -amplitude; 00 => zero;
         // 01 0 => EOB.
-        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0xb1, 0x00]))
-        XCTAssertEqual(try reader.readSmallCoefficient(at: 1, amplitude: 8).value, 8)
-        XCTAssertEqual(try reader.readSmallCoefficient(at: 2, amplitude: 8).value, -8)
-        XCTAssertNil(try reader.readSmallCoefficient(at: 3, amplitude: 8).value)
-        XCTAssertEqual(
-            try reader.readSmallCoefficient(at: 4, amplitude: 8).nextIndex,
-            64)
+        try Data([0xb1, 0x00]).withUnsafeBytes { bytes in
+            var reader = AppleAdaptiveDCTDecoder.BitReader(bytes)
+            XCTAssertEqual(try reader.readSmallCoefficient(at: 1, amplitude: 8).value, 8)
+            XCTAssertEqual(try reader.readSmallCoefficient(at: 2, amplitude: 8).value, -8)
+            XCTAssertNil(try reader.readSmallCoefficient(at: 3, amplitude: 8).value)
+            XCTAssertEqual(
+                try reader.readSmallCoefficient(at: 4, amplitude: 8).nextIndex,
+                64)
+        }
     }
 
     func testSmallCoefficientLongZeroRun() throws {
         // 01 1 11 enters the long form; 111 then 010 adds 6+7+2.
-        var reader = AppleAdaptiveDCTDecoder.BitReader(Data([0x7f, 0x40]))
-        let result = try reader.readSmallCoefficient(at: 3, amplitude: 2)
-        XCTAssertEqual(result.nextIndex, 18)
-        XCTAssertNil(result.value)
+        try Data([0x7f, 0x40]).withUnsafeBytes { bytes in
+            var reader = AppleAdaptiveDCTDecoder.BitReader(bytes)
+            let result = try reader.readSmallCoefficient(at: 3, amplitude: 2)
+            XCTAssertEqual(result.nextIndex, 18)
+            XCTAssertNil(result.value)
+        }
     }
 
     func testType2InstallsBothQuantizationTables() throws {

@@ -1,15 +1,22 @@
 #include "RFBRenderingC.h"
-#if defined(__aarch64__)
+#include <string.h>
+// RFB_DCT_FORCE_SCALAR is used by the standalone portability checks.
+#if defined(__aarch64__) && !defined(RFB_DCT_FORCE_SCALAR)
+#define RFB_DCT_NEON 1
 #include <arm_neon.h>
+#else
+#define RFB_DCT_NEON 0
 #endif
 
 // Integer DCT_ISLOW and YCbCr conversion derived from stb_image, which is
 // public domain or MIT licensed. Keeping the integer biases and shifts is
 // necessary for output identical to its ARM SIMD implementation.
 
+// Unsigned intermediates make 32-bit wrapping explicit for extreme input.
+// Cast back before arithmetic right shifts, matching the SIMD lane operations.
 #define FSH(x) ((x) * 4096)
 #define IDCT_1D(s0,s1,s2,s3,s4,s5,s6,s7) \
-    int t0,t1,t2,t3,p1,p2,p3,p4,p5,x0,x1,x2,x3; \
+    uint32_t t0,t1,t2,t3,p1,p2,p3,p4,p5,x0,x1,x2,x3; \
     p2=(s2); p3=(s6); p1=(p2+p3)*2217; \
     t2=p1+p3*-7567; t3=p1+p2*3135; \
     p2=(s0); p3=(s4); t0=FSH(p2+p3); t1=FSH(p2-p3); \
@@ -37,10 +44,10 @@ static void idct_block(uint8_t output[64], const int16_t input[64]) {
         } else {
             IDCT_1D(d[0],d[8],d[16],d[24],d[32],d[40],d[48],d[56]);
             x0+=512; x1+=512; x2+=512; x3+=512;
-            v[0]=(x0+t3)>>10; v[56]=(x0-t3)>>10;
-            v[8]=(x1+t2)>>10; v[48]=(x1-t2)>>10;
-            v[16]=(x2+t1)>>10; v[40]=(x2-t1)>>10;
-            v[24]=(x3+t0)>>10; v[32]=(x3-t0)>>10;
+            v[0]=(int32_t)(x0+t3)>>10; v[56]=(int32_t)(x0-t3)>>10;
+            v[8]=(int32_t)(x1+t2)>>10; v[48]=(int32_t)(x1-t2)>>10;
+            v[16]=(int32_t)(x2+t1)>>10; v[40]=(int32_t)(x2-t1)>>10;
+            v[24]=(int32_t)(x3+t0)>>10; v[32]=(int32_t)(x3-t0)>>10;
         }
     }
     v = values;
@@ -48,20 +55,20 @@ static void idct_block(uint8_t output[64], const int16_t input[64]) {
         IDCT_1D(v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7]);
         x0+=65536+(128<<17); x1+=65536+(128<<17);
         x2+=65536+(128<<17); x3+=65536+(128<<17);
-        output[row*8+0]=clamp_u8((x0+t3)>>17);
-        output[row*8+7]=clamp_u8((x0-t3)>>17);
-        output[row*8+1]=clamp_u8((x1+t2)>>17);
-        output[row*8+6]=clamp_u8((x1-t2)>>17);
-        output[row*8+2]=clamp_u8((x2+t1)>>17);
-        output[row*8+5]=clamp_u8((x2-t1)>>17);
-        output[row*8+3]=clamp_u8((x3+t0)>>17);
-        output[row*8+4]=clamp_u8((x3-t0)>>17);
+        output[row*8+0]=clamp_u8((int32_t)(x0+t3)>>17);
+        output[row*8+7]=clamp_u8((int32_t)(x0-t3)>>17);
+        output[row*8+1]=clamp_u8((int32_t)(x1+t2)>>17);
+        output[row*8+6]=clamp_u8((int32_t)(x1-t2)>>17);
+        output[row*8+2]=clamp_u8((int32_t)(x2+t1)>>17);
+        output[row*8+5]=clamp_u8((int32_t)(x2-t1)>>17);
+        output[row*8+3]=clamp_u8((int32_t)(x3+t0)>>17);
+        output[row*8+4]=clamp_u8((int32_t)(x3-t0)>>17);
     }
 }
 
-#if defined(__aarch64__)
-// stb_image's ARM integer IDCT. It is designed to be bit-identical to the
-// scalar DCT_ISLOW routine above while processing all eight lanes together.
+#if RFB_DCT_NEON
+// stb_image's ARM integer IDCT. It matches scalar DCT_ISLOW while its 16-bit
+// intermediates fit; larger inputs retain the original ARM narrowing behavior.
 static void idct_block_neon(uint8_t *out, const int16_t data[64]) {
     int16x8_t row0,row1,row2,row3,row4,row5,row6,row7;
     int16x4_t rot0_0=vdup_n_s16(2217),rot0_1=vdup_n_s16(-7567),rot0_2=vdup_n_s16(3135);
@@ -129,22 +136,127 @@ static uint32_t ycbcr_to_bgra(uint8_t y, uint8_t cb_byte, uint8_t cr_byte) {
         ((uint32_t)clamp_u8(g)<<8) | clamp_u8(b);
 }
 
+// The DC shortcut must preserve the ARM kernel's 16-bit narrowing, including
+// unusual quantization tables that wrap the dequantized coefficient.
+static uint8_t idct_dc(int16_t dc) {
+#if RFB_DCT_NEON
+    int16_t intermediate = (int16_t)((int16_t)(dc + 1024) * 4);
+    return clamp_u8(((int)intermediate + 16) >> 5);
+#else
+    return clamp_u8((((int)dc + 4) >> 3) + 128);
+#endif
+}
+
+#if RFB_DCT_NEON
+// Convert eight pixels together, retaining the scalar green-Cb mask before
+// adding Cr and the rounding bias. Saturating narrows implement clamp_u8.
+static void ycbcr_row_bgra(uint32_t *output, const uint8_t *y,
+                           const uint8_t *cb, const uint8_t *cr) {
+    int16x8_t yy = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(y)));
+    int16x8_t cc = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vld1_u8(cb))), vdupq_n_s16(128));
+    int16x8_t rr = vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vld1_u8(cr))), vdupq_n_s16(128));
+    // Coefficients are multiples of 256. Work at 12 fractional bits and
+    // retain the equivalent low-eight-bit mask on the green Cb term.
+#define COLOR_HALF(suffix, half) \
+    int32x4_t yf_##suffix = vaddq_s32(vshll_n_s16(half(yy), 12), vdupq_n_s32(2048)); \
+    int32x4_t red_##suffix = vmlal_n_s16(yf_##suffix, half(rr), 5743); \
+    int32x4_t cbg_##suffix = vmull_n_s16(half(cc), -1410); \
+    cbg_##suffix = vandq_s32(cbg_##suffix, vdupq_n_s32(-256)); \
+    int32x4_t green_##suffix = vaddq_s32(vmlal_n_s16(yf_##suffix, half(rr), -2925), cbg_##suffix); \
+    int32x4_t blue_##suffix = vmlal_n_s16(yf_##suffix, half(cc), 7258)
+    COLOR_HALF(lo, vget_low_s16);
+    COLOR_HALF(hi, vget_high_s16);
+#define CHANNEL(name) vqmovun_s16(vcombine_s16(vshrn_n_s32(name##_lo, 12), vshrn_n_s32(name##_hi, 12)))
+    uint8x8x4_t bgra = {{CHANNEL(blue), CHANNEL(green), CHANNEL(red), vdup_n_u8(255)}};
+    vst4_u8((uint8_t *)output, bgra);
+#undef COLOR_HALF
+#undef CHANNEL
+}
+#endif
+
 void rfb_apple_dct_tile_bgra(
     uint32_t output[64], const int16_t coefficients[192],
     const uint16_t luma_quantization[64],
     const uint16_t chroma_quantization[64]) {
     int16_t dequantized[64];
     uint8_t planes[192];
-    for (int plane=0; plane<3; ++plane) {
-        const uint16_t *quant=plane==0 ? luma_quantization : chroma_quantization;
-        for (int i=0; i<64; ++i)
-            dequantized[i]=(int16_t)(coefficients[plane*64+i]*quant[i]);
-#if defined(__aarch64__)
-        idct_block_neon(planes+plane*64,dequantized);
+    int constant_planes = 0;
+    for (int plane = 0; plane < 3; ++plane) {
+        const uint16_t *quant = plane == 0 ? luma_quantization : chroma_quantization;
+        const int16_t *source = coefficients + plane * 64;
+#if RFB_DCT_NEON
+        int16x8_t values = vmulq_s16(vld1q_s16(source), vreinterpretq_s16_u16(vld1q_u16(quant)));
+        vst1q_s16(dequantized, values);
+        int16x8_t ac_values = vsetq_lane_s16(0, values, 0);
+#if !defined(__OPTIMIZE__)
+        unsigned magnitude = vaddlvq_u16(vreinterpretq_u16_s16(vabsq_s16(values)));
+#endif
+        for (int i = 8; i < 64; i += 8) {
+            values = vmulq_s16(vld1q_s16(source + i), vreinterpretq_s16_u16(vld1q_u16(quant + i)));
+            vst1q_s16(dequantized + i, values);
+            ac_values = vorrq_s16(ac_values, values);
+#if !defined(__OPTIMIZE__)
+            magnitude += vaddlvq_u16(vreinterpretq_u16_s16(vabsq_s16(values)));
+#endif
+        }
+        int ac = vmaxvq_u16(vreinterpretq_u16_s16(ac_values));
 #else
-        idct_block(planes+plane*64,dequantized);
+        int ac = 0;
+        for (int i = 0; i < 64; ++i) {
+            int16_t value = (int16_t)(source[i] * quant[i]);
+            dequantized[i] = value;
+            if (i != 0) ac |= value;
+        }
+#endif
+        if (ac == 0) {
+            memset(planes + plane * 64, idct_dc(dequantized[0]), 64);
+            constant_planes |= 1 << plane;
+            continue;
+        }
+#if RFB_DCT_NEON
+#if !defined(__OPTIMIZE__)
+        // At -O0 NEON intrinsics spill many intermediates. The scalar routine
+        // is faster there for small blocks. This conservative L1 bound keeps
+        // every 16-bit sum/narrow in the ARM transform in range (including its
+        // DC bias), so scalar and ARM rounding are identical. Larger blocks
+        // must retain the ARM wrapping behavior.
+        if (magnitude <= 2048) idct_block(planes + plane * 64, dequantized);
+        else idct_block_neon(planes + plane * 64, dequantized);
+#else
+        idct_block_neon(planes + plane * 64, dequantized);
+#endif
+#else
+        idct_block(planes + plane * 64, dequantized);
 #endif
     }
-    for (int i=0; i<64; ++i)
-        output[i]=ycbcr_to_bgra(planes[i],planes[64+i],planes[128+i]);
+    if (constant_planes == 7) {
+        uint32_t color = ycbcr_to_bgra(planes[0], planes[64], planes[128]);
+        for (int i = 0; i < 64; ++i) output[i] = color;
+        return;
+    }
+#if RFB_DCT_NEON
+    if ((constant_planes & 6) == 6) {
+        // Base updates usually contain only a chroma DC predictor. Hoisting
+        // the color offsets avoids repeating multiplies for all 64 pixels.
+        int cb = (int)planes[64] - 128, cr = (int)planes[128] - 128;
+        int16x8_t red = vdupq_n_s16((2048 + cr * 5743) >> 12);
+        int16x8_t green = vdupq_n_s16((2048 - cr * 2925 + ((cb * -1410) & ~255)) >> 12);
+        int16x8_t blue = vdupq_n_s16((2048 + cb * 7258) >> 12);
+        for (int i = 0; i < 64; i += 8) {
+            int16x8_t yy = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(planes + i)));
+            uint8x8x4_t bgra = {{vqmovun_s16(vaddq_s16(yy, blue)),
+                                vqmovun_s16(vaddq_s16(yy, green)),
+                                vqmovun_s16(vaddq_s16(yy, red)), vdup_n_u8(255)}};
+            vst4_u8((uint8_t *)(output + i), bgra);
+        }
+        return;
+    }
+#endif
+#if RFB_DCT_NEON && defined(__OPTIMIZE__)
+    for (int i = 0; i < 64; i += 8)
+        ycbcr_row_bgra(output + i, planes + i, planes + 64 + i, planes + 128 + i);
+#else
+    for (int i = 0; i < 64; ++i)
+        output[i] = ycbcr_to_bgra(planes[i], planes[64 + i], planes[128 + i]);
+#endif
 }
