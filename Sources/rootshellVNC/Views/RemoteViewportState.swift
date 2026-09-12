@@ -201,6 +201,85 @@ struct RemoteViewportState: Equatable, Sendable {
         return CGPoint(x: x, y: y)
     }
 
+    /// Inverse of `framebufferPoint(for:viewSize:framebufferSize:)`.
+    ///
+    /// Deliberately does not require the result to be on screen: a virtual
+    /// cursor may sit outside the visible bounds after a pinch, and the
+    /// caller needs to know where it went in order to bring it back.
+    func viewPoint(
+        forFramebufferPoint point: CGPoint,
+        viewSize: CGSize,
+        framebufferSize: CGSize
+    ) -> CGPoint? {
+        guard let frame = displayedFrame(
+            viewSize: viewSize,
+            framebufferSize: framebufferSize),
+              framebufferSize.width > 0, framebufferSize.height > 0,
+              point.x.isFinite, point.y.isFinite else { return nil }
+
+        return CGPoint(
+            x: frame.minX + point.x / framebufferSize.width * frame.width,
+            y: frame.minY + point.y / framebufferSize.height * frame.height)
+    }
+
+    /// How many framebuffer pixels one view point covers at the current zoom,
+    /// the conversion factor relative pointer motion needs to stay tied to
+    /// finger travel on glass.
+    func framebufferPixelsPerPoint(
+        viewSize: CGSize,
+        framebufferSize: CGSize
+    ) -> CGFloat? {
+        guard let frame = displayedFrame(
+            viewSize: viewSize,
+            framebufferSize: framebufferSize),
+              frame.width > 0 else { return nil }
+        return framebufferSize.width / frame.width
+    }
+
+    /// Returns the translation, ready to hand to `pan(by:)`, that brings
+    /// `viewPoint` back inside the view bounds inset by `inset`.
+    ///
+    /// The desktop moves opposite to the overshoot, which drags the point
+    /// that rides on it into view. The result is measured after clamping on a
+    /// copy rather than derived from the raw overshoot, so a caller that pans
+    /// by it gets exactly the movement it was promised even at the pan limits
+    /// and can trust the value when deciding whether the viewport moved.
+    func translationToReveal(
+        viewPoint: CGPoint,
+        viewSize: CGSize,
+        framebufferSize: CGSize,
+        inset: CGFloat
+    ) -> CGSize {
+        guard scale > Self.minimumScale,
+              viewPoint.x.isFinite, viewPoint.y.isFinite,
+              inset.isFinite,
+              displayedFrame(
+                viewSize: viewSize,
+                framebufferSize: framebufferSize) != nil else { return .zero }
+
+        // An inset wider than half the viewport would invert the rectangle
+        // and turn "bring inside" into a jump to the far edge; capping it
+        // degenerates to aiming at the center line instead.
+        let bounds = CGRect(origin: .zero, size: viewSize).insetBy(
+            dx: min(max(0, inset), viewSize.width / 2),
+            dy: min(max(0, inset), viewSize.height / 2))
+        let requested = CGSize(
+            width: min(max(viewPoint.x, bounds.minX), bounds.maxX)
+                - viewPoint.x,
+            height: min(max(viewPoint.y, bounds.minY), bounds.maxY)
+                - viewPoint.y)
+        guard requested != .zero else { return .zero }
+
+        var revealed = self
+        revealed.pan(
+            by: requested,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+        return CGSize(
+            width: revealed.offset.width - offset.width,
+            height: revealed.offset.height - offset.height)
+    }
+
     func displayedFrame(
         viewSize: CGSize,
         framebufferSize: CGSize

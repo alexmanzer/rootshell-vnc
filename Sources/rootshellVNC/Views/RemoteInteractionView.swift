@@ -14,6 +14,8 @@ import GameController
 struct RemoteInteractionView: UIViewRepresentable {
     @Binding var viewport: RemoteViewportState
     let viewportPanningMode: RemoteViewportPanningMode
+    let pointerMode: RemotePointerMode
+    let pointerSpeed: Double
     @Binding var keyboardActive: Bool
     @Binding var hardwareKeyboardAttached: Bool
 
@@ -72,6 +74,8 @@ struct RemoteInteractionView: UIViewRepresentable {
             framebufferSize: framebufferSize,
             viewport: viewport,
             viewportPanningMode: viewportPanningMode,
+            pointerMode: pointerMode,
+            pointerSpeed: pointerSpeed,
             keyboardActive: keyboardActive,
             keyboardCaptured: keyboardCapture.isCaptured
                 && !suspendsKeyboardCapture,
@@ -115,6 +119,21 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var framebufferOrigin: CGPoint = .zero
     private var viewport = RemoteViewportState()
     private var viewportPanningMode = RemoteViewportPanningMode.edge
+    private(set) var pointerMode: RemotePointerMode = .direct
+    private(set) var pointerSpeed: Double = 1.0
+    /// Virtual cursor driven by relative finger motion. Non-nil exactly while
+    /// `.trackpad` is active, so its absence is also what keeps every relative
+    /// path inert in `.direct`.
+    private var trackpadModel: TrackpadPointerModel?
+    private var trackpadVelocity = TrackpadVelocityEstimator()
+    /// Recognizer translation already folded into the cursor. The recognizer
+    /// reports cumulative translation; relative motion needs the difference
+    /// between callbacks.
+    private var trackpadConsumedTranslation = CGPoint.zero
+    /// Set once any cursor shape has arrived. A server that has not described
+    /// its pointer yet is not the same as one that deliberately hid it, and
+    /// only the former earns a locally drawn arrow.
+    private var hasReceivedRemoteCursorShape = false
     private var softwareKeyboardRequested = false
     private var acceptsHardwareInput = true
     private var lastSeenInputViewsGeneration: UInt64 = 0
@@ -194,7 +213,13 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             }
             self.momentumCatchPending = false
             self.momentumCatchTimestamp = 0
-            self.positionRemotePointerForTouch(at: location)
+            self.prepareDragEngageFeedback()
+            // Relative motion has no landing point to adopt: jumping the
+            // remote pointer under the finger is exactly the absolute
+            // behaviour trackpad mode exists to avoid.
+            if self.pointerMode == .direct {
+                self.positionRemotePointerForTouch(at: location)
+            }
             return false
         }
         return recognizer
@@ -217,6 +242,20 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private lazy var rightTapRecognizer = UITapGestureRecognizer(
         target: self,
         action: #selector(handleRightTap(_:)))
+    /// A physical trackpad reports a click the moment the finger lifts; macOS
+    /// itself decides what is a double click from the timing. Waiting for a
+    /// second tap to fail would put a third of a second between the tap and
+    /// the remote button-down, which reads as a dropped click. This recognizer
+    /// exists only so `.trackpad` can click without that dependency.
+    private lazy var trackpadTapRecognizer = UITapGestureRecognizer(
+        target: self,
+        action: #selector(handleTrackpadTap(_:)))
+    /// Two-finger scrolling for `.trackpad`, where one finger already means
+    /// cursor motion. It replaces the two-finger viewport pan rather than
+    /// joining it, so the finger count keeps its single meaning.
+    private lazy var trackpadScrollRecognizer = UIPanGestureRecognizer(
+        target: self,
+        action: #selector(handleTrackpadScroll(_:)))
     private lazy var hoverRecognizer = UIHoverGestureRecognizer(
         target: self,
         action: #selector(handleHover(_:)))
@@ -242,6 +281,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         return imageView
     }()
     private var remoteCursorHoverLocation: CGPoint?
+    /// Rendered once and kept, since it is redrawn on every cursor move.
+    private var fallbackCursorImage: UIImage?
+    #endif
+    #if !os(visionOS)
+    /// Prepared at touch-down so the taptic engine is already spun up when a
+    /// hold turns into a drag; the confirmation is useless if it lands after
+    /// the drag has visibly started.
+    private lazy var dragEngageFeedback = UIImpactFeedbackGenerator(
+        style: .light,
+        view: self)
     #endif
 
     override var keyCommands: [UIKeyCommand]? {
@@ -711,6 +760,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     override func willMove(toWindow newWindow: UIWindow?) {
         if newWindow == nil {
             releasePointerDrag()
+            releaseTouchHoldDrag()
             releaseAllPressedKeys()
             cancelScrollInteraction()
             stopEdgeScrolling()
@@ -755,6 +805,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         framebufferSize: CGSize,
         viewport: RemoteViewportState,
         viewportPanningMode: RemoteViewportPanningMode,
+        pointerMode: RemotePointerMode,
+        pointerSpeed: Double,
         keyboardActive: Bool,
         keyboardCaptured: Bool,
         inputViewsGeneration: UInt64,
@@ -773,6 +825,15 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             UIMenuSystem.main.setNeedsRebuild()
         }
         acceptsHardwareInput = keyboardCaptured
+        if self.framebufferSize != framebufferSize
+            || self.framebufferOrigin != framebufferOrigin {
+            // A different desktop surface is on screen, so whatever the old
+            // one said about its pointer no longer describes this one. The
+            // check below re-arms the flag in this same pass whenever a shape
+            // is in fact present, leaving it cleared only when the new surface
+            // genuinely has not described a cursor.
+            hasReceivedRemoteCursorShape = false
+        }
         self.framebufferSize = framebufferSize
         self.framebufferOrigin = framebufferOrigin
         self.viewport = viewport
@@ -780,6 +841,13 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             stopEdgeScrolling()
             self.viewportPanningMode = viewportPanningMode
         }
+        self.pointerSpeed = pointerSpeed
+        if self.pointerMode != pointerMode {
+            let previousPointerMode = self.pointerMode
+            self.pointerMode = pointerMode
+            pointerModeDidChange(from: previousPointerMode, to: pointerMode)
+        }
+        synchronizeTrackpadModel()
         self.requestPasswordSend = requestPasswordSend
         self.requestDictation = requestDictation
         self.toggleFullScreen = toggleFullScreen
@@ -788,6 +856,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             viewSize: bounds.size,
             framebufferSize: framebufferSize)
 
+        if remoteCursor != nil { hasReceivedRemoteCursorShape = true }
         if self.remoteCursor?.image !== remoteCursor?.image {
             self.remoteCursor = remoteCursor
             #if targetEnvironment(macCatalyst)
@@ -801,6 +870,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             pointerInteraction.invalidate()
             #endif
         }
+        #if !targetEnvironment(macCatalyst)
+        // Zoom and pan move the virtual cursor across the glass without any
+        // finger involved, so the drawn cursor has to be re-derived from the
+        // viewport this update carries.
+        refreshTrackpadCursorImage()
+        #endif
 
         let keyboardModeChanged = keyboardActive != softwareKeyboardRequested
         softwareKeyboardRequested = keyboardActive
@@ -817,6 +892,42 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                 reloadInputViews()
             }
         }
+    }
+
+    /// Called once per switch, after `pointerMode` already holds the new value.
+    /// Switching mid-gesture would otherwise strand a held button or a running
+    /// momentum scroll, so the gesture layer settles that state here.
+    func pointerModeDidChange(
+        from previous: RemotePointerMode,
+        to current: RemotePointerMode
+    ) {
+        // Every in-flight interaction belongs to the mode that started it: the
+        // button it holds is anchored to a point the other mode cannot reach,
+        // and a fling begun under one finger meaning would keep scrolling
+        // after that finger changed meaning.
+        releasePointerDrag()
+        releaseTouchHoldDrag()
+        stopEdgeScrolling()
+        cancelScrollInteraction()
+        trackpadVelocity.reset()
+        trackpadConsumedTranslation = .zero
+
+        switch current {
+        case .direct:
+            trackpadModel = nil
+        case .trackpad:
+            makeTrackpadModelIfNeeded()
+            adoptInFlightTouchStroke()
+        }
+        updateRecognizerEnablement()
+
+        #if !targetEnvironment(macCatalyst)
+        if current == .direct, !hoverIsActive {
+            updateRemoteCursorImage(at: nil)
+        }
+        refreshTrackpadCursorImage()
+        pointerInteraction.invalidate()
+        #endif
     }
 
     override func layoutSubviews() {
@@ -1875,9 +1986,13 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         }
     }
 
+    /// `overridingScrollPoint` lets a caller that already knows the remote
+    /// coordinate skip the round trip through view space. Relative pointing
+    /// scrolls at the virtual cursor, which no finger location describes.
     private func beginScrollInteractionIfNeeded(
         at location: CGPoint,
-        initialTranslation: CGPoint
+        initialTranslation: CGPoint,
+        overridingScrollPoint: (x: UInt16, y: UInt16)? = nil
     ) {
         guard !directScrollPhaseActive else { return }
         if momentumScrollPhaseActive {
@@ -1887,7 +2002,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         lastScrollPoint = nil
         scrollPointAccumulator.reset()
         horizontalScrollIntentFilter.reset()
-        captureScrollPoint(at: location)
+        if let overridingScrollPoint {
+            lastScrollPoint = overridingScrollPoint
+        } else {
+            captureScrollPoint(at: location)
+        }
         if let point = lastScrollPoint {
             // The Apple scroll record carries coordinates, but remote WebKit
             // hit-testing still follows the server's current pointer. Sync it
@@ -2187,15 +2306,19 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         previousScrollTranslation = .zero
     }
 
+    private static let directTouchTypes = [
+        NSNumber(value: UITouch.TouchType.direct.rawValue)
+    ]
+    private static let pointerTypes = [
+        NSNumber(value: UITouch.TouchType.pencil.rawValue),
+        NSNumber(value: UITouch.TouchType.indirectPointer.rawValue),
+    ]
+    private static let allPointerTypes = directTouchTypes + pointerTypes
+
     private func configureRecognizers() {
-        let directTouchTypes = [
-            NSNumber(value: UITouch.TouchType.direct.rawValue)
-        ]
-        let pointerTypes = [
-            NSNumber(value: UITouch.TouchType.pencil.rawValue),
-            NSNumber(value: UITouch.TouchType.indirectPointer.rawValue),
-        ]
-        let allPointerTypes = directTouchTypes + pointerTypes
+        let directTouchTypes = Self.directTouchTypes
+        let pointerTypes = Self.pointerTypes
+        let allPointerTypes = Self.allPointerTypes
 
         // UIKit represents trackpad/wheel scrolling as a zero-touch pan. Keep
         // it separate from the ordinary one-finger recognizer: the delegate
@@ -2241,6 +2364,20 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         rightTapRecognizer.allowedTouchTypes = directTouchTypes
         rightTapRecognizer.delegate = self
 
+        // Deliberately without the double-tap dependency the direct-mode tap
+        // carries. Exclusivity with DirectTouchGestureRecognizer still comes
+        // for free: a touch that moves far enough to scroll or drag makes that
+        // recognizer begin, which cancels this one.
+        trackpadTapRecognizer.numberOfTapsRequired = 1
+        trackpadTapRecognizer.numberOfTouchesRequired = 1
+        trackpadTapRecognizer.allowedTouchTypes = directTouchTypes
+        trackpadTapRecognizer.delegate = self
+
+        trackpadScrollRecognizer.minimumNumberOfTouches = 2
+        trackpadScrollRecognizer.maximumNumberOfTouches = 2
+        trackpadScrollRecognizer.allowedTouchTypes = directTouchTypes
+        trackpadScrollRecognizer.delegate = self
+
         hoverRecognizer.allowedTouchTypes = pointerTypes
         hoverRecognizer.delegate = self
 
@@ -2253,11 +2390,29 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             tapRecognizer,
             doubleTapRecognizer,
             rightTapRecognizer,
+            trackpadTapRecognizer,
+            trackpadScrollRecognizer,
             hoverRecognizer,
         ] {
             recognizer.cancelsTouchesInView = false
             addGestureRecognizer(recognizer)
         }
+        updateRecognizerEnablement()
+    }
+
+    /// One finger means a different thing in each mode, so the recognizers
+    /// that read it are swapped wholesale rather than branching inside every
+    /// handler. A pencil or an attached mouse is not a finger: its taps and
+    /// clicks, the secondary button included, keep going to the direct-mode
+    /// recognizers in both modes, so switching how the finger works changes
+    /// nothing about how the mouse does.
+    private func updateRecognizerEnablement() {
+        let usesTrackpad = pointerMode == .trackpad
+        let clickTypes = usesTrackpad ? Self.pointerTypes : Self.allPointerTypes
+        tapRecognizer.allowedTouchTypes = clickTypes
+        doubleTapRecognizer.allowedTouchTypes = clickTypes
+        trackpadTapRecognizer.isEnabled = usesTrackpad
+        trackpadScrollRecognizer.isEnabled = usesTrackpad
     }
 
     @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
@@ -2370,13 +2525,23 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handleRightTap(_ recognizer: UITapGestureRecognizer) {
-        guard recognizer.state == .ended,
-              let point = framebufferPoint(
-                for: recognizer.location(in: self)) else { return }
+        guard recognizer.state == .ended else { return }
+        let usesTrackpad = pointerMode == .trackpad
+        let location = usesTrackpad
+            ? trackpadWirePoint()
+            : framebufferPoint(for: recognizer.location(in: self))
+        guard let point = location else { return }
         if catchMomentumFlingIfActive() || momentumCatchPending {
             momentumCatchPending = false
             momentumCatchTimestamp = 0
             return
+        }
+        if usesTrackpad {
+            // No finger location produced this point, so the cached
+            // framebuffer point that seeds a future cursor has to be written
+            // here rather than as a side effect of converting one.
+            lastPointerPoint = point
+            lastKnownFramebufferPoint = point
         }
         touchHandler.handleRightClick(x: point.x, y: point.y)
     }
@@ -2385,6 +2550,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         _ recognizer: DirectTouchGestureRecognizer
     ) {
         guard let mode = recognizer.mode else { return }
+        if pointerMode == .trackpad {
+            handleTrackpadTouchState(mode: mode, recognizer: recognizer)
+            return
+        }
         switch (mode, recognizer.state) {
         case (.scroll, .began):
             if momentumScrollPhaseActive {
@@ -2431,6 +2600,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         case (.drag, .began):
             guard let point = framebufferPoint(
                 for: recognizer.currentLocation) else { return }
+            fireDragEngageFeedback()
             touchHoldDragLastPoint = point
             touchHoldDragActive = true
             lastPointerPoint = point
@@ -2447,6 +2617,308 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         default:
             break
         }
+    }
+
+    /// Margin the virtual cursor keeps from the viewport edge before the
+    /// desktop starts sliding under it. Same figure as pointer edge
+    /// scrolling, so both ways of reaching past the viewport feel alike.
+    private static let trackpadFollowInset: CGFloat = 24
+
+    /// One-finger touch in `.trackpad`. The recognizer's two outcomes keep
+    /// their meaning — motion versus a stationary hold — but neither reads the
+    /// finger's location any more: motion nudges the cursor and the hold
+    /// presses wherever the cursor already is.
+    private func handleTrackpadTouchState(
+        mode: DirectTouchGestureRecognizer.Mode,
+        recognizer: DirectTouchGestureRecognizer
+    ) {
+        switch (mode, recognizer.state) {
+        case (.scroll, .began):
+            // The touch that caught a fling has already paid for it; from here
+            // it is an ordinary cursor stroke.
+            momentumCatchPending = false
+            momentumCatchTimestamp = 0
+            beginTrackpadStroke(from: .zero)
+            recenterTrackpadCursorIfOffscreen()
+            if moveTrackpadCursor(to: recognizer.translation) {
+                sendTrackpadPointer(buttonHeld: false)
+            }
+        case (.scroll, .changed):
+            if moveTrackpadCursor(to: recognizer.translation) {
+                sendTrackpadPointer(buttonHeld: false)
+            }
+        case (.scroll, .ended), (.scroll, .cancelled):
+            trackpadVelocity.reset()
+        case (.drag, .began):
+            recenterTrackpadCursorIfOffscreen()
+            guard let point = trackpadWirePoint() else { return }
+            fireDragEngageFeedback()
+            // Movement under the slop before the hold committed was noise, not
+            // intent: start the drag from where the finger rests.
+            beginTrackpadStroke(from: recognizer.translation)
+            touchHoldDragLastPoint = point
+            touchHoldDragActive = true
+            lastPointerPoint = point
+            lastKnownFramebufferPoint = point
+            // Touch-down sends no absolute move in this mode, so a hold that
+            // follows no cursor motion would press at a coordinate the server
+            // was never moved to. Sync the pointer first, exactly as the
+            // scroll path does, or remote UIs hit-test the previous spot.
+            touchHandler.handleMove(x: point.x, y: point.y)
+            touchHandler.handleDrag(x: point.x, y: point.y)
+        case (.drag, .changed):
+            guard touchHoldDragActive else { return }
+            if moveTrackpadCursor(to: recognizer.translation) {
+                sendTrackpadPointer(buttonHeld: true)
+            }
+        case (.drag, .ended), (.drag, .cancelled):
+            releaseTouchHoldDrag()
+            trackpadVelocity.reset()
+        default:
+            break
+        }
+    }
+
+    @objc private func handleTrackpadTap(_ recognizer: UITapGestureRecognizer) {
+        guard recognizer.state == .ended,
+              let point = trackpadWirePoint() else { return }
+        if momentumCatchPending {
+            // The touch that stopped a fling belongs to the scroll
+            // interaction; catching never clicks the remote desktop.
+            momentumCatchPending = false
+            momentumCatchTimestamp = 0
+            return
+        }
+        catchMomentumFlingIfActive()
+        focusForHardwareKeyboardIfNeeded(recognizer)
+        lastPointerPoint = point
+        lastKnownFramebufferPoint = point
+        touchHandler.handleTap(x: point.x, y: point.y)
+    }
+
+    /// Two-finger scrolling in `.trackpad`, driving the same precise pipeline
+    /// as the one-finger direct scroll it stands in for. Only the anchor
+    /// differs: the samples are addressed to the virtual cursor rather than to
+    /// the fingers doing the scrolling.
+    @objc private func handleTrackpadScroll(_ recognizer: UIPanGestureRecognizer) {
+        stopEdgeScrolling()
+        switch recognizer.state {
+        case .began:
+            if momentumScrollPhaseActive {
+                endMomentumScrollPhase()
+                finishScrollInteraction()
+            }
+            momentumCatchPending = false
+            momentumCatchTimestamp = 0
+            activeScrollRecognizer = recognizer
+            activeScrollUsesDirectTouch = true
+            let translation = recognizer.translation(in: self)
+            let now = CACurrentMediaTime()
+            releaseVelocityEstimator.reset()
+            releaseVelocityEstimator.record(position: translation, at: now)
+            previousScrollTranslation = translation
+            previousScrollTimestamp = now
+            beginScrollInteractionIfNeeded(
+                at: trackpadCursorViewPoint()
+                    ?? CGPoint(x: bounds.midX, y: bounds.midY),
+                initialTranslation: translation,
+                overridingScrollPoint: trackpadWirePoint())
+        case .changed:
+            guard activeScrollRecognizer === recognizer else { return }
+            let translation = recognizer.translation(in: self)
+            let now = CACurrentMediaTime()
+            let deltaX = translation.x - previousScrollTranslation.x
+            let deltaY = translation.y - previousScrollTranslation.y
+            releaseVelocityEstimator.record(position: translation, at: now)
+            previousScrollTranslation = translation
+            previousScrollTimestamp = now
+            sendFilteredScrollDelta(
+                deltaX: deltaX,
+                deltaY: deltaY,
+                scrollPhase: .changed)
+        case .ended:
+            guard activeScrollRecognizer === recognizer else { return }
+            flushPendingScrollDelta()
+            endDirectScrollPhase(.ended)
+            if !beginSyntheticMomentumIfNeeded() {
+                finishScrollInteraction()
+            }
+        case .cancelled, .failed:
+            guard activeScrollRecognizer === recognizer else { return }
+            cancelScrollInteraction()
+        default:
+            break
+        }
+    }
+
+    private func beginTrackpadStroke(from translation: CGPoint) {
+        trackpadConsumedTranslation = translation
+        trackpadVelocity.reset()
+    }
+
+    /// Takes over a finger that is already down when the mode changes.
+    ///
+    /// The HUD can switch modes mid-stroke. `DirectTouchGestureRecognizer` has
+    /// been tracking that touch since it landed and will deliver its next
+    /// `.changed` with no `.began` in front of it, so without adopting the
+    /// translation accumulated so far the cursor would receive the finger's
+    /// entire journey since touch-down as a single jump.
+    private func adoptInFlightTouchStroke() {
+        guard directTouchRecognizer.mode != nil,
+              directTouchRecognizer.state == .began
+                || directTouchRecognizer.state == .changed else { return }
+        beginTrackpadStroke(from: directTouchRecognizer.translation)
+        recenterTrackpadCursorIfOffscreen()
+    }
+
+    /// Folds the recognizer's cumulative translation into the cursor and
+    /// reports whether the remote pixel under it changed. Sub-pixel motion is
+    /// kept by the model, so a stream of tiny deltas eventually moves the
+    /// pointer instead of being rounded away one callback at a time.
+    @discardableResult
+    private func moveTrackpadCursor(to translation: CGPoint) -> Bool {
+        guard var model = trackpadModel else { return false }
+        let delta = CGPoint(
+            x: translation.x - trackpadConsumedTranslation.x,
+            y: translation.y - trackpadConsumedTranslation.y)
+        trackpadConsumedTranslation = translation
+        let velocity = trackpadVelocity.record(
+            translation: delta,
+            at: CACurrentMediaTime())
+        let previous = model.integerPosition
+        model.move(
+            by: delta,
+            framebufferPixelsPerPoint: viewport.framebufferPixelsPerPoint(
+                viewSize: bounds.size,
+                framebufferSize: framebufferSize) ?? 0,
+            velocity: velocity)
+        trackpadModel = model
+        let current = model.integerPosition
+        followTrackpadCursor()
+        #if !targetEnvironment(macCatalyst)
+        refreshTrackpadCursorImage()
+        #endif
+        return current != previous
+    }
+
+    private func sendTrackpadPointer(buttonHeld: Bool) {
+        guard let point = trackpadWirePoint() else { return }
+        lastPointerPoint = point
+        lastKnownFramebufferPoint = point
+        if buttonHeld {
+            touchHoldDragLastPoint = point
+            touchHandler.handleDrag(x: point.x, y: point.y)
+        } else {
+            touchHandler.handleMove(x: point.x, y: point.y)
+        }
+    }
+
+    /// Slides the desktop when the cursor approaches the viewport edge, so a
+    /// zoomed-in session can be crossed without lifting the finger to pan.
+    private func followTrackpadCursor() {
+        guard let viewPoint = trackpadCursorViewPoint() else { return }
+        let translation = viewport.translationToReveal(
+            viewPoint: viewPoint,
+            viewSize: bounds.size,
+            framebufferSize: framebufferSize,
+            inset: Self.trackpadFollowInset)
+        guard translation != .zero else { return }
+        viewport.pan(
+            by: translation,
+            viewSize: bounds.size,
+            framebufferSize: framebufferSize)
+        onViewportChange?(viewport)
+    }
+
+    private func trackpadWirePoint() -> (x: UInt16, y: UInt16)? {
+        guard let trackpadModel else { return nil }
+        return TrackpadPointerWire.wirePoint(
+            framebufferPoint: trackpadModel.integerPosition,
+            origin: framebufferOrigin)
+    }
+
+    private func trackpadCursorViewPoint() -> CGPoint? {
+        guard let trackpadModel else { return nil }
+        return viewport.viewPoint(
+            forFramebufferPoint: trackpadModel.position,
+            viewSize: bounds.size,
+            framebufferSize: framebufferSize)
+    }
+
+    private func makeTrackpadModelIfNeeded() {
+        guard trackpadModel == nil else { return }
+        trackpadModel = TrackpadPointerModel(
+            position: trackpadSeedPosition(),
+            framebufferSize: framebufferSize,
+            speed: pointerSpeed)
+    }
+
+    /// Keeps the cursor's own idea of the desktop and of the user's speed
+    /// preference current, both of which can change mid-session.
+    private func synchronizeTrackpadModel() {
+        guard var model = trackpadModel else { return }
+        let hadNoDesktop = model.framebufferSize == .zero
+        model.updateFramebufferSize(framebufferSize)
+        model.speed = pointerSpeed
+        if hadNoDesktop, model.framebufferSize != .zero {
+            // Trackpad mode can be chosen before the server has reported its
+            // dimensions, which pins the cursor to the corner because every
+            // coordinate clamps to zero. Seed it properly now that there is a
+            // desktop to seed it against.
+            model.place(at: trackpadSeedPosition())
+        }
+        trackpadModel = model
+    }
+
+    /// Where the cursor appears the first time relative pointing takes over.
+    /// Wherever this pane last put the pointer is the least surprising spot;
+    /// the middle of what is on screen is the answer when nothing has been
+    /// sent yet.
+    private func trackpadSeedPosition() -> CGPoint {
+        guard let lastKnownFramebufferPoint else {
+            return visibleCenterFramebufferPosition()
+        }
+        return TrackpadPointerWire.framebufferPoint(
+            wirePoint: lastKnownFramebufferPoint,
+            origin: framebufferOrigin)
+    }
+
+    private func visibleCenterFramebufferPosition() -> CGPoint {
+        if let center = viewport.framebufferPoint(
+            for: visibleLocation(for: CGPoint(x: bounds.midX, y: bounds.midY)),
+            viewSize: bounds.size,
+            framebufferSize: framebufferSize) {
+            return center
+        }
+        return CGPoint(
+            x: framebufferSize.width / 2,
+            y: framebufferSize.height / 2)
+    }
+
+    /// A pinch, or a mode switch made while zoomed elsewhere, can leave the
+    /// cursor off the visible desktop, where the user has nothing to aim
+    /// with. Bring it back before the stroke rather than after it.
+    private func recenterTrackpadCursorIfOffscreen() {
+        makeTrackpadModelIfNeeded()
+        guard var model = trackpadModel else { return }
+        if let viewPoint = trackpadCursorViewPoint(),
+           bounds.contains(viewPoint) {
+            return
+        }
+        model.place(at: visibleCenterFramebufferPosition())
+        trackpadModel = model
+    }
+
+    private func prepareDragEngageFeedback() {
+        #if !os(visionOS)
+        dragEngageFeedback.prepare()
+        #endif
+    }
+
+    private func fireDragEngageFeedback() {
+        #if !os(visionOS)
+        dragEngageFeedback.impactOccurred()
+        #endif
     }
 
     private func positionRemotePointerForTouch(at location: CGPoint) {
@@ -2482,6 +2954,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             stopEdgeScrolling()
             remoteCursorHoverLocation = nil
             remoteCursorImageView.isHidden = true
+            // The pointer that outranked the virtual cursor has left the
+            // glass; the virtual one is visible again.
+            refreshTrackpadCursorImage()
             return
         }
         if recognizer.state == .began || recognizer.state == .changed {
@@ -2645,25 +3120,138 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// Draw the server-selected bitmap at the locally delivered hover point.
     /// This remains as responsive as UIKit's pointer because it does not wait
     /// for the remote cursor-position echo; only shape changes cross the wire.
-    private func updateRemoteCursorImage(at location: CGPoint?) {
+    /// `allowingFallback` belongs to the virtual cursor alone. A real pointer
+    /// on the glass already draws itself, so adding a local arrow under it
+    /// would show two pointers where the server described none.
+    private func updateRemoteCursorImage(
+        at location: CGPoint?,
+        allowingFallback: Bool = false
+    ) {
         remoteCursorHoverLocation = location
-        guard let location, let remoteCursor else {
-            remoteCursorImageView.isHidden = true
-            remoteCursorImageView.image = nil
+        guard let location else {
+            hideRemoteCursorImage()
             return
         }
+        if let remoteCursor {
+            drawRemoteCursorImage(
+                UIImage(cgImage: remoteCursor.image, scale: 1, orientation: .up),
+                hotspot: CGPoint(
+                    x: CGFloat(remoteCursor.hotspotX),
+                    y: CGFloat(remoteCursor.hotspotY)),
+                size: CGSize(
+                    width: CGFloat(remoteCursor.width),
+                    height: CGFloat(remoteCursor.height)),
+                at: location)
+            return
+        }
+        // A server that has not described its pointer yet leaves relative
+        // pointing with nothing on screen to aim, and unlike direct touch
+        // there is no finger standing in for it. Draw a local arrow until the
+        // server says otherwise; once it has, a nil cursor is a deliberate
+        // hide and must stay hidden.
+        guard allowingFallback, !hasReceivedRemoteCursorShape else {
+            hideRemoteCursorImage()
+            return
+        }
+        let fallback = makeFallbackCursorImage()
+        drawRemoteCursorImage(
+            fallback,
+            hotspot: .zero,
+            size: fallback.size,
+            at: location)
+    }
 
-        remoteCursorImageView.image = UIImage(
-            cgImage: remoteCursor.image,
-            scale: 1,
-            orientation: .up)
+    private func hideRemoteCursorImage() {
+        remoteCursorImageView.isHidden = true
+        remoteCursorImageView.image = nil
+    }
+
+    private func drawRemoteCursorImage(
+        _ image: UIImage,
+        hotspot: CGPoint,
+        size: CGSize,
+        at location: CGPoint
+    ) {
+        remoteCursorImageView.image = image
         remoteCursorImageView.frame = CGRect(
-            x: location.x - CGFloat(remoteCursor.hotspotX),
-            y: location.y - CGFloat(remoteCursor.hotspotY),
-            width: CGFloat(remoteCursor.width),
-            height: CGFloat(remoteCursor.height))
+            x: location.x - hotspot.x,
+            y: location.y - hotspot.y,
+            width: size.width,
+            height: size.height)
         remoteCursorImageView.isHidden = false
         bringSubviewToFront(remoteCursorImageView)
+    }
+
+    private var hoverIsActive: Bool {
+        hoverRecognizer.state == .began || hoverRecognizer.state == .changed
+    }
+
+    /// Redraws the virtual cursor wherever the viewport now places it. A real
+    /// pointer on the glass outranks it: hover carries its own position and
+    /// that is the one the user is following.
+    private func refreshTrackpadCursorImage() {
+        guard pointerMode == .trackpad, !hoverIsActive else { return }
+        let location = trackpadCursorViewPoint()
+        guard location != remoteCursorHoverLocation
+                || remoteCursorImageView.isHidden else { return }
+        updateRemoteCursorImage(at: location, allowingFallback: true)
+    }
+
+    /// Classic pointer silhouette, drawn rather than shipped so it scales with
+    /// whatever size the mode wants and needs no asset catalog entry. The white
+    /// outline is what keeps it legible over a dark remote desktop.
+    private static let fallbackCursorSize = CGSize(width: 20, height: 28)
+    private static let fallbackCursorOutlineWidth: CGFloat = 1
+
+    private func makeFallbackCursorImage() -> UIImage {
+        if let fallbackCursorImage { return fallbackCursorImage }
+        let image = Self.renderFallbackCursorImage()
+        fallbackCursorImage = image
+        return image
+    }
+
+    private static func renderFallbackCursorImage() -> UIImage {
+        let size = fallbackCursorSize
+        let renderer = UIGraphicsImageRenderer(size: size)
+        return renderer.image { _ in
+            let path = fallbackCursorPath(
+                in: CGRect(origin: .zero, size: size).insetBy(
+                    dx: fallbackCursorOutlineWidth / 2,
+                    dy: fallbackCursorOutlineWidth / 2))
+            UIColor.black.setFill()
+            UIColor.white.setStroke()
+            path.fill()
+            path.lineWidth = fallbackCursorOutlineWidth
+            path.lineJoinStyle = .round
+            path.stroke()
+        }
+    }
+
+    private static func fallbackCursorPath(in rect: CGRect) -> UIBezierPath {
+        // Proportions of the standard arrow, as fractions of the bounding box:
+        // tip, the long left edge, the notch, the tail, and the barb.
+        let outline: [(CGFloat, CGFloat)] = [
+            (0, 0),
+            (0, 0.78),
+            (0.26, 0.60),
+            (0.42, 0.94),
+            (0.58, 0.87),
+            (0.40, 0.54),
+            (0.68, 0.54),
+        ]
+        let path = UIBezierPath()
+        for (index, fraction) in outline.enumerated() {
+            let point = CGPoint(
+                x: rect.minX + fraction.0 * rect.width,
+                y: rect.minY + fraction.1 * rect.height)
+            if index == 0 {
+                path.move(to: point)
+            } else {
+                path.addLine(to: point)
+            }
+        }
+        path.close()
+        return path
     }
     #endif
 
@@ -2743,6 +3331,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
            !gestureRecognizer.buttonMask.isEmpty {
             return gestureRecognizer.buttonMask.contains(.primary)
         }
+        // Two fingers scroll in trackpad mode, so they cannot also drag the
+        // viewport; the cursor pulls the desktop along instead.
+        if gestureRecognizer === viewportPanRecognizer,
+           pointerMode == .trackpad {
+            return false
+        }
         #if targetEnvironment(macCatalyst)
         // The context-menu interaction also recognizes a held primary button,
         // which would cancel an in-flight remote drag (e.g. a Finder drag)
@@ -2766,6 +3360,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             || recognizer === tapRecognizer
             || recognizer === doubleTapRecognizer
             || recognizer === rightTapRecognizer
+            || recognizer === trackpadTapRecognizer
+            || recognizer === trackpadScrollRecognizer
             || recognizer === hoverRecognizer
     }
 
