@@ -73,6 +73,10 @@ public struct RemoteDesktopView: View {
     private let hostOwnsRecoveryChrome: Bool
     private let brightnessGain: Double
     private let pointerSpeed: Double
+    /// On-screen height of the locally drawn pointer, in view points. The
+    /// host owns this because only it knows the display the desktop is being
+    /// viewed on and what the user asked for.
+    private let cursorHeight: CGFloat
 
     #if canImport(UIKit)
     /// A host-provided accessory can remain visible without the software
@@ -93,6 +97,7 @@ public struct RemoteDesktopView: View {
         initialViewportPanningMode: RemoteViewportPanningMode = .edge,
         initialPointerMode: RemotePointerMode = .direct,
         pointerSpeed: Double = 1.0,
+        cursorHeight: CGFloat = 17,
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0
@@ -107,6 +112,7 @@ public struct RemoteDesktopView: View {
             initialViewportPanningMode: initialViewportPanningMode,
             initialPointerMode: initialPointerMode,
             pointerSpeed: pointerSpeed,
+            cursorHeight: cursorHeight,
             onSharedClipboardUserChange: onSharedClipboardUserChange,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
@@ -129,6 +135,7 @@ public struct RemoteDesktopView: View {
         initialViewportPanningMode: RemoteViewportPanningMode = .edge,
         initialPointerMode: RemotePointerMode = .direct,
         pointerSpeed: Double = 1.0,
+        cursorHeight: CGFloat = 17,
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0,
@@ -144,6 +151,7 @@ public struct RemoteDesktopView: View {
             initialViewportPanningMode: initialViewportPanningMode,
             initialPointerMode: initialPointerMode,
             pointerSpeed: pointerSpeed,
+            cursorHeight: cursorHeight,
             onSharedClipboardUserChange: onSharedClipboardUserChange,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
@@ -160,6 +168,7 @@ public struct RemoteDesktopView: View {
         initialViewportPanningMode: RemoteViewportPanningMode,
         initialPointerMode: RemotePointerMode,
         pointerSpeed: Double,
+        cursorHeight: CGFloat,
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?,
         hostOwnsRecoveryChrome: Bool,
         brightnessGain: Double,
@@ -171,6 +180,7 @@ public struct RemoteDesktopView: View {
         self._viewportPanningMode = State(initialValue: initialViewportPanningMode)
         self._pointerMode = State(initialValue: initialPointerMode)
         self.pointerSpeed = pointerSpeed
+        self.cursorHeight = cursorHeight
         self._keyboardCapture = State(
             initialValue: keyboardCapture ?? VNCKeyboardCapture())
         self.isFullScreen = isFullScreen
@@ -399,6 +409,8 @@ public struct RemoteDesktopView: View {
             viewportPanningMode: viewportPanningMode,
             pointerMode: pointerMode,
             pointerSpeed: pointerSpeed,
+            cursorHeight: cursorHeight,
+            serverRendersCursor: session.activeCursorRendering == .server,
             keyboardActive: $keyboardActive,
             hardwareKeyboardAttached: $hardwareKeyboardAttached,
             framebufferSize: framebufferSize,
@@ -413,7 +425,8 @@ public struct RemoteDesktopView: View {
             disconnect: { session.disconnect() },
             // Apple's adaptive profile asks the server for cached cursor
             // images so the responsive local pointer can adopt their shape.
-            remoteCursor: session.remoteCursor)
+            remoteCursor: session.remoteCursor,
+            remoteCursorPresence: session.remoteCursorPresence)
             .frame(width: viewSize.width, height: viewSize.height)
             .contentShape(Rectangle())
         #else

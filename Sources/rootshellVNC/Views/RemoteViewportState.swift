@@ -250,9 +250,31 @@ struct RemoteViewportState: Equatable, Sendable {
         framebufferSize: CGSize,
         inset: CGFloat
     ) -> CGSize {
+        translationToReveal(
+            viewPoint: viewPoint,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            horizontalInset: inset,
+            verticalInset: inset)
+    }
+
+    /// Per-axis variant, for callers that keep the point inside a rectangle
+    /// rather than away from an edge. A viewport is far wider than it is tall
+    /// in landscape, so one inset in points would carve out very different
+    /// margins on the two axes.
+    ///
+    /// Same post-clamp contract as the single-inset form: the returned
+    /// translation is what `pan(by:)` will actually apply.
+    func translationToReveal(
+        viewPoint: CGPoint,
+        viewSize: CGSize,
+        framebufferSize: CGSize,
+        horizontalInset: CGFloat,
+        verticalInset: CGFloat
+    ) -> CGSize {
         guard scale > Self.minimumScale,
               viewPoint.x.isFinite, viewPoint.y.isFinite,
-              inset.isFinite,
+              horizontalInset.isFinite, verticalInset.isFinite,
               displayedFrame(
                 viewSize: viewSize,
                 framebufferSize: framebufferSize) != nil else { return .zero }
@@ -261,8 +283,8 @@ struct RemoteViewportState: Equatable, Sendable {
         // and turn "bring inside" into a jump to the far edge; capping it
         // degenerates to aiming at the center line instead.
         let bounds = CGRect(origin: .zero, size: viewSize).insetBy(
-            dx: min(max(0, inset), viewSize.width / 2),
-            dy: min(max(0, inset), viewSize.height / 2))
+            dx: min(max(0, horizontalInset), viewSize.width / 2),
+            dy: min(max(0, verticalInset), viewSize.height / 2))
         let requested = CGSize(
             width: min(max(viewPoint.x, bounds.minX), bounds.maxX)
                 - viewPoint.x,

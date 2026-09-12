@@ -250,6 +250,18 @@ public struct VNCConfiguration: Sendable {
     /// confirm the existing password-send dialog before any input is sent.
     public var promptForLoginPasswordAtLoginWindow: Bool
 
+    /// Who draws the remote pointer. Changing this changes which encodings the
+    /// session advertises, so it takes effect only on a new connection.
+    public var cursorRendering: VNCCursorRendering
+
+    /// The pseudo-encodings that ask a server to deliver the pointer as a
+    /// separate shape rather than drawn into the framebuffer. Advertising any
+    /// one of them is what makes the server withhold the pointer, so
+    /// server-rendered mode has to suppress all of them.
+    static let clientCursorEncodings: [Encoding] = [
+        .unknown(1104), .unknown(1100), .cursor, .xCursor,
+    ]
+
     /// Whether the selected connection and sizing modes can carry remote
     /// system audio.
     var supportsRemoteAudio: Bool {
@@ -315,6 +327,7 @@ public struct VNCConfiguration: Sendable {
         displayMode: DisplayMode? = nil,
         enableRemoteAudio: Bool = true,
         promptForLoginPasswordAtLoginWindow: Bool = false,
+        cursorRendering: VNCCursorRendering = .client,
         targetFrameRate: Int = 60,
         enableProtocolTrace: Bool = false,
         reconnectionPolicy: VNCReconnectionPolicy = VNCReconnectionPolicy(),
@@ -353,6 +366,7 @@ public struct VNCConfiguration: Sendable {
         self.enableRemoteAudio = enableRemoteAudio
         self.promptForLoginPasswordAtLoginWindow =
             promptForLoginPasswordAtLoginWindow
+        self.cursorRendering = cursorRendering
         self.targetFrameRate = max(1, min(120, targetFrameRate))
         self.enableProtocolTrace = enableProtocolTrace
         self.reconnectionPolicy = reconnectionPolicy
@@ -472,6 +486,18 @@ public struct VNCConfiguration: Sendable {
         // though newer servers support the standard full-color Cursor shape.
         if !encodings.contains(.xCursor) {
             encodings.append(.xCursor)
+        }
+
+        // Strip the cursor pseudo-encodings in one place rather than gating
+        // each list above: Standard mode front-loads 1100 and 1104 with its
+        // own priorities, and `preferredEncodings` is caller-supplied, so a
+        // per-site condition would leave a way for one to survive. Running
+        // only in server mode keeps the client list byte-identical.
+        //
+        // DisplayInfo2 (1105) is deliberately not in this set. It carries
+        // display layout and Login Window state, nothing about the pointer.
+        if cursorRendering == .server {
+            encodings.removeAll { Self.clientCursorEncodings.contains($0) }
         }
 
         // Ensure raw is present as ultimate fallback

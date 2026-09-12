@@ -476,4 +476,109 @@ final class RemoteViewportStateTests: XCTestCase {
         XCTAssertEqual(translation.width, 200, accuracy: 0.001)
         XCTAssertEqual(translation.height, 0, accuracy: 0.001)
     }
+
+    func testPerAxisRevealAppliesEachInsetToItsOwnAxis() {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        // Inside the narrow horizontal margin but above the tall vertical one:
+        // only the axis that is actually breached may move.
+        let vertical = viewport.translationToReveal(
+            viewPoint: CGPoint(x: 150, y: 300),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            horizontalInset: 100,
+            verticalInset: 400)
+        XCTAssertEqual(vertical.width, 0, accuracy: 0.001)
+        XCTAssertEqual(vertical.height, 100, accuracy: 0.001)
+
+        let horizontal = viewport.translationToReveal(
+            viewPoint: CGPoint(x: 150, y: 300),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            horizontalInset: 400,
+            verticalInset: 100)
+        XCTAssertEqual(horizontal.width, 250, accuracy: 0.001)
+        XCTAssertEqual(horizontal.height, 0, accuracy: 0.001)
+    }
+
+    func testPerAxisRevealMatchesTheSingleInsetFormWhenBothAgree() {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        for point in [
+            CGPoint(x: -5_000, y: 5_000),
+            CGPoint(x: 10, y: 990),
+            CGPoint(x: 500, y: 500),
+        ] {
+            XCTAssertEqual(
+                viewport.translationToReveal(
+                    viewPoint: point,
+                    viewSize: viewSize,
+                    framebufferSize: framebufferSize,
+                    inset: 24),
+                viewport.translationToReveal(
+                    viewPoint: point,
+                    viewSize: viewSize,
+                    framebufferSize: framebufferSize,
+                    horizontalInset: 24,
+                    verticalInset: 24))
+        }
+    }
+
+    func testPerAxisRevealCapsEachInsetIndependently() {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        // One axis collapses onto its center line, the other is not inset at
+        // all, and neither decision leaks into the other.
+        let translation = viewport.translationToReveal(
+            viewPoint: CGPoint(x: 300, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            horizontalInset: 600,
+            verticalInset: 0)
+        XCTAssertEqual(translation.width, 200, accuracy: 0.001)
+        XCTAssertEqual(translation.height, 0, accuracy: 0.001)
+    }
+
+    func testDeadZoneLetsTheCursorRoamTheMiddleBeforeTheDesktopMoves() throws {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        let inset = viewSize.width * TrackpadFollowPolicy.deadZoneInsetFraction
+        // Just inside the central 60%: the camera holds still.
+        XCTAssertEqual(viewport.translationToReveal(
+            viewPoint: CGPoint(x: inset + 1, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            horizontalInset: inset,
+            verticalInset: inset), .zero)
+
+        // Past it, the desktop moves by exactly the overshoot.
+        let translation = viewport.translationToReveal(
+            viewPoint: CGPoint(x: inset - 30, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            horizontalInset: inset,
+            verticalInset: inset)
+        XCTAssertEqual(translation.width, 30, accuracy: 0.001)
+        XCTAssertEqual(translation.height, 0, accuracy: 0.001)
+    }
 }
