@@ -805,6 +805,27 @@ public final class VNCSession {
     /// the local system pointer. Nil when the server has not sent a shape
     /// (or sent an explicit empty one) — callers fall back to the default.
     public private(set) var remoteCursor: RemoteCursor?
+    /// Distinguishes a pointer the server has not described yet from one
+    /// it deliberately hid; `remoteCursor` is nil in both cases.
+    public private(set) var remoteCursorPresence: RemoteCursorPresence = .undescribed
+
+    /// Who draws the pointer on the connection that is open right now.
+    ///
+    /// The transport snapshots `configuration.cursorRendering` as it dials and
+    /// negotiates its encodings from that snapshot, so flipping the
+    /// configuration mid-session cannot change what the server is already
+    /// doing. Anything deciding whether to draw a pointer locally has to
+    /// follow the connection rather than the configuration, or a mid-session
+    /// change leaves the user looking at two pointers or none. A session with
+    /// no established connection reports the configured value, which is what
+    /// the next dial will negotiate.
+    public var activeCursorRendering: VNCCursorRendering {
+        negotiatedCursorRendering ?? configuration.cursorRendering
+    }
+
+    /// The snapshot behind ``activeCursorRendering``, taken where the
+    /// transport is created and cleared whenever the connection is torn down.
+    private var negotiatedCursorRendering: VNCCursorRendering?
 
     /// Whether the server has requested a one-shot password confirmation for
     /// the current Apple Login Window episode. This remains pending until a
@@ -1235,6 +1256,8 @@ public final class VNCSession {
         lastError = nil
         currentImage = nil
         remoteCursor = nil
+        remoteCursorPresence = .undescribed
+        negotiatedCursorRendering = nil
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
@@ -1325,6 +1348,8 @@ public final class VNCSession {
         renderer = nil
         currentImage = nil
         remoteCursor = nil
+        remoteCursorPresence = .undescribed
+        negotiatedCursorRendering = nil
         isHighPerformanceMode = false
         supportsRemoteClipboardRequest = false
         supportsRemoteSharedClipboardControl = false
@@ -2393,8 +2418,10 @@ public final class VNCSession {
         switch result.cursorUpdate {
         case .shape(let cursor):
             remoteCursor = cursor
+            remoteCursorPresence = .described
         case .hidden:
             remoteCursor = nil
+            remoteCursorPresence = .hidden
         case nil:
             break
         }
@@ -2726,6 +2753,8 @@ public final class VNCSession {
         remoteDisplayRegionByID = [:]
         remoteDisplayRegionOrder = []
         remoteCursor = nil
+        remoteCursorPresence = .undescribed
+        negotiatedCursorRendering = nil
         diagnostics.isHighPerformanceMode = false
 
         videoStreamManager?.stopStream()
@@ -3567,6 +3596,10 @@ public final class VNCSession {
         } else {
             customConnection = nil
         }
+        // Read the pointer choice once, here, and publish the same value the
+        // transport negotiates from. The configuration is mutable while a
+        // session is live, and only a new dial can act on a change.
+        let cursorRendering = configuration.cursorRendering
         let transport = TransportSession(
             host: credentials.host,
             port: credentials.port,
@@ -3581,9 +3614,11 @@ public final class VNCSession {
                 configuration.displaySizingMode == .matchClient,
             appleMediaTilesPerFrameOverride:
                 appleMediaTilesPerFrameOverride,
+            serverRendersCursor: cursorRendering == .server,
             connection: customConnection,
             securityPolicy: configuration.securityPolicy,
             certificateValidationHandler: configuration.certificateValidationHandler)
+        negotiatedCursorRendering = cursorRendering
         transportSession = transport
 
         if configuration.displaySizingMode == .matchClient,

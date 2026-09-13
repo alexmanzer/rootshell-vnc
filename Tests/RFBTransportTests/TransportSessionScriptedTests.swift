@@ -231,6 +231,79 @@ final class TransportSessionScriptedTests: XCTestCase {
         XCTAssertEqual(states.snapshot(), [true, false])
     }
 
+    /// `portableEncodings` rewrites the list for conventional servers rather
+    /// than adding to it, so it has to honour the server-rendered choice too.
+    /// Asserting the whole byte stream proves nothing else shifted with it.
+    func testServerRenderedCursorOmitsCursorEncodingsForConventionalServer() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_3.wireBytes()
+        script.append(contentsOf: [0, 0, 0, SecurityType.none.rawValue])
+        script.append(Self.serverInitMessage(
+            width: 640, height: 480, name: "legacy-linux"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "legacy-linux.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.copyRect, .raw],
+            serverRendersCursor: true,
+            connection: connection)
+        try await session.connect()
+
+        var expected = ProtocolVersion.v3_3.wireBytes()
+        expected.append(0x01) // ClientInit, immediately after the version.
+        expected.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
+        expected.append(ClientMessage.setEncodings([
+            .copyRect, .raw, .zrle, .zlib,
+            .desktopSize, .extendedDesktopSize,
+        ]).serialize())
+        expected.append(ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0, y: 0, width: 640, height: 480).serialize())
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(sent, expected)
+        await session.disconnect()
+    }
+
+    /// The Apple path keeps the configured list verbatim instead of rewriting
+    /// it, so the suppression has to happen before that list is installed. A
+    /// host that builds the transport itself takes the default encodings,
+    /// which carry the portable cursor shapes.
+    func testServerRenderedCursorOmitsCursorEncodingsFromDefaultAppleList() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 640, height: 480, name: "apple-scripted"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            serverRendersCursor: true,
+            connection: connection)
+        try await session.connect()
+
+        // The default list with the two portable cursor shapes taken out and
+        // nothing else disturbed.
+        let cursorless = ClientMessage.setEncodings([
+            .copyRect, .raw,
+            .desktopSize, .extendedDesktopSize,
+            .encryptionInfo, .serverDisplayInfo,
+            .mediaStreamOffer, .mediaStreamAnswer,
+        ]).serialize()
+        let withCursors = ClientMessage.setEncodings(
+            ConnectionStateMachine.defaultPreferredEncodings).serialize()
+        let sent = await connection.sentBytes()
+
+        XCTAssertEqual(Self.occurrenceCount(of: cursorless, in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: withCursors, in: sent), 0)
+        await session.disconnect()
+    }
+
     func testRFB33ServerSelectedNoneDoesNotSendSecuritySelectionByte() async throws {
         let connection = ScriptedRFBConnection()
         var script = ProtocolVersion.v3_3.wireBytes()

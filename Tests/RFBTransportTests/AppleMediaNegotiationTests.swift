@@ -168,6 +168,43 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertTrue(encodings.contains(.raw))
     }
 
+    /// Asking the server to draw the pointer means advertising no cursor
+    /// pseudo-encoding at all. 0x450 and 0x44c are Apple's cached alpha cursor
+    /// records; the generic `.cursor` shape has to go with them, or the server
+    /// still withholds the pointer from the picture.
+    func testPostAcceptEncodingsDropCursorCapabilitiesWhenServerRendersCursor() {
+        let encodings = TransportSession.appleMediaPostAcceptEncodings(
+            from: [.appleH264, .zlib, .raw, .unknown(1104), .unknown(1100)],
+            serverRendersCursor: true)
+
+        XCTAssertFalse(encodings.contains(.unknown(1104)))
+        XCTAssertFalse(encodings.contains(.unknown(1100)))
+        XCTAssertFalse(encodings.contains(.cursor))
+        XCTAssertFalse(encodings.contains(.xCursor))
+        // The rest of the post-accept list is unaffected.
+        XCTAssertTrue(encodings.contains(.appleH264))
+        XCTAssertTrue(encodings.contains(.desktopSize))
+        XCTAssertTrue(encodings.contains(.unknown(0x451)))
+    }
+
+    /// Bit 2 is the "viewer composites the cursor itself" requirement, so a
+    /// server-rendered pointer is expressed by clearing it.
+    func testReceiverFlagsClearCursorBitWhenServerSendsCursor() {
+        XCTAssertEqual(
+            appleMediaReceiverFlags(displayCount: 1, sendsCursor: true) & 0x04,
+            0)
+        XCTAssertEqual(
+            appleMediaReceiverFlags(displayCount: 1, sendsCursor: false) & 0x04,
+            0x04)
+        // Clearing it must not disturb the 60-fps receiver bits.
+        XCTAssertEqual(
+            appleMediaReceiverFlags(
+                displayCount: 2,
+                supports60FPS: true,
+                sendsCursor: true),
+            0x03)
+    }
+
     func testNativeScreenSharingReceiverFlagsTrackSixtyFPSCapability() {
         XCTAssertEqual(appleMediaReceiverFlags(displayCount: 1), 0x04)
         XCTAssertEqual(appleMediaReceiverFlags(displayCount: 2), 0x04)

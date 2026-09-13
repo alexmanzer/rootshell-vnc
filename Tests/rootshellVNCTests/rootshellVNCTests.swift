@@ -687,6 +687,80 @@ final class VNCConfigurationTests: XCTestCase {
         XCTAssertTrue(effective.contains(.raw))
     }
 
+    /// Server-rendered mode has to suppress every cursor pseudo-encoding on
+    /// every path: Standard mode front-loads 1100 and 1104 with its own
+    /// priorities, and `preferredEncodings` is caller-supplied.
+    func testServerCursorRenderingDropsCursorEncodingsInEveryQualityMode() {
+        for mode in VNCConfiguration.VideoQualityMode.allCases {
+            let config = VNCConfiguration(
+                preferredEncodings: [.zrle, .raw, .cursor, .xCursor],
+                videoQualityMode: mode,
+                cursorRendering: .server)
+            let effective = config.effectiveEncodings
+
+            XCTAssertFalse(effective.contains(.unknown(1104)), "\(mode)")
+            XCTAssertFalse(effective.contains(.unknown(1100)), "\(mode)")
+            XCTAssertFalse(effective.contains(.cursor), "\(mode)")
+            XCTAssertFalse(effective.contains(.xCursor), "\(mode)")
+            // DisplayInfo2 carries display layout and Login Window state, not
+            // the pointer, so it survives.
+            XCTAssertTrue(effective.contains(.unknown(1105)), "\(mode)")
+            XCTAssertTrue(effective.contains(.raw), "\(mode)")
+        }
+    }
+
+    /// The default must stay byte-for-byte what shipped before the option.
+    ///
+    /// These lists are the ones `effectiveEncodings` produced before the
+    /// cursor rendering option existed, transcribed literally. Comparing the
+    /// default against an explicitly `.client` configuration would only prove
+    /// the two agree with each other, and would keep passing if both drifted.
+    func testClientCursorRenderingIsTheDefaultAndKeepsCursorEncodings() {
+        for mode in VNCConfiguration.VideoQualityMode.allCases {
+            let shipped: [Encoding]
+            switch mode {
+            case .adaptive:
+                shipped = [
+                    .appleH264, .appleMultiVariantScreenshare, .zlib, .zrle,
+                    .raw, .encryptionInfo, .serverDisplayInfo,
+                    .mediaStreamOffer, .mediaStreamAnswer,
+                    .desktopSize, .extendedDesktopSize,
+                    .unknown(1105), .unknown(1104), .unknown(1100),
+                    .cursor, .xCursor,
+                ]
+            case .standard:
+                shipped = [
+                    .appleMultiVariantScreenshare, .tight, .lastRect,
+                    .zrle, .zlib, .copyRect,
+                    .unknown(1105), .unknown(1101), .unknown(1100),
+                    .unknown(1104), .raw, .unknown(-23),
+                    .serverDisplayInfo, .desktopSize, .extendedDesktopSize,
+                    .cursor, .xCursor,
+                ]
+            case .fullQuality:
+                shipped = [
+                    .copyRect, .zlib, .zrle, .raw,
+                    .desktopSize, .extendedDesktopSize,
+                    .unknown(1105), .unknown(1104), .unknown(1100),
+                    .cursor, .xCursor,
+                ]
+            }
+
+            let explicit = VNCConfiguration(
+                preferredEncodings: [.zrle, .raw],
+                videoQualityMode: mode,
+                cursorRendering: .client)
+            let byDefault = VNCConfiguration(
+                preferredEncodings: [.zrle, .raw],
+                videoQualityMode: mode)
+
+            XCTAssertEqual(byDefault.cursorRendering, .client, "\(mode)")
+            XCTAssertEqual(explicit.cursorRendering, .client, "\(mode)")
+            XCTAssertEqual(byDefault.effectiveEncodings, shipped, "\(mode)")
+            XCTAssertEqual(explicit.effectiveEncodings, shipped, "\(mode)")
+        }
+    }
+
     func testEffectiveEncodingsWithoutHighPerformance() {
         let config = VNCConfiguration(
             preferredEncodings: [.zrle, .raw],

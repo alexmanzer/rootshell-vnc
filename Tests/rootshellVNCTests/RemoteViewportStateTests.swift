@@ -295,4 +295,290 @@ final class RemoteViewportStateTests: XCTestCase {
             framebufferSize: framebufferSize)
         XCTAssertEqual(translation, .zero)
     }
+
+    func testViewPointInvertsFramebufferMapping() throws {
+        var viewport = RemoteViewportState()
+        let fitted = try XCTUnwrap(viewport.viewPoint(
+            forFramebufferPoint: CGPoint(x: 960, y: 540),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertEqual(fitted.x, 500, accuracy: 0.001)
+        XCTAssertEqual(fitted.y, 500, accuracy: 0.001)
+
+        viewport.zoom(
+            by: 3,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+        viewport.pan(
+            by: CGSize(width: 200, height: -150),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        for remotePoint in [CGPoint(x: 960, y: 540),
+                            CGPoint(x: 0, y: 0),
+                            CGPoint(x: 1_200, y: 25)] {
+            let point = try XCTUnwrap(viewport.viewPoint(
+                forFramebufferPoint: remotePoint,
+                viewSize: viewSize,
+                framebufferSize: framebufferSize))
+            let roundTrip = try XCTUnwrap(viewport.framebufferPoint(
+                for: point,
+                viewSize: viewSize,
+                framebufferSize: framebufferSize))
+            XCTAssertEqual(roundTrip.x, remotePoint.x, accuracy: 0.001)
+            XCTAssertEqual(roundTrip.y, remotePoint.y, accuracy: 0.001)
+        }
+
+        // The zoomed desktop reaches well outside the viewport, and the
+        // inverse has to report that rather than refusing the point.
+        let offScreen = try XCTUnwrap(viewport.viewPoint(
+            forFramebufferPoint: .zero,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertEqual(offScreen.x, -800, accuracy: 0.001)
+        XCTAssertEqual(offScreen.y, -493.75, accuracy: 0.001)
+
+        XCTAssertNil(viewport.viewPoint(
+            forFramebufferPoint: .zero,
+            viewSize: .zero,
+            framebufferSize: framebufferSize))
+    }
+
+    func testFramebufferPixelsPerPointTracksZoom() throws {
+        var viewport = RemoteViewportState()
+        let fitted = try XCTUnwrap(viewport.framebufferPixelsPerPoint(
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertEqual(fitted, 1.92, accuracy: 0.001)
+
+        viewport.zoom(
+            by: 3,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+        let zoomed = try XCTUnwrap(viewport.framebufferPixelsPerPoint(
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertEqual(zoomed, 0.64, accuracy: 0.001)
+
+        XCTAssertNil(viewport.framebufferPixelsPerPoint(
+            viewSize: .zero,
+            framebufferSize: framebufferSize))
+    }
+
+    func testRevealDoesNothingInsideTheInsetOrAtFittedScale() {
+        var viewport = RemoteViewportState()
+        XCTAssertEqual(viewport.translationToReveal(
+            viewPoint: CGPoint(x: -400, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            inset: 24), .zero)
+
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+        XCTAssertEqual(viewport.translationToReveal(
+            viewPoint: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            inset: 24), .zero)
+        XCTAssertEqual(viewport.translationToReveal(
+            viewPoint: CGPoint(x: 24, y: 976),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            inset: 24), .zero)
+    }
+
+    func testRevealBringsAnOffscreenCursorInsideTheInset() throws {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        let cursor = CGPoint(x: 100, y: 540)
+        let before = try XCTUnwrap(viewport.viewPoint(
+            forFramebufferPoint: cursor,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertLessThan(before.x, 24)
+
+        let translation = viewport.translationToReveal(
+            viewPoint: before,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            inset: 24)
+        viewport.pan(
+            by: translation,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        let after = try XCTUnwrap(viewport.viewPoint(
+            forFramebufferPoint: cursor,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize))
+        XCTAssertEqual(after.x, 24, accuracy: 0.001)
+        XCTAssertEqual(after.y, before.y, accuracy: 0.001)
+        XCTAssertEqual(after.x - before.x, translation.width, accuracy: 0.001)
+    }
+
+    func testRevealReportsOnlyTheTranslationThePanLimitsAllow() {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        // Far beyond any reachable position: the answer is the remaining
+        // travel, so a caller panning by it is not promised movement the
+        // clamp will refuse.
+        let translation = viewport.translationToReveal(
+            viewPoint: CGPoint(x: -5_000, y: 5_000),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            inset: 24)
+        XCTAssertEqual(translation.width, 1_000, accuracy: 0.001)
+        XCTAssertEqual(translation.height, -562.5, accuracy: 0.001)
+
+        viewport.pan(
+            by: translation,
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+        XCTAssertEqual(viewport.offset.width, 1_000, accuracy: 0.001)
+        XCTAssertEqual(viewport.offset.height, -562.5, accuracy: 0.001)
+        XCTAssertEqual(viewport.translationToReveal(
+            viewPoint: CGPoint(x: -5_000, y: 5_000),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            inset: 24), .zero)
+    }
+
+    func testRevealCapsAnInsetWiderThanTheViewport() {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        // An inset past the halfway mark collapses onto the center line
+        // instead of inverting and pushing the point the wrong way.
+        let translation = viewport.translationToReveal(
+            viewPoint: CGPoint(x: 300, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            inset: 600)
+        XCTAssertEqual(translation.width, 200, accuracy: 0.001)
+        XCTAssertEqual(translation.height, 0, accuracy: 0.001)
+    }
+
+    func testPerAxisRevealAppliesEachInsetToItsOwnAxis() {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        // Inside the narrow horizontal margin but above the tall vertical one:
+        // only the axis that is actually breached may move.
+        let vertical = viewport.translationToReveal(
+            viewPoint: CGPoint(x: 150, y: 300),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            horizontalInset: 100,
+            verticalInset: 400)
+        XCTAssertEqual(vertical.width, 0, accuracy: 0.001)
+        XCTAssertEqual(vertical.height, 100, accuracy: 0.001)
+
+        let horizontal = viewport.translationToReveal(
+            viewPoint: CGPoint(x: 150, y: 300),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            horizontalInset: 400,
+            verticalInset: 100)
+        XCTAssertEqual(horizontal.width, 250, accuracy: 0.001)
+        XCTAssertEqual(horizontal.height, 0, accuracy: 0.001)
+    }
+
+    func testPerAxisRevealMatchesTheSingleInsetFormWhenBothAgree() {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        for point in [
+            CGPoint(x: -5_000, y: 5_000),
+            CGPoint(x: 10, y: 990),
+            CGPoint(x: 500, y: 500),
+        ] {
+            XCTAssertEqual(
+                viewport.translationToReveal(
+                    viewPoint: point,
+                    viewSize: viewSize,
+                    framebufferSize: framebufferSize,
+                    inset: 24),
+                viewport.translationToReveal(
+                    viewPoint: point,
+                    viewSize: viewSize,
+                    framebufferSize: framebufferSize,
+                    horizontalInset: 24,
+                    verticalInset: 24))
+        }
+    }
+
+    func testPerAxisRevealCapsEachInsetIndependently() {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        // One axis collapses onto its center line, the other is not inset at
+        // all, and neither decision leaks into the other.
+        let translation = viewport.translationToReveal(
+            viewPoint: CGPoint(x: 300, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            horizontalInset: 600,
+            verticalInset: 0)
+        XCTAssertEqual(translation.width, 200, accuracy: 0.001)
+        XCTAssertEqual(translation.height, 0, accuracy: 0.001)
+    }
+
+    func testDeadZoneLetsTheCursorRoamTheMiddleBeforeTheDesktopMoves() throws {
+        var viewport = RemoteViewportState()
+        viewport.zoom(
+            by: 2,
+            around: CGPoint(x: 500, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize)
+
+        let inset = viewSize.width * TrackpadFollowPolicy.deadZoneInsetFraction
+        // Just inside the central 60%: the camera holds still.
+        XCTAssertEqual(viewport.translationToReveal(
+            viewPoint: CGPoint(x: inset + 1, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            horizontalInset: inset,
+            verticalInset: inset), .zero)
+
+        // Past it, the desktop moves by exactly the overshoot.
+        let translation = viewport.translationToReveal(
+            viewPoint: CGPoint(x: inset - 30, y: 500),
+            viewSize: viewSize,
+            framebufferSize: framebufferSize,
+            horizontalInset: inset,
+            verticalInset: inset)
+        XCTAssertEqual(translation.width, 30, accuracy: 0.001)
+        XCTAssertEqual(translation.height, 0, accuracy: 0.001)
+    }
 }

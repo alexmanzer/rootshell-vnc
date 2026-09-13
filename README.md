@@ -270,6 +270,16 @@ files.
 - [rootshell.com](https://www.rootshell.com) — downloads, screenshots, release
   notes, and documentation for the rootshell app
 
+## Cursor artwork
+
+Remote cursor images come from the connected server. The client preserves their
+shapes and hotspots; it does not bundle extracted macOS cursor artwork. An original
+vector arrow is the fallback before a trackpad session receives its first cursor.
+
+The original arrow and text-caret paths live in
+`Sources/rootshellVNC/Views/TrackpadCursorArtwork.swift` and are covered by the
+repository's MIT license. The app renders the vectors at the display's pixel density.
+
 ## License
 
 rootshellVNC is available under the [MIT License](LICENSE).
