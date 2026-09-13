@@ -148,18 +148,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// Bumped whenever the server's shape changes, so a redraw decision can
     /// compare shapes without holding on to the previous image.
     private var remoteCursorShapeRevision: UInt64 = 0
-    /// Silhouette height of the first shape recognised as an arrow, which
-    /// sets the scale every shape kept as the server's pixels is drawn at.
-    private var referenceArrowHeight: CGFloat?
-    /// Cursors the server has described so far, by canvas, hotspot and
-    /// verdict, so each distinct one is logged once rather than on every
+    /// Cursors the server has described so far, by canvas and hotspot,
+    /// so each distinct size is logged once rather than on every
     /// change back to it.
     private var loggedTrackpadCursorShapes: Set<String> = []
-    private let trackpadCursorMatcher = TrackpadCursorMatcher()
-    /// How the current `remoteCursor` is drawn in trackpad mode. Resolved when
-    /// the shape arrives: recognition reads every pixel of it, cheap once per
-    /// shape and wasteful once per move.
-    private var trackpadCursorStyle: TrackpadCursorStyle?
     /// Not gated behind the input trace flag: it fires once per view, and the
     /// question it answers can only be checked on a device.
     private static let trackpadCursorLog = VNCLogger(category: "TrackpadCursor")
@@ -310,10 +302,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         return imageView
     }()
     private var remoteCursorHoverLocation: CGPoint?
-    /// Rendered once and kept, since it is redrawn on every cursor move.
-    /// Misses are cached too: artwork that failed to load once fails on every
-    /// move, and a bundle lookup per move is a frame spent on nothing.
-    private var nativeCursorImages: [NativeCursorKey: NativeCursorImage?] = [:]
+    /// Reuse the rasterized fallback across moves at the same size and density.
+    private var fallbackCursorImages: [FallbackCursorKey: FallbackCursorImage?] = [:]
     /// What the virtual cursor currently shows. A redraw happens when any
     /// part of this differs, which is what keeps a shape change from being
     /// read as "nothing moved".
@@ -738,7 +728,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         registerForTraitChanges(
             [UITraitDisplayScale.self]
         ) { (view: RemoteInputUIView, _: UITraitCollection) in
-            view.nativeCursorImages.removeAll(keepingCapacity: true)
+            view.fallbackCursorImages.removeAll(keepingCapacity: true)
             view.refreshTrackpadCursorImage()
         }
         #endif
@@ -899,10 +889,6 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         if self.remoteCursor?.image !== remoteCursor?.image {
             self.remoteCursor = remoteCursor
             remoteCursorShapeRevision &+= 1
-            trackpadCursorStyle = remoteCursor.map {
-                resolveTrackpadCursorStyle($0)
-            }
-            adoptReferenceArrowHeight(from: remoteCursor)
             logTrackpadCursorShape(remoteCursor)
             #if targetEnvironment(macCatalyst)
             catalystCursor = nil
@@ -2803,53 +2789,20 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     private func trackpadBitmapScale() -> CGFloat {
-        TrackpadCursorStyle.bitmapScale(
-            cursorHeight: cursorHeight,
-            referenceArrowHeight: referenceArrowHeight
-                ?? TrackpadCursorStyle.fallbackArrowHeight)
+        TrackpadCursorStyle.bitmapScale(cursorHeight: cursorHeight)
     }
 
-    /// A cursor is drawn from the bundled artwork only when its canvas,
-    /// hotspot and pixels agree with one of macOS's own. Anything less is a
-    /// guess, and a guessed arrow over a custom tool cursor would replace what
-    /// the desktop meant with what it merely resembled.
-    private func resolveTrackpadCursorStyle(
-        _ cursor: RemoteCursor
-    ) -> TrackpadCursorStyle {
-        guard let match = trackpadCursorMatcher.match(
-            cursor.image,
-            hotspot: CGPoint(x: cursor.hotspotX, y: cursor.hotspotY))
-        else { return .serverBitmap }
-        return .native(match.shape)
-    }
-
-    /// Measures the server's own arrow once, so every other shape can be drawn
-    /// at the factor that makes that arrow `cursorHeight` tall.
-    private func adoptReferenceArrowHeight(from cursor: RemoteCursor?) {
-        guard referenceArrowHeight == nil, let cursor,
-              trackpadCursorStyle == .nativeArrow else { return }
-        let bounds = cursor.shapePath.boundingBox
-        guard bounds.height > 0 else { return }
-        referenceArrowHeight = bounds.height
-    }
-
-    /// Records each distinct cursor the server describes, once. Whether a
-    /// desktop's shapes are recognised can only be answered against a real
-    /// one, and the same few shapes recur far too often to log every change.
+    /// Records cursor dimensions and the display scale once per size/hotspot.
     private func logTrackpadCursorShape(_ cursor: RemoteCursor?) {
         guard let cursor else { return }
-        let style = trackpadCursorStyle.map { "\($0)" } ?? "none"
         let key = "\(cursor.width)x\(cursor.height)"
-            + "@\(cursor.hotspotX),\(cursor.hotspotY):\(style)"
+            + "@\(cursor.hotspotX),\(cursor.hotspotY)"
         guard loggedTrackpadCursorShapes.insert(key).inserted else { return }
         let bounds = cursor.shapePath.boundingBox
-        let closest = trackpadCursorMatcher.closest(
-            to: cursor.image,
-            hotspot: CGPoint(x: cursor.hotspotX, y: cursor.hotspotY))
         #if targetEnvironment(macCatalyst)
         let displayScale = traitCollection.displayScale
         #else
-        let displayScale = nativeCursorDisplayScale
+        let displayScale = fallbackCursorDisplayScale
         #endif
         Self.trackpadCursorLog.info(
             "cursor shape"
@@ -2857,11 +2810,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             + " hotspot=(\(cursor.hotspotX),\(cursor.hotspotY))"
             + " bounds=(\(bounds.minX),\(bounds.minY),"
             + "\(bounds.width),\(bounds.height))"
-            + " closest=\(closest?.shape.name ?? "none")"
-            + " similarity=\(closest.map { String(format: "%.3f", $0.similarity) } ?? "-")"
-            + " style=\(style)"
+            + " style=serverBitmap"
             + " cursorHeight=\(cursorHeight)"
-            + " artworkScale=\(TrackpadCursorArtwork.scale(cursorHeight: cursorHeight))"
             + " bitmapScale=\(trackpadBitmapScale())"
             + " displayScale=\(displayScale)")
     }
@@ -3294,6 +3244,15 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             hideRemoteCursorImage()
             return
         }
+        let style = TrackpadCursorStyle.resolve(
+            hasServerCursor: remoteCursor != nil,
+            presence: remoteCursorPresence,
+            allowingFallback: allowingFallback,
+            serverRendersCursor: serverRendersCursor)
+        guard style != .hidden else {
+            hideRemoteCursorImage()
+            return
+        }
         if let remoteCursor {
             if allowingFallback {
                 drawTrackpadCursor(remoteCursor, at: location)
@@ -3314,9 +3273,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         // nothing on screen to aim, and unlike direct touch there is no finger
         // standing in for it. A pointer the server explicitly hid is the
         // opposite: the desktop wants no pointer and drawing one would lie.
-        guard allowingFallback,
-              remoteCursorPresence == .undescribed,
-              let fallback = nativeCursorImage(.arrow, height: cursorHeight)
+        guard style == .fallbackArrow,
+              let fallback = fallbackCursorImage(.arrow, height: cursorHeight)
         else {
             hideRemoteCursorImage()
             return
@@ -3328,22 +3286,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             at: location)
     }
 
-    /// The virtual cursor's own drawing rules: macOS's own artwork for the
-    /// shapes it is bundled for, and the server's pixels at one session-wide
-    /// scale for the rest so their relative sizes survive.
+    /// All remote shapes retain the server's pixels and share one scale, so
+    /// their relative sizes and hotspot positions survive shape changes.
     private func drawTrackpadCursor(_ cursor: RemoteCursor, at location: CGPoint) {
-        let style = trackpadCursorStyle ?? .serverBitmap
-        if let shape = style.artwork,
-           let native = nativeCursorImage(shape, height: cursorHeight) {
-            drawRemoteCursorImage(
-                native.image,
-                hotspot: native.hotspot,
-                size: native.image.size,
-                at: location)
-            return
-        }
-        // A shape with no artwork of its own, or artwork the bundle failed to
-        // load: the server's pixels are a worse picture, never a wrong one.
         let scale = trackpadBitmapScale()
         drawRemoteCursorImage(
             UIImage(cgImage: cursor.image, scale: 1, orientation: .up),
@@ -3383,7 +3328,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             shapeRevision: remoteCursorShapeRevision,
             presence: remoteCursorPresence,
             height: cursorHeight,
-            displayScale: nativeCursorDisplayScale,
+            displayScale: fallbackCursorDisplayScale,
             hotspot: remoteCursor.map {
                 CGPoint(x: CGFloat($0.hotspotX), y: CGFloat($0.hotspotY))
             } ?? .zero)
@@ -3411,15 +3356,15 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         var hotspot: CGPoint
     }
 
-    /// Rasterisation scale for the bundled cursors. Before the view reaches a
+    /// Rasterisation scale for the original fallback. Before the view reaches a
     /// window its trait collection reports no scale, and the renderer's own
     /// preferred format is the same main-screen value UIKit would pick.
-    private var nativeCursorDisplayScale: CGFloat {
+    private var fallbackCursorDisplayScale: CGFloat {
         let scale = traitCollection.displayScale
         return scale > 0 ? scale : UIGraphicsImageRendererFormat.preferred().scale
     }
 
-    private struct NativeCursorKey: Hashable {
+    private struct FallbackCursorKey: Hashable {
         var shape: TrackpadCursorArtwork.Shape
         var height: CGFloat
         var displayScale: CGFloat
@@ -3428,72 +3373,51 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// A rendered cursor and the point inside it the pointer aims with. The
     /// hotspot is not the image corner: the canvas holds the white outline and
     /// the drop shadow around the shape, so the arrow's tip sits well inside.
-    private struct NativeCursorImage {
+    private struct FallbackCursorImage {
         var image: UIImage
         var hotspot: CGPoint
     }
 
     /// Heights are quantized to this many points before rendering, so a
     /// continuous change reuses images instead of rasterizing one per frame.
-    private static let nativeCursorHeightStep: CGFloat = 0.5
-    /// Past this many distinct entries the cache is dropped whole. A few
-    /// dozen shapes at a handful of heights is all a settled session needs.
-    private static let nativeCursorCacheLimit = 96
+    private static let fallbackCursorHeightStep: CGFloat = 0.5
+    /// Bound memory while the user adjusts the cursor size preference.
+    private static let fallbackCursorCacheLimit = 96
 
-    private func nativeCursorImage(
+    private func fallbackCursorImage(
         _ shape: TrackpadCursorArtwork.Shape,
         height: CGFloat
-    ) -> NativeCursorImage? {
-        let step = Self.nativeCursorHeightStep
+    ) -> FallbackCursorImage? {
+        let step = Self.fallbackCursorHeightStep
         let quantized = max(step, (height / step).rounded() * step)
-        let scale = nativeCursorDisplayScale
-        let key = NativeCursorKey(
+        let scale = fallbackCursorDisplayScale
+        let key = FallbackCursorKey(
             shape: shape, height: quantized, displayScale: scale)
-        if let cached = nativeCursorImages[key] { return cached }
-        if nativeCursorImages.count >= Self.nativeCursorCacheLimit {
-            nativeCursorImages.removeAll(keepingCapacity: true)
+        if let cached = fallbackCursorImages[key] { return cached }
+        if fallbackCursorImages.count >= Self.fallbackCursorCacheLimit {
+            fallbackCursorImages.removeAll(keepingCapacity: true)
         }
-        let rendered = Self.renderNativeCursorImage(
+        let rendered = Self.renderFallbackCursorImage(
             shape, height: quantized, displayScale: scale)
-        nativeCursorImages[key] = rendered
+        fallbackCursorImages[key] = rendered
         return rendered
     }
 
-    /// Rasterises one of macOS's own cursors at `height` points tall.
-    ///
-    /// macOS keeps each at several scales; the smallest that still covers the
-    /// pixel size wanted is downsampled, never stretched, so the result is as
-    /// sharp as the source. The canvas is the cursor's own, scaled: macOS
-    /// sizes it to hold the drop shadow, and cropping to the silhouette would
-    /// clip the shadow off the bottom-right. Nil only when the bundle lacks
-    /// the artwork, which is a broken build rather than a state to handle.
-    private static func renderNativeCursorImage(
+    /// Rasterises our vector fallback at the destination display density.
+    private static func renderFallbackCursorImage(
         _ shape: TrackpadCursorArtwork.Shape,
         height: CGFloat,
         displayScale: CGFloat
-    ) -> NativeCursorImage? {
-        let scale = TrackpadCursorArtwork.scale(cursorHeight: height)
+    ) -> FallbackCursorImage? {
+        let scale = height / shape.visibleHeight
         let canvas = CGSize(
             width: shape.canvasSize.width * scale,
             height: shape.canvasSize.height * scale)
         guard let source = TrackpadCursorArtwork.image(
             for: shape, pixelHeight: canvas.height * displayScale)
         else { return nil }
-        let format = UIGraphicsImageRendererFormat.preferred()
-        // Rasterise at the panel's own pixel density. At the renderer's
-        // default this is a point-sized bitmap stretched over a Retina
-        // display, which is the blur the artwork exists to avoid.
-        format.scale = displayScale
-        format.opaque = false
-        let image = UIGraphicsImageRenderer(
-            size: canvas, format: format
-        ).image { context in
-            context.cgContext.interpolationQuality = .high
-            UIImage(cgImage: source).draw(
-                in: CGRect(origin: .zero, size: canvas))
-        }
-        return NativeCursorImage(
-            image: image,
+        return FallbackCursorImage(
+            image: UIImage(cgImage: source, scale: displayScale, orientation: .up),
             hotspot: CGPoint(
                 x: shape.hotspot.x * scale,
                 y: shape.hotspot.y * scale))
