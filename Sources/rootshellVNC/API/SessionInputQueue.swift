@@ -16,7 +16,9 @@ enum SessionInputEvent: Sendable, Equatable {
     case pointer(buttonMask: UInt8, x: UInt16, y: UInt16)
     case scroll(AppleScrollEvent)
     case gesture(AppleGestureEvent)
-    case clipboard(String)
+    /// `deliveryID` identifies a `deliverClipboardText(_:)` call that waits
+    /// for the transport write; nil for fire-and-forget sends.
+    case clipboard(String, deliveryID: UInt64?)
     case clipboardRequest
     case sharedClipboard(Bool)
     case curtain(enabled: Bool, message: String)

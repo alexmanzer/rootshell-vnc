@@ -831,6 +831,20 @@ public final class VNCSession {
     @ObservationIgnored
     public var onServerClipboardText: ((String) -> Void)?
 
+    /// Invoked on the main actor when an Apple packed pasteboard message
+    /// arrives, with its size on the wire, before any text callback. Also
+    /// invoked for payloads without a text flavor, such as images. Hosts
+    /// that poll the remote clipboard can pace their requests by this size.
+    @ObservationIgnored
+    public var onServerClipboardPayload: ((Int) -> Void)?
+
+    /// Continuations of `deliverClipboardText(_:)` calls whose message is
+    /// still queued, keyed by delivery ID.
+    @ObservationIgnored
+    private var clipboardDeliveries: [UInt64: CheckedContinuation<Void, any Error>] = [:]
+    @ObservationIgnored
+    private var nextClipboardDeliveryID: UInt64 = 0
+
     /// Internal multicast used by package features such as shared clipboard.
     /// The public single callback above remains source-compatible for hosts
     /// that already consume raw ServerCutText events themselves.
@@ -1660,7 +1674,31 @@ public final class VNCSession {
             )
         }
 
-        enqueueInput(.clipboard(text))
+        enqueueInput(.clipboard(text, deliveryID: nil))
+    }
+
+    /// Send clipboard text and return once the transport has written it.
+    ///
+    /// Throws when the session is not connected, when the write fails, or
+    /// when the session disconnects while the message is still queued.
+    /// Input queued after this call is written after the clipboard text.
+    public func deliverClipboardText(_ text: String) async throws {
+        guard connectionState.isConnected, transportSession != nil else {
+            throw VNCProtocolError.connectionClosed
+        }
+        nextClipboardDeliveryID &+= 1
+        let id = nextClipboardDeliveryID
+        try await withCheckedThrowingContinuation { continuation in
+            clipboardDeliveries[id] = continuation
+            if !enqueueInput(.clipboard(text, deliveryID: id)) {
+                resumeClipboardDelivery(id, with: .failure(VNCProtocolError.connectionClosed))
+            }
+        }
+    }
+
+    private func resumeClipboardDelivery(_ id: UInt64?, with result: Result<Void, any Error>) {
+        guard let id, let continuation = clipboardDeliveries.removeValue(forKey: id) else { return }
+        continuation.resume(with: result)
     }
 
     /// Request the current remote clipboard from a capable Apple server.
@@ -1994,6 +2032,9 @@ public final class VNCSession {
                     "Failed to acknowledge framebuffer update: "
                         + error.localizedDescription)
             }
+
+        case .clipboardPayloadReceived(let bytes):
+            onServerClipboardPayload?(bytes)
 
         case .clipboardText(let text):
             if isTraceEnabled {
@@ -3787,12 +3828,15 @@ public final class VNCSession {
     /// Append input to one ordered, bounded pump. Redundant pointer positions
     /// and queued continuous-scroll samples are coalesced while button/key and
     /// gesture lifecycle transitions remain exact.
-    private func enqueueInput(_ event: SessionInputEvent) {
+    /// Returns false when the session is not connected and nothing was queued.
+    @discardableResult
+    private func enqueueInput(_ event: SessionInputEvent) -> Bool {
         guard connectionState.isConnected,
-              let transport = transportSession else { return }
+              let transport = transportSession else { return false }
 
         inputQueue.enqueue(event)
         startInputPumpIfNeeded(transport: transport)
+        return true
     }
 
     private func startInputPumpIfNeeded(transport: TransportSession) {
@@ -3826,13 +3870,15 @@ public final class VNCSession {
                     try? await transport.sendScrollEvent(event)
                 case .gesture(let event):
                     try? await transport.sendGestureEvent(event)
-                case .clipboard(let text):
+                case .clipboard(let text, let deliveryID):
                     do {
                         try await transport.sendClipboardText(text)
+                        self.resumeClipboardDelivery(deliveryID, with: .success(()))
                     } catch {
                         self.logger.warning(
                             "Failed to send clipboard: "
                                 + error.localizedDescription)
+                        self.resumeClipboardDelivery(deliveryID, with: .failure(error))
                     }
                 case .clipboardRequest:
                     do {
@@ -3963,6 +4009,11 @@ public final class VNCSession {
         inputTask?.cancel()
         inputTask = nil
         inputQueue.removeAll()
+        let pending = clipboardDeliveries
+        clipboardDeliveries.removeAll()
+        for continuation in pending.values {
+            continuation.resume(throwing: VNCProtocolError.connectionClosed)
+        }
     }
 
     #if canImport(UIKit)

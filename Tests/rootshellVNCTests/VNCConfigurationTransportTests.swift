@@ -82,13 +82,19 @@ private actor SuccessfulRFBConnection: RFBConnection {
     private var sentFramebufferUpdateRequests = 0
     private var latestFramebufferUpdateRequest: Data?
     private let recordsFramebufferUpdateRequests: Bool
+    /// Every payload the client wrote, in order.
+    private var sentPayloads: [Data] = []
+    /// Pause applied to every write, to keep a queued message pending.
+    private let sendDelay: Duration
 
     init(
         name: String,
         width: UInt16 = 1024,
         height: UInt16 = 768,
-        recordsFramebufferUpdateRequests: Bool = false
+        recordsFramebufferUpdateRequests: Bool = false,
+        sendDelay: Duration = .zero
     ) {
+        self.sendDelay = sendDelay
         var script = Data("RFB 003.008\n".utf8)
         script.append(contentsOf: [1, SecurityType.none.rawValue])
         script.append(contentsOf: [0, 0, 0, 0])
@@ -126,6 +132,9 @@ private actor SuccessfulRFBConnection: RFBConnection {
 
     func send(_ data: Data) async throws {
         if closed { throw VNCProtocolError.connectionClosed }
+        if sendDelay > .zero { try? await Task.sleep(for: sendDelay) }
+        if closed { throw VNCProtocolError.connectionClosed }
+        sentPayloads.append(data)
         if recordsFramebufferUpdateRequests, data.first == 3 {
             sentFramebufferUpdateRequests += 1
             latestFramebufferUpdateRequest = data
@@ -153,6 +162,8 @@ private actor SuccessfulRFBConnection: RFBConnection {
     func framebufferUpdateRequestCount() -> Int {
         sentFramebufferUpdateRequests
     }
+
+    func sentClientPayloads() -> [Data] { sentPayloads }
 
     func lastFramebufferUpdateRequest() -> Data? {
         latestFramebufferUpdateRequest
@@ -351,6 +362,99 @@ final class VNCConfigurationTransportTests: XCTestCase {
         session.removeConnectionStateObserver(observerID)
         session.disconnect()
         XCTAssertNil(session.negotiatedContentEncryption)
+    }
+
+    @MainActor
+    func testDeliverClipboardTextReturnsAfterTheTransportWrite() async throws {
+        let connection = SuccessfulRFBConnection(name: "clipboard-delivery")
+        let session = try await connectedSession(over: connection)
+
+        try await session.deliverClipboardText("hello")
+
+        let expected = ClientMessage.clientCutText("hello").serialize()
+        let payloads = await connection.sentClientPayloads()
+        XCTAssertTrue(payloads.contains(expected), "The clipboard message is written before the call returns")
+        session.disconnect()
+    }
+
+    @MainActor
+    func testDeliverClipboardTextThrowsWithoutAConnection() async {
+        let session = VNCSession(configuration: VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0)))
+        do {
+            try await session.deliverClipboardText("hello")
+            XCTFail("Expected connectionClosed")
+        } catch let error as VNCProtocolError {
+            guard case .connectionClosed = error else {
+                return XCTFail("Expected connectionClosed, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    @MainActor
+    func testDeliverClipboardTextFailsWhenTheSessionDisconnectsFirst() async throws {
+        let connection = SuccessfulRFBConnection(
+            name: "clipboard-pending", sendDelay: .seconds(2))
+        let session = try await connectedSession(over: connection)
+
+        let delivery = Task { @MainActor () -> Bool in
+            do {
+                try await session.deliverClipboardText("pending")
+                return true
+            } catch {
+                return false
+            }
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        session.disconnect()
+
+        let delivered = await delivery.value
+        XCTAssertFalse(delivered, "A delivery pending at disconnect must fail, not hang or succeed")
+    }
+
+    @MainActor
+    func testServerClipboardPayloadCallbackReportsWireSizeBeforeText() async throws {
+        let connection = SuccessfulRFBConnection(name: "clipboard-payload")
+        let session = try await connectedSession(over: connection)
+        var seen: [String] = []
+        session.onServerClipboardPayload = { seen.append("payload:\($0)") }
+        session.onServerClipboardText = { seen.append("text:\($0)") }
+
+        // Apple packed pasteboard message: one utf8 flavor holding "hello",
+        // as a complete zlib stream of 47 uncompressed bytes.
+        let compressed = Data([
+            120, 156, 99, 96, 96, 96, 100, 96, 96, 16, 43, 40, 77, 202,
+            201, 76, 214, 43, 45, 73, 179, 208, 45, 200, 73, 204, 204,
+            211, 45, 73, 173, 40, 97, 64, 0, 214, 140, 212, 156, 156, 124,
+            0, 249, 124, 10, 152,
+        ])
+        var packed = Data([31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 47])
+        packed.append(contentsOf: [0, 0, 0, UInt8(compressed.count)])
+        packed.append(compressed)
+        await connection.enqueueServerBytes(packed)
+
+        let completed = await waitUntil { seen.count == 2 }
+        XCTAssertTrue(completed)
+        XCTAssertEqual(seen, ["payload:\(packed.count)", "text:hello"])
+        session.disconnect()
+    }
+
+    /// Connects a standard-mode session over `connection` and waits for it.
+    @MainActor
+    private func connectedSession(over connection: SuccessfulRFBConnection) async throws -> VNCSession {
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0))
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "clipboard.test", port: 5900, password: ""))
+        let connected = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(connected)
+        return session
     }
 
     @MainActor

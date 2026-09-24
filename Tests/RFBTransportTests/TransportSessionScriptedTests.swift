@@ -774,6 +774,46 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    func testApplePackedClipboardEmitsPayloadSizeBeforeText() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.v3_8.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 640, height: 480, name: "packed"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "packed.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            connection: connection)
+        try await session.connect()
+
+        let packed = try AppleClipboardProtocol.packedTextMessage("hello")
+        await connection.enqueueServerBytes(packed)
+
+        let observed = await Self.withTimeout(seconds: 2) {
+            () -> [String] in
+            var seen: [String] = []
+            for await event in session.events {
+                switch event {
+                case .clipboardPayloadReceived(let bytes):
+                    seen.append("payload:\(bytes)")
+                case .clipboardText(let text):
+                    seen.append("text:\(text)")
+                    return seen
+                default:
+                    break
+                }
+            }
+            return seen
+        }
+        XCTAssertEqual(observed, ["payload:\(packed.count)", "text:hello"])
+        await session.disconnect()
+    }
+
     func testAppleStandardOneDisplayActivatesAutoUpdatesAfterEitherInitialRectangleOrder() async throws {
         let width: UInt16 = 2
         let height: UInt16 = 1

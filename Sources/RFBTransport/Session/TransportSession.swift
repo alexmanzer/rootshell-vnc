@@ -204,6 +204,11 @@ public enum SessionEvent: Sendable {
     /// The server's clipboard text changed.
     case clipboardText(String)
 
+    /// An Apple packed pasteboard message arrived; `bytes` is its size on
+    /// the wire. Emitted before any `clipboardText` decoded from it, and
+    /// also for payloads without a text flavor.
+    case clipboardPayloadReceived(bytes: Int)
+
     /// The handshake completed and the server sent its init message.
     case serverInit(ServerInit)
 
@@ -2711,6 +2716,8 @@ public actor TransportSession {
         }
 
         let compressed = try await readControlChannel(exactly: compressedLength)
+        continuation?.yield(.clipboardPayloadReceived(
+            bytes: AppleClipboardProtocol.packedScrapHeaderSize + compressedLength))
         decodeApplePackedClipboard(
             compressed,
             uncompressedLength: uncompressedLength)
@@ -4143,6 +4150,8 @@ public actor TransportSession {
         let compressed = Data(appleDecryptedRFBBuffer[
             base + headerSize..<messageEnd])
         appleDecryptedRFBBuffer.removeSubrange(base..<messageEnd)
+        continuation?.yield(.clipboardPayloadReceived(
+            bytes: headerSize + compressedLength))
         decodeApplePackedClipboard(
             compressed,
             uncompressedLength: uncompressedLength)
