@@ -111,6 +111,155 @@ struct SupplementalHardwareModifierState: Sendable {
     }
 }
 
+/// UIKeyCommand supplies layout-dependent text, not a physical HID identity.
+/// Only hardware observations can identify a held/repeating key. If a command
+/// cannot be correlated, send a bounded tap and consume a subsequent physical
+/// report of that same keysym rather than inventing a US-layout HID usage.
+struct UniversalCommandKeyState {
+    enum Route: Equatable {
+        case duplicate
+        case tap
+    }
+
+    private(set) var pressed: [UInt32: UInt32] = [:]
+    private var heldRemotely: Set<UInt32> = []
+    private var unidentifiedTaps: Set<UInt32> = []
+
+    mutating func routeCommand(keysym: UInt32) -> Route {
+        if pressed.contains(where: { $0.value == keysym && heldRemotely.contains($0.key) }) {
+            return .duplicate
+        }
+        // Command-only autorepeat is a sequence of bounded taps. A physical
+        // key already consumed by a tap does not suppress those repeat events.
+        if !pressed.values.contains(keysym) { unidentifiedTaps.insert(keysym) }
+        return .tap
+    }
+
+    /// Returns false for duplicate UIKit/GameController delivery or a physical
+    /// press whose command was already sent as an unidentified bounded tap.
+    mutating func beginPhysical(usage: UInt32, keysym: UInt32) -> Bool {
+        guard pressed[usage] == nil else { return false }
+        pressed[usage] = keysym
+        guard unidentifiedTaps.remove(keysym) == nil else { return false }
+        heldRemotely.insert(usage)
+        return true
+    }
+
+    @discardableResult
+    mutating func release(usage: UInt32, keysym: UInt32? = nil) -> Bool {
+        let recordedKeysym = pressed.removeValue(forKey: usage)
+        // UIKit can provide layout-correct text even if it omitted key-down.
+        // GameController key-ups carry only a usage, so an unknown usage must
+        // leave pending matches for other strokes intact.
+        if let releasedKeysym = recordedKeysym ?? keysym {
+            unidentifiedTaps.remove(releasedKeysym)
+        }
+        heldRemotely.remove(usage)
+        return recordedKeysym != nil
+    }
+
+    mutating func endTranslatedChord() {
+        unidentifiedTaps.removeAll()
+    }
+
+    mutating func releaseAll() {
+        pressed.removeAll()
+        heldRemotely.removeAll()
+        unidentifiedTaps.removeAll()
+    }
+}
+
+/// Physical modifier identities are separate from the remote keys they hold.
+/// Multiple physical Command keys and the translated chord share one remote
+/// Command, so releasing one source cannot release another source's modifier.
+struct CommandModifierState: Sendable {
+    private(set) var physical: [UInt32: UInt32] = [:]
+    private var inferredUsages: Set<UInt32> = []
+    private var emitted: [UInt32] = []
+
+    func contains(keysym: UInt32) -> Bool { emitted.contains(keysym) }
+
+    var isControlOptionChordActive: Bool {
+        (physical[0xE0] != nil || physical[0xE4] != nil)
+            && (physical[0xE2] != nil || physical[0xE6] != nil)
+    }
+
+    mutating func press(usage: UInt32, keysym: UInt32) -> [HardwareKeyboardTransition] {
+        // A UIKeyCommand may report flags before the physical modifier press.
+        // Replace its inferred side with the actual side, rather than keeping
+        // a phantom left modifier after a right-hand key is released.
+        for inferred in inferredUsages.filter({ ($0 & 3) == (usage & 3) }) {
+            physical.removeValue(forKey: inferred)
+            inferredUsages.remove(inferred)
+        }
+        physical[usage] = keysym
+        return reconcile()
+    }
+
+    mutating func release(usage: UInt32) -> [HardwareKeyboardTransition] {
+        physical.removeValue(forKey: usage)
+        inferredUsages.remove(usage)
+        for inferred in inferredUsages.filter({ ($0 & 3) == (usage & 3) }) {
+            physical.removeValue(forKey: inferred)
+            inferredUsages.remove(inferred)
+        }
+        return reconcile()
+    }
+
+    mutating func synchronize(
+        modifiers: VNCKeyboardModifiers,
+        optionKeysym: UInt32
+    ) -> [HardwareKeyboardTransition] {
+        let groups: [(VNCKeyboardModifiers, UInt32, UInt32, UInt32)] = [
+            (.control, 0xE0, 0xE4, KeyboardInputHandler.keysymControlL),
+            (.shift, 0xE1, 0xE5, KeyboardInputHandler.keysymShiftL),
+            (.option, 0xE2, 0xE6, optionKeysym),
+            (.command, 0xE3, 0xE7, KeyboardInputHandler.keysymSuperL),
+        ]
+        for (flag, left, right, keysym) in groups {
+            if !modifiers.contains(flag) {
+                physical.removeValue(forKey: left)
+                physical.removeValue(forKey: right)
+                inferredUsages.remove(left)
+                inferredUsages.remove(right)
+            } else if physical[left] == nil && physical[right] == nil {
+                physical[left] = keysym
+                inferredUsages.insert(left)
+            }
+        }
+        return reconcile()
+    }
+
+    mutating func releaseAll() -> [HardwareKeyboardTransition] {
+        physical.removeAll()
+        inferredUsages.removeAll()
+        return reconcile()
+    }
+
+    private mutating func reconcile() -> [HardwareKeyboardTransition] {
+        let control = physical[0xE0] != nil || physical[0xE4] != nil
+        let option = physical[0xE2] != nil || physical[0xE6] != nil
+        var desired: [UInt32] = []
+        for usage in physical.keys.sorted() {
+            if control && option && [0xE0, 0xE4, 0xE2, 0xE6].contains(usage) { continue }
+            let keysym = (usage == 0xE3 || usage == 0xE7)
+                ? KeyboardInputHandler.keysymSuperL : physical[usage]!
+            if !desired.contains(keysym) { desired.append(keysym) }
+        }
+        if control && option && !desired.contains(KeyboardInputHandler.keysymSuperL) {
+            desired.append(KeyboardInputHandler.keysymSuperL)
+        }
+        let releases = emitted.reversed().filter { !desired.contains($0) }.map {
+            HardwareKeyboardTransition(downFlag: false, keysym: $0)
+        }
+        let presses = desired.filter { !emitted.contains($0) }.map {
+            HardwareKeyboardTransition(downFlag: true, keysym: $0)
+        }
+        emitted = desired
+        return releases + presses
+    }
+}
+
 #if canImport(UIKit)
 import UIKit
 
@@ -118,6 +267,12 @@ import UIKit
 final class HardwareKeyboardController {
     private let keyboardHandler: KeyboardInputHandler
     private var state = HardwareKeyboardState()
+    private var commandModifiers = CommandModifierState()
+    var controlOptionAsCommand = true {
+        didSet {
+            if oldValue != controlOptionAsCommand { releaseAll() }
+        }
+    }
     private var delayTimer: Timer?
     private var repeatTimer: Timer?
     private var repeatingUsage: UInt32?
@@ -126,14 +281,18 @@ final class HardwareKeyboardController {
         self.keyboardHandler = keyboardHandler
     }
 
-    var hasPressedKeys: Bool { !state.isEmpty }
+    var hasPressedKeys: Bool { !state.isEmpty || !commandModifiers.physical.isEmpty }
 
     func contains(usage: UInt32) -> Bool {
-        state.contains(usage)
+        state.contains(usage) || commandModifiers.physical[usage] != nil
     }
 
     @discardableResult
     func press(usage: UInt32, keysym: UInt32) -> Bool {
+        if controlOptionAsCommand, (0xE0...0xE7).contains(usage) {
+            commandModifiers.press(usage: usage, keysym: keysym).forEach(send)
+            return true
+        }
         guard let transition = state.press(usage: usage, keysym: keysym) else {
             // UIKit and UIKeyCommand can both report OS repeat callbacks. The
             // controller owns repeat timing, so duplicate begins are consumed.
@@ -148,6 +307,10 @@ final class HardwareKeyboardController {
 
     @discardableResult
     func release(usage: UInt32) -> Bool {
+        if controlOptionAsCommand, (0xE0...0xE7).contains(usage) {
+            commandModifiers.release(usage: usage).forEach(send)
+            return true
+        }
         guard let transition = state.release(usage: usage) else { return false }
         if repeatingUsage == usage { stopRepeat() }
         send(transition)
@@ -157,6 +320,24 @@ final class HardwareKeyboardController {
     func releaseAll() {
         stopRepeat()
         state.releaseAll().forEach(send)
+        commandModifiers.releaseAll().forEach(send)
+    }
+
+    func synchronizeModifiers(_ modifiers: VNCKeyboardModifiers) {
+        guard controlOptionAsCommand else { return }
+        commandModifiers.synchronize(
+            modifiers: modifiers,
+            optionKeysym: KeyboardInputHandler.optionLeftKeysym(
+                appleModifierConvention: keyboardHandler.usesAppleModifierMapping)
+        ).forEach(send)
+    }
+
+    func emitsModifier(keysym: UInt32) -> Bool {
+        commandModifiers.contains(keysym: keysym)
+    }
+
+    var isControlOptionChordActive: Bool {
+        controlOptionAsCommand && commandModifiers.isControlOptionChordActive
     }
 
     private func startRepeat(for usage: UInt32) {

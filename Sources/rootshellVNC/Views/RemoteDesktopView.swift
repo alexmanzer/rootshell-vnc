@@ -47,6 +47,7 @@ public struct RemoteDesktopView: View {
 
     @State private var viewport = RemoteViewportState()
     @State private var viewportPanningMode: RemoteViewportPanningMode
+    @State private var pointerMode: RemotePointerMode
     @State private var keyboardActive = false
     @State private var confirmPasswordSend = false
     @State private var curtainPromptPresented = false
@@ -71,6 +72,11 @@ public struct RemoteDesktopView: View {
     private let onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?
     private let hostOwnsRecoveryChrome: Bool
     private let brightnessGain: Double
+    private let pointerSpeed: Double
+    /// On-screen height of the locally drawn pointer, in view points. The
+    /// host owns this because only it knows the display the desktop is being
+    /// viewed on and what the user asked for.
+    private let cursorHeight: CGFloat
 
     #if canImport(UIKit)
     /// A host-provided accessory can remain visible without the software
@@ -89,6 +95,9 @@ public struct RemoteDesktopView: View {
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
         clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
         initialViewportPanningMode: RemoteViewportPanningMode = .edge,
+        initialPointerMode: RemotePointerMode = .direct,
+        pointerSpeed: Double = 1.0,
+        cursorHeight: CGFloat = 17,
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0
@@ -101,6 +110,9 @@ public struct RemoteDesktopView: View {
             keyboardAvoidanceMode: keyboardAvoidanceMode,
             clipboardSynchronizer: clipboardSynchronizer,
             initialViewportPanningMode: initialViewportPanningMode,
+            initialPointerMode: initialPointerMode,
+            pointerSpeed: pointerSpeed,
+            cursorHeight: cursorHeight,
             onSharedClipboardUserChange: onSharedClipboardUserChange,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
@@ -121,6 +133,9 @@ public struct RemoteDesktopView: View {
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode = .automatic,
         clipboardSynchronizer: VNCClipboardSynchronizer? = nil,
         initialViewportPanningMode: RemoteViewportPanningMode = .edge,
+        initialPointerMode: RemotePointerMode = .direct,
+        pointerSpeed: Double = 1.0,
+        cursorHeight: CGFloat = 17,
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0,
@@ -134,6 +149,9 @@ public struct RemoteDesktopView: View {
             keyboardAvoidanceMode: keyboardAvoidanceMode,
             clipboardSynchronizer: clipboardSynchronizer,
             initialViewportPanningMode: initialViewportPanningMode,
+            initialPointerMode: initialPointerMode,
+            pointerSpeed: pointerSpeed,
+            cursorHeight: cursorHeight,
             onSharedClipboardUserChange: onSharedClipboardUserChange,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
@@ -148,6 +166,9 @@ public struct RemoteDesktopView: View {
         keyboardAvoidanceMode: VNCKeyboardAvoidanceMode,
         clipboardSynchronizer: VNCClipboardSynchronizer?,
         initialViewportPanningMode: RemoteViewportPanningMode,
+        initialPointerMode: RemotePointerMode,
+        pointerSpeed: Double,
+        cursorHeight: CGFloat,
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?,
         hostOwnsRecoveryChrome: Bool,
         brightnessGain: Double,
@@ -157,6 +178,9 @@ public struct RemoteDesktopView: View {
         self.hostOwnsRecoveryChrome = hostOwnsRecoveryChrome
         self.hudMenuExtras = hudMenuExtras
         self._viewportPanningMode = State(initialValue: initialViewportPanningMode)
+        self._pointerMode = State(initialValue: initialPointerMode)
+        self.pointerSpeed = pointerSpeed
+        self.cursorHeight = cursorHeight
         self._keyboardCapture = State(
             initialValue: keyboardCapture ?? VNCKeyboardCapture())
         self.isFullScreen = isFullScreen
@@ -383,6 +407,10 @@ public struct RemoteDesktopView: View {
         RemoteInteractionView(
             viewport: $viewport,
             viewportPanningMode: viewportPanningMode,
+            pointerMode: pointerMode,
+            pointerSpeed: pointerSpeed,
+            cursorHeight: cursorHeight,
+            serverRendersCursor: session.activeCursorRendering == .server,
             keyboardActive: $keyboardActive,
             hardwareKeyboardAttached: $hardwareKeyboardAttached,
             framebufferSize: framebufferSize,
@@ -397,7 +425,8 @@ public struct RemoteDesktopView: View {
             disconnect: { session.disconnect() },
             // Apple's adaptive profile asks the server for cached cursor
             // images so the responsive local pointer can adopt their shape.
-            remoteCursor: session.remoteCursor)
+            remoteCursor: session.remoteCursor,
+            remoteCursorPresence: session.remoteCursorPresence)
             .frame(width: viewSize.width, height: viewSize.height)
             .contentShape(Rectangle())
         #else
@@ -466,6 +495,12 @@ public struct RemoteDesktopView: View {
             }
 
             keyboardCaptureControl
+            Toggle(isOn: Binding(
+                get: { keyboardCapture.controlOptionAsCommand },
+                set: { keyboardCapture.controlOptionAsCommand = $0 }
+            )) {
+                Label(String(localized: "Control+Option as Command", bundle: .module), systemImage: "keyboard")
+            }
             remoteCommandsMenu
             #endif
 
@@ -540,6 +575,19 @@ public struct RemoteDesktopView: View {
 
     private var remoteCommandsMenu: some View {
         Menu {
+            Menu(String(localized: "Editing", bundle: .module)) {
+                remoteShortcutButtons(RemoteMenuShortcut.editing)
+            }
+            Menu(String(localized: "Apps and Windows", bundle: .module)) {
+                remoteShortcutButtons(RemoteMenuShortcut.applications)
+            }
+            Menu(String(localized: "Documents and Tabs", bundle: .module)) {
+                remoteShortcutButtons(RemoteMenuShortcut.documents)
+            }
+            Menu(String(localized: "Special Keys", bundle: .module)) {
+                remoteShortcutButtons(RemoteMenuShortcut.keys)
+            }
+
             Section(String(localized: "Mac Specific", bundle: .module)) {
                 ForEach(RemoteCommand.macSpecific) { command in
                     Button(command.title) {
@@ -558,18 +606,19 @@ public struct RemoteDesktopView: View {
                         keyboardHandler.handleRemoteCommand(command)
                     }
                 }
-
-                Button(String(localized: "Command-H", bundle: .module)) {
-                    keyboardHandler.handleCommandTap("h")
-                }
-                Button(String(localized: "Command-M", bundle: .module)) {
-                    keyboardHandler.handleCommandTap("m")
-                }
             }
         } label: {
             Label(
                 String(localized: "Commands", bundle: .module),
                 systemImage: "command")
+        }
+    }
+
+    private func remoteShortcutButtons(_ shortcuts: [RemoteMenuShortcut]) -> some View {
+        ForEach(shortcuts) { shortcut in
+            Button(shortcut.menuTitle) {
+                keyboardHandler.handleShortcutTap(shortcut.character, modifiers: shortcut.modifiers)
+            }
         }
     }
     #endif
@@ -596,6 +645,25 @@ public struct RemoteDesktopView: View {
                 Label(
                     String(localized: "Screen Panning", bundle: .module),
                     systemImage: "cursorarrow.motionlines")
+            }
+
+            Menu {
+                ForEach(RemotePointerMode.allCases, id: \.self) { mode in
+                    Button {
+                        pointerMode = mode
+                    } label: {
+                        Label(
+                            pointerModeTitle(mode),
+                            systemImage: pointerMode == mode
+                                ? "checkmark"
+                                : pointerModeImage(mode))
+                    }
+                    .disabled(pointerMode == mode)
+                }
+            } label: {
+                Label(
+                    String(localized: "Pointer", bundle: .module),
+                    systemImage: "cursorarrow.rays")
             }
 
             Button {
@@ -697,6 +765,24 @@ public struct RemoteDesktopView: View {
             return "arrow.up.left.and.arrow.down.right"
         case .continuous:
             return "cursorarrow.rays"
+        }
+    }
+
+    private func pointerModeTitle(_ mode: RemotePointerMode) -> String {
+        switch mode {
+        case .direct:
+            return String(localized: "Touch", bundle: .module)
+        case .trackpad:
+            return String(localized: "Trackpad", bundle: .module)
+        }
+    }
+
+    private func pointerModeImage(_ mode: RemotePointerMode) -> String {
+        switch mode {
+        case .direct:
+            return "hand.point.up.left"
+        case .trackpad:
+            return "rectangle.and.hand.point.up.left"
         }
     }
 

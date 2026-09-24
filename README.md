@@ -98,15 +98,16 @@ In Xcode, choose **File → Add Package Dependencies** and enter:
 https://github.com/kitknox/rootshell-vnc.git
 ```
 
-Add the `rootshellVNC` product to the application target. Until the adaptive DCT
-hot path no longer needs target-level Debug optimization, Swift packages should
-track a branch or revision:
+Add the `rootshellVNC` product to the application target. The DCT decoder uses
+normal Debug and Release build settings starting in `0.1.3`, so that version and
+later support semantic-version requirements. Tags through `0.1.2` still contain
+the old unsafe build flags.
 
 ```swift
 dependencies: [
     .package(
         url: "https://github.com/kitknox/rootshell-vnc.git",
-        branch: "main"
+        from: "0.1.3"
     ),
 ],
 targets: [
@@ -201,11 +202,29 @@ viewer, or build and test the package from the repository root:
 swift test
 ```
 
-Rendering benchmarks should use `swift test -c release`. Debug builds also
-optimize the `RFBRendering` and `RFBRenderingC` targets because the adaptive DCT
-decoder is not usable at Retina resolutions under `-Onone`. SwiftPM permits
-these flags for local, branch, and revision dependencies, but rejects the
-product when it is selected through a semantic-version requirement.
+Both rendering targets use the normal configuration defaults, without unsafe
+optimization flags. The Adaptive DCT decoder borrows buffers once per rectangle,
+reuses coefficient storage, and uses DC and constant-chroma kernel shortcuts.
+Release builds are still faster than unoptimized Debug builds.
+
+Run the deterministic offline Retina workloads in both configurations:
+
+```sh
+VNC_DCT_BENCHMARK=1 swift test --filter AppleDCTPerformanceTests
+VNC_DCT_BENCHMARK=1 swift test -c release --filter AppleDCTPerformanceTests
+```
+
+The benchmark reports median decode time after warm-up, excluding stream
+construction. `draw=false` suppresses DCT pixel generation; the existing
+solid/palette/copy commands still render. Pixel fixtures, truncated streams,
+cache wraparound, resize, and quantization changes run without the environment
+flag. Kernel golden checks exercise native and portable scalar implementations
+at both `-O0` and `-O3`, including extreme coefficients:
+
+```sh
+Tools/Diagnostics/check_apple_dct_kernel.sh --sanitize
+swift test --sanitize=address --filter 'AppleDCTPerformanceTests|AppleAdaptiveDCTDecoderTests'
+```
 
 The test suites cover protocol parsing and state transitions, authentication and
 crypto, TCP/UDP transport behavior, Apple media negotiation and resiliency,
@@ -250,6 +269,16 @@ files.
   Metal-accelerated terminal app that uses this package
 - [rootshell.com](https://www.rootshell.com) — downloads, screenshots, release
   notes, and documentation for the rootshell app
+
+## Cursor artwork
+
+Remote cursor images come from the connected server. The client preserves their
+shapes and hotspots; it does not bundle extracted macOS cursor artwork. An original
+vector arrow is the fallback before a trackpad session receives its first cursor.
+
+The original arrow and text-caret paths live in
+`Sources/rootshellVNC/Views/TrackpadCursorArtwork.swift` and are covered by the
+repository's MIT license. The app renders the vectors at the display's pixel density.
 
 ## License
 

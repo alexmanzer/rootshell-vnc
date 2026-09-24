@@ -440,6 +440,11 @@ public actor TransportSession {
     /// Whether this connection negotiated Apple's adaptive DCT encoding.
     private let appleDCTRequested: Bool
     private let appleClassicAutoUpdateRequested: Bool
+
+    /// Whether the server was asked to draw the pointer into the picture. The
+    /// client then advertises no cursor pseudo-encoding, so every list this
+    /// session builds has to leave them out too, not just the configured one.
+    private let serverRendersCursor: Bool
     /// Last DisplayInfo2 session state emitted to the UI layer. Apple can send
     /// this metadata with every layout/control refresh, so suppress identical
     /// events at the transport boundary.
@@ -787,6 +792,7 @@ public actor TransportSession {
         displayCount: Int = 1,
         requestsVirtualDisplays: Bool = false,
         appleMediaTilesPerFrameOverride: UInt64? = nil,
+        serverRendersCursor: Bool = false,
         connection: (any RFBConnection)? = nil,
         securityPolicy: VNCSecurityPolicy = .automatic,
         certificateValidationHandler: VNCCertificateValidationHandler? = nil
@@ -815,16 +821,27 @@ public actor TransportSession {
             && environment["ROOTSHELL_VNC_DISABLE_RATE_CONTROL"] != "1"
         self.usesCustomTransport = connection != nil
         self.tcp = connection ?? TCPConnection(host: host, port: port)
-        let configuredEncodings =
-            preferredEncodings ?? ConnectionStateMachine.defaultPreferredEncodings
+        // Suppress the cursor shape encodings once, here, before anything is
+        // derived from the list. `preferredEncodings` is caller-supplied and
+        // the default list carries the portable shapes, so a host that builds
+        // this transport directly would otherwise still ask the server for a
+        // pointer it has just said it wants drawn into the picture.
+        let configuredEncodings = Self.suppressingCursorShapes(
+            preferredEncodings ?? ConnectionStateMachine.defaultPreferredEncodings,
+            when: serverRendersCursor)
         let shouldUseAppleDCT =
             configuredEncodings.contains(.appleMultiVariantScreenshare)
                 && !configuredEncodings.contains(.appleH264)
+        // 1104 stands in for "Apple classic adaptive profile" here. A
+        // server-rendered cursor suppresses that encoding for an unrelated
+        // reason, so accept the deliberate omission rather than silently
+        // dropping back to plain framebuffer request pacing.
         let shouldUseAppleClassicAutoUpdate =
             !preferFullQualityVideo
                 && !configuredEncodings.contains(.appleH264)
                 && configuredEncodings.contains(.unknown(1105))
-                && configuredEncodings.contains(.unknown(1104))
+                && (configuredEncodings.contains(.unknown(1104))
+                    || serverRendersCursor)
         self.stateMachine = ConnectionStateMachine(
             preferredPixelFormat: preferredPixelFormat,
             preferredEncodings: configuredEncodings,
@@ -845,6 +862,7 @@ public actor TransportSession {
         self.requestedAppleMediaStream = configuredEncodings.contains(.appleH264)
         self.appleDCTRequested = shouldUseAppleDCT
         self.appleClassicAutoUpdateRequested = shouldUseAppleClassicAutoUpdate
+        self.serverRendersCursor = serverRendersCursor
         self.awaitingAppleDCTBootstrap = shouldUseAppleDCT
 
         var cont: AsyncStream<SessionEvent>.Continuation!
@@ -1568,12 +1586,14 @@ public actor TransportSession {
         if requestedAppleMediaStream, !serverVersion.isApple {
             stateMachine.preferredEncodings = Self.portableEncodings(
                 from: stateMachine.preferredEncodings,
-                preferTight: true)
+                preferTight: true,
+                serverRendersCursor: serverRendersCursor)
             log.info("Conventional RFB server detected; using portable Standard mode")
         } else if !serverVersion.isApple {
             stateMachine.preferredEncodings = Self.portableEncodings(
                 from: stateMachine.preferredEncodings,
-                preferTight: stateMachine.preferredEncodings.contains(.tight))
+                preferTight: stateMachine.preferredEncodings.contains(.tight),
+                serverRendersCursor: serverRendersCursor)
         }
 
         let actions1 = stateMachine.handle(event: .receivedProtocolVersion(serverVersion))
@@ -1672,9 +1692,33 @@ public actor TransportSession {
         throw error
     }
 
+    /// The pseudo-encodings that ask a server to deliver the pointer as a
+    /// separate shape instead of drawing it into the picture: the two portable
+    /// RFB shapes and macOS's cached CursorImageAlpha records. Advertising any
+    /// single one of them is enough to make the server withhold the pointer,
+    /// so a server-rendered pointer means suppressing all four.
+    private nonisolated static let cursorShapeEncodings: [Encoding] = [
+        .cursor, .xCursor, .unknown(1104), .unknown(1100),
+    ]
+
+    /// Filters ``cursorShapeEncodings`` out of a list bound for the wire.
+    ///
+    /// Every list this session advertises passes through here rather than each
+    /// site testing the flag on its own: the initial list is caller-supplied
+    /// and the later rewrites are built from it, so a per-site condition would
+    /// leave a way for one cursor encoding to survive.
+    private nonisolated static func suppressingCursorShapes(
+        _ encodings: [Encoding],
+        when serverRendersCursor: Bool
+    ) -> [Encoding] {
+        guard serverRendersCursor else { return encodings }
+        return encodings.filter { !cursorShapeEncodings.contains($0) }
+    }
+
     private nonisolated static func portableEncodings(
         from configured: [Encoding],
-        preferTight: Bool
+        preferTight: Bool,
+        serverRendersCursor: Bool = false
     ) -> [Encoding] {
         var result: [Encoding] = []
         func append(_ encoding: Encoding) {
@@ -1701,7 +1745,10 @@ public actor TransportSession {
         append(.xCursor)
         append(.desktopSize)
         append(.extendedDesktopSize)
-        return result
+        // This list is a rewrite, not an addition, so the cursor fallbacks
+        // have to be withheld here as well or a conventional server would
+        // start sending shapes the configured list already declined.
+        return suppressingCursorShapes(result, when: serverRendersCursor)
     }
 
     private func performAuthentication(_ securityType: SecurityType) async throws {
@@ -3023,11 +3070,13 @@ public actor TransportSession {
 
     private func appleMediaPostAcceptEncodings() -> [Encoding] {
         Self.appleMediaPostAcceptEncodings(
-            from: stateMachine.preferredEncodings)
+            from: stateMachine.preferredEncodings,
+            serverRendersCursor: serverRendersCursor)
     }
 
     static func appleMediaPostAcceptEncodings(
-        from preferredEncodings: [Encoding]
+        from preferredEncodings: [Encoding],
+        serverRendersCursor: Bool = false
     ) -> [Encoding] {
         // The native viewer also lists SubZlib (1002) here. We do not, because
         // no rectangle parser in this package can frame its payload: sending
@@ -3047,13 +3096,15 @@ public actor TransportSession {
                 && !$0.isUnframeableContent
         }
 
-        return baseEncodings + [
-            // Prefer macOS's cached alpha cursor over the generic RFB shape.
-            // Standard mode advertises the same priority; putting .cursor
-            // first makes AppleVNCServer choose its limited fallback path.
-            .unknown(0x450),
-            .unknown(0x44c),
-            .cursor,
+        // Prefer macOS's cached alpha cursor over the generic RFB shape.
+        // Standard mode advertises the same priority; putting .cursor
+        // first makes AppleVNCServer choose its limited fallback path.
+        // Asking for none of them leaves the pointer in the HEVC picture.
+        let cursorEncodings: [Encoding] = serverRendersCursor
+            ? []
+            : [.unknown(0x450), .unknown(0x44c), .cursor]
+
+        return baseEncodings + cursorEncodings + [
             .desktopSize,
             .unknown(0x44d),
             .unknown(0x451),
@@ -4996,7 +5047,8 @@ public actor TransportSession {
         writeUInt16BE(3, into: &message, at: 4)
         let receiverFlags = appleMediaReceiverFlags(
             displayCount: appleMediaDisplayCount,
-            supports60FPS: requestedFrameRate >= 60)
+            supports60FPS: requestedFrameRate >= 60,
+            sendsCursor: serverRendersCursor)
         writeUInt32BE(receiverFlags, into: &message, at: 6)
         writeUInt16BE(UInt16(audioOffer.count), into: &message, at: 10)
         writeUInt16BE(UInt16(videoOffer.count), into: &message, at: 12)
