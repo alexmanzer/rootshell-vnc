@@ -143,6 +143,42 @@ final class AppleMediaNegotiationTests: XCTestCase {
         XCTAssertEqual(Array(sent.prefix(2)), [3, 1])
     }
 
+    /// High Performance sessions carry the RFB control messages inside
+    /// decrypted media records; the packed clipboard must report its wire
+    /// size there as well, before the decoded text.
+    func testDecryptedPackedClipboardEmitsPayloadSizeBeforeText() async throws {
+        let connection = ScriptedRFBConnection()
+        let session = TransportSession(
+            host: "scripted.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.appleH264, .unknown(1105), .unknown(1104)],
+            connection: connection)
+        let packed = try AppleClipboardProtocol.packedTextMessage("hello")
+
+        let eventTask = Task { () -> [String] in
+            var seen: [String] = []
+            for await event in session.events {
+                switch event {
+                case .clipboardPayloadReceived(let bytes):
+                    seen.append("payload:\(bytes)")
+                case .clipboardText(let text):
+                    seen.append("text:\(text)")
+                    return seen
+                default:
+                    break
+                }
+            }
+            return seen
+        }
+        // Split across two records, as Apple may deliver it.
+        try await session.ingestAppleDecryptedRFBPayload(packed.prefix(20))
+        try await session.ingestAppleDecryptedRFBPayload(packed.dropFirst(20))
+
+        let seen = await eventTask.value
+        XCTAssertEqual(seen, ["payload:\(packed.count)", "text:hello"])
+    }
+
     func testPostAcceptEncodingsRetainAppleLocalCursorCapabilities() {
         let encodings = TransportSession.appleMediaPostAcceptEncodings(
             from: [.appleH264, .zlib, .raw, .unknown(1104), .unknown(1100)])
