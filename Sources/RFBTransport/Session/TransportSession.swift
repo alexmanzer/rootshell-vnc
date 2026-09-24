@@ -1081,17 +1081,26 @@ public actor TransportSession {
             || serverVersion?.isApple == true
     }
 
+    /// Whether clipboard text must use Apple's packed pasteboard message.
+    ///
+    /// Apple RFB 3.889 servers accept only this message for client clipboard
+    /// text. They ignore classic ClientCutText without an error. Their
+    /// ServerInit may carry no command bitmap at all, so the negotiated
+    /// version alone selects the packed message.
     static func shouldUseApplePackedClipboard(
+        serverVersion: ProtocolVersion?,
         capabilities: AppleServerCapabilities?
     ) -> Bool {
         capabilities?.supportsServerCommand(
             AppleClipboardProtocol.packedScrapMessageType) == true
+            || serverVersion?.isApple == true
     }
 
     /// Send clipboard text to the server.
     public func sendClipboardText(_ text: String) async throws {
         let payload: Data
         if Self.shouldUseApplePackedClipboard(
+            serverVersion: stateMachine.negotiatedVersion,
             capabilities: appleServerCapabilities) {
             payload = try AppleClipboardProtocol.packedTextMessage(text)
         } else {

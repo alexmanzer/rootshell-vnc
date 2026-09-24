@@ -119,11 +119,32 @@ final class AppleClipboardProtocolTests: XCTestCase {
         let legacyCapabilities = capabilities(bitmap: legacyBitmap)
 
         XCTAssertTrue(TransportSession.shouldUseApplePackedClipboard(
+            serverVersion: .v3_8,
             capabilities: packedCapabilities))
         XCTAssertFalse(TransportSession.shouldUseApplePackedClipboard(
+            serverVersion: .v3_8,
             capabilities: legacyCapabilities))
         XCTAssertFalse(TransportSession.shouldUseApplePackedClipboard(
+            serverVersion: .v3_8,
             capabilities: nil))
+        XCTAssertFalse(TransportSession.shouldUseApplePackedClipboard(
+            serverVersion: nil,
+            capabilities: nil))
+    }
+
+    func testAppleServerUsesPackedClipboardWithoutCommandBitmap() {
+        var legacyBitmap = Data(repeating: 0, count: 16)
+        legacyBitmap[0] = 0x02 // command 6 only
+        let legacyCapabilities = capabilities(bitmap: legacyBitmap)
+
+        // A real macOS Screen Sharing server negotiates RFB 3.889, sends no
+        // command bitmap and ignores classic ClientCutText.
+        XCTAssertTrue(TransportSession.shouldUseApplePackedClipboard(
+            serverVersion: .apple,
+            capabilities: nil))
+        XCTAssertTrue(TransportSession.shouldUseApplePackedClipboard(
+            serverVersion: .apple,
+            capabilities: legacyCapabilities))
     }
 
     private func capabilities(bitmap: Data) -> AppleServerCapabilities {
