@@ -168,6 +168,66 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    /// Encoding 1010 in SetEncodings makes macOS start its video stream at
+    /// once. The server encrypts media message 1 only when it has already
+    /// handled the viewer's media request (message 18). The native viewer
+    /// therefore sends viewer info and the request ahead of SetEncodings.
+    func testKeyedHighPerformanceRequestsMediaEncryptionBeforeSetEncodings() async throws {
+        let encodings: [Encoding] = [
+            .appleH264, .mediaStreamOffer, .serverDisplayInfo, .raw,
+        ]
+        let keyLength = 16
+        var serverBytes = ProtocolVersion.apple.wireBytes()
+        serverBytes.append(contentsOf: [1, SecurityType.apple30.rawValue])
+        serverBytes.append(contentsOf: [0x00, 0x02, 0x00, UInt8(keyLength)])
+        var prime = Data(repeating: 0xff, count: keyLength)
+        prime[keyLength - 1] = 0x61 // 2^128 - 159, a 128-bit prime
+        serverBytes.append(prime)
+        var serverPublicKey = Data(repeating: 0, count: keyLength)
+        serverPublicKey[keyLength - 1] = 5
+        serverBytes.append(serverPublicKey)
+        serverBytes.append(contentsOf: [0, 0, 0, 0]) // SecurityResult OK
+        serverBytes.append(Self.appleServerInitMessage(
+            width: 1920,
+            height: 1080,
+            name: "Keyed Mac"))
+
+        let fixture = try LoopbackRFBFixture(serverBytes: serverBytes)
+        defer { fixture.close() }
+        let session = TransportSession(
+            host: "127.0.0.1",
+            port: fixture.port,
+            password: "account-password",
+            username: "account",
+            preferredEncodings: encodings)
+
+        try await session.connect()
+
+        var expectedAfterAuth = Data([0xc1])
+        expectedAfterAuth.append(ClientMessage.setPixelFormat(.bgra8888).serialize())
+        expectedAfterAuth.append(ClientMessage.appleMediaStreamConfiguration.serialize())
+        expectedAfterAuth.append(ClientMessage.appleMediaStreamRequest.serialize())
+        expectedAfterAuth.append(ClientMessage.setEncodings(encodings).serialize())
+        expectedAfterAuth.append(ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080).serialize())
+
+        let bytesBeforeClientInit = ProtocolVersion.apple.wireBytes().count
+            + 1 // selected Apple DH security type
+            + 128 + keyLength // encrypted credentials + client public key
+        let expectedCount = bytesBeforeClientInit + expectedAfterAuth.count
+        let captured = await fixture.waitForClientBytes(atLeast: expectedCount)
+        let sent = try XCTUnwrap(captured)
+        XCTAssertEqual(
+            Data(sent.dropFirst(bytesBeforeClientInit).prefix(expectedAfterAuth.count)),
+            expectedAfterAuth)
+
+        await session.disconnect()
+    }
+
     func testPasswordOnlySessionSelectionReadsOneByteResultStatus() async throws {
         let encodings: [Encoding] = [.appleH264, .mediaStreamOffer, .raw]
         var serverBytes = ProtocolVersion.apple.wireBytes()

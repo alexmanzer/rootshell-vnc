@@ -1907,11 +1907,11 @@ public actor TransportSession {
         let actions = stateMachine.handle(event: .receivedServerInit(serverInit))
         emitState()
         // High Performance still begins with the ordinary post-ServerInit
-        // negotiation. `executeActions` flushes SetPixelFormat/SetEncodings
-        // before the authentication-specific media setup. Password-only Pro
-        // Mode then waits for encoding-1010 AVC message 1; keyed Apple auth
-        // sends its legacy media configuration and request. Skipping the
-        // ordinary actions leaves the control stream immediately desynchronized.
+        // negotiation. Keyed Apple auth sends its legacy media configuration
+        // and request between SetPixelFormat and SetEncodings. Password-only
+        // Pro Mode sends neither and waits for encoding-1010 AVC message 1.
+        // Skipping the ordinary actions leaves the control stream immediately
+        // desynchronized.
         try await executeActions(actions)
 
         continuation?.yield(.serverInit(serverInit))
@@ -2840,13 +2840,17 @@ public actor TransportSession {
                             displayID: 0))
                         sentAppleMediaInitialSetDisplay = true
                     }
-                    pending.append(ClientMessage.setEncodings(encodings).serialize())
-                    log.debug("Queued SetEncodings (\(encodings.count) encodings)")
                     if !pending.isEmpty {
                         try await sendClientPayload(pending)
                         pending = Data()
                     }
+                    // Encoding 1010 in SetEncodings starts the server's video
+                    // stream at once. The keyed media request must already be
+                    // handled then, or macOS sends media message 1 unencrypted
+                    // and drops the viewer when its encrypted reply arrives.
                     try await sendAppleMediaStreamSetupIfNeeded()
+                    pending.append(ClientMessage.setEncodings(encodings).serialize())
+                    log.debug("Queued SetEncodings (\(encodings.count) encodings)")
                 } else {
                     pending.append(ClientMessage.setEncodings(encodings).serialize())
                     log.debug("Queued SetEncodings (\(encodings.count) encodings)")
@@ -2924,12 +2928,13 @@ public actor TransportSession {
             log.debug("Sent SetPixelFormat")
 
         case .sendSetEncodings(let encodings):
-            let msg = ClientMessage.setEncodings(encodings)
-            try await sendControlChannel(msg.serialize())
-            log.debug("Sent SetEncodings (\(encodings.count) encodings)")
+            // See `executeActions`: the media request precedes encoding 1010.
             if requestAppleMediaStream && !sentAppleMediaStreamConfiguration {
                 try await sendAppleMediaStreamSetupIfNeeded()
             }
+            let msg = ClientMessage.setEncodings(encodings)
+            try await sendControlChannel(msg.serialize())
+            log.debug("Sent SetEncodings (\(encodings.count) encodings)")
 
         case .sendFramebufferUpdateRequest(let incremental, let width, let height):
             let msg = ClientMessage.framebufferUpdateRequest(
