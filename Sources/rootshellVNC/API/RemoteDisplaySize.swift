@@ -18,8 +18,17 @@ struct RemoteDisplaySize: Sendable, Equatable {
     let pointWidth: UInt16
     let pointHeight: UInt16
 
+    /// Smallest 2× virtual display mode that macOS Screen Sharing installs.
+    /// macOS 26.7.1 accepted 800×528 and 592×864 points and refused 792×600,
+    /// 960×520 and 488×1056 points (CGDisplaySetDisplayMode error 1001).
+    /// A refused mode on a new virtual display stalls the server for 20–40
+    /// seconds before it sends video again.
+    static let minimumHiDPIPointLongSide: CGFloat = 800
+    static let minimumHiDPIPointShortSide: CGFloat = 528
+
     /// Exact host-selected pixels. No implicit Retina doubling or upward rounding.
-    /// Express Apple's virtual workspace in half as many points (2× backing).
+    /// Express Apple's virtual workspace in half as many points (2× backing)
+    /// when macOS accepts that mode, otherwise in as many points as pixels (1×).
     static func explicit(pixelSize: CGSize) -> RemoteDisplaySize? {
         guard pixelSize.width.isFinite, pixelSize.height.isFinite,
               pixelSize.width >= 16, pixelSize.height >= 16,
@@ -27,9 +36,12 @@ struct RemoteDisplaySize: Sendable, Equatable {
               pixelSize.width * pixelSize.height <= 3840 * 2160,
               pixelSize.width.truncatingRemainder(dividingBy: 16) == 0,
               pixelSize.height.truncatingRemainder(dividingBy: 16) == 0 else { return nil }
+        let acceptsHiDPI = max(pixelSize.width, pixelSize.height) / 2 >= minimumHiDPIPointLongSide
+            && min(pixelSize.width, pixelSize.height) / 2 >= minimumHiDPIPointShortSide
+        let scale: CGFloat = acceptsHiDPI ? 2 : 1
         return RemoteDisplaySize(pixelWidth: UInt16(pixelSize.width),
-            pixelHeight: UInt16(pixelSize.height), pointWidth: UInt16(pixelSize.width / 2),
-            pointHeight: UInt16(pixelSize.height / 2))
+            pixelHeight: UInt16(pixelSize.height), pointWidth: UInt16(pixelSize.width / scale),
+            pointHeight: UInt16(pixelSize.height / scale))
     }
 
     /// A literal iPhone viewport is too small to be a usable macOS workspace,
