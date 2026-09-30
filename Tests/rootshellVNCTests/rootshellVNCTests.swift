@@ -294,6 +294,21 @@ final class StandardFramebufferPipelineTests: XCTestCase {
         }
     }
 
+    func testAppleMediaControlRectangleIsNotReportedAsUnsupportedPixels() {
+        let framebuffer = Framebuffer(
+            width: 8, height: 8, pixelFormat: .bgra8888)
+        let renderer = FramebufferRenderer(
+            framebuffer: framebuffer, pixelFormat: .bgra8888)
+        let rect = FramebufferRect(
+            x: 0, y: 0, width: 0, height: 0, encoding: .appleH264)
+        var framedMessageOne = Data([0x00, 0x24])
+        framedMessageOne.append(Data(repeating: 0, count: 36))
+
+        XCTAssertEqual(
+            renderer.applyBatch([(rect, framedMessageOne)], snapshot: false).issues,
+            [])
+    }
+
     func testProgressiveDCTPublishesEachDecodedRectangleDirectly() throws {
         let framebuffer = Framebuffer(
             width: 8, height: 8, pixelFormat: .bgra8888)

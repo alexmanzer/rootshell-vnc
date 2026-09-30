@@ -151,6 +151,11 @@ public final class FramebufferRenderer: @unchecked Sendable {
                  .mediaStreamOffer, .mediaStreamAnswer:
                 break
 
+            case .appleH264:
+                // Encoding 1010 carries media control messages. The video
+                // itself arrives over UDP, not in this rectangle.
+                break
+
             case .unknown(let value)
                 where value == 1100 || value == 1101
                     || value == 1105 || value == 1107
