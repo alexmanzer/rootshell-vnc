@@ -488,6 +488,11 @@ public actor TransportSession {
     private var sentAppleMediaPostAnswerViewerInfo = false
     private var sentAppleMediaReconfigurationRequest = false
     private var sentAppleMediaInitialSetDisplay = false
+    /// Geometry of the one physical display a Standard-mode SetDisplay just
+    /// selected. Apple encodes only that display afterwards, at its own size
+    /// and origin, without sending DesktopSize, so the update that announced
+    /// it carries a synthesized resize to the selected display's dimensions.
+    private var pendingSelectedDisplayResize: FramebufferRect?
     private var sentAppleMediaAutoFrameUpdate = false
     private var appleMediaGenerationTracker = AppleMediaNegotiationGenerationTracker()
     private var acceptedAppleMediaStream = false
@@ -2331,7 +2336,7 @@ public actor TransportSession {
                 // atomic topology replacement/geometry recovery.
                 continuation?.yield(.displayInfo(info))
                 try await sendAppleStandardDisplaySelectionIfNeeded(
-                    displayID: info.displayIndex)
+                    display: info)
                 // Feed to state machine (informational, no response)
                 let _ = stateMachine.handle(event: .receivedAppleDisplayInfo(info))
                 pixelData = Data()
@@ -2457,7 +2462,7 @@ public actor TransportSession {
                     emitAppleDisplayInfoCompatibilityEvents(displayInfos)
                     if let firstDisplay = displayInfos.first {
                         try await sendAppleStandardDisplaySelectionIfNeeded(
-                            displayID: firstDisplay.displayIndex,
+                            display: firstDisplay,
                             announcedDisplayCount: displayInfos.count)
                     }
                 }
@@ -2517,6 +2522,15 @@ public actor TransportSession {
             rectsWithData.append((rect, pixelData))
             if rect.isSuccessfulDesktopResize {
                 pendingResize = rect
+            }
+        }
+
+        if let selectedDisplayResize = pendingSelectedDisplayResize {
+            pendingSelectedDisplayResize = nil
+            // A real DesktopSize in the same update is authoritative.
+            if pendingResize == nil {
+                rectsWithData.append((selectedDisplayResize, Data()))
+                pendingResize = selectedDisplayResize
             }
         }
 
@@ -3298,9 +3312,10 @@ public actor TransportSession {
     }
 
     private func sendAppleStandardDisplaySelectionIfNeeded(
-        displayID: UInt32,
+        display: AppleDisplayInfo,
         announcedDisplayCount: Int? = nil
     ) async throws {
+        let displayID = display.displayIndex
         guard !requestAppleMediaStream,
               requestedDisplayCount == 1,
               !sentAppleMediaInitialSetDisplay else { return }
@@ -3321,6 +3336,24 @@ public actor TransportSession {
             isGlobal: false,
             displayID: displayID))
         log.info("Selected Apple display ID \(displayID)")
+
+        // The server now encodes only this display, at its own size. Without
+        // adopting that size the framebuffer keeps the combined ServerInit
+        // desktop, and initial-frame coverage can never complete. A zero-sized
+        // ServerInit builds its geometry from the display layout instead.
+        guard !usesDeferredAppleDisplayLayout,
+              display.width > 0, display.height > 0,
+              display.width <= UInt32(UInt16.max),
+              display.height <= UInt32(UInt16.max) else { return }
+        let width = UInt16(display.width)
+        let height = UInt16(display.height)
+        guard width != fbWidth || height != fbHeight else { return }
+        pendingSelectedDisplayResize = FramebufferRect(
+            x: 0, y: 0, width: width, height: height,
+            encoding: .desktopSize)
+        log.info(
+            "Adopting selected display geometry \(width)x\(height) "
+                + "in place of \(fbWidth)x\(fbHeight)")
     }
 
     private func resetAppleDCTBootstrapCoverage() {

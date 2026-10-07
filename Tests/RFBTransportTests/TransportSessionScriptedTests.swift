@@ -1050,6 +1050,75 @@ final class TransportSessionScriptedTests: XCTestCase {
         }
     }
 
+    func testAppleStandardOneDisplaySelectionAdoptsSelectedDisplayGeometry() async throws {
+        // Mirrors a MacBook with an external monitor: the built-in display is
+        // announced first but sits to the right of the larger external one, so
+        // the combined ServerInit desktop is bigger than the selected display.
+        let selectedID: UInt32 = 1
+        let displays = [
+            AppleDisplayInfo(
+                displayIndex: selectedID,
+                originX: 4, originY: 0,
+                width: 2, height: 1,
+                flags: 0),
+            AppleDisplayInfo(
+                displayIndex: 3,
+                originX: 0, originY: 0,
+                width: 4, height: 2,
+                flags: 0),
+        ]
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 6, height: 2, name: "apple-two-displays"))
+        script.append(Self.framebufferUpdate([(
+            Self.rectangleHeader(
+                x: 0, y: 0, width: 0, height: 0,
+                encoding: 1105),
+            appleDisplayInfo2TestPayload(displays: displays)
+        )]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "apple-two-displays.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: Self.appleDCTEncodings,
+            displayCount: 1,
+            connection: connection)
+        let updateTask = Task { () -> FramebufferRect? in
+            for await event in session.events {
+                guard case .framebufferUpdate(let rects) = event else { continue }
+                try? await session.finishFramebufferUpdate()
+                return rects.last?.0
+            }
+            return nil
+        }
+
+        try await session.connect()
+        let lastRect = await Self.withTimeout(seconds: 2) {
+            await updateTask.value
+        } ?? nil
+
+        var setDisplay = Data([0x0d, 0x00, 0x00, 0x00])
+        setDisplay.append(Self.uint32Bytes(selectedID))
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: setDisplay, in: sent), 1)
+
+        guard let resize = lastRect else {
+            XCTFail("Missing framebuffer update")
+            await session.disconnect()
+            return
+        }
+        XCTAssertEqual(resize.encoding, .desktopSize)
+        XCTAssertTrue(resize.isSuccessfulDesktopResize)
+        XCTAssertEqual(resize.width, 2)
+        XCTAssertEqual(resize.height, 1)
+        await session.disconnect()
+    }
+
     func testAppleStandardSoleDisplayAnnouncementDoesNotResetBootstrapSelection() async throws {
         let connection = ScriptedRFBConnection()
         let width: UInt16 = 2
