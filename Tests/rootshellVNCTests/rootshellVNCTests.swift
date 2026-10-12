@@ -268,6 +268,51 @@ final class StandardFramebufferPipelineTests: XCTestCase {
         ])
     }
 
+    /// A MacBook with a smaller Sidecar iPad to its right. The bounding box
+    /// has never-encoded gaps above and below the iPad.
+    private static let sidecarLayout = [
+        CGRect(x: 0, y: 0, width: 12, height: 8),
+        CGRect(x: 12, y: 1, width: 8, height: 6),
+    ]
+
+    func testCombinedLayoutPresentsOnceAnEncodedDisplayIsCovered() {
+        var tracker = StandardInitialFramePresentationTracker()
+        XCTAssertTrue(tracker.ingest(
+            [dctRect(x: 0, y: 0, width: 12, height: 8, type: 0)],
+            framebufferWidth: 20, framebufferHeight: 8,
+            displayRegions: Self.sidecarLayout))
+        XCTAssertFalse(tracker.suppressesPresentation)
+    }
+
+    func testCombinedLayoutWaitsForPartlyCoveredDisplay() {
+        var tracker = StandardInitialFramePresentationTracker()
+        XCTAssertFalse(tracker.ingest([
+            dctRect(x: 0, y: 0, width: 12, height: 8, type: 0),
+            dctRect(x: 12, y: 1, width: 4, height: 6, type: 0),
+        ], framebufferWidth: 20, framebufferHeight: 8,
+            displayRegions: Self.sidecarLayout))
+        XCTAssertTrue(tracker.suppressesPresentation)
+
+        XCTAssertTrue(tracker.ingest(
+            [dctRect(x: 16, y: 1, width: 4, height: 6, type: 0)],
+            framebufferWidth: 20, framebufferHeight: 8,
+            displayRegions: Self.sidecarLayout))
+    }
+
+    func testDisplayLayoutOutsideFramebufferKeepsFullCoverageGate() {
+        // After a one-display selection the framebuffer is that display
+        // alone, so the combined layout no longer shares its coordinates.
+        var tracker = StandardInitialFramePresentationTracker()
+        XCTAssertFalse(tracker.ingest(
+            [dctRect(x: 0, y: 0, width: 8, height: 2, type: 0)],
+            framebufferWidth: 8, framebufferHeight: 4,
+            displayRegions: [
+                CGRect(x: 8, y: 0, width: 8, height: 4),
+                CGRect(x: 0, y: 0, width: 8, height: 8),
+            ]))
+        XCTAssertTrue(tracker.suppressesPresentation)
+    }
+
     func testDCTRefinementDoesNotClaimMissingInitialCoverage() {
         var tracker = StandardInitialFramePresentationTracker()
         XCTAssertFalse(tracker.ingest([
