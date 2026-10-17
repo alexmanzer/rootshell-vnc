@@ -1056,6 +1056,32 @@ final class DisplayPresentationTests: XCTestCase {
             CGRect(x: 0, y: 0, width: 1920, height: 1080))
     }
 
+    func testOffsetDisplayCropsCombinedFramebufferAtItsOrigin() {
+        let displays = [
+            CGRect(x: 0, y: 0, width: 1920, height: 1080),
+            CGRect(x: -1280, y: 0, width: 1280, height: 800),
+        ]
+        XCTAssertEqual(
+            normalizedSelectedDisplayRegion(
+                displays,
+                displayCount: 1,
+                framebufferSize: CGSize(width: 3200, height: 1080)),
+            CGRect(x: 1280, y: 0, width: 1920, height: 1080))
+    }
+
+    func testSelectedDisplayFramebufferIsPresentedAtLocalOrigin() {
+        let displays = [
+            CGRect(x: 0, y: 0, width: 1920, height: 1080),
+            CGRect(x: -1280, y: 0, width: 1280, height: 800),
+        ]
+        XCTAssertEqual(
+            normalizedSelectedDisplayRegion(
+                displays,
+                displayCount: 1,
+                framebufferSize: CGSize(width: 1920, height: 1080)),
+            CGRect(x: 0, y: 0, width: 1920, height: 1080))
+    }
+
     func testTwoDisplaysPresentCompleteStandardFramebuffer() {
         XCTAssertEqual(
             normalizedSelectedDisplayRegion(displays, displayCount: 2),

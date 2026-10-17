@@ -23,16 +23,24 @@ private actor MediaRecoveryCoordinator {
 }
 
 /// Union the selected leading displays and translate the result into the
-/// framebuffer's normalized coordinate space.
+/// framebuffer's normalized coordinate space. A framebuffer that has been
+/// resized to the selection alone, as after a Standard SetDisplay, already
+/// holds it at the origin.
 func normalizedSelectedDisplayRegion(
     _ regions: [CGRect],
-    displayCount: Int
+    displayCount: Int,
+    framebufferSize: CGSize? = nil
 ) -> CGRect? {
     guard let first = regions.first else { return nil }
     let all = regions.dropFirst().reduce(first) { $0.union($1) }
     let count = min(max(1, displayCount), regions.count)
     let selected = regions.prefix(count).dropFirst().reduce(first) {
         $0.union($1)
+    }
+    if let framebufferSize,
+       framebufferSize == selected.size,
+       framebufferSize != all.size {
+        return CGRect(origin: .zero, size: selected.size)
     }
     return selected.offsetBy(dx: -all.minX, dy: -all.minY)
 }
@@ -2358,7 +2366,10 @@ public final class VNCSession {
         }
         return normalizedSelectedDisplayRegion(
             remoteDisplayRegions,
-            displayCount: configuration.displayCount)
+            displayCount: configuration.displayCount,
+            framebufferSize: CGSize(
+                width: framebufferWidth,
+                height: framebufferHeight))
     }
 
     var presentedFramebufferSize: CGSize {
