@@ -291,6 +291,29 @@ final class TransportSessionScriptedTests: XCTestCase {
         XCTAssertEqual(states.snapshot(), [true, false])
     }
 
+    func testWithdrawnRemoteDisplayRequestSettlesTheResize() async throws {
+        let states = LockedResizeSettledStates()
+        let session = TransportSession(
+            host: "display.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.appleH264, .raw],
+            requestsVirtualDisplays: true)
+        await session.setAppleRemoteDisplayResizeSettledSink {
+            states.append($0)
+        }
+        _ = try await session.requestRemoteDisplaySize(
+            pixelWidth: 2048,
+            pixelHeight: 1536,
+            pointWidth: 1024,
+            pointHeight: 768)
+
+        await session.withdrawPendingRemoteDisplaySize()
+        await session.withdrawPendingRemoteDisplaySize()
+
+        XCTAssertEqual(states.snapshot(), [true, false, true])
+    }
+
     /// `portableEncodings` rewrites the list for conventional servers rather
     /// than adding to it, so it has to honour the server-rendered choice too.
     /// Asserting the whole byte stream proves nothing else shifted with it.

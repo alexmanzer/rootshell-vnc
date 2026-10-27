@@ -1965,6 +1965,12 @@ public final class VNCSession {
             pointHeight: requested.pointHeight)
     }
 
+    /// Drops a requested size that has not been sent yet. Use it when the
+    /// display already has the size the client wants.
+    public func withdrawPendingRemotePixelSize() async {
+        await transportSession?.withdrawPendingRemoteDisplaySize()
+    }
+
     public func supportsRemotePixelSize() async -> Bool {
         guard let transport = transportSession else { return false }
         let supported = await transport.supportsRemoteDisplayResize

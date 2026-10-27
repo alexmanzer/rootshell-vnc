@@ -1376,6 +1376,14 @@ public actor TransportSession {
         appleRemoteDisplaySizeSink = sink
     }
 
+    /// Drops a display size that waits to be sent, for example when the
+    /// client wants to keep the size the server shows now.
+    public func withdrawPendingRemoteDisplaySize() {
+        guard pendingRemoteDisplaySize != nil else { return }
+        pendingRemoteDisplaySize = nil
+        emitAppleRemoteDisplayResizeSettled()
+    }
+
     /// Reports whether every staged Apple virtual-display request has reached
     /// a media generation with all expected RTP sources. A complete decoded
     /// frame is still required by the UI before input is considered safe.
@@ -1500,6 +1508,9 @@ public actor TransportSession {
             pointWidth: pointWidth,
             pointHeight: pointHeight)
         guard requested != lastSentRemoteDisplaySize else {
+            // The server already has this size; a different size queued
+            // behind the running reconfiguration is no longer wanted.
+            pendingRemoteDisplaySize = nil
             emitAppleRemoteDisplayResizeSettled()
             return appleServerCapabilities?.supportsServerCommand(
                 AppleServerCapabilities.displayConfigurationCommand) == true
@@ -3611,7 +3622,8 @@ public actor TransportSession {
         let message = ClientMessage.setDesktopSize(request)
         try await sendClientPayload(message.serialize())
         lastSentRemoteDisplaySize = requested
-        pendingRemoteDisplaySize = nil
+        // A newer size queued during the send stays queued.
+        if pendingRemoteDisplaySize == requested { pendingRemoteDisplaySize = nil }
         emitAppleRemoteDisplayResizeSettled()
         appleRemoteDisplaySizeSink?(
             request.width,
@@ -3687,7 +3699,8 @@ public actor TransportSession {
             throw error
         }
         lastSentRemoteDisplaySize = requested
-        pendingRemoteDisplaySize = nil
+        // A newer size queued during the send stays queued.
+        if pendingRemoteDisplaySize == requested { pendingRemoteDisplaySize = nil }
         emitAppleRemoteDisplayResizeSettled()
         let aggregateWidth = UInt16(min(
             Int(UInt16.max),
