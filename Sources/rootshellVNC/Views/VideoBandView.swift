@@ -31,8 +31,8 @@ public final class VideoBandLayerRenderer {
     /// Screen size of the media generation whose first frame has not
     /// arrived yet. Adopted together with that frame.
     private var pendingScreenSize: CGSize?
-    /// The screen size changed while presentation was suspended; the layer
-    /// layout waits for resume like every other layer commit.
+    /// A layout was asked for while presentation was suspended; it waits
+    /// for resume like every other layer commit.
     private var needsLayoutAfterResume = false
     private var viewBounds: CGRect = .zero
     /// A media renegotiation can replace every SSRC. Retain the previous
@@ -247,7 +247,7 @@ public final class VideoBandLayerRenderer {
             compositor.reset()
             replaceLayersOnNextFrame = false
             pendingDisplayFlush = true
-            if adoptPendingScreenSize() { needsLayoutAfterResume = true }
+            if adoptPendingScreenSize() { layout() }
         }
         for (ssrc, pixelBuffer) in buffers {
             previousBandBuffers[ssrc] = bandBuffers[ssrc]
@@ -377,6 +377,10 @@ public final class VideoBandLayerRenderer {
     /// already been clipped by `CompoundBandSurfaceCompositor`.
     public func layout() {
         guard screenWidth > 0, screenHeight > 0, viewBounds.width > 0, viewBounds.height > 0 else { return }
+        if isPresentationSuspended || VNCPresentationPolicy.isPresentationProhibited() {
+            needsLayoutAfterResume = true
+            return
+        }
 
         // Aspect-fit the native screen into the view.
         let scale = min(viewBounds.width / screenWidth, viewBounds.height / screenHeight)

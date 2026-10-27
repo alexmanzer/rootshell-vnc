@@ -64,6 +64,19 @@ final class ScreenSizeHandoffTests: XCTestCase {
         XCTAssertEqual(committedWidths, [128, 64])
     }
 
+    func testLayoutWaitsForResume() throws {
+        let renderer = makeRenderer()
+        renderer.setBands([1: try makeBuffer(width: 128)])
+
+        renderer.setPresentationSuspended(true)
+        renderer.setViewBounds(CGRect(x: 0, y: 0, width: 128, height: 48))
+        renderer.setScreenSize(width: 128, height: 96)
+        XCTAssertEqual(renderer.containerLayer.frame.width, 128)
+
+        renderer.setPresentationSuspended(false)
+        XCTAssertEqual(renderer.containerLayer.frame.width, 64)
+    }
+
     /// A renderer showing 128×96 in a 256×96 view: the picture is 128 points wide.
     private func makeRenderer() -> VideoBandLayerRenderer {
         let renderer = VideoBandLayerRenderer()
