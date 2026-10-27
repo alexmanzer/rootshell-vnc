@@ -139,6 +139,9 @@ public final class VideoStreamManager: @unchecked Sendable {
     private var mediaGeneration: UInt64 = 0
     private var fullFrameWidth = 0
     private var fullFrameHeight = 0
+    /// Media generation whose codec geometry `onFrameGeometryChange` last
+    /// reported.
+    private var reportedGeometryGeneration: UInt64 = 0
     private var codedBandHeight = 0
     private var expectedBandCount = 0
     private var presentationTimeline = HEVCPresentationTimeline()
@@ -831,6 +834,7 @@ public final class VideoStreamManager: @unchecked Sendable {
         nonFatalDecodeFailureCount = 0
         fullFrameWidth = 0
         fullFrameHeight = 0
+        reportedGeometryGeneration = 0
         mediaGeneration = 0
         codedBandHeight = 0
         expectedBandCount = 0
@@ -1147,10 +1151,17 @@ public final class VideoStreamManager: @unchecked Sendable {
         let callback: (@Sendable (VideoFrameGeometry) -> Void)?
         lock.lock()
         codedBandHeight = height
+        // A replacement generation reports its geometry even when it matches:
+        // a size request no longer applies it when sent, so the receiver may
+        // still hold the size from before the request.
+        let isReplacementGeneration = mediaGeneration > 1
+            && mediaGeneration != reportedGeometryGeneration
         if !usesDecodingOrderNumbers
-            && (width != fullFrameWidth || height != fullFrameHeight) {
+            && (width != fullFrameWidth || height != fullFrameHeight
+                || isReplacementGeneration) {
             fullFrameWidth = width
             fullFrameHeight = height
+            reportedGeometryGeneration = mediaGeneration
             update = VideoFrameGeometry(
                 width: width,
                 height: height,

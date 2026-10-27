@@ -149,6 +149,27 @@ final class CompoundHEVCDONReorderBufferTests: XCTestCase {
         manager.stopStream()
     }
 
+    func testReplacementGenerationReportsOneTileGeometryOnceEvenWhenUnchanged() {
+        let manager = VideoStreamManager()
+        manager.startStream(
+            streamID: 7,
+            width: 1136,
+            height: 1808,
+            usesDecodingOrderNumbers: false
+        ) { _, _ in }
+        XCTAssertNil(
+            manager.acceptCodedDimensions(width: 1136, height: 1808),
+            "the initial generation reports only changes")
+
+        manager.prepareForStreamReconfiguration(mediaGeneration: 2)
+
+        XCTAssertEqual(
+            manager.acceptCodedDimensions(width: 1136, height: 1808),
+            VideoFrameGeometry(width: 1136, height: 1808, mediaGeneration: 2))
+        XCTAssertNil(manager.acceptCodedDimensions(width: 1136, height: 1808))
+        manager.stopStream()
+    }
+
     func testExpectedBandCountRoundsUpPartialFinalBand() {
         XCTAssertEqual(
             VideoStreamManager.expectedBandCount(
