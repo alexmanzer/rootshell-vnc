@@ -382,7 +382,8 @@ public actor TransportSession {
     private var appleMediaGenerationSink: (@Sendable (UInt64, Int) -> Void)?
     private var appleMediaSenderClockSink:
         (@Sendable (AppleMediaSenderClockMapping) -> Void)?
-    private var appleRemoteDisplaySizeSink: (@Sendable (UInt16, UInt16) -> Void)?
+    private var appleRemoteDisplaySizeSink:
+        (@Sendable (UInt16, UInt16, Bool) -> Void)?
     private var appleRemoteDisplayResizeSettledSink:
         (@Sendable (Bool) -> Void)?
     private var activeAppleMediaTilesPerFrame = Int(
@@ -1370,8 +1371,12 @@ public actor TransportSession {
         }
     }
 
+    /// Reports every display size sent to the server. The flag is true when
+    /// the size reaches the picture only with the next media generation,
+    /// whose one-tile codec format carries it; until then the server keeps
+    /// sending frames of the previous size.
     public func setAppleRemoteDisplaySizeSink(
-        _ sink: (@Sendable (UInt16, UInt16) -> Void)?
+        _ sink: (@Sendable (UInt16, UInt16, Bool) -> Void)?
     ) {
         appleRemoteDisplaySizeSink = sink
     }
@@ -3627,7 +3632,8 @@ public actor TransportSession {
         emitAppleRemoteDisplayResizeSettled()
         appleRemoteDisplaySizeSink?(
             request.width,
-            request.height)
+            request.height,
+            false)
         log.info(
             "Requested standard remote desktop \(request.width)x\(request.height)")
     }
@@ -3707,7 +3713,9 @@ public actor TransportSession {
             Int(requested.pixelWidth) * displays.count))
         appleRemoteDisplaySizeSink?(
             aggregateWidth,
-            requested.pixelHeight)
+            requested.pixelHeight,
+            requestAppleMediaStream && displays.count == 1
+                && activeAppleMediaTilesPerFrame == 1)
         log.info(
             "Requested Apple dynamic virtual display \(requested.pixelWidth)x"
                 + "\(requested.pixelHeight) pixels (\(requested.pointWidth)x"

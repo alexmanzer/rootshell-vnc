@@ -28,6 +28,12 @@ public final class VideoBandLayerRenderer {
     private var previousDisplayedBuffer: CVPixelBuffer?
     private var screenWidth: CGFloat = 0
     private var screenHeight: CGFloat = 0
+    /// Screen size of the media generation whose first frame has not
+    /// arrived yet. Adopted together with that frame.
+    private var pendingScreenSize: CGSize?
+    /// The screen size changed while presentation was suspended; the layer
+    /// layout waits for resume like every other layer commit.
+    private var needsLayoutAfterResume = false
     private var viewBounds: CGRect = .zero
     /// A media renegotiation can replace every SSRC. Retain the previous
     /// generation on screen while the server negotiates, then remove its
@@ -86,10 +92,32 @@ public final class VideoBandLayerRenderer {
         displayLayer.contentsScale = scale
     }
 
+    /// Sets the desktop size the bands are composed to. After
+    /// `beginStreamGeneration` the size waits for the new generation's first
+    /// frame: the retiring generation still sends frames of its own size, and
+    /// composing them to the new size would show them shrunken and cropped.
     public func setScreenSize(width: Int, height: Int) {
-        screenWidth = CGFloat(width)
-        screenHeight = CGFloat(height)
+        if replaceLayersOnNextFrame {
+            pendingScreenSize = CGSize(width: width, height: height)
+            return
+        }
+        applyScreenSize(width: CGFloat(width), height: CGFloat(height))
+    }
+
+    private func applyScreenSize(width: CGFloat, height: CGFloat) {
+        screenWidth = width
+        screenHeight = height
         layout()
+    }
+
+    /// Takes over the size that waits for the first frame of a new generation.
+    /// Returns false when no size was waiting.
+    private func adoptPendingScreenSize() -> Bool {
+        guard let size = pendingScreenSize else { return false }
+        pendingScreenSize = nil
+        screenWidth = size.width
+        screenHeight = size.height
+        return true
     }
 
     public func configureExpectedBandCount(_ count: Int) {
@@ -104,6 +132,7 @@ public final class VideoBandLayerRenderer {
         previousDisplayedBuffer = nil
         compositor.reset()
         replaceLayersOnNextFrame = false
+        pendingScreenSize = nil
         hasPendingSuspendedBands = false
         if isPresentationSuspended || VNCPresentationPolicy.isPresentationProhibited() {
             // Connection setup/teardown can run while the device is locked
@@ -152,6 +181,7 @@ public final class VideoBandLayerRenderer {
             partialCommitCount &+= 1
         }
         performPendingDisplayFlushIfNeeded()
+        performPendingLayoutIfNeeded()
         if replaceLayersOnNextFrame {
             displayLayer.sampleBufferRenderer.flush(
                 removingDisplayedImage: true,
@@ -162,6 +192,7 @@ public final class VideoBandLayerRenderer {
             previousDisplayedBuffer = nil
             compositor.reset()
             replaceLayersOnNextFrame = false
+            if adoptPendingScreenSize() { layout() }
         }
         for (ssrc, pixelBuffer) in buffers {
             previousBandBuffers[ssrc] = bandBuffers[ssrc]
@@ -216,6 +247,7 @@ public final class VideoBandLayerRenderer {
             compositor.reset()
             replaceLayersOnNextFrame = false
             pendingDisplayFlush = true
+            if adoptPendingScreenSize() { needsLayoutAfterResume = true }
         }
         for (ssrc, pixelBuffer) in buffers {
             previousBandBuffers[ssrc] = bandBuffers[ssrc]
@@ -231,6 +263,7 @@ public final class VideoBandLayerRenderer {
         // gate composes from the full retained band set.
         guard !VNCPresentationPolicy.isPresentationProhibited() else { return }
         performPendingDisplayFlushIfNeeded()
+        performPendingLayoutIfNeeded()
         guard hasPendingSuspendedBands, !bandBuffers.isEmpty else { return }
         hasPendingSuspendedBands = false
         frameCommitCount &+= 1
@@ -254,6 +287,12 @@ public final class VideoBandLayerRenderer {
             reconcilePresentationPath()
             pendingPresenterReset = false
         }
+    }
+
+    private func performPendingLayoutIfNeeded() {
+        guard needsLayoutAfterResume else { return }
+        needsLayoutAfterResume = false
+        layout()
     }
 
     private func presentComposedFrame() {

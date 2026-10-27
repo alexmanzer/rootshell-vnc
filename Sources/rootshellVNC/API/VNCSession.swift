@@ -4856,10 +4856,20 @@ public final class VNCSession {
                 // repeated stream-offer path above intentionally does not.
                 sinkAudioPlayer?.reset()
             }
-            await transport.setAppleRemoteDisplaySizeSink { [weak self] width, height in
+            await transport.setAppleRemoteDisplaySizeSink {
+                [weak self] width, height, followsMediaGeneration in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.acceptsDeferredAppleDisplayGeometry = false
+                    // The server keeps sending the previous size until the
+                    // next media generation. That generation's codec format
+                    // applies the new geometry (applyMediaStreamGeometry), and
+                    // the renderer adopts it with the generation's first frame.
+                    if followsMediaGeneration,
+                       self.configuration.displaySizingMode == .matchClient,
+                       self.activeVideoDisplayCount == 1 {
+                        return
+                    }
                     await self.applyDesktopResizeMetadata(
                         width: width,
                         height: height)
