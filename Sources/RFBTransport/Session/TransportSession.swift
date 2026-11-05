@@ -1338,8 +1338,7 @@ public actor TransportSession {
     }
 
     public var supportsRemoteDisplayResize: Bool {
-        appleServerCapabilities?.supportsServerCommand(
-            AppleServerCapabilities.displayConfigurationCommand) == true || standardDesktopLayout != nil
+        usesAppleVirtualDisplays || standardDesktopLayout != nil
     }
 
     public var currentAppleMediaTilesPerFrame: Int {

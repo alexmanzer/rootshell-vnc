@@ -751,6 +751,34 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    /// The virtual-display command belongs to High Performance; a Standard
+    /// session resizes only through ExtendedDesktopSize.
+    func testAppleStandardDoesNotOfferResizeThroughVirtualDisplays() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.appleServerInitMessage(
+            width: 1920,
+            height: 1080,
+            name: "Display Mac",
+            flags: 0x20,
+            serverCommands: [AppleServerCapabilities.displayConfigurationCommand]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "display.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            connection: connection)
+        try await session.connect()
+
+        let supportsResize = await session.supportsRemoteDisplayResize
+        XCTAssertFalse(supportsResize)
+        await session.disconnect()
+    }
+
     func testAppleStandardRunsSessionSelectionWhenServerAnnouncesIt() async throws {
         let connection = ScriptedRFBConnection()
         var script = ProtocolVersion.apple.wireBytes()
