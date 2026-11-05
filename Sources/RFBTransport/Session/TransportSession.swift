@@ -2817,9 +2817,12 @@ public actor TransportSession {
     }
 
     private func handleAppleAutoPasteboardInfo() async throws {
-        // Apple sends this fixed eight-byte notification after command 21 has
-        // enabled automatic pasteboard updates. It announces a change; the
-        // viewer must still issue command 11 to fetch the packed scrap.
+        // Apple sends this fixed eight-byte notice to a viewer that sent
+        // viewer info. Measured against macOS 26 it arrives about every two
+        // seconds with the same payload whether or not the pasteboard
+        // changed, so it does not mark a change. A fetch on each notice
+        // (command 11) polls the whole pasteboard; the host opts in with
+        // command 21.
         _ = try await readControlChannel(exactly: 7)
         guard appleSharedClipboardEnabled else { return }
         do {
