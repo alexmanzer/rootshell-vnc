@@ -56,6 +56,15 @@ public final class VideoBandLayerRenderer {
     /// without adding a second compositor or touching individual HEVC bands.
     var onFrameCommitted: ((CVPixelBuffer, UInt64) -> Void)?
 
+    /// Receives each stitched frame right after it is committed, while set.
+    /// A host uses it to read pixels of the picture, for example to magnify
+    /// a part of it. Nil stops the delivery.
+    public var onComposedFrame: ((CVPixelBuffer) -> Void)?
+
+    /// The stitched frame on screen. Nil before the first commit and after
+    /// a reset.
+    public var composedFrame: CVPixelBuffer? { displayedBuffer }
+
     var renderedBandCount: Int { bandBuffers.count }
 
     var renderedBandDimensions: [(width: Int, height: Int)] {
@@ -320,6 +329,7 @@ public final class VideoBandLayerRenderer {
             videoRenderer.enqueue(sampleBuffer)
         }
         onFrameCommitted?(frame, streamGenerationCount)
+        onComposedFrame?(frame)
     }
 
     /// Wrap an already-decoded image buffer without copying its pixels. The
