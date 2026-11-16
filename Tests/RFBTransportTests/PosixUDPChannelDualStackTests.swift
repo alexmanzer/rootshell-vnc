@@ -157,6 +157,41 @@ final class PosixUDPChannelDualStackTests: XCTestCase {
         XCTAssertEqual(counter.snapshot().received, 4, "Closing must preserve aggregate media counts")
     }
 
+    /// The keepalive that opens a NAT mapping keys off these two readings.
+    func testChannelReportsSendIdleTimeAndFirstReceive() async throws {
+        guard let peer = UDPTestPeer(family: AF_INET) else {
+            XCTFail("failed to create test peer")
+            return
+        }
+        defer { peer.close() }
+
+        let channel = PosixUDPChannel(
+            localPort: nil, remoteHost: "127.0.0.1", remotePort: peer.port, enableReusePort: false)
+        try await channel.start()
+        var idle = await channel.nanosecondsSinceLastSend
+        var received = await channel.hasReceivedDatagram
+        XCTAssertNil(idle)
+        XCTAssertFalse(received)
+
+        try await channel.send(Data([1]))
+        idle = await channel.nanosecondsSinceLastSend
+        XCTAssertNotNil(idle)
+        XCTAssertLessThan(idle ?? .max, 5_000_000_000)
+
+        guard let (_, sender) = peer.receive() else {
+            XCTFail("peer never received the datagram")
+            return
+        }
+        peer.send(Data([7]), to: sender)
+        _ = try await withTimeout(seconds: 5) {
+            try await channel.receive()
+        }
+        received = await channel.hasReceivedDatagram
+        XCTAssertTrue(received)
+
+        await channel.close()
+    }
+
     func testIPv4LiteralRoundTrip() async throws {
         try await assertRoundTrip(peerFamily: AF_INET, remoteHost: "127.0.0.1")
     }

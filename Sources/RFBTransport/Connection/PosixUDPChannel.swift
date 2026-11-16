@@ -173,6 +173,8 @@ public actor PosixUDPChannel {
     private nonisolated(unsafe) var publishedSinceBacklogLog = 0
     private nonisolated(unsafe) var droppedSinceBacklogLog = 0
     private nonisolated(unsafe) var lockedClosed = false
+    private nonisolated(unsafe) var lockedReceivedDatagram = false
+    private var lastSendNanos: UInt64?
     /// Soft cap so a stalled consumer degrades like a kernel buffer overflow
     /// (bounded memory, oldest dropped) instead of growing without bound.
     private var closed = false
@@ -380,6 +382,17 @@ public actor PosixUDPChannel {
             throw VNCProtocolError.ioError("UDP send failed: \(errnoString())")
         }
         byteCounter.send(sent)
+        lastSendNanos = DispatchTime.now().uptimeNanoseconds
+    }
+
+    /// Whether the peer has delivered anything on this channel yet.
+    public var hasReceivedDatagram: Bool {
+        stateLock.withLock { lockedReceivedDatagram }
+    }
+
+    /// Nanoseconds since the last successful send, or nil before the first.
+    public var nanosecondsSinceLastSend: UInt64? {
+        lastSendNanos.map { DispatchTime.now().uptimeNanoseconds &- $0 }
     }
 
     public func close() {
@@ -450,6 +463,7 @@ public actor PosixUDPChannel {
     private nonisolated func publishBatchInOrder(_ batch: [PosixUDPDatagram]) {
         byteCounter.receive(batch.reduce(0) { $0 + $1.data.count })
         stateLock.lock()
+        lockedReceivedDatagram = true
         let dropped = pendingDatagrams.append(contentsOf: batch)
         let queuedBeforeDelivery = pendingDatagrams.count
         backlogHighWater = max(backlogHighWater, queuedBeforeDelivery)
